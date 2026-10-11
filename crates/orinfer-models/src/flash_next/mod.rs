@@ -1,5 +1,6 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
 mod batching;
+mod experts;
 mod inputs;
 mod mtp;
 mod plan;
@@ -112,6 +113,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Flash package arithmetic/checkpoint signature mismatch".into());
     }
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
+    let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,
         request
@@ -144,6 +146,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
     }
     let created = CreatedPlan {
+        expert_banks,
         metadata: metadata.clone(),
         decode_programs,
     };

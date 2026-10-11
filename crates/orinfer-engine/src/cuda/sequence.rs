@@ -724,6 +724,7 @@ impl Executor {
                 } else {
                     &k.spec
                 };
+                self.ensure_experts(spec, &values)?;
                 super::launch_kernel(
                     spec,
                     k.function

@@ -38,6 +38,8 @@ impl FromStr for CudaGraphMode {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
+    /// Routed experts per layer equivalent; finite budgets are shared across banks.
+    pub resident_experts: ResidentExperts,
     pub cuda_graph: CudaGraphMode,
     /// Hash loaded weight payloads and CPU row tables in addition to structural checks.
     pub verify_weights: bool,
@@ -49,6 +51,45 @@ pub struct LoadOptions {
     pub mtp_drafts: Option<usize>,
     /// Opt in to request-local copied proposals for greedy speculation.
     pub prompt_lookup: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(into = "serde_json::Value")]
+pub enum ResidentExperts {
+    #[default]
+    Full,
+    Count(usize),
+}
+impl From<ResidentExperts> for serde_json::Value {
+    fn from(value: ResidentExperts) -> Self {
+        match value {
+            ResidentExperts::Full => Self::String("full".into()),
+            ResidentExperts::Count(n) => n.into(),
+        }
+    }
+}
+pub use crate::cuda::experts::Statistics as ExpertCacheStatistics;
+impl fmt::Display for ResidentExperts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Full => f.write_str("full"),
+            Self::Count(n) => write!(f, "{n}"),
+        }
+    }
+}
+impl FromStr for ResidentExperts {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "full" {
+            return Ok(Self::Full);
+        }
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .map(Self::Count)
+            .ok_or_else(|| "Resident experts must be full or a positive integer".into())
+    }
 }
 
 pub fn parse_load_workers(value: &str) -> Result<usize> {
@@ -231,6 +272,20 @@ mod tests {
         assert_eq!(LoadOptions::default().cuda_graph, CudaGraphMode::DecodeOnly);
         assert_eq!(LoadOptions::default().mtp_drafts, None);
         assert!(!LoadOptions::default().prompt_lookup);
+        assert_eq!(
+            LoadOptions::default().resident_experts,
+            ResidentExperts::Full
+        );
+        assert_eq!(
+            serde_json::to_string(&ResidentExperts::Full).unwrap(),
+            "\"full\""
+        );
+        for value in ["full", "1", "128", "256", "512"] {
+            assert_eq!(value.parse::<ResidentExperts>().unwrap().to_string(), value);
+        }
+        for value in ["", "0", "-1", "1.5", "FULL", "18446744073709551616"] {
+            assert!(value.parse::<ResidentExperts>().is_err());
+        }
         assert_eq!(parse_mtp_drafts("auto").unwrap(), None);
         for n in 0..=7 {
             assert_eq!(parse_mtp_drafts(&n.to_string()).unwrap(), Some(n));

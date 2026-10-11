@@ -34,6 +34,8 @@ pub struct RequestReport {
 }
 #[derive(Debug, Serialize)]
 pub struct Report {
+    pub resident_experts: crate::execution::ResidentExperts,
+    pub expert_cache: Option<crate::execution::ExpertCacheStatistics>,
     pub manifest_sha256: String,
     pub model: String,
     pub device: crate::cuda::DeviceInfo,
@@ -182,6 +184,9 @@ pub fn score_with_options(
     crate::runtime::ModelRuntime::load_with_options(path, options)?.score(input)
 }
 impl Model {
+    pub fn expert_cache_statistics(&self) -> Option<crate::execution::ExpertCacheStatistics> {
+        self.0.expert_cache_statistics()
+    }
     pub fn frontend_assets(&self) -> &std::collections::BTreeMap<String, String> {
         &self.0.frontend_assets
     }

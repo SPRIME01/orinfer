@@ -1,5 +1,8 @@
 //! Typed service configuration; argument parsing belongs to the CLI.
-use orinfer_engine::{execution::CudaGraphMode, scheduler};
+use orinfer_engine::{
+    execution::{CudaGraphMode, ResidentExperts},
+    scheduler,
+};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -13,6 +16,7 @@ pub struct ServerConfig {
     pub cuda_graph: CudaGraphMode,
     pub verify_weights: bool,
     pub load_workers: Option<usize>,
+    pub resident_experts: ResidentExperts,
     pub mtp_drafts: Option<usize>,
     pub prompt_lookup: bool,
     pub prefix_cache_bytes: usize,
@@ -30,6 +34,7 @@ impl Default for ServerConfig {
             cuda_graph: CudaGraphMode::default(),
             verify_weights: false,
             load_workers: None,
+            resident_experts: ResidentExperts::default(),
             mtp_drafts: None,
             prompt_lookup: false,
             prefix_cache_bytes: 12usize << 30,
@@ -52,6 +57,9 @@ impl ServerConfig {
         }
         if self.mtp_drafts.is_some_and(|n| n > 7) {
             return Err("MTP drafts must be auto or 0..7".into());
+        }
+        if self.resident_experts == ResidentExperts::Count(0) {
+            return Err("Resident expert count must be positive".into());
         }
         if !(1..=32).contains(&self.limits.preprocess_workers)
             || !(512..=16384).contains(&self.limits.memory_mib)
@@ -95,6 +103,9 @@ mod tests {
             ..Default::default()
         };
         config.validate().unwrap();
+        config.resident_experts = ResidentExperts::Count(0);
+        assert!(config.validate().is_err());
+        config.resident_experts = ResidentExperts::Full;
         config.mtp_drafts = Some(8);
         assert!(config.validate().is_err());
         config.mtp_drafts = None;

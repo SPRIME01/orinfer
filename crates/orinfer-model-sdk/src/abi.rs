@@ -34,6 +34,9 @@ pub struct PackageInfo {
 }
 #[derive(Deserialize, Serialize)]
 pub struct CreateRequest {
+    /// Immutable kernel bindings available to architecture-owned residency contracts.
+    #[serde(default)]
+    pub kernel_contracts: Vec<crate::artifact::Kernel>,
     #[serde(default)]
     pub model_root: String,
     /// Full CPU weight-table verification; structural checks are always required.
@@ -48,8 +51,20 @@ pub struct CreateRequest {
 }
 #[derive(Deserialize, Serialize)]
 pub struct CreatedPlan {
+    #[serde(default)]
+    pub expert_banks: Vec<ExpertBank>,
     pub metadata: Manifest,
     pub decode_programs: std::collections::BTreeSet<String>,
+}
+
+/// Whole-expert storage and the kernels whose histogram selects its consumers.
+/// Each consumer argument is an I32[experts] count array produced on the stream.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpertBank {
+    pub experts: usize,
+    pub buffers: Vec<String>,
+    pub consumers: std::collections::BTreeMap<String, usize>,
 }
 
 #[repr(C)]

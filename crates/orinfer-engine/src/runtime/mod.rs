@@ -52,6 +52,11 @@ pub(crate) struct ModelRuntime {
     idle_admission_since: Option<Instant>,
 }
 impl ModelRuntime {
+    pub(crate) fn expert_cache_statistics(
+        &self,
+    ) -> Option<crate::execution::ExpertCacheStatistics> {
+        self.execution.expert_statistics()
+    }
     pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
         let mut statistics = self.scheduler_statistics.clone();
         statistics.batch_execution = self.execution.batch_statistics.get();
@@ -63,7 +68,14 @@ impl ModelRuntime {
     }
     pub(crate) fn load_with_options(path: &std::path::Path, options: LoadOptions) -> Result<Self> {
         let started = Instant::now();
-        let mut prepared = crate::loader::load(path, options.verify_weights)?;
+        let mut prepared = crate::loader::load_with_experts(
+            path,
+            options.verify_weights,
+            !matches!(
+                options.resident_experts,
+                crate::execution::ResidentExperts::Full
+            ),
+        )?;
         let request_hidden_ring = prepared
             .plan
             .mtp

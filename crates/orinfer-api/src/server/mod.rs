@@ -46,6 +46,7 @@ struct Service {
     mtp_drafts: usize,
     prompt_lookup: bool,
     verify_weights: bool,
+    resident_experts: orinfer_engine::execution::ResidentExperts,
     vision: Option<orinfer_engine::vision::VisionSpec>,
     api_key: Option<Arc<str>>,
     ids: Arc<AtomicU64>,
@@ -121,6 +122,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
+    let resident_experts = settings.resident_experts;
     let load_workers = settings.load_workers;
     let prompt_lookup = settings.prompt_lookup;
     let activity = Arc::new(continuous::Activity::default());
@@ -160,6 +162,7 @@ async fn serve(settings: Settings) -> Result<()> {
                             cuda_graph: settings.cuda_graph,
                             verify_weights,
                             load_workers,
+                            resident_experts: settings.resident_experts,
                             prefix_cache_bytes: settings.prefix_cache_bytes,
                             mtp_drafts: settings.mtp_drafts,
                             prompt_lookup: settings.prompt_lookup,
@@ -217,6 +220,7 @@ continuous::worker(
         mtp_drafts,
         prompt_lookup,
         verify_weights,
+        resident_experts,
         vision,
         api_key: std::env::var("ORINFER_API_KEY")
             .ok()
@@ -375,6 +379,7 @@ async fn health(State(state): State<Service>) -> Response {
         json!({"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
         "frontend_assets":state.codec.asset_hashes,
         "verify_weights":state.verify_weights,
+        "resident_experts":state.resident_experts,
         "default_request_params":state.default_request_params.as_ref(),
         "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",

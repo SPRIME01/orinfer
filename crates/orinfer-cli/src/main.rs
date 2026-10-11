@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use orinfer_api::{PreprocessingLimits, ServerConfig};
 use orinfer_engine::execution::{
-    CudaGraphMode, LoadOptions, parse_cache_mib, parse_load_workers, parse_mtp_drafts,
+    CudaGraphMode, LoadOptions, ResidentExperts, parse_cache_mib, parse_load_workers,
+    parse_mtp_drafts,
 };
 use std::{path::PathBuf, process::ExitCode};
 
@@ -45,6 +46,9 @@ enum Command {
 }
 #[derive(Args)]
 struct LoadArgs {
+    /// Routed experts per layer equivalent, shared globally; full keeps all. MTP stays resident.
+    #[arg(long, value_name = "full|N", default_value_t = ResidentExperts::default())]
+    resident_experts: ResidentExperts,
     /// CUDA graph capture: decode_only, full or off.
     #[arg(long, value_name = "MODE", default_value_t = CudaGraphMode::default())]
     cuda_graph: CudaGraphMode,
@@ -121,6 +125,7 @@ impl From<ServeArgs> for ServerConfig {
             cuda_graph: args.load.cuda_graph,
             verify_weights: args.load.verify_weights,
             load_workers: args.load.load_workers,
+            resident_experts: args.load.resident_experts,
             mtp_drafts: args.mtp_drafts.0,
             prompt_lookup: args.load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
@@ -195,6 +200,7 @@ fn execute(command: Command) -> Result<(), String> {
                 prompt_lookup: args.load.prompt_lookup,
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
+                resident_experts: args.load.resident_experts,
                 ..Default::default()
             },
         )?),
@@ -206,6 +212,7 @@ fn execute(command: Command) -> Result<(), String> {
                 prompt_lookup: args.load.prompt_lookup,
                 verify_weights: args.load.verify_weights,
                 load_workers: args.load.load_workers,
+                resident_experts: args.load.resident_experts,
                 ..Default::default()
             },
         )?),
@@ -240,6 +247,7 @@ mod tests {
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
         assert_eq!(config.mtp_drafts, None);
+        assert_eq!(config.resident_experts, ResidentExperts::Full);
         assert!(!config.prompt_lookup);
         assert!(!config.verify_weights);
         assert_eq!(config.load_workers, None);
@@ -248,6 +256,7 @@ mod tests {
             "--verify-weights",
             "--prompt-lookup",
             "--mtp-drafts=7",
+            "--resident-experts=256",
             "--cuda-graph",
             "off",
             "--max-active-requests",
@@ -267,6 +276,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.cuda_graph, CudaGraphMode::Off);
         assert_eq!(config.mtp_drafts, Some(7));
+        assert_eq!(config.resident_experts, ResidentExperts::Count(256));
         assert!(config.prompt_lookup);
         assert!(config.verify_weights);
         assert_eq!(config.prefix_cache_bytes, 0);

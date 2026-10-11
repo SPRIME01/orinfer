@@ -23,6 +23,8 @@ MODEL_DIR/
 
 创建时用 JSON 传递配置及数据契约；热路径的 batch 程序使用 C 数组，一次返回 kernel/copy/zero 指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
 
+有限专家常驻模式在创建请求中提供可选的 `kernel_contracts`，模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，管理全局 SLRU 和 CUDA VMM 页，不识别模型专属名称或维度。默认全量常驻不请求此契约；未声明该能力的执行包不能使用有限模式。两项都是 JSON 的可选扩展，C ABI v1 和 schema 1 保持不变。
+
 模型可声明 hash 固定的 `input_assets`，通过独立可选入口 `orinfer_model_inputs_v1` 接收执行程序名、当前 token 和请求历史，返回命名 buffer 的上传数据；原有 ABI v1 函数表不变。核心校验访问权限与上传范围，并在库释放数据前完成上传。Flash Next 在包内完成 CPU W8 embedding／E8P PLE 查表，有预算的行缓存共享，n-gram 历史从请求提供。CPU 资产随模型克隆和执行包更新一起保留。主模型、验证和 shifted draft 输入由模型包区分，核心不注册架构专属输入分派。
 
 MTP 的验证计划可声明始终提交紧凑 recurrent 更新，也可提供 draft 分支的保存/恢复程序；调度器在提出草稿前保存、刷新已提交前缀前恢复。Flash Next 使用这些通用接口保留 GDN、卷积、PLE、HC 和 QSA pending/index 的完整状态。

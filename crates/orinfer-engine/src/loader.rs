@@ -44,10 +44,18 @@ pub(crate) struct PreparedModel {
     pub policy: ComputePolicy,
     pub frontend_assets: BTreeMap<String, String>,
     pub decode_programs: std::collections::BTreeSet<String>,
+    pub expert_banks: Vec<orinfer_model_sdk::abi::ExpertBank>,
     pub execution_model: crate::model_package::ModelPackage,
 }
 
 pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
+    load_with_experts(path, verify_weights, false)
+}
+pub(crate) fn load_with_experts(
+    path: &Path,
+    verify_weights: bool,
+    expert_contracts: bool,
+) -> Result<PreparedModel> {
     let descriptor = crate::model::resolve_manifest(path)?;
     let weights_root = descriptor
         .parent()
@@ -101,6 +109,11 @@ pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
         &kernel_root,
         &package.execution,
         orinfer_model_sdk::abi::CreateRequest {
+            kernel_contracts: if expert_contracts {
+                package.kernels.clone()
+            } else {
+                vec![]
+            },
             model_root: root.display().to_string(),
             verify_weights,
             config,
@@ -114,6 +127,7 @@ pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
     model.metadata = built.metadata;
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
     let decode_programs = built.decode_programs;
+    let expert_banks = built.expert_banks;
     model.metadata.kernels = package.kernels;
     model.metadata.validate()?;
     // The descriptor pins the package; configuration also affects generated plans.
@@ -129,6 +143,7 @@ pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
         policy: model.compute_policy,
         frontend_assets: model.frontend_assets,
         decode_programs,
+        expert_banks,
         execution_model,
     })
 }

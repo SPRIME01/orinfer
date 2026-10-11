@@ -25,6 +25,7 @@ pub(crate) struct Executor {
     pub(super) direct: Option<DirectPrograms>,
     pub(super) kernels: RefCell<super::kernels::Catalog>,
     pub(super) cuda_graph: CudaGraphMode,
+    pub(super) expert_cache: RefCell<Option<super::experts::Pager>>,
     growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
@@ -55,6 +56,7 @@ pub(crate) struct Allocations {
     pub workspace: BufferArena,
 }
 pub(crate) struct LoadStats {
+    pub(crate) resident_experts: crate::execution::ResidentExperts,
     pub(crate) manifest_sha256: String,
     pub(crate) device: DeviceInfo,
     pub(crate) load_to_ready_s: f64,
@@ -83,7 +85,18 @@ impl Executor {
         let scopes = &prepared.scopes;
         let decode_programs = &prepared.decode_programs;
         let fingerprint = prepared.fingerprint.clone();
-        let cuda_graph = options.cuda_graph;
+        let expert_plan = super::experts::Plan::new(prepared, options.resident_experts)?;
+        let cuda_graph = if expert_plan.is_some() {
+            if options.cuda_graph != CudaGraphMode::Off {
+                eprintln!(
+                    "Finite expert residency uses direct execution for route-dependent SSD paging (requested CUDA graph mode: {})",
+                    options.cuda_graph
+                );
+            }
+            CudaGraphMode::Off
+        } else {
+            options.cuda_graph
+        };
         let load_workers = options.weight_workers()?;
         if decode_programs
             .iter()
@@ -144,7 +157,19 @@ impl Executor {
                 sum.checked_add(b.bytes()?)
                     .ok_or_else(|| "Unused weight sum overflow".to_string())
             })?;
-        let buffer_bytes = capacity_bytes - lazy_bytes - unused_weights;
+        let paged_bytes = manifest
+            .buffers
+            .iter()
+            .filter(|b| {
+                expert_plan
+                    .as_ref()
+                    .is_some_and(|p| p.names.contains(&b.name))
+            })
+            .try_fold(0usize, |sum, b| {
+                sum.checked_add(b.bytes()?)
+                    .ok_or_else(|| "Expert weight sum overflow".to_string())
+            })?;
+        let buffer_bytes = capacity_bytes - lazy_bytes - unused_weights - paged_bytes;
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
@@ -217,6 +242,7 @@ impl Executor {
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
         let mut weights = crate::weights::Weights::open(base, options.verify_weights)?;
         let mut uploads = Vec::new();
+        let mut expert_sources = BTreeMap::new();
         for b in &manifest.buffers {
             if b.data.is_some()
                 && b.access == crate::artifact::Access::Read
@@ -226,6 +252,9 @@ impl Executor {
             }
             let bytes = b.bytes()?;
             let mut address = 0;
+            let paged = expert_plan
+                .as_ref()
+                .is_some_and(|p| p.names.contains(&b.name));
             // SAFETY: Allocation length is checked by manifest validation and owned
             // by Session before any fallible operation can return.
             let stride = lazy
@@ -235,7 +264,13 @@ impl Executor {
                         .or_else(|| kv.prefill_workspace.get(&b.name))
                 })
                 .copied();
-            if let Some(stride) = stride {
+            if paged {
+                let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, 1)?;
+                address = reservation.address;
+                s.expert_buffers
+                    .borrow_mut()
+                    .insert(b.name.clone(), reservation);
+            } else if let Some(stride) = stride {
                 let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, stride)?;
                 address = reservation.address;
                 s.virtual_buffers
@@ -262,10 +297,18 @@ impl Executor {
                 crate::loader::BufferScope::Workspace => &mut allocations.workspace,
             };
             arena.addresses.insert(b.name.clone(), address);
-            arena.bytes += bytes;
+            if !paged {
+                arena.bytes += bytes;
+            }
             if b.data.is_some() {
                 let t = Instant::now();
-                if options.verify_weights {
+                if paged {
+                    if options.verify_weights {
+                        weights.read(b)?;
+                    }
+                    expert_sources.insert(b.name.clone(), weights.source(b)?);
+                    weight_io_hash_s += t.elapsed().as_secs_f64();
+                } else if options.verify_weights {
                     let raw = weights.read(b)?;
                     weight_io_hash_s += t.elapsed().as_secs_f64();
                     let t = Instant::now();
@@ -372,6 +415,9 @@ impl Executor {
             direct,
             kernels: RefCell::new(catalog),
             cuda_graph,
+            expert_cache: RefCell::new(
+                expert_plan.map(|p| super::experts::Pager::new(p, expert_sources, load_workers)),
+            ),
             growth: manifest
                 .kv_cache
                 .as_ref()
@@ -400,6 +446,7 @@ impl Executor {
             batch_graph_clock: std::cell::Cell::new(0),
         };
         let stats = LoadStats {
+            resident_experts: options.resident_experts,
             manifest_sha256: fingerprint,
             device,
             load_to_ready_s,
@@ -584,6 +631,7 @@ impl Executor {
                                 *value = Value::Pointer(address + offset as u64);
                             }
                         }
+                        self.ensure_experts(&kernel.spec, &kernel.values)?;
                         launch_kernel(
                             &kernel.spec,
                             kernel

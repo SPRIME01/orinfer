@@ -77,6 +77,7 @@ pub(crate) fn create(
     }
     let metadata = request.metadata;
     let plan = CreatedPlan {
+        expert_banks: vec![],
         metadata: metadata.clone(),
         decode_programs,
     };

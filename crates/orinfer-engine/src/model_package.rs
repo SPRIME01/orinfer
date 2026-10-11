@@ -482,6 +482,7 @@ mod tests {
             root,
             spec,
             CreateRequest {
+                kernel_contracts: vec![],
                 model_root: String::new(),
                 verify_weights: false,
                 config: serde_json::json!({"model_type":"test_family"}),

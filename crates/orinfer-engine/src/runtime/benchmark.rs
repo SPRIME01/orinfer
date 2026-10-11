@@ -253,6 +253,8 @@ impl ModelRuntime {
         }
         self.execution.session.cleanup()?;
         Ok(Report {
+            resident_experts: stats.resident_experts,
+            expert_cache: self.execution.expert_statistics(),
             manifest_sha256: stats.manifest_sha256,
             model: manifest.model.clone(),
             device: stats.device,

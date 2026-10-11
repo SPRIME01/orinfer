@@ -18,6 +18,19 @@
 
 先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，未设置 XDG 时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
 
+### 专家常驻容量
+
+`serve`、`run-model` 和 `score-model` 提供 `--resident-experts full|N`，默认 `full`，保持专家权重全量常驻。Flash Next 的有限模式要求执行包包含专家分页声明；旧执行库需要通过模型工具重新附加匹配的原生执行库，权重及 cubin 不变。
+
+`N` 是每层等效容量：48 层主干共享最多 `48 × N` 个专家的全局 SLRU 缓存，各层不固定分配配额；可指定 1–512，512 等效全量常驻。MTP 专家不进入此缓存，继续全量常驻。缺失专家的压缩权重和 scale 从模型文件按需读取，并映射到稳定的 CUDA 虚拟地址，不缓存完整展开的 INT8 权重。
+
+```bash
+./target/release/orinfer serve /path/to/prepared-flash-model \
+  --model qwen-flash-next --resident-experts 256
+```
+
+有限模式在路由后执行 CPU 调度和 SSD 加载，自动使用 `cuda_graph=off`；`full` 保留所选 Graph 模式。容量限制按专家数量计算，实际物理内存还包含 CUDA 分配粒度和共享页开销。一轮 prefill 或 batch 路由的专家集合超过容量时，临时映射额外专家，随后释放，因此该参数不是严格的字节预算。较小容量会增加 I/O、降低吞吐；模型文件在整个服务期间必须保持可读且不变。
+
 ### 请求默认参数
 
 `--default-request-params` 接受一个 JSON 对象，为本次部署填充客户端省略的 Chat 请求字段。例如，默认开启 thinking，同时设置采样温度：
@@ -193,6 +206,7 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--model` | `qwen3.8-27b` | API 模型 ID |
 | `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
+| `--resident-experts` | `full` | 主干专家每层等效常驻容量；有限模式全局缓存，MTP 全量常驻 |
 | `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |

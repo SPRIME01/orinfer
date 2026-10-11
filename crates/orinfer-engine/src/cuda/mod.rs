@@ -10,6 +10,7 @@ use std::{
     ptr,
     time::Instant,
 };
+pub(crate) mod experts;
 mod kernels;
 mod sequence;
 pub(crate) mod snapshot;
@@ -130,6 +131,7 @@ pub(crate) struct Session {
     pub(crate) stream: sys::CUstream,
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
+    pub(crate) expert_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
     pub(crate) events: Vec<sys::CUevent>,
     pub(crate) graph: sys::CUgraph,
@@ -147,6 +149,7 @@ impl Session {
             stream: ptr::null_mut(),
             buffers: vec![],
             virtual_buffers: Default::default(),
+            expert_buffers: Default::default(),
             modules: Default::default(),
             events: vec![],
             graph: ptr::null_mut(),
@@ -197,7 +200,10 @@ impl Session {
             for event in self.events.drain(..) {
                 record(sys::cuEventDestroy_v2(event), "destroy event");
             }
-            for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut()) {
+            for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut())
+                .into_iter()
+                .chain(std::mem::take(self.expert_buffers.get_mut()))
+            {
                 if let Err(e) = buffer.release_slabs(&self.driver) {
                     eprintln!("CUDA KV cleanup: {e}");
                 }

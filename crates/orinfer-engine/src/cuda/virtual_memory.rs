@@ -14,6 +14,75 @@ pub(crate) struct Reservation {
     poisoned: bool,
 }
 impl Reservation {
+    /// Map one sparse weight page. Payload initialization belongs to the uploader.
+    pub(crate) fn map_page(&mut self, s: &Session, offset: usize) -> Result<()> {
+        if self.poisoned
+            || !offset.is_multiple_of(self.granularity)
+            || offset
+                .checked_add(self.granularity)
+                .is_none_or(|end| end > self.bytes)
+            || self.slabs.iter().any(|p| p.offset == offset)
+        {
+            return Err("Invalid sparse weight page transition".into());
+        }
+        let prop = properties(s.device);
+        let access = AccessDesc {
+            location: prop.location,
+            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        };
+        let mut handle = 0;
+        // SAFETY: Aligned reserved extent; record ownership before mapping/access can fail.
+        unsafe {
+            check(
+                sys::cuMemCreate(&mut handle, self.granularity, &prop, 0),
+                "create expert page",
+            )?;
+        }
+        self.slabs.push(Slab {
+            offset,
+            bytes: self.granularity,
+            handle,
+            mapped: false,
+        });
+        let slab = self.slabs.last_mut().unwrap();
+        let result = (|| {
+            // SAFETY: Unique owned page, wholly within the reserved address range.
+            unsafe {
+                check(
+                    sys::cuMemMap(self.address + offset as u64, slab.bytes, 0, handle, 0),
+                    "map expert page",
+                )?;
+                slab.mapped = true;
+                check(
+                    sys::cuMemSetAccess(self.address + offset as u64, slab.bytes, &access, 1),
+                    "expert page access",
+                )
+            }
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+    /// Caller must finish all consumers before releasing a sparse page.
+    pub(crate) fn unmap_page(&mut self, s: &Session, offset: usize) -> Result<()> {
+        let index = self
+            .slabs
+            .iter()
+            .position(|p| p.offset == offset)
+            .ok_or("Unknown expert page")?;
+        let slab = &mut self.slabs[index];
+        if slab.mapped {
+            unsafe_unmap(&s.driver, self.address, slab)?;
+            slab.mapped = false;
+        }
+        unsafe_release(&s.driver, slab.handle)?;
+        self.slabs.swap_remove(index);
+        Ok(())
+    }
+    pub(crate) fn physical_bytes(&self) -> usize {
+        self.slabs.iter().map(|p| p.bytes).sum()
+    }
     pub(crate) fn reserve(s: &Session, bytes: usize, stride: usize) -> Result<Self> {
         let prop = properties(s.device);
         let mut granularity = 0;
