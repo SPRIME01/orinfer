@@ -13,6 +13,7 @@ MODEL_DIR/
   cache/packages/<sha256>/
     package.json
     lib/model.so
+    lib/bindings.rs, lib/BUILD.txt    # 生成模块的对应源码与重建方法
     assets.safetensors               # 或独立 cubin/source/host ABI 文件
     LICENSE
 ```
@@ -53,7 +54,7 @@ make build
 cargo build --release --locked --offline -p orinfer-models
 ```
 
-该产物提供注册的模型逻辑；可部署库还需要离线构建工具生成匹配当前 kernel ABI 和物理 tensor 角色的绑定模块。发布器通过 `ORINFER_BINDINGS_SOURCE` 编译该模块，原生库只依赖 SDK，不链接引擎；结果位于包的 `lib/model.so`。
+该产物提供注册的模型逻辑；可部署库还需要离线构建工具生成匹配当前 kernel ABI 和物理 tensor 角色的绑定模块。发布器通过 `ORINFER_BINDINGS_SOURCE` 编译该模块，原生库只依赖 SDK，不链接引擎；结果位于包的 `lib/model.so`。包同时保存生成的 `lib/bindings.rs` 和 `lib/BUILD.txt`，与发行版内的 workspace 源码及 Cargo.lock 一起用于重建该库；这些文件不参与在线执行。
 
 在保留权重和 cubin 的情况下，重建原生库和目录：
 

@@ -215,6 +215,15 @@ def build_library(package, bindings, directory, engine=None):
         temporary = library.with_suffix(".tmp")
         shutil.copyfile(target / "release/liborinfer_models.so", temporary)
         temporary.replace(library)
+        # Corresponding source for the generated LGPL native binding module.
+        shutil.copyfile(source, library.with_name("bindings.rs"))
+        library.with_name("BUILD.txt").write_text(
+            "Use the matching release source.tar.gz (included in the CLI archive).\n"
+            "From that workspace, rebuild this library with:\n"
+            "ORINFER_BINDINGS_SOURCE=/absolute/path/to/lib/bindings.rs "
+            "cargo build --release --locked --offline -p orinfer-models\n"
+            "The generated module contains tensor roles and ABI bindings, no weights.\n"
+        )
     return execution_identity(library, engine, package["architecture"], package["compute_policy"])
 
 
