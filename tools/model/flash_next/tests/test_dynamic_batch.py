@@ -7,6 +7,17 @@ from tools.model.flash_next.dynamic_batch import factory
 
 
 class DynamicRowsTests(unittest.TestCase):
+    def test_large_route_histograms_keep_capacity_strides_and_live_assignment_rows(self):
+        for label in ("histogram-local-1024", "histogram-finish-1024"):
+            fn = explicit_rows(factory(label, 1024))
+            (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+            buffers = {b.name: b for b in fn.buffer_map.values()}
+            self.assertTrue(buffers["IDs"].shape[0].same_as(rows))
+            self.assertTrue(buffers["Slots"].shape[0].same_as(rows))
+            partial = buffers.get("Partial", buffers.get("Offsets"))
+            self.assertEqual([int(n) for n in partial.shape], [512, 10])
+        self.assertIsNone(factory("histogram-offsets-1024", 1024))
+
     def test_affine_greedy_output_has_an_explicit_scalar_parameter(self):
         fn = explicit_rows(factory("greedy-merge-4-248320", 4))
         (scalar,) = [p for p in fn.params if str(p.dtype) == "int32"]

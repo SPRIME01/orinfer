@@ -11,6 +11,37 @@ from tools.model.flash_next.optimize_decode import (
 
 
 class DecodePackageTests(unittest.TestCase):
+    def test_explicit_dynamic_binding_retains_offsets_and_validates_row_scalars(self):
+        original = dict(
+            name="joined",
+            args=[
+                dict(kind="buffer_slice", name="Input", offset=256),
+                dict(kind="i32", value=1024),
+            ],
+        )
+        host = dict(
+            ordered_arguments=[
+                dict(ctype="ctypes.c_void_p", value="A.data_ptr()"),
+                dict(ctype="ctypes.c_int32", value="m"),
+            ],
+            symbol="dynamic",
+            launch_expressions=dict(
+                gridDimX="(m+31)//32",
+                gridDimY="1",
+                gridDimZ="1",
+                blockDimX="128",
+                blockDimY="1",
+                blockDimZ="1",
+                sharedMemBytes="0",
+            ),
+        )
+        with self.assertRaises(ValueError):
+            pointer_bindings(original, host)
+        pointers = pointer_bindings(original, host, allow_scalars=True)
+        binding = replace_binding(original, host, {}, pointers, dimensions=dict(m=1024))
+        self.assertEqual(binding["grid"], [32, 1, 1])
+        self.assertEqual(binding["args"], original["args"])
+
     def test_gdn_matrix_and_flat_arena_have_the_same_extent(self):
         for shape in ([48, 128, 128], [48 * 128 * 128]):
             validate_gdn_prefill_state(dict(dtype="f32", shape=shape), dict(kind="buffer"))

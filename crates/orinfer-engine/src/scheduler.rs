@@ -224,6 +224,7 @@ pub struct BatchExecutionStatistics {
     pub eviction_s: f64,
     pub replay_s: f64,
     pub direct_s: f64,
+    pub kernel_load_s: f64,
     pub sequence_captures: usize,
     pub sequence_capture_s: f64,
 }

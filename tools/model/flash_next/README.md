@@ -172,3 +172,18 @@ bash tools/model/run_flash_teacher.sh \
 `weights.py`/`checkpoint.py` 管理权重，`native.py`/`mtp.py` 是离线执行参考，`reference/` 保留独立数学与原始权重读取，`checks/` 与 `tests/` 管理回归验证。算子留在公共 `kernels/model/`，不按模型复制。
 
 `orinfer-models/src/flash_next` 提供在线适配器和 CPU 查表，复用 SDK 和 CUDA 执行器；QSA KV/scale/index/pending、GDN 与卷积均为请求私有状态。Python 执行器用于离线计划、数值参考和 MTP 研究。
+
+## 混合 prefill/decode
+
+已带动态 decode 和 K64 精确 E8P 专家的包可增加真正的混合执行。共享 HC、投影、路由和专家计算按拼接后的实际 token 行数运行；GDN、QSA、卷积、PLE 和 MTP 隐藏历史仍按请求分别推进。只有各片段的最后一行进入输出头。现有权重逐字节复用，线上不需要编译。
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/mixed.py artifacts/flash-mixed-build \
+  --model /path/to/optimized-flash-model --model-output artifacts/models/flash-mixed
+bash tools/operators/run.sh tools/model/flash_next/mixed_hc.py artifacts/flash-mixed-hc-build \
+  --model artifacts/models/flash-mixed --model-output artifacts/models/flash-mixed-hc
+```
+
+混合片段支持 16、128、512 token，拼接容量最高 1024 行；独立长 prefill 继续使用原有 2048/4096 档。BF16 HC 操作数在矩阵乘法前准备，保留原来的 FP16 舍入边界。kernel 首次装载、graph capture 和 prefill 完成时的 head/cache/MTP 预热分别计时，避免影响后续普通批次的耗时预测；请求总时延仍包含这些开销。
+
+Orin 上可用 `--prefill-budget-ms 350 --target-tpot-ms 400` 起步调优。350 ms 是混合批次的预测预算，400 ms 是 decode 间隔的软目标；首次加载算子仍可能超过目标。MTP 验证继续使用现有独立执行计划，普通 decode 可与 prefill 合并。

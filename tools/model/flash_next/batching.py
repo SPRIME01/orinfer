@@ -59,9 +59,136 @@ def kind(label):
     return next((prefix[:-1] for prefix in PRIVATE if label.startswith(prefix)), None)
 
 
+def shape_planner(metadata, buffers, original, output, shared_kernel=None):
+    from tools.model.flash_next.native import Model
+    import torch
+    from tools.model.flash_next.prepare import DTYPES
+
+    class ShapeModel(Model):
+        def kernel(self, key, build):
+            if kind(key):
+                return None
+            if getattr(self, "exact_mixed_experts", False) and key.startswith(
+                ("expert-gu-", "expert-down-")
+            ):
+                return None
+            if key not in self.kernels and shared_kernel is not None:
+                kernel = shared_kernel(key)
+                if kernel is not None:
+                    from tools.operators.common import export_kernel
+
+                    self.kernels[key] = kernel
+                    export_kernel(kernel, self.output / "aot" / key)
+            return super().kernel(key, build)
+
+    planner = ShapeModel.__new__(ShapeModel)
+    planner.capacity, planner.position, planner.output = (
+        metadata["max_context"],
+        metadata["max_context"] - 128,
+        output,
+    )
+    planner.is_mtp, planner.draft_vocab, planner.decode_w8_optimized = False, None, True
+    planner.layer_ids = tuple(range(48))
+    planner.weights, planner.states, planner.plans, planner.workspaces, planner.kernels = (
+        {},
+        {},
+        {},
+        {},
+        {},
+    )
+    planner.prefill_workspace_rows = 0
+    logical = {}
+    weight_tensors = {}
+    types = {v[0]: getattr(torch, k) for k, v in DTYPES.items()}
+    for name, b in buffers.items():
+        if not name.startswith("W_"):
+            continue
+        match = re.fullmatch(r"W_(.+)_(short_table|packed|table|signs|value|weight|scale)", name)
+        if not match and not name.startswith("W_e8p_"):
+            raise ValueError(f"Unknown Flash weight role: {name}")
+        tensor = torch.empty(b["shape"], dtype=types[b["dtype"]], device="meta")
+        logical[tensor.untyped_storage()._cdata] = name
+        weight_tensors[name] = tensor
+        if match is None:
+            continue
+        role, suffix = match.groups()
+        if suffix == "value":
+            planner.weights[role] = tensor
+        else:
+            planner.weights.setdefault(role, {})[suffix] = tensor
+    # Identical E8P books are physically shared across layers in native data.
+    # Recover those aliases from the pinned argument bindings, without copying.
+    for kernel in original.values():
+        packed = [a["name"] for a in kernel["args"] if a.get("name", "").endswith("_packed")]
+        if len(packed) != 1 or not packed[0].startswith("W_"):
+            continue
+        role = packed[0][2 : -len("_packed")]
+        for arg in kernel["args"]:
+            name = arg.get("name", "")
+            suffix = (
+                "short_table"
+                if name.endswith("_short_table")
+                else "table"
+                if name.endswith("_table")
+                else None
+            )
+            if suffix and name in weight_tensors:
+                planner.weights[role][suffix] = weight_tensors[name]
+    selectors = [t for n, t in weight_tensors.items() if n.startswith("W_e8p_selector_")]
+    for value in planner.weights.values():
+        if isinstance(value, dict) and "packed" in value:
+            value["parity_xor"] = False
+            if len(selectors) == 1:
+                value["selector_table"] = selectors[0]
+    planner.batch_body = True
+    packed_words = {
+        b["shape"][-1]
+        for b in buffers.values()
+        if b["name"].startswith("W_blk.") and b["name"].endswith("_packed")
+    }
+    if packed_words not in ({8}, {16}):
+        raise ValueError("Inconsistent compressed expert bank layout")
+    planner.expert_packed_k = 64 if packed_words == {8} else 128
+    for name, value in list(planner.weights.items()):
+        if isinstance(value, dict) and set(value) == {"weight", "scale"}:
+            planner.weights[name] = (value["weight"], value["scale"])
+    # The logical map keys are storage identities. Retain even unused/aliased
+    # operands: otherwise a later workspace can reuse a freed meta storage ID
+    # and be mistaken for an immutable weight during ABI publication.
+    planner.weight_tensors = weight_tensors
+    for layer in range(48):
+        if layer % 4 != 3:
+            shapes = {"conv": (1, 3, 10240), "gdn": (48, 128, 128)}
+        else:
+            shapes = {
+                "key": (planner.capacity, 2, 256),
+                "value": (planner.capacity, 2, 256),
+                "key_scale": (planner.capacity, 2, 4),
+                "value_scale": (planner.capacity, 2, 4),
+                "index": ((planner.capacity + 3) // 4, 128),
+                "pending": (4, 128),
+            }
+        for suffix, shape in shapes.items():
+            name = f"State_{layer}_{suffix}"
+            tensor = torch.empty(shape, device="meta", dtype=types[buffers[name]["dtype"]])
+            planner.states[f"{layer}:{suffix}"] = tensor
+            logical[tensor.untyped_storage()._cdata] = name
+    for attr, name in [
+        ("position_gpu", "Position"),
+        ("lengths", "Length"),
+        ("position_out", "PositionOut"),
+    ]:
+        tensor = torch.empty(1, device="meta", dtype=torch.int32)
+        setattr(planner, attr, tensor)
+        logical[tensor.untyped_storage()._cdata] = name
+    planner.states["ple"] = torch.empty((9, 10240), device="meta", dtype=torch.float16)
+    logical[planner.states["ple"].untyped_storage()._cdata] = "State_ple"
+
+    return planner, logical
+
+
 def upgrade(model, destination, output):
     import torch
-    from tools.model.flash_next.native import Model
     from tools.model.flash_next.prepare import Publisher, DTYPES
     from tools.operators.common import configure
     from tools.operators.abi import parse_host
@@ -114,93 +241,7 @@ def upgrade(model, destination, output):
     initialize = original[f"decode/begin/k{int(metadata.get('vision') is not None)}"]
     residual_role = variable(initialize, 1)
 
-    class ShapeModel(Model):
-        def kernel(self, key, build):
-            if kind(key):
-                return None
-            return super().kernel(key, build)
-
-    planner = ShapeModel.__new__(ShapeModel)
-    planner.capacity, planner.position, planner.output = (
-        metadata["max_context"],
-        metadata["max_context"] - 128,
-        output,
-    )
-    planner.is_mtp, planner.draft_vocab, planner.decode_w8_optimized = False, None, True
-    planner.layer_ids = tuple(range(48))
-    planner.weights, planner.states, planner.plans, planner.workspaces, planner.kernels = (
-        {},
-        {},
-        {},
-        {},
-        {},
-    )
-    planner.prefill_workspace_rows = 0
-    logical = {}
-    weight_tensors = {}
-    types = {v[0]: getattr(torch, k) for k, v in DTYPES.items()}
-    for name, b in buffers.items():
-        if not name.startswith("W_"):
-            continue
-        match = re.fullmatch(r"W_(.+)_(short_table|packed|table|signs|value|weight|scale)", name)
-        if not match:
-            raise ValueError(f"Unknown Flash weight role: {name}")
-        tensor = torch.empty(b["shape"], dtype=types[b["dtype"]], device="meta")
-        logical[tensor.untyped_storage()._cdata] = name
-        weight_tensors[name] = tensor
-        role, suffix = match.groups()
-        if suffix == "value":
-            planner.weights[role] = tensor
-        else:
-            planner.weights.setdefault(role, {})[suffix] = tensor
-    # Identical E8P books are physically shared across layers in native data.
-    # Recover those aliases from the pinned argument bindings, without copying.
-    for kernel in original.values():
-        packed = [a["name"] for a in kernel["args"] if a.get("name", "").endswith("_packed")]
-        if len(packed) != 1 or not packed[0].startswith("W_"):
-            continue
-        role = packed[0][2 : -len("_packed")]
-        for arg in kernel["args"]:
-            name = arg.get("name", "")
-            suffix = (
-                "short_table"
-                if name.endswith("_short_table")
-                else "table"
-                if name.endswith("_table")
-                else None
-            )
-            if suffix and name in weight_tensors:
-                planner.weights[role][suffix] = weight_tensors[name]
-    for name, value in list(planner.weights.items()):
-        if isinstance(value, dict) and set(value) == {"weight", "scale"}:
-            planner.weights[name] = (value["weight"], value["scale"])
-    for layer in range(48):
-        if layer % 4 != 3:
-            shapes = {"conv": (1, 3, 10240), "gdn": (48, 128, 128)}
-        else:
-            shapes = {
-                "key": (planner.capacity, 2, 256),
-                "value": (planner.capacity, 2, 256),
-                "key_scale": (planner.capacity, 2, 4),
-                "value_scale": (planner.capacity, 2, 4),
-                "index": ((planner.capacity + 3) // 4, 128),
-                "pending": (4, 128),
-            }
-        for suffix, shape in shapes.items():
-            name = f"State_{layer}_{suffix}"
-            tensor = torch.empty(shape, device="meta", dtype=types[buffers[name]["dtype"]])
-            planner.states[f"{layer}:{suffix}"] = tensor
-            logical[tensor.untyped_storage()._cdata] = name
-    for attr, name in [
-        ("position_gpu", "Position"),
-        ("lengths", "Length"),
-        ("position_out", "PositionOut"),
-    ]:
-        tensor = torch.empty(1, device="meta", dtype=torch.int32)
-        setattr(planner, attr, tensor)
-        logical[tensor.untyped_storage()._cdata] = name
-    planner.states["ple"] = torch.empty((9, 10240), device="meta", dtype=torch.float16)
-    logical[planner.states["ple"].untyped_storage()._cdata] = "State_ple"
+    planner, logical = shape_planner(metadata, buffers, original, output)
 
     class BatchPublisher(Publisher):
         def bind(self, *args):

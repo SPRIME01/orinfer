@@ -48,7 +48,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     if m.batch_profiles.is_empty() {
         return Ok(());
     }
-    if m.batch_profiles != PROFILES || !m.prefill_batch_profiles.is_empty() {
+    if m.batch_profiles != PROFILES {
         return Err("Flash decode requires 2/4/8/16/32/64/128 profiles".into());
     }
     let layout = m
@@ -56,8 +56,6 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         .as_ref()
         .ok_or("Missing Flash batch layout")?;
     if layout.hidden != 2560
-        || !layout.profiles.is_empty()
-        || !layout.small_mixed_shapes.is_empty()
         || layout.layers
             != (0..48)
                 .map(|i| {
@@ -174,7 +172,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             }
         }
     }
-    Ok(())
+    super::mixed::register(m)
 }
 
 fn private_role(column: &str, layer: usize) -> String {
@@ -194,8 +192,11 @@ pub(super) fn state_bindings(
     if layout.state_columns.is_empty() {
         return Ok(vec![]);
     }
+    if segments.iter().any(|s| s.tokens != 1) {
+        super::mixed::validate_segments(m, segments)?;
+        return Ok(vec![]);
+    }
     if segments.len() > 128
-        || segments.iter().any(|s| s.tokens != 1)
         || segments
             .iter()
             .map(|s| s.slot)
@@ -266,6 +267,9 @@ fn append(
 }
 
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
+    if segments.iter().any(|s| s.tokens != 1) {
+        return super::mixed::plan(m, segments);
+    }
     if segments.is_empty()
         || segments.len() > 128
         || segments.iter().any(|s| s.tokens != 1)
@@ -561,6 +565,96 @@ mod tests {
         register(&mut m).unwrap();
         m
     }
+    fn mixed_manifest() -> Manifest {
+        let mut m = manifest();
+        let layout = m.batch_layout.as_mut().unwrap();
+        layout.profiles = [16, 128, 512]
+            .into_iter()
+            .map(|n| (n, "flash_recurrent".into()))
+            .collect();
+        layout.small_mixed_shapes = vec![16, 128, 512];
+        m.prefill_batch_profiles = [256, 1024]
+            .into_iter()
+            .map(|tokens| orinfer_model_sdk::architecture::PrefillProfile {
+                tokens,
+                kind: "flash_mixed".into(),
+            })
+            .collect();
+        for (name, bytes) in [
+            ("FlashMixedResidual", 1024 * 20480),
+            ("FlashMixed_Residual", 1024 * 20480),
+        ] {
+            m.buffers.push(serde_json::from_value(serde_json::json!({"name":name,"dtype":"u8","shape":[bytes],"layout":"native_contiguous","alignment":256,"access":"read_write","data":null})).unwrap());
+        }
+        register(&mut m).unwrap();
+        m
+    }
+    #[test]
+    fn mixed_prefill_and_decode_share_layer_weights_and_gather_only_endpoints() {
+        let m = mixed_manifest();
+        let segments = [
+            BatchSegment {
+                slot: 7,
+                tokens: 128,
+            },
+            BatchSegment { slot: 3, tokens: 1 },
+        ];
+        let plan = plan(&m, &segments).unwrap();
+        assert!(state_bindings(&m, &segments).unwrap().is_empty());
+        for layer in 0..48 {
+            let prefix = format!("flash_mixed_m256/layer{layer}/pre/");
+            assert_eq!(plan.iter().filter(|i| matches!(&i.operation, Operation::Kernel { name } if name.starts_with(&prefix))).count(), if layer%4==3 {10} else if layer==1 {12} else {11});
+            for segment in segments {
+                let name = format!("flash_segment_m{}/layer{layer}/private/k0", segment.tokens);
+                let private = plan
+                    .iter()
+                    .find(|i| matches!(&i.operation, Operation::Kernel { name:n } if n == &name))
+                    .unwrap();
+                assert_eq!(private.sequence, Some(segment.slot));
+                assert_eq!(
+                    private.views["FlashMixedResidual"].offset,
+                    if segment.slot == 7 { 0 } else { 128 * 20480 }
+                );
+            }
+        }
+        let endpoints: Vec<_> = plan.iter().filter(|i| matches!(&i.operation, Operation::Copy { source,destination,bytes:20480 } if source=="FlashMixedResidual" && destination=="FlashMixedHeadResidual")).map(|i| i.views["FlashMixedResidual"].offset).collect();
+        assert_eq!(endpoints, [127 * 20480, 128 * 20480]);
+        assert!(plan.iter().any(|i| matches!(&i.operation,Operation::Kernel {name} if name.starts_with("flash_mixed_head_m2/head/"))));
+        assert!(!plan.iter().any(|i| matches!(&i.operation,Operation::Kernel {name} if name.starts_with("prefill_m128/layer") || name.starts_with("decode/layer"))));
+    }
+    #[test]
+    fn mixed_segments_reject_invalid_shapes_aliases_and_capacity() {
+        let m = mixed_manifest();
+        for segments in [
+            vec![],
+            vec![BatchSegment { slot: 0, tokens: 0 }],
+            vec![BatchSegment {
+                slot: 0,
+                tokens: 32,
+            }],
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 128,
+                },
+                BatchSegment { slot: 0, tokens: 1 },
+            ],
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 512,
+                },
+                BatchSegment {
+                    slot: 1,
+                    tokens: 512,
+                },
+                BatchSegment { slot: 2, tokens: 1 },
+            ],
+        ] {
+            assert!(super::super::mixed::validate_segments(&m, &segments).is_err());
+        }
+    }
+
     #[test]
     fn batching_preserves_common_profiles_and_pads_only_shared_rows() {
         let m = manifest();

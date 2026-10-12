@@ -33,13 +33,15 @@ from tools.model.flash_next.kernel_policy import (
 from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
 
-def pointer_bindings(kernel, host):
+def pointer_bindings(kernel, host, *, allow_scalars=False):
     """Retain the original offsets; exported argument order is authoritative."""
     if len(kernel["args"]) != len(host["ordered_arguments"]):
         raise ValueError("Original host ABI differs from the native package")
     pointers = {}
     for actual, argument in zip(kernel["args"], host["ordered_arguments"]):
         value = argument["value"]
+        if allow_scalars and argument["ctype"] == "ctypes.c_int32" and actual["kind"] == "i32":
+            continue
         if argument["ctype"] != "ctypes.c_void_p" or not value.endswith(".data_ptr()"):
             raise ValueError("Small static projection must use pointer-only ABI")
         if actual["kind"] not in ("buffer", "buffer_slice"):
@@ -48,11 +50,14 @@ def pointer_bindings(kernel, host):
     return pointers
 
 
-def replace_binding(original, host, assets, pointers):
+def replace_binding(original, host, assets, pointers, *, dimensions=None):
     launch = host["launch_expressions"]
     args = []
     for argument in host["ordered_arguments"]:
         value = argument["value"]
+        if dimensions is not None and argument["ctype"] == "ctypes.c_int32":
+            args.append(dict(kind="i32", value=evaluate(value, dimensions)))
+            continue
         if argument["ctype"] != "ctypes.c_void_p" or not value.endswith(".data_ptr()"):
             raise ValueError("Unexpected rebuilt projection ABI")
         args.append(copy.deepcopy(pointers[value.removesuffix(".data_ptr()")]))
@@ -60,9 +65,9 @@ def replace_binding(original, host, assets, pointers):
         name=original["name"],
         **assets,
         symbol=host["symbol"],
-        grid=[evaluate(launch["gridDim" + axis], {}) for axis in "XYZ"],
-        block=[evaluate(launch["blockDim" + axis], {}) for axis in "XYZ"],
-        shared_memory_bytes=evaluate(launch["sharedMemBytes"], {}),
+        grid=[evaluate(launch["gridDim" + axis], dimensions or {}) for axis in "XYZ"],
+        block=[evaluate(launch["blockDim" + axis], dimensions or {}) for axis in "XYZ"],
+        shared_memory_bytes=evaluate(launch["sharedMemBytes"], dimensions or {}),
         cooperative=False,
         args=args,
     )

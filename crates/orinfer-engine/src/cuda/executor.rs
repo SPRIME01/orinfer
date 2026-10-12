@@ -751,11 +751,15 @@ impl Executor {
             .get_mut(name)
             .ok_or_else(|| format!("Unknown kernel {name}"))?;
         if kernel.function.is_none() {
+            let at = Instant::now();
             kernel.function = Some(
                 self.kernels
                     .borrow_mut()
                     .resolve(&self.session, &kernel.spec)?,
             );
+            let mut statistics = self.batch_statistics.get();
+            statistics.kernel_load_s += at.elapsed().as_secs_f64();
+            self.batch_statistics.set(statistics);
         }
         Ok(())
     }

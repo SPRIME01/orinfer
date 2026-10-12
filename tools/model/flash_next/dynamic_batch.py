@@ -76,12 +76,22 @@ def factory(label, capacity):
             capacity, int(n), int(k), dtype, int(bm), int(bn), int(bk), int(gm), **opts
         )
     if parts[0] == "dense" and parts[1] != "quant":
-        _, _, n, k, wd, od = parts
-        return f.dense_projection.__wrapped__(capacity, int(n), int(k), wd, od, **opts)
+        _, _, n, k, wd, od, *tile = parts
+        if len(tile) > 1:
+            raise ValueError("Unsupported dense output tile")
+        return f.dense_projection.__wrapped__(
+            capacity, int(n), int(k), wd, od, block_n=int(tile[0]) if tile else 64, **opts
+        )
     if label.startswith("gdn-sigmoid-"):
         return f.gdn_sigmoid_norm.__wrapped__(capacity, **opts)
     if label.startswith("router-"):
         return moe.router_topk.__wrapped__(capacity, 512, 10, **opts)
+    if label.startswith("histogram-local-"):
+        return moe.expert_histogram_local.__wrapped__(capacity, dynamic_rows=True)
+    if label.startswith("histogram-offsets-"):
+        return None
+    if label.startswith("histogram-finish-"):
+        return moe.expert_histogram_finish.__wrapped__(capacity, dynamic_rows=True)
     if label.startswith("histogram-"):
         return moe.expert_histogram.__wrapped__(capacity, 512, 10, **opts)
     if label.startswith("rotate-a8-"):

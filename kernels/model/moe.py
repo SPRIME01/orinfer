@@ -285,15 +285,16 @@ def moe_combine(M: int, H: int, slots: int, top_k: int = 10, dynamic_rows: bool 
 
 
 @orin_jit
-def expert_histogram_local(M, E=512, K=10, block=1024):
+def expert_histogram_local(M, E=512, K=10, block=1024, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (M, E, K, block))
         or K > E
         or block not in (512, 1024, 2048)
     ):
         raise ValueError("Invalid segmented MoE histogram geometry")
+    segments = (M * K + block - 1) // block
+    M = row_count(M, dynamic_rows)
     assignments = M * K
-    segments = (assignments + block - 1) // block
 
     @T.prim_func
     def main(
@@ -355,15 +356,16 @@ def expert_histogram_offsets(M, E=512, K=10, block=1024):
 
 
 @orin_jit
-def expert_histogram_finish(M, E=512, K=10, block=1024):
+def expert_histogram_finish(M, E=512, K=10, block=1024, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (M, E, K, block))
         or K > E
         or block not in (512, 1024, 2048)
     ):
         raise ValueError("Invalid segmented MoE histogram geometry")
+    segments = (M * K + block - 1) // block
+    M = row_count(M, dynamic_rows)
     assignments = M * K
-    segments = (assignments + block - 1) // block
 
     @T.prim_func
     def main(

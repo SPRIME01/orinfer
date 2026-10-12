@@ -4,6 +4,7 @@ mod decode_fusions;
 mod experts;
 mod hc;
 mod inputs;
+mod mixed;
 mod mtp;
 mod parallel;
 mod plan;
@@ -118,6 +119,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Flash package arithmetic/checkpoint signature mismatch".into());
     }
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
+    mixed::operands(&mut request.metadata, &request.kernel_contracts)?;
     q4::build(&mut request.metadata)?;
     experts::build(&mut request.metadata, &request.kernel_contracts)?;
     hc::build(&mut request.metadata, &request.kernel_contracts)?;

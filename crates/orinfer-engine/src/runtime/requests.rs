@@ -760,6 +760,7 @@ impl ModelRuntime {
             })
             .unwrap_or((1, "decode".into(), None));
         let at = Instant::now();
+        let load_before = self.execution.batch_statistics.get().kernel_load_s;
         self.upload_ids(
             if chunk == 1 {
                 &self.manifest.token
@@ -777,6 +778,8 @@ impl ModelRuntime {
         if let Some(spec) = &self.manifest.mtp {
             self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
         }
+        let regular_s = at.elapsed().as_secs_f64()
+            - (self.execution.batch_statistics.get().kernel_load_s - load_before);
         if (req.offset + chunk == req.input.len()
             || req.checkpoints.contains(&(req.offset + chunk)))
             && let Some(head) = head
@@ -785,7 +788,10 @@ impl ModelRuntime {
         }
         let tokens = self.after_prefill(req, chunk)?;
         let seconds = at.elapsed().as_secs_f64();
-        self.prefill_costs.observe_at(chunk, req.offset, seconds);
+        // Head/checkpoint/MTP warm-up is terminal work, and module loading is
+        // a one-time cost. Neither predicts the next ordinary prompt tile.
+        self.prefill_costs
+            .observe_at(chunk, req.offset, regular_s.max(0.000001));
         self.scheduler_statistics.prefill_tokens += chunk;
         *self
             .scheduler_statistics
@@ -828,6 +834,18 @@ impl ModelRuntime {
         let key = Self::iteration_key(requests, selected);
         if let Some(estimate) = self.iteration_costs.get(&key) {
             return estimate.upper();
+        }
+        if selected.iter().any(|(_, n)| *n > 1) {
+            // Joined projections/expert tiles pay one weight pass. A cold
+            // linear rows*context prior greatly overestimates prompt work and
+            // can permanently prevent the scheduler from trying useful tiles.
+            let prompt_s: f64 = selected
+                .iter()
+                .filter(|(_, n)| *n > 1)
+                .map(|(i, n)| self.prefill_costs.chunk_upper(*n, requests[*i].offset + n))
+                .sum();
+            let decode_rows = selected.iter().filter(|(_, n)| *n == 1).count();
+            return prompt_s + decode_rows as f64 * 0.005;
         }
         let kv: usize = selected
             .iter()
@@ -1124,7 +1142,15 @@ impl ModelRuntime {
             && prefills
                 .iter()
                 .any(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset > cap);
-        if long_joint {
+        let long_mixed = !decode.is_empty()
+            && prefill.is_some()
+            && self
+                .manifest
+                .batch_layout
+                .as_ref()
+                .is_some_and(|layout| layout.small_mixed_shapes.iter().any(|&n| n > cap))
+            && !self.manifest.prefill_batch_profiles.is_empty();
+        if long_joint || long_mixed {
             cap = self
                 .manifest
                 .prefill_batch_profiles
@@ -1188,7 +1214,8 @@ impl ModelRuntime {
             self.scheduler_statistics.deadline_decode_iterations += 1;
         }
         let reserve = usize::from(prefill.is_some() && mixed && permit_prefill && progress_due);
-        decode.truncate(cap - reserve);
+        // A large prompt arena does not raise the caller's decoder batch limit.
+        decode.truncate((cap - reserve).min(options.max_batch_tokens));
         self.scheduler_cursor = self.scheduler_cursor.wrapping_add(decode.len());
         let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
         self.pack_prefill(
@@ -1231,6 +1258,7 @@ impl ModelRuntime {
             let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
             let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
+            let load_before = self.execution.batch_statistics.get().kernel_load_s;
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
                 #[cfg(test)]
@@ -1285,15 +1313,17 @@ impl ModelRuntime {
                 .or_default() += 1;
             let capture_s =
                 self.execution.batch_statistics.get().sequence_capture_s - capture_before;
+            let load_s = self.execution.batch_statistics.get().kernel_load_s - load_before;
             self.iteration_costs
                 .entry(key)
                 .or_default()
-                .observe((at.elapsed().as_secs_f64() - capture_s).max(0.000001));
+                .observe((at.elapsed().as_secs_f64() - capture_s - load_s).max(0.000001));
             return Ok(());
         }
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();
+        let load_before = self.execution.batch_statistics.get().kernel_load_s;
         let segments = self.prepare_batch_inputs(requests, selected)?;
         #[cfg(test)]
         profile::mark("inputs");
@@ -1321,6 +1351,7 @@ impl ModelRuntime {
         )?;
         #[cfg(test)]
         profile::mark("execute");
+        let load_s = self.execution.batch_statistics.get().kernel_load_s - load_before;
         let commit_at = Instant::now();
         *self
             .scheduler_statistics
@@ -1340,13 +1371,14 @@ impl ModelRuntime {
                 .or_default() += 1;
         }
         self.commit_batch(requests, selected, output)?;
-        self.scheduler_statistics.batch_commit_s += commit_at.elapsed().as_secs_f64();
+        let commit_s = commit_at.elapsed().as_secs_f64();
+        self.scheduler_statistics.batch_commit_s += commit_s;
         let seconds = inputs_at.elapsed().as_secs_f64();
         let capture_s = self.execution.batch_statistics.get().capture_s - capture_before;
         self.iteration_costs
             .entry(key)
             .or_default()
-            .observe((seconds - capture_s).max(0.000001));
+            .observe((seconds - capture_s - load_s - commit_s).max(0.000001));
         let rows: usize = selected.iter().map(|(_, n)| n).sum();
         for &(i, chunk) in selected {
             requests[i].credit_s -= seconds * chunk as f64 / rows as f64;
@@ -1437,6 +1469,11 @@ impl ModelRuntime {
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling {
                     model.scheduler_statistics.prefill_tokens += chunk;
+                    *model
+                        .scheduler_statistics
+                        .prefill_chunk_histogram
+                        .entry(chunk)
+                        .or_default() += 1;
                     model.after_prefill(req, chunk)
                 } else {
                     model.scheduler_statistics.decode_tokens += 1;

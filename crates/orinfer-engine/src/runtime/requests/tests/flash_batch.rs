@@ -22,15 +22,6 @@ fn validate_flash_decode_batches() {
     )
     .unwrap();
     assert!(!model.manifest.batch_profiles.is_empty());
-    assert!(
-        model
-            .manifest
-            .batch_layout
-            .as_ref()
-            .unwrap()
-            .small_mixed_shapes
-            .is_empty()
-    );
     let spec = model.manifest.mtp.take();
     let options = scheduler::Options {
         memory_reserve_bytes: 256 << 20,
@@ -330,6 +321,116 @@ fn distribution(model: &mut ModelRuntime, request: &mut RequestState) -> Vec<f64
 }
 
 #[test]
+#[ignore = "Requires native Flash mixed package and exclusive GPU experiment lock"]
+fn validate_flash_mixed_segments() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    assert!(fixture.cases.len() >= 2 && fixture.cases[1].input_tokens.len() >= 512);
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = scheduler::Options::default();
+    let mut rows = vec![];
+    for (round, chunk) in [16, 128, 512, 16, 128, 512].into_iter().enumerate() {
+        let mut baseline = model
+            .start_request(input(&fixture.cases[0], 4), &|| false)
+            .unwrap();
+        while baseline.prefilling {
+            model
+                .advance_requests(&mut [&mut baseline], &options)
+                .unwrap();
+        }
+        let first = *baseline.history.last().unwrap();
+        model
+            .advance_requests(&mut [&mut baseline], &options)
+            .unwrap();
+        let reference = distribution(&mut model, &mut baseline);
+        model.finish_request(&mut baseline, false).unwrap();
+
+        let mut anchor = model
+            .start_request(input(&fixture.cases[0], 4), &|| false)
+            .unwrap();
+        while anchor.prefilling {
+            model
+                .advance_requests(&mut [&mut anchor], &options)
+                .unwrap();
+        }
+        assert_eq!(*anchor.history.last().unwrap(), first);
+        let mut cold = model
+            .start_request(input(&fixture.cases[1], 4), &|| false)
+            .unwrap();
+        let mut output = vec![];
+        let before = model.execution.batch_statistics.get();
+        let inputs_before = model.scheduler_statistics.batch_inputs_s;
+        let plan_before = model.scheduler_statistics.batch_plan_s;
+        let commit_before = model.scheduler_statistics.batch_commit_s;
+        let at = Instant::now();
+        model
+            .execute_selected(
+                &mut [&mut anchor, &mut cold],
+                &[(0, 1), (1, chunk)],
+                &mut output,
+            )
+            .unwrap();
+        let elapsed = at.elapsed().as_secs_f64();
+        assert_eq!(cold.offset, chunk);
+        assert_eq!(anchor.generated, 2);
+        assert!(output.iter().any(|s| s.request == 0));
+        let actual = distribution(&mut model, &mut anchor);
+        let kl: f64 = reference
+            .iter()
+            .zip(&actual)
+            .map(|(b, a)| b.exp() * (b - a))
+            .sum();
+        let token = *anchor.history.last().unwrap();
+        let delta = reference[token as usize] - actual[token as usize];
+        let after = model.execution.batch_statistics.get();
+        let row = json!({"round":round,"chunk":chunk,"decode_tokens":1,"mixed_s":elapsed,
+            "direct_s":after.direct_s-before.direct_s,"kernel_load_s":after.kernel_load_s-before.kernel_load_s,
+            "inputs_s":model.scheduler_statistics.batch_inputs_s-inputs_before,
+            "plan_s":model.scheduler_statistics.batch_plan_s-plan_before,
+            "commit_s":model.scheduler_statistics.batch_commit_s-commit_before,
+            "same_history_kl":kl,"nll_delta":delta});
+        eprintln!("forced mixed {row}");
+        assert!(
+            kl.is_finite() && kl < 0.05 && delta.abs() < 0.1,
+            "Mixed decoder distribution changed: {row}"
+        );
+        rows.push(row);
+        model.finish_request(&mut cold, false).unwrap();
+        // Cancelling a partial prompt cannot release or mutate the decoder's state.
+        while !anchor.is_finished() {
+            model
+                .advance_requests(&mut [&mut anchor], &options)
+                .unwrap();
+        }
+        assert!(anchor.failure().is_none());
+        model.finish_request(&mut anchor, false).unwrap();
+    }
+    model.execution.reclaim_idle_graphs().unwrap();
+    model.execution.reclaim_idle_state().unwrap();
+    assert!(model.reserved_requests.is_empty());
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(
+            &json!({"seed":20261002,"cases":rows,"cancellation_passed":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires native Flash package and exclusive GPU experiment lock"]
 fn validate_flash_bounded_prefill() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
@@ -368,6 +469,7 @@ fn validate_flash_bounded_prefill() {
         let mut scores = vec![];
         let mut output = vec![];
         let bounded_before = model.scheduler_statistics.bounded_prefill_iterations;
+        let mixed_before = model.scheduler_statistics.mixed_iterations;
         let mut decode_during_prefill = 0;
         while !cold.is_finished() || !anchor.is_finished() {
             let (offset, generated) = (cold.offset, anchor.generated);
@@ -389,9 +491,18 @@ fn validate_flash_bounded_prefill() {
             }
         }
         let elapsed = began.elapsed().as_secs_f64();
-        assert_eq!(output.len(), 4);
+        assert!(!output.is_empty() && output.len() <= 4);
         assert!(decode_during_prefill > 0);
-        assert!(model.scheduler_statistics.bounded_prefill_iterations > bounded_before);
+        if model
+            .manifest
+            .batch_layout
+            .as_ref()
+            .is_some_and(|l| !l.profiles.is_empty())
+        {
+            assert!(model.scheduler_statistics.mixed_iterations > mixed_before);
+        } else {
+            assert!(model.scheduler_statistics.bounded_prefill_iterations > bounded_before);
+        }
         // A cold-only 2048/4096 tile must not block an already-live decoder.
         assert!(
             chunks

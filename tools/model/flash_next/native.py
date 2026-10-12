@@ -532,7 +532,13 @@ class Model:
             # Fold only an adjacent residual update. PLE operations consume
             # residuals between some mixers, and the output mixer belongs to
             # the separately captured head rather than the target body.
-            if m >= 256 and prefix != "output_hc_" and labels and labels[-1] == f"hc-combine-{m}":
+            if (
+                m >= 256
+                and not getattr(self, "batch_body", False)
+                and prefix != "output_hc_"
+                and labels
+                and labels[-1] == f"hc-combine-{m}"
+            ):
                 _, combine_args = ops.pop()
                 labels.pop()
                 previous_block, previous_residual, previous_inject, previous_output = combine_args
@@ -676,7 +682,8 @@ class Model:
         )
         # Larger row tiles amortize expert decoding on long prompts; short
         # requests need the smaller tile to bound padding and register costs.
-        expert_config = expert_tile_config(m)
+        expert_rows = getattr(self, "expert_profile_rows", {}).get(m, m)
+        expert_config = expert_tile_config(expert_rows)
         expert_bm = expert_config["block_m"]
         byte_permute = expert_config["byte_permute"]
         tiles = (assignments + expert_bm - 1) // expert_bm + min(e, assignments)
@@ -1125,7 +1132,10 @@ class Model:
                     h,
                     kind="e8p",
                     shared_table=True,
-                    **expert_projection_config(m, h, parity_xor=gate_weight["parity_xor"]),
+                    packed_k=getattr(self, "expert_packed_k", 128),
+                    **expert_projection_config(
+                        expert_rows, h, parity_xor=gate_weight["parity_xor"]
+                    ),
                 ),
                 dispatch,
                 gate_weight["packed"],
@@ -1158,7 +1168,10 @@ class Model:
                     f,
                     kind="e8p",
                     shared_table=True,
-                    **expert_projection_config(m, f, parity_xor=down_weight["parity_xor"]),
+                    packed_k=getattr(self, "expert_packed_k", 128),
+                    **expert_projection_config(
+                        expert_rows, f, parity_xor=down_weight["parity_xor"]
+                    ),
                 ),
                 fq,
                 down_weight["packed"],

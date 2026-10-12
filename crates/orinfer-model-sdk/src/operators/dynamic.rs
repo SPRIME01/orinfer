@@ -82,7 +82,9 @@ pub struct RowLaunch {
 }
 impl DynamicBatchKernel {
     pub fn launch(&self, rows: usize) -> Result<RowLaunch> {
-        if !(2..=128).contains(&self.capacity) || !(2..=self.capacity).contains(&rows) {
+        // Rows count concatenated tokens, not requests. Mixed prefill bodies
+        // need larger arenas while their number of independent requests stays bounded.
+        if !(2..=8192).contains(&self.capacity) || !(2..=self.capacity).contains(&rows) {
             return Err("Dynamic batch rows exceed the kernel capacity".into());
         }
         let mut grid = [0; 3];
@@ -167,6 +169,25 @@ mod tests {
         template.arguments.pop();
         template.grid[0] = RowExpression::Constant { value: 64 };
         assert!(template.validate(&kernel).is_err());
+    }
+    #[test]
+    fn mixed_prefill_rows_are_independent_of_the_request_limit() {
+        let template = DynamicBatchKernel {
+            name: "mixed".into(),
+            capacity: 1024,
+            grid: [
+                RowExpression::Rows,
+                RowExpression::Constant { value: 1 },
+                RowExpression::Constant { value: 1 },
+            ],
+            arguments: vec![RowArgument {
+                index: 0,
+                value: RowExpression::Rows,
+            }],
+        };
+        assert_eq!(template.launch(513).unwrap().arguments, [(0, 513)]);
+        assert_eq!(template.launch(129).unwrap().grid, [129, 1, 1]);
+        assert!(template.launch(1025).is_err());
     }
     #[test]
     fn expressions_preserve_partial_tiles_and_reject_bad_arithmetic() {
