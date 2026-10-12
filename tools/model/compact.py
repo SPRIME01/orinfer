@@ -98,7 +98,7 @@ def groups(items, limit, size, compatible=lambda a, b: True):
         yield current
 
 
-def compact_weights(source, target, descriptor, limit):
+def compact_weights(source, target, descriptor, limit, partitioner=None):
     origin = source / "cache/weights"
     index = json.loads((origin / "model.safetensors.index.json").read_text())
     buffers = {b["data"]["tensor"]: b for b in descriptor["metadata"]["buffers"] if b.get("data")}
@@ -125,10 +125,26 @@ def compact_weights(source, target, descriptor, limit):
                 sha256=buffers[name]["data"]["sha256"],
             )
         )
-    partitions = list(groups(tensors, limit, lambda t: t["segments"][0][2]))
+    if partitioner is None:
+        parts = list(groups(tensors, limit, lambda t: t["segments"][0][2]))
+        partitions = [
+            (f"model-{i + 1:05d}-of-{len(parts):05d}.safetensors", part)
+            for i, part in enumerate(parts)
+        ]
+    else:
+        partitions = list(partitioner(tensors, limit))
+    names = [name for name, _ in partitions]
+    selected = [t["name"] for _, part in partitions for t in part]
+    if (
+        len(set(names)) != len(names)
+        or any(Path(name).name != name or not name.endswith(".safetensors") for name in names)
+        or len(selected) != len(tensors)
+        or set(selected) != set(buffers)
+        or any(not part for _, part in partitions)
+    ):
+        raise ValueError("Invalid weight shard partition")
     mapping = {}
-    for i, partition in enumerate(partitions):
-        name = f"model-{i + 1:05d}-of-{len(partitions):05d}.safetensors"
+    for i, (name, partition) in enumerate(partitions):
         write_shard(
             target / "cache/weights" / name,
             partition,
@@ -137,6 +153,9 @@ def compact_weights(source, target, descriptor, limit):
         mapping.update((t["name"], name) for t in partition)
         print(f"GPU shard {i + 1}/{len(partitions)} verified", flush=True)
     index["weight_map"] = mapping
+    index.setdefault("metadata", {})["total_size"] = sum(
+        sum(segment[2] for segment in t["segments"]) for t in tensors
+    )
     write_json(target / "cache/weights/model.safetensors.index.json", index)
     return len(partitions)
 

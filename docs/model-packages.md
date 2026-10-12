@@ -91,6 +91,16 @@ PYTHONPATH=. .venv/bin/python tools/model/compact.py \
 orinfer validate-model /path/to/compact-model
 ```
 
+Flash Next 的正式权重发布采用稳定的组件和层组名称：主模型专家每三层一片，其余原权重每八层一片，Q4 投影、输出头、HC 无损压缩表示、MTP 和视觉各自独立；CPU 表复用已合并的连续行分片。单片默认不超过 2 GiB，组件超限时拒绝发布。重打包保留每个张量的字节、布局和身份，不重新量化或编译 kernel：
+
+```bash
+PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.repack \
+  --model /path/to/optimized-model --output /path/to/published-model
+orinfer validate-model /path/to/published-model
+```
+
+输出不包含 `cache/packages`。Hugging Face 和 ModelScope 模型仓库只发布配置、tokenizer、模型描述、GPU 权重与 CPU 表；匹配执行包通过 GitHub Release 独立发行，先安装到公共执行缓存再加载模型。模型描述中的 `execution_package` 固定对应包 digest，重打包不改变它。
+
 包内 `assets.safetensors` 用具名 U8 tensor 收纳 cubin、生成源码与 host ABI，去重字节相同的资产。schema 1 的文件身份可带 `tensor` 字段，SHA256 校验对应 tensor 的原始字节；原生 `.so` 保持独立文件。引擎复用 bundle 的 mmap 和头部索引，直接读取具名资产，不解包成小文件；CUDA 模块仍分别加载。此布局需要支持具名资产的引擎版本。
 
 模型托管仓库不包含执行包。包可单独归档、安装，模型通过 `execution_package` digest 在共享缓存中找到它。合并用于最终发布。离线调优工具通过 `plan-model` 从 Rust 库读取当前绑定，在编译阶段展开和修改，再重新生成原生模块及目录；在线格式保持一致。

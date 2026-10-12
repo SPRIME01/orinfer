@@ -12,7 +12,7 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-from tools.model.compact import compact, header, write_shard
+from tools.model.compact import compact, compact_weights, header, write_shard
 from tools.model.publication import AssetReader, file_hash, write_json
 from tools.model.package import archive, install
 
@@ -211,6 +211,23 @@ class CompactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "identity changed"):
             compact(self.model, self.root / "output", self.root / "operators")
         self.assertFalse((self.root / "output").exists())
+
+    def test_custom_partitions_cannot_drop_repeat_or_escape_tensor_files(self):
+        descriptor = json.loads((self.model / "cache/model.json").read_text())
+        cases = (
+            lambda tensors, limit: [("weights.safetensors", tensors[:1])],
+            lambda tensors, limit: [("weights.safetensors", [tensors[0], tensors[0]])],
+            lambda tensors, limit: [("../weights.safetensors", tensors)],
+            lambda tensors, limit: [
+                ("weights.safetensors", tensors[:1]),
+                ("weights.safetensors", tensors[1:]),
+            ],
+        )
+        for i, partitioner in enumerate(cases):
+            output = self.root / f"invalid-partition-{i}"
+            with self.subTest(partition=i), self.assertRaisesRegex(ValueError, "Invalid weight"):
+                compact_weights(self.model, output, descriptor, 10000, partitioner)
+            self.assertFalse(output.exists())
 
     def test_invalid_extent_never_publishes_shard(self):
         source = self.root / "data"
