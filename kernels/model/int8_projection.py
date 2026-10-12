@@ -11,6 +11,13 @@ from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
 
 
+_DP4A_SOURCE = """
+__device__ __forceinline__ int orinfer_dp4a(int a, int b, int c) {
+    return __dp4a(a, b, c);
+}
+"""
+
+
 @orin_jit
 def int8_projection(
     M: int,
@@ -74,6 +81,80 @@ def int8_projection(
 
 
 @orin_jit
+def int8_small_projection(
+    M: int, N: int, K: int, output_dtype: str = "float16", dynamic_rows: bool = False
+):
+    """Four outputs per CTA for narrow projections; packed views alias INT8.
+
+    Each warp reduces one output, reusing its weight words across four token
+    rows. INT32 accumulation is exact; rescaling keeps the Tensor Core path's
+    FP32 multiply order and final output rounding.
+    """
+    if (
+        any(type(v) is not int or v <= 0 for v in (M, N, K))
+        or N > 128
+        or K % 128
+        or K * 128 * 128 > 2**31 - 1
+    ):
+        raise ValueError("Invalid small INT8 projection geometry")
+    if output_dtype not in ("float16", "float32"):
+        raise ValueError("Invalid small INT8 projection output dtype")
+    bm, bn = min(M, 4), 4
+    M = row_count(M, dynamic_rows)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K // 4), T.int32),
+        Weight: T.Tensor((N, K // 4), T.int32),
+        WeightScale: T.Tensor((N,), T.float16),
+        TokenScale: T.Tensor((M,), T.float16),
+        Output: T.Tensor((M, N), output_dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, bm), T.ceildiv(N, bn), threads=128) as (by, bx):
+            T.import_source(_DP4A_SOURCE)
+            acc = T.alloc_fragment((bm, bn, 32), T.int32)
+            total = T.alloc_fragment((bm, bn), T.int32)
+            w = T.alloc_fragment((bn, 32), T.int32)
+            T.annotate_layout(
+                {
+                    acc: tilelang.Fragment(
+                        (bm, bn, 32),
+                        forward_thread_fn=lambda i, n, k: n * 32 + k,
+                        forward_index_fn=lambda i, n, k: i,
+                    ),
+                    w: tilelang.Fragment(
+                        (bn, 32),
+                        forward_thread_fn=lambda n, k: n * 32 + k,
+                        forward_index_fn=lambda n, k: 0,
+                    ),
+                }
+            )
+            T.clear(acc)
+            for kg in T.serial(K // 128):
+                for n, k in T.Parallel(bn, 32):
+                    w[n, k] = 0
+                    if bx * bn + n < N:
+                        w[n, k] = Weight[bx * bn + n, kg * 32 + k]
+                for i, n, k in T.Parallel(bm, bn, 32):
+                    if by * bm + i < M:
+                        acc[i, n, k] = T.call_pure_extern(
+                            "int32",
+                            "orinfer_dp4a",
+                            A[by * bm + i, kg * 32 + k],
+                            w[n, k],
+                            acc[i, n, k],
+                        )
+            T.reduce_sum(acc, total, dim=2)
+            for i, n in T.Parallel(bm, bn):
+                if by * bm + i < M and bx * bn + n < N:
+                    Output[by * bm + i, bx * bn + n] = (
+                        T.cast(total[i, n], T.float32) * T.cast(WeightScale[bx * bn + n], T.float32)
+                    ) * T.cast(TokenScale[by * bm + i], T.float32)
+
+    return main
+
+
+@orin_jit
 def int8_gemv(N: int, K: int, output_dtype: str = "float16", block_n: int = 16):
     """Single-token signed DP4A; packed views alias the original INT8 buffers."""
     if any(type(v) is not int or v <= 0 for v in (N, K)) or K % 128 or K * 128 * 128 > 2**31 - 1:
@@ -90,9 +171,7 @@ def int8_gemv(N: int, K: int, output_dtype: str = "float16", block_n: int = 16):
         Output: T.Tensor((1, N), output_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_n), threads=128) as bx:
-            T.import_source(
-                "\n__device__ __forceinline__ int orinfer_dp4a(int a, int b, int c) { return __dp4a(a,b,c); }\n"
-            )
+            T.import_source(_DP4A_SOURCE)
             acc = T.alloc_fragment((block_n, 32), T.int32)
             total = T.alloc_fragment((block_n,), T.int32)
             T.annotate_layout(

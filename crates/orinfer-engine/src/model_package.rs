@@ -41,6 +41,7 @@ pub(crate) struct ModelPackage {
     handle: *mut c_void,
     api: *const abi::Api,
     input_api: Option<*const abi::inputs::Api>,
+    pub(crate) plan_contracts: std::cell::RefCell<std::collections::BTreeSet<String>>,
     // Retain code until the opaque model and all of its buffers are destroyed.
     _library: Library,
     bindings: BindingCache,
@@ -78,6 +79,7 @@ impl ModelPackage {
             handle: ptr::null_mut(),
             api,
             input_api: None,
+            plan_contracts: Default::default(),
             _library: library,
             bindings: Default::default(),
         })
@@ -164,8 +166,158 @@ impl ModelPackage {
         if model.handle.is_null() {
             return Err("Model package returned a null handle".into());
         }
-        let plan = serde_json::from_slice(&bytes).map_err(|e| format!("Model plan: {e}"))?;
+        let mut plan: CreatedPlan =
+            serde_json::from_slice(&bytes).map_err(|e| format!("Model plan: {e}"))?;
+        if let Some(catalog) = &request.catalog {
+            model.export_execution(catalog, &mut plan.metadata)?;
+        }
         Ok((model, plan))
+    }
+    fn export_execution(
+        &self,
+        catalog: &orinfer_model_sdk::catalog::Catalog,
+        metadata: &mut crate::model::Manifest,
+    ) -> Result<()> {
+        use crate::artifact::Argument;
+        if !metadata.kernels.is_empty()
+            || !metadata.programs.is_empty()
+            || !metadata.dynamic_batch_kernels.is_empty()
+        {
+            return Err(
+                "Native catalog packages must export bulk bindings/programs through C arrays"
+                    .into(),
+            );
+        }
+        // SAFETY: the selected hash-verified library provides this versioned C entry.
+        let entry = unsafe {
+            self._library
+                .get::<unsafe extern "C" fn(u32) -> *const abi::plans::Api>(abi::plans::ENTRYPOINT)
+        }
+        .map_err(|e| format!("Native plan adapter: {e}"))?;
+        // SAFETY: the entry returns a static table retained by self._library.
+        let api = unsafe { entry(1) };
+        if api.is_null() {
+            return Err("Model rejects plan ABI".into());
+        }
+        // SAFETY: every extension table begins with its version/size header.
+        let header = unsafe { &*api.cast::<Header>() };
+        if header.version != 1 || header.size != std::mem::size_of::<abi::plans::Api>() {
+            return Err("Incompatible model plan function table".into());
+        }
+        // SAFETY: the size/version were checked and the library remains mapped.
+        let table = unsafe { &*api };
+        if table.kernel_size != std::mem::size_of::<abi::plans::Kernel>()
+            || table.argument_size != std::mem::size_of::<abi::plans::Argument>()
+            || table.program_size != std::mem::size_of::<abi::plans::Program>()
+            || table.command_size != std::mem::size_of::<abi::plans::Command>()
+        {
+            return Err("Incompatible native plan record layout".into());
+        }
+        let mut output = abi::plans::Output::default();
+        let mut error = OwnedBytes::default();
+        // SAFETY: handle belongs to this library and output/error are live slots.
+        let status = unsafe { (table.export)(self.handle, &mut output, &mut error) };
+        let result = (|| {
+            let error = self.consume_bytes(error)?;
+            if status != 0 {
+                return Err(format!("Native plans: {}", String::from_utf8_lossy(&error)));
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for k in span(output.kernels, output.kernel_count, 1_000_000)? {
+                let name = string(k.name)?;
+                match k.plan_contract {
+                    0 => {}
+                    1 => {
+                        self.plan_contracts.borrow_mut().insert(name.clone());
+                    }
+                    _ => return Err("Invalid native plan contract flag".into()),
+                }
+                if !names.insert(name.clone()) {
+                    return Err("Duplicate native kernel binding".into());
+                }
+                let args = span(k.arguments, k.argument_count, 256)?
+                    .iter()
+                    .map(|a| {
+                        if (a.kind >= 2 && (a.name.len != 0 || a.offset != 0))
+                            || (a.kind <= 1 && a.scalar != 0)
+                            || (a.kind == 0 && a.offset != 0)
+                        {
+                            return Err("Invalid native argument payload".into());
+                        }
+                        let narrow = || {
+                            u32::try_from(a.scalar)
+                                .map_err(|_| "Native scalar exceeds u32".to_owned())
+                        };
+                        Ok(match a.kind {
+                            0 => Argument::Buffer {
+                                name: string(a.name)?,
+                            },
+                            1 => Argument::BufferSlice {
+                                name: string(a.name)?,
+                                offset: a.offset,
+                            },
+                            2 => Argument::I32 {
+                                value: narrow()? as i32,
+                            },
+                            3 => Argument::U32 { value: narrow()? },
+                            4 => Argument::I64 {
+                                value: a.scalar as i64,
+                            },
+                            5 => Argument::U64 { value: a.scalar },
+                            6 => Argument::F32 {
+                                value: f32::from_bits(narrow()?),
+                            },
+                            _ => return Err("Unknown native argument kind".into()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let binding = catalog.bind(k.definition, name.clone(), k.grid, args)?;
+                if k.dynamic != usize::MAX {
+                    let template = catalog
+                        .dynamic
+                        .get(k.dynamic)
+                        .ok_or("Unknown dynamic launch definition")?
+                        .bind(&name);
+                    template.validate(&binding)?;
+                    metadata.dynamic_batch_kernels.insert(name, template);
+                }
+                metadata.kernels.push(binding);
+            }
+            for p in span(output.programs, output.program_count, 65536)? {
+                let ops = span(p.commands, p.command_count, 1_000_000)?
+                    .iter()
+                    .map(|c| {
+                        Ok(match c.kind {
+                            0 if c.bytes == 0 && c.destination.len == 0 => Operation::Kernel {
+                                name: string(c.name)?,
+                            },
+                            1 => Operation::Copy {
+                                source: string(c.name)?,
+                                destination: string(c.destination)?,
+                                bytes: c.bytes,
+                            },
+                            2 if c.name.len == 0 => Operation::Zero {
+                                destination: string(c.destination)?,
+                                bytes: c.bytes,
+                            },
+                            _ => return Err("Invalid native plan command".into()),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if metadata.programs.insert(string(p.name)?, ops).is_some() {
+                    return Err("Duplicate native program".into());
+                }
+            }
+            if metadata.kernels.is_empty() || metadata.programs.is_empty() {
+                return Err("Empty native execution plan".into());
+            }
+            Ok(())
+        })();
+        // SAFETY: return the exact output, including error-path allocations, once.
+        unsafe {
+            (table.free)(output);
+        }
+        result
     }
     pub(crate) fn prepare_inputs(
         &self,
@@ -482,6 +634,8 @@ mod tests {
             root,
             spec,
             CreateRequest {
+                catalog: None,
+                expert_contracts: false,
                 kernel_contracts: vec![],
                 model_root: String::new(),
                 verify_weights: false,
@@ -493,6 +647,44 @@ mod tests {
                 prefill_profiles: vec![],
             },
         )
+    }
+    #[test]
+    fn native_bulk_export_preserves_parameter_bits_and_program_commands() {
+        use crate::artifact::Argument;
+        let (root, spec, mut request) = fixture();
+        let catalog: orinfer_model_sdk::catalog::Catalog =
+            serde_json::from_value(serde_json::json!({
+                "binding_signature":"0".repeat(64),
+                "assets":[{"file":"kernel.cubin","sha256":"0".repeat(64)}],
+                "definitions":[{"module":0,"source":0,"host_abi":0,"symbol":"main",
+                    "block":[32,1,1],"shared_memory_bytes":0,"cooperative":false,
+                    "parameters":["buffer","buffer_slice","i32","u32","i64","u64","f32"]}],
+                "dynamic":[]
+            }))
+            .unwrap();
+        request.catalog = Some(catalog);
+        let (model, created) = ModelPackage::create(&root, &spec, request).unwrap();
+        let k = &created.metadata.kernels[0];
+        assert_eq!(k.name, "projection");
+        assert_eq!(k.grid, [1, 1, 1]);
+        assert!(matches!(&k.args[0], Argument::Buffer { name } if name == "Input"));
+        assert!(matches!(&k.args[1], Argument::BufferSlice { name, offset:64 } if name == "State"));
+        assert!(matches!(k.args[2], Argument::I32 { value: -1 }));
+        assert!(matches!(k.args[3], Argument::U32 { value: u32::MAX }));
+        assert!(matches!(k.args[4], Argument::I64 { value: -1 }));
+        assert!(matches!(k.args[5], Argument::U64 { value: u64::MAX }));
+        assert!(matches!(k.args[6], Argument::F32 { value } if value.to_bits() == 0x80000000));
+        assert_eq!(created.metadata.programs["decode"].len(), 3);
+        assert!(matches!(
+            created.metadata.programs["decode"][1],
+            Operation::Copy { bytes: 4, .. }
+        ));
+        assert!(matches!(
+            created.metadata.programs["decode"][2],
+            Operation::Zero { bytes: 4, .. }
+        ));
+        drop(model);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn independent_c_package_loads_unknown_family_and_preserves_binary_batch_contract() {

@@ -29,6 +29,9 @@ pub struct Manifest {
     pub kernels: Vec<Kernel>,
     #[serde(default)]
     pub programs: BTreeMap<String, Vec<Operation>>,
+    /// Derived by the model adapter: fork, side start/end, join operation names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub graph_branches: BTreeMap<String, Vec<[String; 4]>>,
     pub reset_buffers: Vec<String>,
     pub input: String,
     pub token: String,
@@ -120,6 +123,100 @@ pub enum Operation {
         destination: String,
         bytes: usize,
     },
+}
+
+/// Conservatively prove fork/join independence at whole-buffer granularity.
+pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Result<()> {
+    let catalog: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    for (program, branches) in &manifest.graph_branches {
+        let ops = manifest
+            .programs
+            .get(program)
+            .ok_or("Missing branch program")?;
+        let positions: BTreeMap<_, _> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                if let Operation::Kernel { name } = op {
+                    Some((name.as_str(), i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if positions.len()
+            != ops
+                .iter()
+                .filter(|op| matches!(op, Operation::Kernel { .. }))
+                .count()
+        {
+            return Err("Branch program has duplicate kernel names".into());
+        }
+        let io = |range: std::ops::Range<usize>| -> Result<(BTreeSet<&str>, BTreeSet<&str>)> {
+            let (mut reads, mut writes) = (BTreeSet::new(), BTreeSet::new());
+            for op in &ops[range] {
+                match op {
+                    Operation::Copy {
+                        source,
+                        destination,
+                        ..
+                    } => {
+                        reads.insert(source.as_str());
+                        writes.insert(destination.as_str());
+                    }
+                    Operation::Zero { destination, .. } => {
+                        writes.insert(destination.as_str());
+                    }
+                    Operation::Kernel { name } => {
+                        let k = catalog
+                            .get(name.as_str())
+                            .ok_or("Missing branch kernel contract")?;
+                        if k.readonly_arguments.len() != k.args.len() {
+                            return Err("Missing branch argument access contract".into());
+                        }
+                        for (arg, readonly) in k.args.iter().zip(&k.readonly_arguments) {
+                            if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } =
+                                arg
+                            {
+                                reads.insert(name.as_str());
+                                if !readonly {
+                                    writes.insert(name.as_str());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok((reads, writes))
+        };
+        let mut regions = Vec::new();
+        for branch in branches {
+            let mut indices = [0; 4];
+            for (i, name) in branch.iter().enumerate() {
+                indices[i] = *positions
+                    .get(name.as_str())
+                    .ok_or("Missing fork/join endpoint")?;
+            }
+            let [fork, start, end, join] = indices;
+            if !(fork < start && start <= end && end + 1 == join) {
+                return Err("Invalid fork/join ordering".into());
+            }
+            let (main_reads, main_writes) = io(fork..start)?;
+            let (side_reads, side_writes) = io(start..join)?;
+            if !main_writes.is_disjoint(&side_reads)
+                || !main_writes.is_disjoint(&side_writes)
+                || !side_writes.is_disjoint(&main_reads)
+            {
+                return Err(format!("Dependent graph branches at {}", branch[0]));
+            }
+            regions.push(indices);
+        }
+        regions.sort();
+        if regions.windows(2).any(|p| p[0][3] >= p[1][0]) {
+            return Err("Overlapping fork/join regions".into());
+        }
+    }
+    Ok(())
 }
 
 impl Manifest {
@@ -279,6 +376,9 @@ impl Manifest {
         }
         let mut names = BTreeSet::new();
         for k in &self.kernels {
+            if !k.readonly_arguments.is_empty() && k.readonly_arguments.len() != k.args.len() {
+                return Err("Mismatched kernel argument access contract".into());
+            }
             identity(&k.module)?;
             identity(&k.source)?;
             identity(&k.host_abi)?;
@@ -297,10 +397,14 @@ impl Manifest {
             {
                 return Err(format!("Invalid model kernel {}", k.name));
             }
-            for a in &k.args {
+            for (index, a) in k.args.iter().enumerate() {
                 match a {
                     Argument::Buffer { name } => {
-                        lookup(name)?;
+                        if lookup(name)?.access == Access::Read
+                            && k.readonly_arguments.get(index) == Some(&false)
+                        {
+                            return Err("Kernel declares a write to immutable weights".into());
+                        }
                     }
                     Argument::BufferSlice { name, offset } => {
                         let b = lookup(name)?;
@@ -363,6 +467,7 @@ impl Manifest {
                 }
             }
         }
+        validate_graph_branches(self, &self.kernels)?;
         if !self.reset_buffers.contains(&self.position) {
             return Err("Position must reset between requests".into());
         }
@@ -454,4 +559,78 @@ pub struct Request {
     pub forced_tokens: Vec<u32>,
     #[serde(default)]
     pub logits_steps: Vec<usize>,
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+    fn fixture() -> (Manifest, Vec<Kernel>) {
+        let identity = serde_json::json!({"file":"k.cubin","sha256":"0".repeat(64)});
+        let kernels: Vec<Kernel> = [
+            ("fork", ["Input", "A"]),
+            ("main", ["A", "C"]),
+            ("side", ["Input", "B"]),
+            ("join", ["C", "B"]),
+        ]
+        .into_iter()
+        .map(|(name, args)| {
+            serde_json::from_value(serde_json::json!({
+                "name":name,"symbol":name,"module":identity,"source":identity,"host_abi":identity,
+                "grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,
+                "readonly_arguments":[true,false],
+                "args":args.map(|name|serde_json::json!({"kind":"buffer","name":name}))
+            }))
+            .unwrap()
+        })
+        .collect();
+        let m = serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","model":"test",
+            "chunk_tokens":512,"max_context":512,"vocab":16,"toolchain":{},"buffers":[],"reset_buffers":[],
+            "input":"Input","token":"Token","status":"Status","logits":"Logits","position":"Position",
+            "weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
+            "programs":{"decode":kernels.iter().map(|k|serde_json::json!({"kind":"kernel","name":k.name})).collect::<Vec<_>>()},
+            "graph_branches":{"decode":[["fork","side","side","join"]]}
+        })).unwrap();
+        (m, kernels)
+    }
+    #[test]
+    fn permits_shared_reads_and_rejects_cross_branch_dependencies() {
+        let (m, mut k) = fixture();
+        validate_graph_branches(&m, &k).unwrap();
+        k[2].args[0] = Argument::Buffer { name: "A".into() };
+        assert!(
+            validate_graph_branches(&m, &k)
+                .unwrap_err()
+                .contains("Dependent")
+        );
+        let (m, mut k) = fixture();
+        k[2].readonly_arguments.clear();
+        assert!(
+            validate_graph_branches(&m, &k)
+                .unwrap_err()
+                .contains("access")
+        );
+        let (m, mut k) = fixture();
+        k[2].args[1] = Argument::BufferSlice {
+            name: "A".into(),
+            offset: 16,
+        };
+        assert!(validate_graph_branches(&m, &k).is_err());
+    }
+    #[test]
+    fn rejects_missing_endpoints_and_overlapping_regions() {
+        let (mut m, k) = fixture();
+        m.graph_branches.get_mut("decode").unwrap()[0][3] = "main".into();
+        assert!(validate_graph_branches(&m, &k).is_err());
+        let (mut m, k) = fixture();
+        let r = m.graph_branches["decode"][0].clone();
+        m.graph_branches.get_mut("decode").unwrap().push(r);
+        assert!(
+            validate_graph_branches(&m, &k)
+                .unwrap_err()
+                .contains("Overlapping")
+        );
+        let (mut m, k) = fixture();
+        m.graph_branches.get_mut("decode").unwrap()[0][0] = "missing".into();
+        assert!(validate_graph_branches(&m, &k).is_err());
+    }
 }

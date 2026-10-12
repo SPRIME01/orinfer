@@ -138,6 +138,8 @@ pub(crate) struct Session {
     pub(crate) exec: Handle,
     pub(crate) graphs: std::cell::RefCell<Vec<(sys::CUgraph, Handle)>>,
     pub(crate) capturing: bool,
+    pub(crate) parallel_handles:
+        std::cell::RefCell<Option<(sys::CUstream, sys::CUevent, sys::CUevent)>>,
 }
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
@@ -156,6 +158,7 @@ impl Session {
             exec: ptr::null_mut(),
             graphs: Default::default(),
             capturing: false,
+            parallel_handles: Default::default(),
         }
     }
     pub(crate) fn cleanup(&mut self) -> Result<()> {
@@ -196,6 +199,12 @@ impl Session {
                     record(sys::cuGraphExecDestroy(exec), "destroy model graph exec");
                 }
                 record(sys::cuGraphDestroy(graph), "destroy model graph");
+            }
+            if let Some((stream, fork, join)) = self.parallel_handles.get_mut().take() {
+                record(sys::cuStreamSynchronize(stream), "sync branch stream");
+                record(sys::cuEventDestroy_v2(fork), "destroy fork event");
+                record(sys::cuEventDestroy_v2(join), "destroy join event");
+                record(sys::cuStreamDestroy_v2(stream), "destroy branch stream");
             }
             for event in self.events.drain(..) {
                 record(sys::cuEventDestroy_v2(event), "destroy event");

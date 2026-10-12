@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tools.model.package import execution_identity, model_library, validate_plan
@@ -53,14 +54,19 @@ def publish(directory, engine=None):
         toolchain=model["toolchain"],
         execution=execution_identity(library, engine, "flash_next", "int8_quality"),
     )
-    raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
+    from tools.model.catalog import seal
+
+    with tempfile.TemporaryDirectory(prefix=".native-", dir=cache) as native:
+        package = seal(package, Path(native), engine)
+        compiled_library = (Path(native) / "lib/model.so").read_bytes()
+    raw = (json.dumps(package, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
     destination = cache / "packages" / digest
     if not destination.exists():
         destination.mkdir(parents=True)
         (destination / "package.json").write_bytes(raw)
         (destination / "lib").mkdir()
-        shutil.copyfile(library, destination / "lib/model.so")
+        (destination / "lib/model.so").write_bytes(compiled_library)
         shutil.copytree(cache / "kernels", destination / "kernels", copy_function=link_or_copy)
         for name in ("LICENSE", "COPYING.LESSER", "COPYING", "THIRD_PARTY_NOTICES.md"):
             if (ROOT / name).is_file():

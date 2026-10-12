@@ -16,6 +16,9 @@ class PublicationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        seal = patch("tools.model.catalog.seal", side_effect=lambda package, *args: package)
+        seal.start()
+        self.addCleanup(seal.stop)
         self.source = self.root / "source"
         weights = self.source / "cache/weights"
         weights.mkdir(parents=True)

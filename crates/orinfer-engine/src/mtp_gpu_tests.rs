@@ -186,7 +186,10 @@ fn validate_adaptive_prefix_cache() {
     .unwrap();
 }
 
-fn complete_prefix_state(model: &ModelRuntime, position: usize) -> BTreeMap<String, String> {
+pub(crate) fn complete_prefix_state(
+    model: &ModelRuntime,
+    position: usize,
+) -> BTreeMap<String, String> {
     use sha2::{Digest, Sha256};
     let mut ranges = model.prefix_ranges(position).unwrap();
     if let Some(kv) = &model.manifest.kv_cache {

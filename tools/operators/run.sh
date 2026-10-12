@@ -26,6 +26,26 @@ extra_mounts=()
 group_args=()
 for group_id in $(id -G); do group_args+=(--group-add "$group_id"); done
 reference_env=()
+# Native binding finalization uses the same pinned host Rust toolchain and
+# cached dependencies. Only compiler/registry assets are mounted, no credentials.
+native_cargo_binary="$(rustup which cargo)"
+native_toolchain="$(dirname -- "$(dirname -- "$native_cargo_binary")")"
+native_registry="${CARGO_HOME:-$HOME/.cargo}/registry"
+native_cargo_cache="$repo_dir/artifacts/compiler-cargo"
+mkdir -p "$native_cargo_cache/registry"
+native_cargo_config="${CARGO_HOME:-$HOME/.cargo}/config.toml"
+if [[ -f "$native_cargo_config" ]]; then
+    # Preserve registry replacement identities for offline lookup, excluding
+    # unrelated HTTP, credential-provider and user configuration sections.
+    awk '/^\[/{source_section=($0 ~ /^\[source\./)} source_section {print}' \
+        "$native_cargo_config" > "$native_cargo_cache/config.toml"
+fi
+extra_mounts+=(-v "$native_toolchain:$native_toolchain:ro"
+    -v "$native_registry:$native_cargo_cache/registry:ro")
+reference_env+=(-e "CARGO_HOME=$native_cargo_cache"
+    -e "RUSTC=$native_toolchain/bin/rustc"
+    -e "RUSTDOC=$native_toolchain/bin/rustdoc"
+    -e "PATH=$native_toolchain/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 declare -A mounted_inputs=()
 for variable in ORINFER_CHECKPOINT_DIR ORINFER_REFERENCE_CHECKPOINT ORINFER_REFERENCE_SOURCE ORINFER_REFERENCE_ACTIVATIONS ORINFER_EXECUTION_CACHE; do
     if [[ -n "${!variable:-}" ]]; then

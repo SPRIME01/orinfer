@@ -5,6 +5,7 @@ All buffers are caller owned, contiguous and mutually non-aliasing. No Torch
 mathematics is used in this production kernel.
 """
 
+import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
 
@@ -22,6 +23,8 @@ def gdn_conv_prep(
     qk_output_dtype: str = "float16",
     conv_product_round_fp16: bool = True,
     weight_dtype: str = "float16",
+    compact_decode: bool = False,
+    inplace_history: bool = False,
 ):
     """Build (X,W,HI,lengths,positions,Q,K,V,HO,positions_out).
 
@@ -35,32 +38,34 @@ def gdn_conv_prep(
     selects an explicit FP32-product candidate. FP32 conv+SiLU is rounded
     to FP16 before normalization. Optional half
     rounding of normalized Q matches staged native prefill; False matches
-    the native fused-decode normalization. Q's scale is then applied in FP32
+    the native fused-decode normalization. compact_decode removes padding for
+    a fixed one-token native tile while retaining its FP32 reduction order. Q's scale is then applied in FP32
     with q_scale and the exported Q cast to qk_output_dtype. Default unscaled
     FP16 output follows native staged prefill; fused decode uses False,
     qk_output_dtype='float32', q_scale=128**-.5. Downstream must apply scaling
     only for q_scale=1.0 and must preserve this mode's rounding contract.
+    inplace_history replaces HI/HO with one History argument for fixed B=1
+    compact decode. Each head caches its raw tail before updating its own slice.
     """
     assert tile_tokens in (1, 2, 4, 8, 16)
     assert qk_output_dtype in ("float16", "float32") and q_scale > 0
     assert weight_dtype in ("float16", "float32")
+    if type(compact_decode) is not bool or compact_decode and (tokens != 1 or tile_tokens != 16):
+        raise ValueError(
+            "Compact decode requires one token and the native 16-token reduction layout"
+        )
+    if type(inplace_history) is not bool or inplace_history and (not compact_decode or B != 1):
+        raise ValueError("In-place history requires a fixed single-request compact decode")
+    if compact_decode:
+        tile_tokens = 1
     batch = T.dynamic("batch") if B is None else B
     time = T.dynamic("tokens") if tokens is None else tokens
 
-    @T.prim_func
-    def kernel(
-        X: T.Tensor((batch, time, CHANNELS), T.float16),
-        W: T.Tensor((CHANNELS, 4), weight_dtype),
-        HI: T.Tensor((batch, 3, CHANNELS), T.float16),
-        lengths: T.Tensor((batch,), T.int32),
-        positions: T.Tensor((batch,), T.int32),
-        Q: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
-        K: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
-        V: T.Tensor((batch, VALUE_HEADS, time, DIM), T.float16),
-        HO: T.Tensor((batch, 3, CHANNELS), T.float16),
-        positions_out: T.Tensor((batch,), T.int32),
-    ):
-        with T.Kernel(T.ceildiv(time, tile_tokens), 80, batch, threads=128) as (bt, head, b):
+    @T.macro
+    def body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out):
+        with T.Kernel(
+            T.ceildiv(time, tile_tokens), 80, batch, threads=16 if compact_decode else 128
+        ) as (bt, head, b):
             acc = T.alloc_fragment((tile_tokens, DIM), T.float32)
             raw = T.alloc_fragment((tile_tokens, DIM), T.float32)
             activated = T.alloc_fragment((tile_tokens, DIM), T.float16)
@@ -69,6 +74,38 @@ def gdn_conv_prep(
             total = T.alloc_fragment((tile_tokens,), T.float32)
             normalized = T.alloc_fragment((tile_tokens, DIM), T.float16)
             product = T.alloc_fragment((tile_tokens, DIM), T.float16)
+            if compact_decode:
+                # The native 16-token tile reduces eight adjacent channels per
+                # thread, then a 16-lane group. Keep that FP32 order for decode.
+                layout = tilelang.Fragment(
+                    (tile_tokens, DIM),
+                    forward_thread_fn=lambda ti, d: ti * 16 + d // 8,
+                    forward_index_fn=lambda ti, d: d % 8,
+                )
+                T.annotate_layout(
+                    {
+                        acc: layout,
+                        raw: layout,
+                        activated: layout,
+                        value: layout,
+                        square: layout,
+                        normalized: layout,
+                        product: layout,
+                    }
+                )
+            if inplace_history:
+                tail = T.alloc_fragment((2, DIM), T.float16)
+                T.annotate_layout(
+                    {
+                        tail: tilelang.Fragment(
+                            (2, DIM),
+                            forward_thread_fn=lambda i, d: d // 8,
+                            forward_index_fn=lambda i, d: i * 8 + d % 8,
+                        )
+                    }
+                )
+                for i, d in T.Parallel(2, DIM):
+                    tail[i, d] = HI[b, i + 1, head * DIM + d]
             T.clear(acc)
             for tap in T.unroll(4):
                 for ti, d in T.Parallel(tile_tokens, DIM):
@@ -117,11 +154,47 @@ def gdn_conv_prep(
                     elif lengths[b] + i >= 3:
                         HO[b, i, head * DIM + d] = X[b, lengths[b] + i - 3, head * DIM + d]
                     elif positions[b] + lengths[b] + i >= 3:
-                        HO[b, i, head * DIM + d] = HI[b, lengths[b] + i, head * DIM + d]
+                        if inplace_history:
+                            HO[b, i, head * DIM + d] = tail[T.min(i, 1), d]
+                        else:
+                            HO[b, i, head * DIM + d] = HI[b, lengths[b] + i, head * DIM + d]
                     else:
                         HO[b, i, head * DIM + d] = 0.0
                 if head == 0:
                     positions_out[b] = positions[b] + lengths[b]
+
+    if inplace_history:
+
+        @T.prim_func
+        def inplace(
+            X: T.Tensor((batch, time, CHANNELS), T.float16),
+            W: T.Tensor((CHANNELS, 4), weight_dtype),
+            History: T.Tensor((batch, 3, CHANNELS), T.float16),
+            lengths: T.Tensor((batch,), T.int32),
+            positions: T.Tensor((batch,), T.int32),
+            Q: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+            K: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+            V: T.Tensor((batch, VALUE_HEADS, time, DIM), T.float16),
+            positions_out: T.Tensor((batch,), T.int32),
+        ):
+            body(X, W, History, lengths, positions, Q, K, V, History, positions_out)
+
+        return inplace.with_attr("global_symbol", "gdn_conv_inplace")
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor((batch, time, CHANNELS), T.float16),
+        W: T.Tensor((CHANNELS, 4), weight_dtype),
+        HI: T.Tensor((batch, 3, CHANNELS), T.float16),
+        lengths: T.Tensor((batch,), T.int32),
+        positions: T.Tensor((batch,), T.int32),
+        Q: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+        K: T.Tensor((batch, KEY_HEADS, time, DIM), qk_output_dtype),
+        V: T.Tensor((batch, VALUE_HEADS, time, DIM), T.float16),
+        HO: T.Tensor((batch, 3, CHANNELS), T.float16),
+        positions_out: T.Tensor((batch,), T.int32),
+    ):
+        body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out)
 
     return kernel
 

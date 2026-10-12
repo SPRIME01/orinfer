@@ -72,6 +72,63 @@ def e8p_sign_table(table):
     )
 
 
+def e8p_selector_table(table):
+    """Encode the spread29 integer basis as exact byte-permute selectors.
+
+    Two plus/minus constants supply the three nonzero magnitudes and zero.
+    This replaces the decoder LUT only; packed weight codes and row scales do
+    not change. Reject other integer bases rather than rounding their values.
+    """
+    if (
+        table.dtype != np.int8
+        or table.shape != (256, 8)
+        or not np.isin(table, [-10, -6, -2, 0, 2, 6, 10]).all()
+    ):
+        raise ValueError("E8P selector decoder requires the spread29 integer basis")
+    values = table.astype(np.int16)
+    selectors = np.where(values == 0, 3, (np.abs(values) - 2) // 4) | (values < 0) * 4
+    return np.sum(
+        selectors.astype(np.uint32) << np.arange(0, 32, 4, dtype=np.uint32),
+        axis=-1,
+        dtype=np.uint32,
+    ).reshape(256, 1)
+
+
+def e8p_selector_supports_parity_xor(selectors):
+    """Check the nonzero-basis contract for the exact XOR parity decoder."""
+    if selectors.dtype != np.uint32 or selectors.shape != (256, 1):
+        raise ValueError("Invalid E8P selector table")
+    if np.any(selectors & np.uint32(0x88888888)):
+        raise ValueError("Invalid E8P selector nibble")
+    return bool(np.all(((selectors >> np.arange(0, 32, 4, dtype=np.uint32)) & 3) != 3))
+
+
+def e8p_nibble_table(selectors):
+    """Losslessly encode (w-1)/2 for the one-PRMT signed-nibble decoder.
+
+    Zero basis coordinates need a different parity rule and are rejected.
+    The paired activation split uses the same within-eight K permutation.
+    """
+    if not e8p_selector_supports_parity_xor(selectors):
+        raise ValueError("Exact E8P nibble decoding requires a nonzero spread29 basis")
+    shifts = np.arange(0, 32, 4, dtype=np.uint32)
+    ids = (selectors >> shifts) & 7
+    half = np.array([1, 3, 5, 0, -1, -3, -5, 0], np.int32)[ids]
+    return np.bitwise_or.reduce(
+        (half[:, [0, 2, 1, 3, 4, 6, 5, 7]] & 15).astype(np.uint32) << shifts, axis=1
+    ).reshape(256, 1)
+
+
+def e8p_repack_k64(packed):
+    """Reorder K128 codes into contiguous K64 rows without changing any code."""
+    if packed.dtype != np.uint16 or packed.ndim != 4 or packed.shape[-1] != 16:
+        raise ValueError("Expected K128 E8P codes")
+    e, g, n, _ = packed.shape
+    return np.ascontiguousarray(packed.reshape(e, g, n, 2, 8).transpose(0, 1, 3, 2, 4)).reshape(
+        e, g * 2, n, 8
+    )
+
+
 @dataclass(frozen=True)
 class Weights:
     kind: str

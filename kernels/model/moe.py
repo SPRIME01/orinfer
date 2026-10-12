@@ -51,7 +51,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool =
 @orin_jit
 def expert_offsets(E: int = 512, block_m: int = 16):
     """Build (Counts, RowOffsets[E], TileOffsets[E], TileCount[1]), INT32."""
-    if type(E) is not int or E <= 0 or block_m not in (16, 32, 64):
+    if type(E) is not int or E <= 0 or block_m not in (8, 16, 32, 64):
         raise ValueError("Invalid MoE expert prefix dimensions")
     width = 1 << (E - 1).bit_length()
 
@@ -89,7 +89,7 @@ def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16):
     Output capacity ceil(M*top_k/block_m)+min(E,M*top_k) bounds all distributions.
     Only the prefix indicated by expert_offsets.TileCount is initialized/read.
     """
-    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (16, 32, 64):
+    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (8, 16, 32, 64):
         raise ValueError("Invalid MoE tile dimensions")
     assignments = M * top_k
     capacity = (assignments + block_m - 1) // block_m + min(E, assignments)
@@ -182,9 +182,12 @@ def router_topk(
     ):
         with T.Kernel(M, threads=128) as row:
             values = T.alloc_fragment((width,), T.float32)
-            candidates = T.alloc_fragment((width,), T.int32)
-            maximum = T.alloc_fragment((1,), T.float32)
-            selected_id = T.alloc_fragment((1,), T.int32)
+            # A total-order key selects the score and its tie-breaking ID in
+            # one reduction. Finite FP32 scores occupy the high word; smaller
+            # expert IDs win equal scores. Canonicalize signed zero because
+            # the original floating comparison treats both zeros as equal.
+            keys = T.alloc_fragment((width,), T.uint64)
+            maximum = T.alloc_fragment((1,), T.uint64)
             selected = T.alloc_shared((selected_width,), T.float32)
             numerator = T.alloc_fragment((selected_width,), T.float32)
             denominator = T.alloc_fragment((1,), T.float32)
@@ -192,21 +195,40 @@ def router_topk(
             global_max = T.alloc_fragment((1,), T.float32)
             for j in T.Parallel(width):
                 values[j] = T.if_then_else(j < E, Logits[row, j], -T.infinity(T.float32))
+                bits = T.reinterpret(values[j], T.uint32)
+                ordered = T.if_then_else(
+                    values[j] == 0,
+                    T.uint32(0x80000000),
+                    T.if_then_else(
+                        (bits & T.uint32(0x80000000)) != 0,
+                        ~bits,
+                        bits ^ T.uint32(0x80000000),
+                    ),
+                )
+                keys[j] = T.if_then_else(
+                    j < E,
+                    (T.cast(ordered, T.uint64) << 32) | T.cast(E - j, T.uint64),
+                    T.uint64(0),
+                )
             T.reduce_max(values, global_max, dim=0)
             if not renormalize:
                 for j in T.Parallel(width):
                     full_exp[j] = T.exp(values[j] - global_max[0])
                 T.reduce_sum(full_exp, denominator, dim=0)
             for rank in T.serial(top_k):
-                T.reduce_max(values, maximum, dim=0)
+                T.reduce_max(keys, maximum, dim=0)
+                selected_id = E - T.cast(maximum[0] & T.uint64(0xFFFFFFFF), T.int32)
+                ordered = T.cast(maximum[0] >> 32, T.uint32)
+                bits = T.if_then_else(
+                    (ordered & T.uint32(0x80000000)) != 0,
+                    ordered ^ T.uint32(0x80000000),
+                    ~ordered,
+                )
                 for j in T.Parallel(width):
-                    candidates[j] = T.if_then_else(j < E and values[j] == maximum[0], j, 2147483647)
-                T.reduce_min(candidates, selected_id, dim=0)
-                for j in T.Parallel(width):
-                    if j == selected_id[0]:
-                        values[j] = -T.infinity(T.float32)
-                IDs[row, rank] = selected_id[0]
-                selected[rank] = maximum[0]
+                    if j == selected_id:
+                        keys[j] = 0
+                IDs[row, rank] = selected_id
+                selected[rank] = T.reinterpret(bits, T.float32)
             for rank in T.Parallel(selected_width):
                 numerator[rank] = T.if_then_else(
                     rank < top_k, T.exp(selected[rank] - global_max[0]), 0.0
@@ -357,3 +379,56 @@ def expert_histogram_finish(M, E=512, K=10, block=1024):
                     Slots[row, rank] += Offsets[IDs[row, rank], assignment // block]
 
     return main
+
+
+@orin_jit
+def single_route_metadata(E: int = 512, top_k: int = 10, capacity: int = 11):
+    """Single-token dispatch in expert-ID order, with no atomics or host reads.
+
+    IDs must be distinct and in [0, E), as guaranteed by router_topk. Each
+    selected expert owns exactly one row/tile. Preserve the unused tile tail.
+    """
+    if (
+        any(type(v) is not int or v <= 0 for v in (E, top_k, capacity))
+        or not top_k <= E
+        or capacity < top_k
+    ):
+        raise ValueError("Invalid single-token MoE routing geometry")
+
+    @T.prim_func
+    def single_route_metadata_kernel(
+        IDs: T.Tensor((1, top_k), T.int32),
+        Counts: T.Tensor((E,), T.int32),
+        Relative: T.Tensor((1, top_k), T.int32),
+        Offsets: T.Tensor((E,), T.int32),
+        TileOffsets: T.Tensor((E,), T.int32),
+        TileExpert: T.Tensor((capacity,), T.int32),
+        TileRow: T.Tensor((capacity,), T.int32),
+        TileCount: T.Tensor((1,), T.int32),
+    ):
+        with T.Kernel(1, threads=128):
+            ids = T.alloc_shared((top_k,), T.int32)
+            T.copy(IDs[0, 0], ids)
+            counts = T.alloc_fragment((E,), T.int32)
+            offsets = T.alloc_fragment((E,), T.int32)
+            T.clear(counts)
+            T.clear(offsets)
+            for rank in T.unroll(top_k):
+                for expert in T.Parallel(E):
+                    counts[expert] += T.cast(ids[rank] == expert, T.int32)
+                    offsets[expert] += T.cast(ids[rank] < expert, T.int32)
+            T.copy(counts, Counts)
+            T.copy(offsets, Offsets)
+            T.copy(offsets, TileOffsets)
+            for rank in T.Parallel(top_k):
+                position = T.alloc_var(T.int32)
+                position = 0
+                for other in T.unroll(top_k):
+                    position += T.cast(ids[other] < ids[rank], T.int32)
+                Relative[0, rank] = 0
+                TileExpert[position] = ids[rank]
+                TileRow[position] = 0
+            if T.get_thread_binding() == 0:
+                TileCount[0] = top_k
+
+    return single_route_metadata_kernel

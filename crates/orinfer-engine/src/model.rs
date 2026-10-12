@@ -138,6 +138,7 @@ pub fn validate_model(path: &Path) -> Result<ValidationReport> {
 /// Profiling and package validation use the same loader as real inference.
 #[derive(Debug, Serialize)]
 pub struct PlanReport {
+    pub plan_kernel_contracts: std::collections::BTreeSet<String>,
     pub manifest_sha256: String,
     pub execution_package: String,
     pub architecture: crate::architecture::Architecture,
@@ -157,6 +158,7 @@ pub fn inspect_plan(path: &Path) -> Result<PlanReport> {
         *allocation_bytes.entry(key.into()).or_insert(0) += buffer.bytes()?;
     }
     Ok(PlanReport {
+        plan_kernel_contracts: prepared.execution_model.plan_contracts.borrow().clone(),
         manifest_sha256: prepared.fingerprint,
         execution_package: prepared.execution_package,
         architecture: prepared.architecture,

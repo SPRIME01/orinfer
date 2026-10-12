@@ -31,22 +31,6 @@ def main():
     package = model / "cache/packages/.building"
     weights.mkdir(parents=True)
     (package / "lib").mkdir(parents=True)
-    subprocess.run(
-        [
-            "cc",
-            "-shared",
-            "-fPIC",
-            "-Werror",
-            "-Wall",
-            "-Wextra",
-            "-I",
-            str(ROOT / "crates/orinfer-model-sdk/include"),
-            str(ROOT / "crates/orinfer-engine/tests/fixtures/model_package.c"),
-            "-o",
-            str(package / "lib/model.so"),
-        ],
-        check=True,
-    )
     weight = torch.rand((4, 4), dtype=torch.float32) - 2
     weight[torch.arange(4), (torch.arange(4) + 1) % 4] = 3
     save_file(
@@ -130,11 +114,69 @@ def main():
         toolchain={"tilelang": "0.1.15"},
         execution=dict(
             abi_version=1,
-            library=dict(file="lib/model.so", sha256=file_hash(package / "lib/model.so")),
+            library=dict(file="lib/model.so", sha256="0" * 64),
             package="test-model",
             version="1",
         ),
     )
+    from tools.model.catalog import factor
+
+    manifest, bindings = factor(manifest)
+
+    def spans(name):
+        return '{(const uint8_t *)"' + name + '",' + str(len(name)) + "}"
+
+    declarations = []
+    records = []
+    for i, binding in enumerate(bindings):
+        arguments = ",".join("{0," + spans(a["name"]) + ",0,0}" for a in binding["args"])
+        declarations.append(f"static const OrinferPlanArgument args{i}[] = {{{arguments}}};")
+        grid = ",".join(map(str, binding["grid"]))
+        records.append(
+            "{"
+            + spans(binding["name"])
+            + f",{binding['definition']},{{{grid}}},args{i},{len(binding['args'])},SIZE_MAX,0"
+            + "}"
+        )
+    declarations.append(
+        "static const OrinferPlanKernel plan_kernels[] = {" + ",".join(records) + "};"
+    )
+    for i, name in enumerate(("prefill", "decode")):
+        declarations.append(
+            f"static const OrinferPlanCommand ops{i}[] = " + "{{0," + spans(name) + ",{NULL,0},0}};"
+        )
+    declarations.append(
+        "static const OrinferPlanCommand head_ops[] = {{2,{NULL,0}," + spans("Scratch") + ",4}};"
+    )
+    declarations.append(
+        "static const OrinferPlanProgram plan_programs[] = {"
+        + ",".join(
+            "{" + spans(name) + f",ops{i},1" + "}" for i, name in enumerate(("prefill", "decode"))
+        )
+        + ",{ "
+        + spans("head")
+        + ",head_ops,1}};"
+    )
+    header = (args.output / "plans.h").resolve()
+    header.write_text("\n".join(declarations))
+    subprocess.run(
+        [
+            "cc",
+            "-shared",
+            "-fPIC",
+            "-Werror",
+            "-Wall",
+            "-Wextra",
+            "-I",
+            str(ROOT / "crates/orinfer-model-sdk/include"),
+            '-DORINFER_PLAN_FIXTURE_HEADER="' + str(header) + '"',
+            str(ROOT / "crates/orinfer-engine/tests/fixtures/model_package.c"),
+            "-o",
+            str(package / "lib/model.so"),
+        ],
+        check=True,
+    )
+    manifest["execution"]["library"]["sha256"] = file_hash(package / "lib/model.so")
     write_json(package / "package.json", manifest)
     digest = file_hash(package / "package.json")
     package.rename(package.with_name(digest))

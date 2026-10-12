@@ -6,7 +6,7 @@ import os
 import shutil
 import statistics
 import time
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 
 import torch
@@ -24,9 +24,14 @@ def configure():
     assert torch.cuda.get_device_capability() == (8, 7)
 
 
-def orin_jit(function):
+def orin_jit(function=None, *, pass_configs=None):
+    if function is None:
+        return partial(orin_jit, pass_configs=pass_configs)
     compiled = tilelang.jit(
-        out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
+        out_idx=[],
+        execution_backend="nvrtc",
+        target={"kind": "cuda", "arch": "sm_87"},
+        pass_configs=pass_configs,
     )(function)
 
     @wraps(function)

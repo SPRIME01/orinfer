@@ -25,6 +25,7 @@ static int32_t create(const uint8_t *p,size_t n,void **model,OrinferOwnedBytes *
     char *slot=strstr(metadata,programs);
     if(!slot || slot>=end) {free(input);bytes(out,"missing program slot");return 1;}
     const char *replacement="\"programs\":{\"decode\":[{\"kind\":\"kernel\",\"name\":\"decode\"}],\"prefill\":[{\"kind\":\"kernel\",\"name\":\"prefill\"}],\"head\":[{\"kind\":\"zero\",\"destination\":\"Scratch\",\"bytes\":4}]}";
+    if (strstr(input,"\"catalog\":") != NULL) replacement = programs;
     const char *prefix="{\"metadata\":";
     const char *suffix=",\"decode_programs\":[\"decode\"]}";
     size_t left=(size_t)(slot-metadata),right=count-left-strlen(programs);
@@ -56,3 +57,29 @@ static int32_t visual(void *model,const uint32_t *t,size_t n,const OrinferImageG
 }
 static const OrinferModelApi api={ORINFER_MODEL_ABI,sizeof(OrinferModelApi),describe,create,destroy,batch,free_bytes,free_batch,visual,free_visual};
 const OrinferModelApi *orinfer_model_v1(uint32_t version) {return version==ORINFER_MODEL_ABI?&api:NULL;}
+
+#ifdef ORINFER_PLAN_FIXTURE_HEADER
+#include ORINFER_PLAN_FIXTURE_HEADER
+#else
+static const OrinferPlanArgument plan_args[] = {
+    {0, SPAN("Input"), 0, 0}, {1, SPAN("State"), 64, 0},
+    {2, SPAN(""), 0, UINT32_MAX}, {3, SPAN(""), 0, UINT32_MAX},
+    {4, SPAN(""), 0, UINT64_MAX}, {5, SPAN(""), 0, UINT64_MAX},
+    {6, SPAN(""), 0, 0x80000000}
+};
+static const OrinferPlanKernel plan_kernels[] = {{SPAN("projection"), 0, {1,1,1}, plan_args, 7, SIZE_MAX, 1}};
+static const OrinferPlanCommand plan_commands[] = {
+    {0, SPAN("projection"), SPAN(""), 0},
+    {1, SPAN("Input"), SPAN("State"), 4},
+    {2, SPAN(""), SPAN("State"), 4}
+};
+static const OrinferPlanProgram plan_programs[] = {{SPAN("decode"), plan_commands, 3}};
+#endif
+static int32_t export_plans(void *model, OrinferPlans *out, OrinferOwnedBytes *error) {
+    (void)model;
+    *out = (OrinferPlans){NULL, plan_kernels, sizeof(plan_kernels)/sizeof(plan_kernels[0]), plan_programs, sizeof(plan_programs)/sizeof(plan_programs[0])};
+    return bytes(error, "");
+}
+static void free_plans(OrinferPlans p) {(void)p;}
+static const OrinferPlanApi plan_api = {1, sizeof(OrinferPlanApi), sizeof(OrinferPlanKernel), sizeof(OrinferPlanArgument), sizeof(OrinferPlanProgram), sizeof(OrinferPlanCommand), export_plans, free_plans};
+const OrinferPlanApi *orinfer_model_plans_v1(uint32_t version) {return version == 1 ? &plan_api : NULL;}

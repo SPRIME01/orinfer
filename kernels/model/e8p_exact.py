@@ -1,0 +1,327 @@
+"""Exact E8P/A8 products using two INT4 Tensor Core products on SM87.
+
+For the nonzero spread29 basis, decoded w=2*y+1 with signed INT4 y.
+A8 a=low_u4+16*high_s4, so dot(w,a)=2*(dot(y,low)+16*dot(y,high))+sum(a).
+TileLang owns every kernel, loop, stage and barrier. Helpers expose instructions.
+The K64 code layout and matching within-eight permutation are lossless.
+"""
+
+import tilelang.language as T
+from tools.operators.common import orin_jit
+
+SOURCE = r"""
+__device__ __forceinline__ unsigned nib_fast(unsigned c,unsigned b){unsigned pp=__popc(c&255u)&1u,ss=c^pp;unsigned sel=(ss&0x33u)|((ss&0xccu)<<6);unsigned f=0xeee00e00u^(pp*0x11111111u);return b^__byte_perm(f,0u,sel);}
+
+__device__ __forceinline__ unsigned nib_pair(const unsigned short* p){return *reinterpret_cast<const unsigned*>(p);}
+__device__ __forceinline__ void nib_store2(signed char* p,unsigned a,unsigned b){*reinterpret_cast<uint2*>(p)=make_uint2(a,b);}
+
+__device__ __forceinline__ void nib_mma_low(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
+ asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.u4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+r"(d[0]),"+r"(d[1]),"+r"(d[2]),"+r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+}
+__device__ __forceinline__ void nib_mma_high(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
+ asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+r"(d[0]),"+r"(d[1]),"+r"(d[2]),"+r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
+}
+__device__ __forceinline__ void nib_ldm4(const signed char* p,unsigned* out) {unsigned a=__cvta_generic_to_shared(p);asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(out[0]),"=r"(out[1]),"=r"(out[2]),"=r"(out[3]) : "r"(a));}
+__device__ __forceinline__ void nib_ldm2(const signed char* p,unsigned* out) {unsigned a=__cvta_generic_to_shared(p);asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(out[0]),"=r"(out[1]) : "r"(a));}
+__device__ __forceinline__ void nib_store(signed char* p,unsigned x){*reinterpret_cast<unsigned*>(p)=x;}
+__device__ __forceinline__ int nib_sum(unsigned a,unsigned b){return __dp4a((int)a,0x01010101,__dp4a((int)b,0x01010101,0));}
+"""
+
+
+@orin_jit
+def split_a8(rows, K):
+    if any(type(x) is not int or x <= 0 for x in (rows, K)) or K % 128:
+        raise ValueError("Invalid exact A8 split geometry")
+    W = 1 << ((K // 8 - 1).bit_length())
+
+    @T.prim_func
+    def pack_exact_a8(
+        A: T.Tensor((rows, K), T.int8),
+        Low: T.Tensor((rows, K // 8), T.uint32),
+        High: T.Tensor((rows, K // 8), T.uint32),
+        Sum: T.Tensor((rows,), T.int32),
+    ):
+        with T.Kernel(rows, threads=128) as row:
+            T.import_source(SOURCE)
+            sums = T.alloc_fragment((W,), T.int32)
+            total = T.alloc_fragment((1,), T.int32)
+            for j in T.Parallel(W):
+                sums[j] = 0
+                if j < K // 8:
+                    x = T.ldg32(A[row, j * 8])
+                    y = T.ldg32(A[row, j * 8 + 4])
+                    Low[row, j] = (
+                        (x & T.uint32(0x00000F0F))
+                        | ((x >> 12) & T.uint32(0x0000F0F0))
+                        | ((y << 16) & T.uint32(0x0F0F0000))
+                        | ((y << 4) & T.uint32(0xF0F00000))
+                    )
+                    High[row, j] = (
+                        ((x >> 4) & T.uint32(0x00000F0F))
+                        | ((x >> 16) & T.uint32(0x0000F0F0))
+                        | ((y << 12) & T.uint32(0x0F0F0000))
+                        | (y & T.uint32(0xF0F00000))
+                    )
+                    sums[j] = T.call_pure_extern("int32", "nib_sum", x, y)
+            T.reduce_sum(sums, total, dim=0)
+            Sum[row] = total[0]
+
+    return pack_exact_a8
+
+
+@orin_jit(
+    pass_configs={
+        "tl.disable_thread_storage_sync": True,
+        "tl.disable_shared_memory_reuse": True,
+        "tl.if_stmt_binding_inline_replayable_binds": False,
+    }
+)
+def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16):
+    if (
+        any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
+        or K % 128
+        or K * 128 * 128 > 2**31 - 1
+        or type(block_m) is not int
+        or block_m not in (8, 16)
+    ):
+        raise ValueError("Invalid exact E8P geometry")
+    BM, BN, BK = block_m, 128, 64
+    # NCU identifies excess shared wavefronts for strided stores. Swizzle
+    # sixteen-byte row halves so ldmatrix and writes both use distinct banks.
+    # The small decode tile benefits from weight swizzling only.
+    input_stride, input_mask = (32, 16) if BM == 16 else (48, 0)
+
+    @T.prim_func
+    def exact_e8p_int4(
+        Low: T.Tensor((rows, K // 2), T.int8),
+        High: T.Tensor((rows, K // 2), T.int8),
+        Sum: T.Tensor((rows,), T.int32),
+        P: T.Tensor((E, K // 64, N, 8), T.uint16),
+        Book: T.Tensor((1, 256, 1), T.uint32),
+        WS: T.Tensor((E, N), T.float16),
+        AS: T.Tensor((rows,), T.float16),
+        Counts: T.Tensor((E,), T.int32),
+        Offsets: T.Tensor((E,), T.int32),
+        TE: T.Tensor((tiles,), T.int32),
+        TR: T.Tensor((tiles,), T.int32),
+        TC: T.Tensor((1,), T.int32),
+        Out: T.Tensor((rows, N), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(N, BN), tiles, threads=128) as (bx, tile):
+            T.import_source(SOURCE)
+            tid = T.get_thread_binding()
+            lane = tid % 32
+            warp = tid // 32
+            packed = T.alloc_shared((2, BN, 8), T.uint16)
+            inputs = T.alloc_shared((2, 2, BM, input_stride), T.int8)
+            weights = T.alloc_shared((BN, 32), T.int8)
+            book = T.alloc_shared((256,), T.uint32)
+            lo = T.alloc_local((BM,), T.int32)
+            hi = T.alloc_local((BM,), T.int32)
+            v = T.alloc_local((4,), T.uint32)
+            a = T.alloc_local((BM // 2,), T.uint32)
+            if tile < TC[0]:
+                expert, first = TE[tile], TR[tile]
+                offset = Offsets[expert] + first
+                count = T.min(BM, Counts[expert] - first)
+                for i in T.unroll(2):
+                    book[tid + i * 128] = Book[0, tid + i * 128, 0]
+                for i in T.unroll(BM):
+                    lo[i] = 0
+                    hi[i] = 0
+                T.sync_threads()
+                T.ptx_cp_async(
+                    T.access_ptr(packed[0, tid, 0], "w", 8),
+                    T.access_ptr(P[expert, 0, T.min(bx * BN + tid, N - 1), 0], "r", 8),
+                    8,
+                    predicate=bx * BN + tid < N,
+                )
+                if tid < BM * 2:
+                    T.ptx_cp_async(
+                        T.access_ptr(
+                            inputs[
+                                0, 0, tid // 2, ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask)
+                            ],
+                            "w",
+                            16,
+                        ),
+                        T.access_ptr(
+                            Low[T.min(offset + tid // 2, rows - 1), (tid % 2) * 16], "r", 16
+                        ),
+                        16,
+                        predicate=offset + tid // 2 < rows,
+                    )
+                    T.ptx_cp_async(
+                        T.access_ptr(
+                            inputs[
+                                0, 1, tid // 2, ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask)
+                            ],
+                            "w",
+                            16,
+                        ),
+                        T.access_ptr(
+                            High[T.min(offset + tid // 2, rows - 1), (tid % 2) * 16], "r", 16
+                        ),
+                        16,
+                        predicate=offset + tid // 2 < rows,
+                    )
+                T.ptx_commit_group()
+                for step in T.serial(K // BK):
+                    slot = step % 2
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
+                    if step + 1 < K // BK:
+                        nxt = (step + 1) % 2
+                        T.ptx_cp_async(
+                            T.access_ptr(packed[nxt, tid, 0], "w", 8),
+                            T.access_ptr(
+                                P[expert, step + 1, T.min(bx * BN + tid, N - 1), 0], "r", 8
+                            ),
+                            8,
+                            predicate=bx * BN + tid < N,
+                        )
+                        if tid < BM * 2:
+                            T.ptx_cp_async(
+                                T.access_ptr(
+                                    inputs[
+                                        nxt,
+                                        0,
+                                        tid // 2,
+                                        ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                    ],
+                                    "w",
+                                    16,
+                                ),
+                                T.access_ptr(
+                                    Low[
+                                        T.min(offset + tid // 2, rows - 1),
+                                        (step + 1) * 32 + (tid % 2) * 16,
+                                    ],
+                                    "r",
+                                    16,
+                                ),
+                                16,
+                                predicate=offset + tid // 2 < rows,
+                            )
+                            T.ptx_cp_async(
+                                T.access_ptr(
+                                    inputs[
+                                        nxt,
+                                        1,
+                                        tid // 2,
+                                        ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                    ],
+                                    "w",
+                                    16,
+                                ),
+                                T.access_ptr(
+                                    High[
+                                        T.min(offset + tid // 2, rows - 1),
+                                        (step + 1) * 32 + (tid % 2) * 16,
+                                    ],
+                                    "r",
+                                    16,
+                                ),
+                                16,
+                                predicate=offset + tid // 2 < rows,
+                            )
+                        T.ptx_commit_group()
+                    for i in T.unroll(4):
+                        n = tid // 4 + i * 32
+                        both = T.call_pure_extern(
+                            "uint32",
+                            "nib_pair",
+                            T.access_ptr(packed[slot, n, (tid % 4) * 2], "r", 2),
+                        )
+                        c0 = both & T.uint32(65535)
+                        c1 = both >> 16
+                        d0 = T.call_pure_extern("uint32", "nib_fast", c0, book[c0 >> 8])
+                        d1 = T.call_pure_extern("uint32", "nib_fast", c1, book[c1 >> 8])
+                        T.evaluate(
+                            T.call_extern(
+                                "void",
+                                "nib_store2",
+                                T.access_ptr(
+                                    weights[n, ((tid % 4) * 8) ^ (((n // 4) % 2) * 16)], "w", 8
+                                ),
+                                d0,
+                                d1,
+                            )
+                        )
+                    T.sync_threads()
+                    for stripe in T.unroll(BM // 8):
+                        m = lane % 8 + stripe * 8
+                        col = (lane // 8 % 2) * 16
+                        T.evaluate(
+                            T.call_extern(
+                                "void",
+                                "nib_ldm2",
+                                T.access_ptr(
+                                    inputs[slot, 0, m, col ^ (((m // 4) % 2) * input_mask)], "r", 16
+                                ),
+                                T.access_ptr(a[stripe * 2], "w", 2),
+                            )
+                        )
+                        T.evaluate(
+                            T.call_extern(
+                                "void",
+                                "nib_ldm2",
+                                T.access_ptr(
+                                    inputs[slot, 1, m, col ^ (((m // 4) % 2) * input_mask)], "r", 16
+                                ),
+                                T.access_ptr(a[BM // 4 + stripe * 2], "w", 2),
+                            )
+                        )
+                    for nt in T.unroll(2):
+                        n = warp * 32 + nt * 16 + lane % 16
+                        col = (lane // 16) * 16
+                        T.evaluate(
+                            T.call_extern(
+                                "void",
+                                "nib_ldm4",
+                                T.access_ptr(weights[n, col ^ (((n // 4) % 2) * 16)], "r", 16),
+                                v.access_ptr("w"),
+                            )
+                        )
+                        for stripe in T.unroll(BM // 8):
+                            T.evaluate(
+                                T.call_extern(
+                                    "void",
+                                    "nib_mma_low",
+                                    T.access_ptr(lo[nt * (BM // 2) + stripe * 4], "rw", 4),
+                                    v[0],
+                                    v[1],
+                                    v[2],
+                                    v[3],
+                                    a[stripe * 2],
+                                    a[stripe * 2 + 1],
+                                )
+                            )
+                            T.evaluate(
+                                T.call_extern(
+                                    "void",
+                                    "nib_mma_high",
+                                    T.access_ptr(hi[nt * (BM // 2) + stripe * 4], "rw", 4),
+                                    v[0],
+                                    v[1],
+                                    v[2],
+                                    v[3],
+                                    a[BM // 4 + stripe * 2],
+                                    a[BM // 4 + 1 + stripe * 2],
+                                )
+                            )
+                    T.sync_threads()
+                for nt in T.unroll(2):
+                    for stripe in T.unroll(BM // 8):
+                        for r in T.unroll(2):
+                            n = bx * BN + warp * 32 + nt * 16 + lane // 4 + r * 8
+                            for t in T.unroll(2):
+                                m = stripe * 8 + (lane % 4) * 2 + t
+                                if m < count and n < N:
+                                    j = nt * (BM // 2) + stripe * 4 + r * 2 + t
+                                    value = 2 * (lo[j] + 16 * hi[j]) + Sum[offset + m]
+                                    Out[offset + m, n] = (
+                                        T.cast(value, T.float32) * T.cast(WS[expert, n], T.float32)
+                                    ) * T.cast(AS[offset + m], T.float32)
+
+    return exact_e8p_int4

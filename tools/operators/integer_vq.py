@@ -24,6 +24,7 @@ from kernels.model.integer_vq import integer_vq, rotate_activation
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--block-m", type=int, choices=(8, 16, 32, 64), default=16)
     a = p.parse_args()
     configure()
     rng = np.random.default_rng(20261002)
@@ -37,9 +38,11 @@ def main():
     for kind, d, dtype in [("vq4", 4, np.uint8), ("e8p", 8, np.uint16)]:
         for m, patched, shared_table in (
             (1, False, False),
+            (3, False, True),
             (17, False, False),
             (17, True, False),
             (17, True, True),
+            (33, False, True),
         ):
             e, n, k = 2, 65, 256
             bank = []
@@ -79,7 +82,16 @@ def main():
             x = torch.randint(-128, 128, (e, m, k), device="cuda", dtype=torch.int8)
             sa = torch.full((e, m), 0.0078125, device="cuda", dtype=torch.float16)
             out = torch.full((e * m + 1, n), 91.0, device="cuda", dtype=torch.float16)
-            kernel = integer_vq(e, m, n, k, kind=kind, patched=patched, shared_table=shared_table)
+            kernel = integer_vq(
+                e,
+                m,
+                n,
+                k,
+                kind=kind,
+                patched=patched,
+                shared_table=shared_table,
+                block_m=a.block_m,
+            )
 
             def run():
                 kernel(x.view(e * m, k), pp, book, patch, ws, sa.view(-1), out[: e * m])
@@ -137,6 +149,7 @@ def main():
                 {
                     "kind": kind,
                     "rows": m,
+                    "block_m": a.block_m,
                     "patched": patched,
                     "shared_table": shared_table,
                     "integer_oracle_equal": True,
@@ -161,6 +174,8 @@ def main():
                     shortbook=True,
                     block_n=128,
                     num_stages=1,
+                    block_m=a.block_m,
+                    byte_permute=True,
                 )
 
                 def run_short():
@@ -191,7 +206,9 @@ def main():
                 report["cases"].append(
                     {
                         "kind": "e8p-short",
+                        "byte_permute": True,
                         "rows": m,
+                        "block_m": a.block_m,
                         "patched": patched,
                         "shared_table": shared_table,
                         "integer_oracle_equal": True,

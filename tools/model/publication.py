@@ -119,7 +119,21 @@ def load_model(model):
     raw = (origin / "package.json").read_bytes()
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError("Source operator package digest mismatch")
-    return data, origin, json.loads(raw)
+    package = json.loads(raw)
+    if "catalog" in package:
+        # Offline tools reuse the registered Rust binding generator. This is
+        # compiler staging data, never an alternative online package format.
+        engine = Path(os.environ.get("ORINFER_ENGINE", str(ROOT / "target/release/orinfer")))
+        completed = subprocess.run(
+            [str(engine), "plan-model", str(model)], check=True, capture_output=True, text=True
+        )
+        report = json.loads(completed.stdout)
+        manifest = report["manifest"]
+        package.pop("catalog")
+        package["kernels"] = manifest["kernels"]
+        package["dynamic_batch_kernels"] = list(manifest["dynamic_batch_kernels"].values())
+        package["plan_kernel_contracts"] = report["plan_kernel_contracts"]
+    return data, origin, package
 
 
 def clone_model(source, destination, operator):
@@ -145,7 +159,10 @@ def clone_model(source, destination, operator):
 
 
 def commit_package(model, operator, data, package):
-    raw = (json.dumps(package, ensure_ascii=False, indent=2) + "\n").encode()
+    from tools.model.catalog import seal
+
+    package = seal(package, operator)
+    raw = (json.dumps(package, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
     # Metadata can be hardlinked to the source. Always replace its inode.
     with tempfile.NamedTemporaryFile(dir=operator, delete=False) as stream:

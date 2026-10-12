@@ -53,13 +53,13 @@ def attach(source, output, library, engine, package_name=None, version=None):
     verify_execution(package, bundled)
     reader = AssetReader(bundled)
     checked = set()
-    for kernel in package["kernels"]:
-        for field in ("module", "source", "host_abi"):
-            asset = kernel[field]
-            key = (asset["file"], asset.get("tensor"), asset["sha256"])
-            if key not in checked:
-                reader.read(asset)
-                checked.add(key)
+    if "kernels" in package or "catalog" not in package:
+        raise ValueError("Expected a compiled kernel catalog; finalize the model package first")
+    for asset in package["catalog"]["assets"]:
+        key = (asset["file"], asset.get("tensor"), asset["sha256"])
+        if key not in checked:
+            reader.read(asset)
+            checked.add(key)
     with atomic_model(output, engine) as staging:
         staging.mkdir()
         for path in source.iterdir():

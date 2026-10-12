@@ -31,6 +31,15 @@ pub(crate) struct Executor {
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
     pub(super) prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
+    pub(crate) parallel_regions: RefCell<Vec<[String; 4]>>,
+    #[cfg(test)]
+    pub(crate) parallel_gate_first: std::cell::Cell<bool>,
+    #[cfg(test)]
+    pub(crate) parallel_priority: RefCell<String>,
+    #[cfg(test)]
+    pub(crate) live_graph_events: std::cell::Cell<Option<[sys::CUevent; 2]>>,
+    #[cfg(test)]
+    pub(crate) live_graph_ms: RefCell<Vec<f32>>,
     pub(crate) snapshot_allocations: Vec<std::rc::Rc<super::snapshot::Allocation>>,
     pub(super) sequences: Vec<super::sequence::Sequence>,
     pub(super) active_sequence: usize,
@@ -408,6 +417,22 @@ impl Executor {
         };
         let executor = Self {
             snapshot_allocations: vec![],
+            parallel_regions: RefCell::new(
+                manifest
+                    .graph_branches
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .collect(),
+            ),
+            #[cfg(test)]
+            parallel_gate_first: Default::default(),
+            #[cfg(test)]
+            parallel_priority: RefCell::new("small_side".into()),
+            #[cfg(test)]
+            live_graph_events: Default::default(),
+            #[cfg(test)]
+            live_graph_ms: Default::default(),
             session: s,
             pointers,
             sizes,
@@ -587,24 +612,61 @@ impl Executor {
     }
     pub(crate) fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.submit_program(name, phase)?;
-        self.sync()
+        self.sync()?;
+        #[cfg(test)]
+        if name == "decode"
+            && phase == ExecutionPhase::Decode
+            && self.cuda_graph.uses_graph(phase)
+            && let Some(events) = self.live_graph_events.get()
+        {
+            let mut ms = 0.;
+            // SAFETY: Both events were recorded on the synchronized stream and are retained by Session.
+            unsafe {
+                check(
+                    sys::cuEventElapsedTime(&mut ms, events[0], events[1]),
+                    "live graph elapsed",
+                )?;
+            }
+            self.live_graph_ms.borrow_mut().push(ms);
+        }
+        Ok(())
     }
 
     /// Submit the same registered program without adding synchronization points.
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.ensure_kv(name)?;
-        self.ensure_program_kernels(name)?;
         if self.cuda_graph.uses_graph(phase) {
+            // Capture resolves all functions once; replay retains its modules
+            // and addresses. KV growth above invalidates captures before reuse.
             let graph = self.program_graph(name)?;
+            #[cfg(test)]
+            let events = (name == "decode" && phase == ExecutionPhase::Decode)
+                .then(|| self.live_graph_events.get())
+                .flatten();
             // SAFETY: Graphs and their stable addresses live in this thread's session.
             unsafe {
+                #[cfg(test)]
+                if let Some(events) = events {
+                    check(
+                        sys::cuEventRecord(events[0], self.session.stream),
+                        "live graph begin",
+                    )?;
+                }
                 check(
                     sys::cuGraphLaunch(graph, self.session.stream),
                     "model graph",
                 )?;
+                #[cfg(test)]
+                if let Some(events) = events {
+                    check(
+                        sys::cuEventRecord(events[1], self.session.stream),
+                        "live graph end",
+                    )?;
+                }
             }
             return Ok(());
         }
+        self.ensure_program_kernels(name)?;
         if let Some(direct) = &self.direct {
             use crate::model::Operation;
             let ops = direct

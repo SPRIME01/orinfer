@@ -27,7 +27,7 @@ from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
 def factory(label, capacity):
     from kernels.model import flash_next as f, hyperconnection as h, moe, ple
-    from kernels.model.int8_projection import int8_projection
+    from kernels.model.int8_projection import int8_projection, int8_small_projection
     from kernels.model.int8_swiglu import int8_swiglu
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.greedy import greedy_partials, greedy_merge
@@ -46,6 +46,8 @@ def factory(label, capacity):
         return h.hc_up_mix.__wrapped__(capacity, 2560, 320, **opts)
     if label.startswith("hc-injection-"):
         return h.hc_injection.__wrapped__(capacity, int(parts[-2]), int(parts[-1]), **opts)
+    if label.startswith("bf16-gate-"):
+        return f.scalar_bf16_projection.__wrapped__(capacity, int(parts[-1]), **opts)
     if label.startswith("hc-silu-"):
         return h.hc_silu.__wrapped__(capacity, 320, 4, "float16", **opts)
     if label.startswith("hc-mix-"):
@@ -65,6 +67,9 @@ def factory(label, capacity):
             silu=silu == "True",
             **opts,
         )
+    if label.startswith("dense-small-a8-"):
+        _, _, _, _, n, k, dtype = parts
+        return int8_small_projection.__wrapped__(capacity, int(n), int(k), dtype, **opts)
     if label.startswith("dense-a8-"):
         _, _, _, n, k, dtype, bm, bn, bk, gm = parts
         return int8_projection.__wrapped__(

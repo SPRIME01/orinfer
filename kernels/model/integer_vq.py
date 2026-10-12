@@ -12,6 +12,17 @@ from tools.operators.common import orin_jit
 
 
 SOURCE = r"""
+__device__ __forceinline__ unsigned int integer_e8p_selector_quad(unsigned int code, unsigned int basis, unsigned int half) {
+    unsigned int parity = __popc(code & 255u) & 1u;
+    unsigned int s = (code ^ parity) >> (half * 2u);
+    unsigned int flags = ((s & 0x11u) << 2u) | ((s & 0x22u) << 9u);
+    unsigned int selector = ((basis >> (half * 16u)) & 0x7777u) ^ flags;
+    unsigned int shift = parity * 0x02020202u;
+    // Both constants retain the parity-dependent zero entry. Each byte of
+    // the nonzero entries is at least two, so subtracting shift has no
+    // inter-byte borrow. The final byte wraps to -1 for the odd-parity zero.
+    return __byte_perm(0x010b0703u - shift, 0x01f7fbffu - shift, selector);
+}
 __device__ __forceinline__ unsigned int integer_e8p_quad(unsigned int code, unsigned int basis, unsigned int half) {
     unsigned int parity = __popc(code & 255u) & 1u;
     unsigned int s = ((code & 255u) ^ parity) >> (half * 2u);
@@ -40,6 +51,7 @@ __device__ __forceinline__ unsigned int integer_e8p_sign_quad_prmt(unsigned int 
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(value) : "r"(positive), "r"(negative), "r"(selector));
     return value;
 }
+
 """
 
 
@@ -60,6 +72,9 @@ def _compile(
     num_stages,
     BM,
     byte_permute,
+    selectorbook,
+    group_n,
+    packed_k,
 ):
     if (
         kind not in ("vq4", "e8p")
@@ -70,36 +85,67 @@ def _compile(
         raise ValueError("Invalid integer VQ geometry")
     if BN not in (64, 128):
         raise ValueError("Invalid VQ output tile")
-    if BM not in (16, 32, 64):
+    if BM not in (8, 16, 32, 64):
         raise ValueError("Invalid VQ row tile")
     if num_stages not in (1, 2) or shortbook and kind != "e8p":
         raise ValueError("Invalid VQ decoder/pipeline")
     if type(byte_permute) is not bool or byte_permute and not shortbook:
         raise ValueError("Byte permutation requires the E8P short table")
+    if type(selectorbook) is not bool or selectorbook and not shortbook:
+        raise ValueError("Selector decoding requires a validated E8P short basis")
+    if type(group_n) is not bool:
+        raise ValueError("Invalid routed tile order")
+    if type(packed_k) is not int or packed_k not in (64, 128) or packed_k == 64 and kind != "e8p":
+        raise ValueError("Invalid integer VQ code layout")
     D = 4 if kind == "vq4" else 8
     PD = T.uint8 if D == 4 else T.uint16
     TE = 1 if shared_table else E
-    entries, words = (512, 4) if shortbook else (256, D // 4)
+    entries, words = (256, 1) if selectorbook else (512, 4) if shortbook else (256, D // 4)
     G = 128
 
     @T.macro
     def project(A, P, Book, Patch, WS, AS, C, expert, offset, count, bx):
         T.import_source(SOURCE)
-        a = T.alloc_shared((BM, G), T.int8)
-        b = T.alloc_shared((BN, G), T.int8)
+        # Small routed batches feed MMA directly from register fragments.
+        # Keep packed-code prefetch and the LUT in shared memory, but avoid
+        # staging expanded INT8 weights and activations through ldmatrix.
+        if BM == 8 and shortbook:
+            a = T.alloc_fragment((BM, G), T.int8)
+            b = T.alloc_fragment((BN, G), T.int8)
+        else:
+            a = T.alloc_shared((BM, G), T.int8)
+            b = T.alloc_shared((BN, G), T.int8)
         packed = T.alloc_shared((BN, G // D), PD)
         table = T.alloc_shared((entries, words), T.uint32)
         patch = T.alloc_shared((BN,), T.uint16)
         decoded = T.alloc_fragment((BN, G // 4), T.uint32)
-        acc = T.alloc_fragment((BM, BN), T.int32)
+        # Put short token batches on MMA's eight-column dimension. Decoding
+        # and stored weights stay unchanged; only the integer product is
+        # transposed, then written in the original token/channel order.
+        acc = T.alloc_fragment((BN, BM) if BM == 8 else (BM, BN), T.int32)
         T.copy(Book[0 if shared_table else expert, 0, 0], table)
         T.clear(acc)
         for kg in T.Pipelined(K // G, num_stages=num_stages):
-            for m, k in T.Parallel(BM, G):
-                a[m, k] = 0
-                if m < count:
-                    a[m, k] = A[offset + m, kg * G + k]
-            T.copy(P[expert, kg, bx * BN, 0], packed)
+            if (BM == 32 or selectorbook and BM == 16) and num_stages == 1:
+                # MMA rows are independent, and only rows below count are
+                # stored. Extra rows may read the following expert's inputs;
+                # T.copy masks the end of the allocation. This permits vector
+                # asynchronous copies instead of conditional byte stores.
+                T.copy(A[offset, kg * G], a)
+            else:
+                for m, k in T.Parallel(BM, G):
+                    a[m, k] = 0
+                    if m < count:
+                        a[m, k] = A[offset + m, kg * G + k]
+            if packed_k == 64:
+                # Two contiguous K64 rows reconstruct the original K128 tile.
+                for half in T.unroll(2):
+                    T.copy(
+                        P[expert, kg * 2 + half, bx * BN : (bx + 1) * BN, 0:8],
+                        packed[:, half * 8 : (half + 1) * 8],
+                    )
+            else:
+                T.copy(P[expert, kg, bx * BN, 0], packed)
             if patched:
                 # Scalar metadata reads avoid mixing two asynchronous producer
                 # stages in TileLang's software-pipeline dependency graph.
@@ -115,7 +161,16 @@ def _compile(
                     decoded[n, q] = table[T.cast(packed[n, q], T.int32), 0]
                 else:
                     code = T.cast(packed[n, q // 2], T.uint32)
-                    if shortbook:
+                    if selectorbook:
+                        basis = table[T.cast(code >> 8, T.int32), 0]
+                        decoded[n, q] = T.call_pure_extern(
+                            "uint32",
+                            "integer_e8p_selector_quad",
+                            code,
+                            basis,
+                            T.cast(q % 2, T.uint32),
+                        )
+                    elif shortbook:
                         parity = T.call_pure_extern("uint32", "integer_e8p_parity", code)
                         index = T.cast((code >> 8) + parity * 256, T.int32)
                         positive = table[index, (q % 2) * 2]
@@ -148,17 +203,21 @@ def _compile(
                     )
             for n, k in T.Parallel(BN, G):
                 b[n, k] = T.cast((decoded[n, k // 4] >> ((k % 4) * 8)) & 255, T.int8)
-            T.gemm(a, b, acc, transpose_B=True)
+            if BM == 8:
+                T.gemm(b, a, acc, transpose_B=True)
+            else:
+                T.gemm(a, b, acc, transpose_B=True)
         for m, n in T.Parallel(BM, BN):
             if m < count and bx * BN + n < N:
                 C[offset + m, bx * BN + n] = (
-                    T.cast(acc[m, n], T.float32) * T.cast(WS[expert, bx * BN + n], T.float32)
+                    T.cast(acc[n, m] if BM == 8 else acc[m, n], T.float32)
+                    * T.cast(WS[expert, bx * BN + n], T.float32)
                 ) * T.cast(AS[offset + m], T.float32)
 
     @T.prim_func
     def direct(
         A: T.Tensor((rows, K), T.int8),
-        P: T.Tensor((E, K // G, N, G // D), PD),
+        P: T.Tensor((E, K // packed_k, N, packed_k // D), PD),
         Book: T.Tensor((TE, entries, words), T.uint32),
         Patch: T.Tensor((E, K // G, N) if patched else (1,), T.uint16),
         WS: T.Tensor((E, N), T.float16),
@@ -171,7 +230,7 @@ def _compile(
     @T.prim_func
     def routed(
         A: T.Tensor((rows, K), T.int8),
-        P: T.Tensor((E, K // G, N, G // D), PD),
+        P: T.Tensor((E, K // packed_k, N, packed_k // D), PD),
         Book: T.Tensor((TE, entries, words), T.uint32),
         Patch: T.Tensor((E, K // G, N) if patched else (1,), T.uint16),
         WS: T.Tensor((E, N), T.float16),
@@ -183,7 +242,14 @@ def _compile(
         TileCount: T.Tensor((1,), T.int32),
         C: T.Tensor((rows, N), T.float16),
     ):
-        with T.Kernel(tiles, T.ceildiv(N, BN), threads=128) as (tile, bx):
+        # Adjacent output tiles reuse one expert's routed activations in L2.
+        with T.Kernel(
+            T.ceildiv(N, BN) if group_n else tiles,
+            tiles if group_n else T.ceildiv(N, BN),
+            threads=128,
+        ) as (first, second):
+            tile = second if group_n else first
+            bx = first if group_n else second
             meta = T.alloc_local((4,), T.int32)
             if tile < TileCount[0]:
                 meta[0] = TileExpert[tile]
@@ -209,6 +275,8 @@ def integer_vq(
     num_stages=2,
     block_m=16,
     byte_permute=False,
+    selectorbook=False,
+    packed_k=128,
 ):
     return _compile(
         E * M,
@@ -226,6 +294,9 @@ def integer_vq(
         num_stages,
         block_m,
         byte_permute,
+        selectorbook,
+        False,
+        packed_k,
     )
 
 
@@ -244,7 +315,43 @@ def integer_vq_grouped(
     num_stages=2,
     block_m=16,
     byte_permute=False,
+    selectorbook=False,
+    warp_decode=False,
+    split_k=1,
+    parity_xor=False,
+    group_n=False,
+    packed_k=128,
 ):
+    if type(group_n) is not bool:
+        raise ValueError("Invalid routed tile order")
+    if type(parity_xor) is not bool or parity_xor and not warp_decode:
+        raise ValueError("XOR parity requires warp decode")
+    if warp_decode:
+        if (
+            kind != "e8p"
+            or not shared_table
+            or not selectorbook
+            or not shortbook
+            or patched
+            or block_m != 8
+            or group_n
+        ):
+            raise ValueError("Warp decode requires unpatched shared E8P selectors and BM8")
+        from kernels.model.e8p_decode import e8p_decode_grouped
+
+        return e8p_decode_grouped(
+            rows,
+            E,
+            tiles,
+            N,
+            K,
+            block_n=block_n,
+            split_k=split_k,
+            parity_xor=parity_xor,
+            packed_k=packed_k,
+        )
+    if split_k != 1:
+        raise ValueError("Split-K requires warp decode")
     return _compile(
         rows,
         E,
@@ -261,6 +368,9 @@ def integer_vq_grouped(
         num_stages,
         block_m,
         byte_permute,
+        selectorbook,
+        group_n,
+        packed_k,
     )
 
 

@@ -4,7 +4,9 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import shutil
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from safetensors import safe_open
@@ -20,6 +22,17 @@ class CompactTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+        def build_library(package, bindings, directory, engine=None):
+            library = Path(directory) / "lib/model.so"
+            library.parent.mkdir(parents=True, exist_ok=True)
+            if not library.exists():
+                shutil.copyfile(self.library, library)
+            return package["execution"]
+
+        builder = patch("tools.model.catalog.build_library", side_effect=build_library)
+        builder.start()
+        self.addCleanup(builder.stop)
         self.model = self.root / "source"
         self.weights = self.model / "cache/weights"
         self.weights.mkdir(parents=True)
@@ -85,6 +98,7 @@ class CompactTests(unittest.TestCase):
         library[16:20] = bytes((3, 0, 183, 0))
         (package / "lib").mkdir()
         (package / "lib/model.so").write_bytes(library)
+        self.library = package / "lib/model.so"
         spec = dict(
             schema_version=1,
             runtime_abi=1,
@@ -94,7 +108,21 @@ class CompactTests(unittest.TestCase):
                 version="1",
                 library=dict(file="lib/model.so", sha256=hashlib.sha256(library).hexdigest()),
             ),
-            kernels=[dict(module=kernels[0], source=kernels[1], host_abi=kernels[2])] * 2,
+            kernels=[
+                dict(
+                    name=f"kernel{i}",
+                    symbol="main",
+                    grid=[1, 1, 1],
+                    block=[32, 1, 1],
+                    shared_memory_bytes=0,
+                    cooperative=False,
+                    args=[],
+                    module=kernels[0],
+                    source=kernels[1],
+                    host_abi=kernels[2],
+                )
+                for i in range(2)
+            ],
         )
         raw = json.dumps(spec).encode()
         digest = hashlib.sha256(raw).hexdigest()
@@ -155,7 +183,12 @@ class CompactTests(unittest.TestCase):
             ("source", b"exact-source"),
             ("host_abi", b"exact-host"),
         ):
-            self.assertEqual(reader.read(manifest["kernels"][0][field]), expected)
+            self.assertEqual(
+                reader.read(
+                    manifest["catalog"]["assets"][manifest["catalog"]["definitions"][0][field]]
+                ),
+                expected,
+            )
         self.assertEqual(len(reader.headers), 1)
         with safe_open(package / "assets.safetensors", framework="numpy") as sf:
             self.assertEqual(len(sf.keys()), 3)
@@ -165,7 +198,7 @@ class CompactTests(unittest.TestCase):
         self.assertEqual(install(packed, installed), report["execution_package"])
         self.assertEqual(
             AssetReader(installed / report["execution_package"]).read(
-                manifest["kernels"][0]["module"]
+                manifest["catalog"]["assets"][manifest["catalog"]["definitions"][0]["module"]]
             ),
             b"\x7fELFexact-cubin",
         )

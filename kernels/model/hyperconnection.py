@@ -15,6 +15,7 @@ import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
+from kernels.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
 
 
 def _dtype(value):
@@ -45,7 +46,7 @@ def hc_norm(
         Weight: T.Tensor((streams, H), T.float32),
         Normed: T.Tensor((M, streams, H), dtype),
     ):
-        with T.Kernel(M, streams, threads=256) as (row, branch):
+        with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
@@ -96,15 +97,14 @@ def hc_mix(M: int, H: int, streams: int = 4, dtype: str = "bfloat16", dynamic_ro
         Mixed: T.Tensor((M, H), dtype),
     ):
         with T.Kernel(M, T.ceildiv(H, 256), threads=128) as (row, block):
+            T.import_source(HALF_MATH)
             total = T.alloc_fragment((256,), T.float32)
             T.clear(total)
             for branch in T.serial(streams):
                 for j in T.Parallel(256, coalesced_width=T.int32(1)):
                     col = block * 256 + j
                     if col < H:
-                        gate = T.cast(
-                            1.0 / (1.0 + T.exp(-T.cast(Up[row, branch, col], T.float32))), dtype
-                        )
+                        gate = stream_sigmoid(T.cast(Up[row, branch, col], T.float32), dtype)
                         product = T.cast(
                             T.cast(gate, T.float32) * T.cast(Normed[row, branch, col], T.float32),
                             dtype,
@@ -140,8 +140,9 @@ def hc_combine(
         Output: T.Tensor((M, streams, H), dtype),
     ):
         with T.Kernel(M, streams, T.ceildiv(H, 256), threads=128) as (row, branch, block):
+            T.import_source(HALF_MATH)
             raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
-            gate = T.cast(2.0 * T.cast(T.cast(1.0 / (1.0 + T.exp(-raw)), dtype), T.float32), dtype)
+            gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
             for j in T.Parallel(256, coalesced_width=T.int32(1)):
                 col = block * 256 + j
                 if col < H:
@@ -156,7 +157,13 @@ def hc_combine(
 
 
 @orin_jit
-def hc_combine_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: str = "bfloat16"):
+def hc_combine_norm(
+    M: int,
+    H: int,
+    streams: int = 4,
+    eps: float = 1e-6,
+    dtype: str = "bfloat16",
+):
     """Combine residuals and normalize, retaining the rounded residual output.
 
     Output may alias Residual. Normed must remain disjoint from all inputs and
@@ -177,12 +184,13 @@ def hc_combine_norm(M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: 
         Output: T.Tensor((M, streams, H), dtype),
         Normed: T.Tensor((M, streams, H), dtype),
     ):
-        with T.Kernel(M, streams, threads=256) as (row, branch):
+        with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
+            T.import_source(HALF_MATH)
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
             raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
-            gate = T.cast(2.0 * T.cast(T.cast(1.0 / (1.0 + T.exp(-raw)), dtype), T.float32), dtype)
+            gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
             for j in T.Parallel(width, coalesced_width=T.int32(1)):
                 values[j] = 0.0
                 if j < H:
@@ -294,7 +302,8 @@ def hc_projection(
 def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = False):
     """BF16 up projection and branch mix, preserving every FP16 boundary."""
     assert M >= 1 and H % 32 == 0 and rank % 64 == 0 and streams == 4
-    bm, bn = 16, 32
+    small = M <= 8
+    bm, bn = (8 if small else 16), 32
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -305,10 +314,12 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = 
         Out: T.Tensor((M, H), T.float16),
     ):
         with T.Kernel(T.ceildiv(M, bm), T.ceildiv(H, bn), threads=128) as (by, bx):
+            T.import_source(HALF_MATH)
             a = T.alloc_shared((bm, 64), T.bfloat16)
             w = T.alloc_shared((streams * bn, 64), T.bfloat16)
-            acc = T.alloc_fragment((bm, streams * bn), T.float32)
-            rounded_up = T.alloc_shared((bm, streams * bn), T.float16)
+            shape = (streams * bn, bm) if small else (bm, streams * bn)
+            acc = T.alloc_fragment(shape, T.float32)
+            rounded_up = T.alloc_shared(shape, T.float16)
             total = T.alloc_fragment((bm, bn), T.float32)
             T.annotate_layout(
                 {
@@ -328,13 +339,22 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = 
                         a[i, j] = A[by * bm + i, kg * 64 + j]
                 for n, j in T.Parallel(streams * bn, 64):
                     w[n, j] = W[(n // bn) * H + bx * bn + n % bn, kg * 64 + j]
-                T.gemm(a, w, acc, transpose_B=True)
+                # N x 8 MMA avoids the sixteen-row activation tile for small
+                # decode/verification batches. Preserve the same K traversal.
+                if small:
+                    T.gemm(w, a, acc, transpose_B=True)
+                else:
+                    T.gemm(a, w, acc, transpose_B=True)
             T.copy(acc, rounded_up)
             for branch in T.serial(streams):
                 for i, j in T.Parallel(bm, bn):
                     if by * bm + i < M:
-                        up = rounded_up[i, branch * bn + j]
-                        gate = T.cast(1 / (1 + T.exp(-T.cast(up, T.float32))), T.float16)
+                        up = (
+                            rounded_up[branch * bn + j, i]
+                            if small
+                            else rounded_up[i, branch * bn + j]
+                        )
+                        gate = stream_sigmoid(T.cast(up, T.float32), "float16")
                         product = T.cast(
                             T.cast(gate, T.float32)
                             * T.cast(Normed[by * bm + i, branch, bx * bn + j], T.float32),
@@ -395,7 +415,13 @@ def hc_down_partial(M: int, N: int, K: int, splits: int = 4, dynamic_rows: bool 
         or K % (64 * splits)
     ):
         raise ValueError("Invalid HC split-K dimensions")
-    bm, bn = 16, 32
+    # Small verification profiles repeatedly convert padded activation rows
+    # within each K tile. Cache only live rows, retaining the four split sums
+    # and the original BF16 MMA traversal. Large dynamic capacities keep the
+    # streaming plan instead of reserving an oversized activation cache.
+    cached = M <= 8
+    live_rows = M if cached else 0
+    bm, bn = 16, 64 if cached else 32
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -408,12 +434,21 @@ def hc_down_partial(M: int, N: int, K: int, splits: int = 4, dynamic_rows: bool 
             a = T.alloc_shared((bm, 64), T.bfloat16)
             w = T.alloc_shared((bn, 64), T.bfloat16)
             acc = T.alloc_fragment((bm, bn), T.float32)
+            if cached:
+                live = T.alloc_shared((live_rows, K // splits), T.bfloat16)
+                for i, j in T.Parallel(live_rows, K // splits):
+                    live[i, j] = 0
+                    if by * bm + i < M:
+                        live[i, j] = A[by * bm + i, part * (K // splits) + j]
             T.clear(acc)
             for kg in T.Pipelined(K // (64 * splits), num_stages=2):
                 for i, j in T.Parallel(bm, 64, coalesced_width=T.int32(1)):
                     a[i, j] = 0
                     if by * bm + i < M:
-                        a[i, j] = A[by * bm + i, part * (K // splits) + kg * 64 + j]
+                        if cached:
+                            a[i, j] = live[i, kg * 64 + j]
+                        else:
+                            a[i, j] = A[by * bm + i, part * (K // splits) + kg * 64 + j]
                 T.copy(W[bx * bn, part * (K // splits) + kg * 64], w)
                 T.gemm(a, w, acc, transpose_B=True)
             for i, j in T.Parallel(bm, bn):

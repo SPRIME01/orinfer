@@ -1,5 +1,7 @@
 # 性能工具
 
+当前 Flash Next 的 Rust CLI / Chat API 实测与 27B 历史参考见[性能参考](../../docs/performance.md)。该文档分别列出执行层 prefill、输入 tokens / API TTFT、排除 TTFT 的 decode，以及完整 prefix 命中时延；本目录各工具的整请求吞吐不能直接替代这些指标。
+
 `reference_bench.py`测量兼容OpenAI SSE接口的prefill/TTFT与decode时间；`test_reference_bench.py`检查token chunk和计时间隔。
 
 参考服务的配置及身份须记录在输出目录的`reference-lock.json`中，输入token由`--seed-tokens /path/to/input-tokens.json`显式提供。请求要求服务支持token-ID输入/输出、固定长度生成和可选的独立计时诊断；不能直接用普通Chat请求代替。

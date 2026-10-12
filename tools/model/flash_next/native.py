@@ -41,7 +41,7 @@ from kernels.model.moe import (
     expert_histogram_finish,
 )
 from kernels.model.greedy import greedy_partials, greedy_merge
-from kernels.model.int8_projection import int8_projection, int8_gemv
+from kernels.model.int8_projection import int8_projection, int8_gemv, int8_small_projection
 from kernels.model.int8_swiglu import int8_swiglu
 from kernels.model.integer_vq import integer_vq_grouped
 from kernels.model.rotation_a8 import rotate_activation_a8
@@ -60,14 +60,22 @@ from kernels.operators.op30_activation_quantization import (
     launch as launch_quant,
 )
 from tools.model.flash_next.checkpoint import Checkpoint
-from tools.model.flash_next.kernel_policy import expert_tile_config, router_tile
+from tools.model.flash_next.kernel_policy import (
+    expert_tile_config,
+    expert_projection_config,
+    router_tile,
+)
 from tools.model.flash_next.chunks import chunks
 from tools.model.flash_next.speculation import DEFAULT_DRAFTS
 from tools.model.flash_next.lookup import RowCache
 from tools.model.flash_next.ple import PleLookup
 from tools.model.flash_next.roles import role
 from tools.model.flash_next.validation import validate_snapshot, probe, baseline_probes
-from tools.quantization.vq import e8p_sign_table
+from tools.quantization.vq import (
+    e8p_selector_supports_parity_xor,
+    e8p_sign_table,
+    e8p_selector_table,
+)
 from tools.operators.common import configure, environment, export_kernel, write_json
 
 
@@ -200,6 +208,7 @@ class Model:
                 ):
                     raise ValueError("Missing or mismatched native QSA indexer weight")
         shortbooks = {}
+        selectorbooks = {}
         for original in sorted(self.source.parts):
             name = role(original)
             if name is None or name == "token_embd.weight":
@@ -228,10 +237,16 @@ class Model:
                     "scale": scales,
                     "signs": torch.from_numpy(signs).cuda(),
                 }
+                self.weights[name]["parity_xor"] = e8p_selector_supports_parity_xor(
+                    e8p_selector_table(table)
+                )
                 key = table.tobytes()
                 if key not in shortbooks:
                     shortbooks[key] = torch.from_numpy(e8p_sign_table(table)[None, ...]).cuda()
                 self.weights[name]["short_table"] = shortbooks[key]
+                if key not in selectorbooks:
+                    selectorbooks[key] = torch.from_numpy(e8p_selector_table(table)[None]).cuda()
+                self.weights[name]["selector_table"] = selectorbooks[key]
                 if name.endswith("ffn_down_exps.weight"):
                     print("loaded expert layer", name.split(".")[1], flush=True)
                 continue
@@ -402,7 +417,17 @@ class Model:
                 gemv = (2048 <= n < self.V and n * width >= 8 * 1024**2) or (
                     self.decode_w8_optimized and 512 <= n < self.V
                 )
-                if rows == 1 and gemv and width % 128 == 0:
+                if rows <= 8 and n == 48 and width % 128 == 0:
+                    call(
+                        f"dense-small-a8-{rows}-{n}-{width}-{od}",
+                        lambda: int8_small_projection(rows, n, width, od),
+                        q.view(torch.int32),
+                        integer.view(torch.int32),
+                        scale,
+                        as_.view(-1),
+                        out,
+                    )
+                elif rows == 1 and gemv and width % 128 == 0:
                     call(
                         f"dense-gemv-{n}-{width}-{od}",
                         lambda: int8_gemv(n, width, od, 8),
@@ -473,6 +498,16 @@ class Model:
                 else:
                     wd = str(weight.dtype).split(".")[-1]
                     od = str(out.dtype).split(".")[-1]
+                    if rows <= 8 and n == 1 and wd == "bfloat16" and od == "float16":
+                        call(
+                            f"bf16-gate-{rows}-{width}",
+                            lambda: fn.scalar_bf16_projection(rows, width),
+                            a,
+                            weight,
+                            out,
+                        )
+                        labels[-1] = f"{label}:{labels[-1]}"
+                        return
                     # Give all 16 SMs work on the small BF16 router, preserving
                     # the K traversal and accumulation/rounding semantics.
                     bn = router_tile(rows, n, width, e, h)
@@ -645,12 +680,13 @@ class Model:
         expert_bm = expert_config["block_m"]
         byte_permute = expert_config["byte_permute"]
         tiles = (assignments + expert_bm - 1) // expert_bm + min(e, assignments)
-        # An auto BM64 arena must also accommodate smaller BM32 tails.
-        # The route tile count is not monotonic in request length.
-        smallest_bm = 32
+        # Route tile count is not monotonic in request length. A conservative
+        # BM32 full-workspace bound covers the BM64 and shorter BM16/BM32
+        # profiles; empty() also reserves at least this profile's live tiles.
+        arena_block_m = 32
         arena_assignments = self.prefill_workspace_rows * k
         route_reserve = (
-            ((arena_assignments + smallest_bm - 1) // smallest_bm + min(e, arena_assignments))
+            ((arena_assignments + arena_block_m - 1) // arena_block_m + min(e, arena_assignments))
             if m >= 256
             else tiles
         )
@@ -779,6 +815,7 @@ class Model:
                     lambda: gdn_conv_prep(
                         B=1,
                         tokens=m,
+                        compact_decode=m == 1,
                         normalize_round_fp16=False,
                         conv_product_round_fp16=False,
                         weight_dtype="float32",
@@ -819,6 +856,7 @@ class Model:
                         value_tile=gdn_value_tile,
                         in_place=not verify,
                         compact=compact,
+                        prefetch_qk=m >= 256 and not verify,
                     ),
                     q[0],
                     keys[0],
@@ -1011,11 +1049,10 @@ class Model:
             projection("router", mixed, prefix + "ffn_gate_inp.weight", logits)
             call(f"router-{m}", lambda: router_topk(m, e, k), logits, ids, prob)
             # Shortbook/BM32 preserves decoded INT8 values and improves real
-            # prefill weight reuse; small verification keeps its BM16 plan.
+            # prefill weight reuse; short verification uses transposed BM8.
             shortbook = expert_config["shortbook"]
-            book_key = "short_table" if shortbook else "table"
-            expert_bn = expert_config["block_n"]
-            expert_stages = expert_config["num_stages"]
+            selectorbook = expert_config["selectorbook"]
+            book_key = "selector_table" if selectorbook else "short_table" if shortbook else "table"
             if m >= 256:
                 call(
                     f"histogram-local-{m}",
@@ -1088,11 +1125,7 @@ class Model:
                     h,
                     kind="e8p",
                     shared_table=True,
-                    block_n=expert_bn,
-                    shortbook=shortbook,
-                    num_stages=expert_stages,
-                    block_m=expert_bm,
-                    byte_permute=byte_permute,
+                    **expert_projection_config(m, h, parity_xor=gate_weight["parity_xor"]),
                 ),
                 dispatch,
                 gate_weight["packed"],
@@ -1125,11 +1158,7 @@ class Model:
                     f,
                     kind="e8p",
                     shared_table=True,
-                    block_n=expert_bn,
-                    shortbook=shortbook,
-                    num_stages=expert_stages,
-                    block_m=expert_bm,
-                    byte_permute=byte_permute,
+                    **expert_projection_config(m, f, parity_xor=down_weight["parity_xor"]),
                 ),
                 fq,
                 down_weight["packed"],

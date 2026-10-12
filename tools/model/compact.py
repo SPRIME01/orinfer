@@ -267,6 +267,9 @@ def compact_package(origin, package, cache):
                 shutil.copytree(path, staging / name)
             elif path.is_file():
                 shutil.copyfile(path, staging / name)
+        from tools.model.catalog import seal
+
+        package = seal(package, staging)
         raw = (json.dumps(package, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
         digest = hashlib.sha256(raw).hexdigest()
         (staging / "package.json").write_bytes(raw)

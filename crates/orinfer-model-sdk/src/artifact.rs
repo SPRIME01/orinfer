@@ -88,6 +88,9 @@ pub struct Kernel {
     pub shared_memory_bytes: u32,
     pub cooperative: bool,
     pub args: Vec<Argument>,
+    /// Generated from the CUDA prototype. Unannotated kernels remain serial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_arguments: Vec<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

@@ -13,7 +13,7 @@ MODEL_DIR/
   cache/packages/<sha256>/
     package.json
     lib/model.so
-    kernels/*.cubin
+    assets.safetensors               # 或独立 cubin/source/host ABI 文件
     LICENSE
 ```
 
@@ -21,9 +21,13 @@ MODEL_DIR/
 
 `.so` 使用 `orinfer-model-sdk`，不依赖 `orinfer-engine`。入口 `orinfer_model_v1` 返回 C 函数表，包含 describe/create/batch/visual 和对应资源释放函数。完整 C 声明位于 [`orinfer_model.h`](../crates/orinfer-model-sdk/include/orinfer_model.h)。Rust 数据结构及 trait 不跨动态库边界。
 
-创建时用 JSON 传递配置及数据契约；热路径的 batch 程序使用 C 数组，一次返回 kernel/copy/zero 指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
+包内 `catalog` 只保存共享资产、编译实现定义和动态行数 launch 模板。定义包含 cubin/source/host ABI 索引、symbol、block、shared memory、cooperative、实际参数类型顺序及只读契约；不保存层号、权重名、逐层参数、grid 或完整执行程序。同一 cubin 可有多个不同 ABI/launch 契约，不能仅按二进制 hash 合并定义。
 
-有限专家常驻模式在创建请求中提供可选的 `kernel_contracts`，模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，管理全局 SLRU 和 CUDA VMM 页，不识别模型专属名称或维度。默认全量常驻不请求此契约；未声明该能力的执行包不能使用有限模式。两项都是 JSON 的可选扩展，C ABI v1 和 schema 1 保持不变。
+离线编译得到的参数映射编译为 `.so` 内的 Rust 张量角色表、共享参数组和绑定表；该映射只记录实现与存储角色，执行顺序和融合仍由注册的 Rust 模型适配器生成。目录与映射分别固定身份，交换实现、参数类型、偏移或动态 launch 后必须重新构建匹配的库。运行时校验目录身份、buffer dtype/shape/layout 和边界，不依赖 Python 或在线编译。
+
+创建时用 JSON 传递配置、数据契约与小型编译目录。独立入口 `orinfer_model_plans_v1` 用 C 数组导出生成的 kernel 参数绑定和 kernel/copy/zero 程序；主 `orinfer_model_v1` 表保持 ABI 1。导出接口显式声明表及记录大小，数组、字符串和嵌套参数由同一个 owner 管理并释放。逐层绑定和完整程序不经过 JSON 序列化往返。动态 batch 热路径继续使用 C 数组，一次返回指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
+
+有限专家常驻模式通过创建请求的 `expert_contracts` 选择更完整的原生绑定契约。模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，管理全局 SLRU 和 CUDA VMM 页，不识别模型专属名称或维度。默认全量常驻只构建模型计划所需的验证契约；不从执行包 JSON 读取逐层 `kernel_contracts`。
 
 模型可声明 hash 固定的 `input_assets`，通过独立可选入口 `orinfer_model_inputs_v1` 接收执行程序名、当前 token 和请求历史，返回命名 buffer 的上传数据；原有 ABI v1 函数表不变。核心校验访问权限与上传范围，并在库释放数据前完成上传。Flash Next 在包内完成 CPU W8 embedding／E8P PLE 查表，有预算的行缓存共享，n-gram 历史从请求提供。CPU 资产随模型克隆和执行包更新一起保留。主模型、验证和 shifted draft 输入由模型包区分，核心不注册架构专属输入分派。
 
@@ -49,20 +53,22 @@ make build
 cargo build --release --locked --offline -p orinfer-models
 ```
 
-产物是 `target/release/liborinfer_models.so`。模型库只依赖 SDK，不链接引擎。此前单独拆出的 Qwen 仓库不再作为本项目的模型维护入口。
+该产物提供注册的模型逻辑；可部署库还需要离线构建工具生成匹配当前 kernel ABI 和物理 tensor 角色的绑定模块。发布器通过 `ORINFER_BINDINGS_SOURCE` 编译该模块，原生库只依赖 SDK，不链接引擎；结果位于包的 `lib/model.so`。
 
-更新已准备模型的执行库时，发布到一个新目录：
+在保留权重和 cubin 的情况下，重建原生库和目录：
 
 ```bash
-cd /path/to/orinfer
-PYTHONPATH=. .venv/bin/python -m tools.model.attach_execution \
-  --model /path/to/prepared-model --output /path/to/new-model \
-  --library /path/to/liborinfer_models.so
+PYTHONPATH=. .venv/bin/python -m tools.model.catalog \
+  --model /path/to/prepared-model --output /path/to/rebuilt-model
 ```
 
-更新工具读取新库的实际身份与版本，校验原执行库与 kernel 资产，复用权重和 cubin，替换 `.so` 后通过加载器校验计划，再原子发布。源目录不会修改。模型数据与包仅支持当前 schema 1 结构，不读取旧算子包或 schema 2。
+工具需要项目固定 Rust 工具链及已缓存的 Cargo 依赖，使用 `--locked --offline` 构建；同文件系统的不可变权重通过 hardlink 复用，模型描述和 `.so` 使用独立文件。构建输出经加载器验证后原子发布，不修改源目录。普通在线启动仅需要已发布的包，不需要 Rust 编译器。
 
-新准备的 Qwen 模型通过 `ORINFER_MODEL_LIBRARY=/path/to/library.so` 指定原生执行库；默认查找本项目 `target/release/liborinfer_models.so`。发布和安装工具：
+`tools.model.attach_execution` 可替换**已具有相同绑定注册表**的原生库；未带绑定表的普通 workspace 库或目录身份不同的库会被拒绝。更新注册模型逻辑后优先使用上述重建工具。
+
+在线数据与包均保留 schema 1；当前加载器只接受 `catalog` 和原生绑定导出接口，不保留逐层 `kernels` 包或 schema 2 的兼容加载分支。离线构建输入仍可包含展开的 bindings，用于精确对照与生成 Rust 模块。
+
+发布和安装工具：
 
 ```bash
 PYTHONPATH=. .venv/bin/python tools/model/package.py archive /path/to/package /path/to/package.tar.gz
@@ -86,7 +92,7 @@ orinfer validate-model /path/to/compact-model
 
 包内 `assets.safetensors` 用具名 U8 tensor 收纳 cubin、生成源码与 host ABI，去重字节相同的资产。schema 1 的文件身份可带 `tensor` 字段，SHA256 校验对应 tensor 的原始字节；原生 `.so` 保持独立文件。引擎复用 bundle 的 mmap 和头部索引，直接读取具名资产，不解包成小文件；CUDA 模块仍分别加载。此布局需要支持具名资产的引擎版本。
 
-模型托管仓库不包含执行包。包可单独归档、安装，模型通过 `execution_package` digest 在共享缓存中找到它。合并用于最终发布；继续离线编译和算子调优时使用原构建目录。
+模型托管仓库不包含执行包。包可单独归档、安装，模型通过 `execution_package` digest 在共享缓存中找到它。合并用于最终发布。离线调优工具通过 `plan-model` 从 Rust 库读取当前绑定，在编译阶段展开和修改，再重新生成原生模块及目录；在线格式保持一致。
 
 ## 验证
 

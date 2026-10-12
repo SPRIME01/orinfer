@@ -1233,6 +1233,8 @@ impl ModelRuntime {
             let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
+                #[cfg(test)]
+                profile::mark("single_activated");
                 if req.prefilling {
                     model.upload_ids(
                         &model.manifest.token,
@@ -1254,8 +1256,14 @@ impl ModelRuntime {
                     (&req.history[last..], &req.history[..last])
                 };
                 model.prepare_inputs(tokens, history)?;
+                #[cfg(test)]
+                profile::mark("single_inputs");
                 model.upload_segment_controls(1)?;
+                #[cfg(test)]
+                profile::mark("single_controls");
                 model.launch_program("decode", phase)?;
+                #[cfg(test)]
+                profile::mark("single_execute");
                 if let Some(spec) = &model.manifest.mtp {
                     model.mtp_capture(spec, 1, phase)?;
                 }

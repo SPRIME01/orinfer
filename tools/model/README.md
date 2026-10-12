@@ -141,7 +141,7 @@ python3 tools/model/prepare.py \
 
 ## 模型执行部署包
 
-先用 `make build` 构建 workspace 内的 `orinfer-models` 原生库；也可设置 `ORINFER_MODEL_LIBRARY` 指向匹配的库，接口、构建和执行库更新见[模型执行包](../../docs/model-packages.md)。在线数据与包均保留 schema 1，旧加载格式不保留。
+先用 `make build` 构建 workspace；发布器再把实际 ABI 对应的张量角色与参数映射编译进 `orinfer-models` 原生库，执行包 JSON 只保存共享 kernel 目录，接口、构建和执行库更新见[模型执行包](../../docs/model-packages.md)。在线数据与包均保留 schema 1，旧加载格式不保留。
 
 ### Decode INT8 FFN
 

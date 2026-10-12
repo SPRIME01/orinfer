@@ -39,7 +39,7 @@ class ExecutionReplacementTests(unittest.TestCase):
             dict(
                 schema_version=1,
                 runtime_abi=1,
-                kernels=[],
+                catalog=dict(assets=[], definitions=[], dynamic=[], binding_signature="0" * 64),
                 execution=dict(
                     abi_version=1,
                     package="test-model",

@@ -21,6 +21,259 @@ fn median(values: &[f64]) -> f64 {
 }
 
 #[test]
+#[ignore = "Captures real kernel arguments; requires model and exclusive GPU experiment lock"]
+fn capture_kernel_arguments() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    std::fs::create_dir(&output).unwrap();
+    let targets: BTreeSet<String> = serde_json::from_value(fixture["kernels"].clone()).unwrap();
+    assert!(!targets.is_empty());
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::Off,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut captures = vec![];
+    for phase in ["prefill", "decode"] {
+        let source: GenerationInput = serde_json::from_value(fixture["cases"][0].clone()).unwrap();
+        assert!(source.images.is_empty());
+        let mut request = model.start_request(source, &|| false).unwrap();
+        if phase == "decode" {
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                    .unwrap();
+            }
+        }
+        model.with_request(&mut request, |model, req| {
+            let (tokens, history, program) = if phase == "prefill" {
+                let (chunk, program, _) = model.manifest.select_prefill_plan(req.input.len())?;
+                if chunk != req.input.len() {
+                    return Err("Kernel capture requires a single full prefill chunk".into());
+                }
+                (&req.input[..], &req.input[..0], program.to_owned())
+            } else {
+                let last = req.history.len() - 1;
+                (&req.history[last..], &req.history[..last], "decode".to_owned())
+            };
+            model.execution.ensure_sequence_program(req.slot, &program)?;
+            model.upload_ids(if phase == "decode" { &model.manifest.token } else { &model.manifest.input }, tokens)?;
+            model.upload_segment_controls(tokens.len())?;
+            model.prepare_inputs(tokens, history)?;
+            let mut remaining = targets.iter().filter(|name| name.starts_with(&format!("{program}/"))).cloned().collect::<BTreeSet<_>>();
+            for operation in model.manifest.programs[&program].clone() {
+                let selected = match &operation {
+                    crate::model::Operation::Kernel { name } if remaining.contains(name) => Some(name.clone()),
+                    _ => None,
+                };
+                let mut records = BTreeMap::new();
+                if let Some(name) = &selected {
+                    let spec = model.manifest.kernels.iter().find(|k| k.name == *name).unwrap();
+                    let directory = output.join(name.replace('/', "-"));
+                    std::fs::create_dir(&directory).map_err(|e| e.to_string())?;
+                    for argument in &spec.args {
+                        let buffer_name = match argument {
+                            crate::artifact::Argument::Buffer { name } | crate::artifact::Argument::BufferSlice { name, .. } => name,
+                            _ => return Err("Kernel capture requires pointer-only arguments".into()),
+                        };
+                        let b = model.manifest.buffers.iter().find(|b| b.name == *buffer_name).unwrap();
+                        if b.data.is_some() || records.contains_key(buffer_name) { continue; }
+                        let bytes = model.execution.session.virtual_buffers.borrow().get(buffer_name)
+                            .map_or(model.execution.sizes[buffer_name], |v| v.mapped.min(model.execution.sizes[buffer_name]));
+                        let raw = model.execution.download_bytes(buffer_name, bytes)?;
+                        let file = format!("{}.before.bin", records.len());
+                        std::fs::write(directory.join(&file), &raw).map_err(|e| e.to_string())?;
+                        records.insert(buffer_name.clone(), json!({"file":file,"bytes":bytes,"sha256":crate::artifact::sha256(&raw)}));
+                    }
+                }
+                model.execution.execute_batch(vec![], &[Invocation { operation, sequence: None, launch: None, views: BTreeMap::new() }], false, false)?;
+                if let Some(name) = selected {
+                    let directory = output.join(name.replace('/', "-"));
+                    for (index, (buffer, record)) in records.iter_mut().enumerate() {
+                        let raw = model.execution.download_bytes(buffer, record["bytes"].as_u64().unwrap() as usize)?;
+                        let file = format!("{index}.after.bin");
+                        std::fs::write(directory.join(&file), &raw).map_err(|e| e.to_string())?;
+                        record["after"] = json!({"file":file,"sha256":crate::artifact::sha256(&raw)});
+                    }
+                    captures.push(json!({"kernel":name,"directory":directory.file_name().unwrap().to_str().unwrap(),"buffers":records}));
+                    remaining.remove(&name);
+                    if remaining.is_empty() { break; }
+                }
+            }
+            if !remaining.is_empty() { return Err("Selected capture kernel is absent from its program".into()); }
+            Ok(())
+        }).unwrap();
+        model.finish_request(&mut request, false).unwrap();
+    }
+    assert_eq!(captures.len(), targets.len());
+    std::fs::write(output.join("capture.json"), serde_json::to_vec_pretty(&json!({
+        "model":fixture["model"],"fingerprint":model.stats.manifest_sha256,"seed":20261002,"captures":captures,
+        "scope":"Real first prefill and decode kernel inputs and outputs, MTP off. State is request-private; individual launches for offline profiling, not performance acceptance. Weight payloads remain in the source model."
+    })).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "Requires real model, tokenized requests and exclusive GPU experiment lock"]
+fn profile_cached_generation() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let repetitions = fixture["repetitions"].as_u64().unwrap_or(2) as usize;
+    let eos: Vec<u32> = serde_json::from_value(fixture["eos"].clone()).unwrap();
+    let prefix_cache_bytes = fixture["prefix_cache_bytes"]
+        .as_u64()
+        .map(|bytes| bytes as usize)
+        .unwrap_or(12usize << 30);
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes,
+            mtp_drafts: Some(fixture["mtp_drafts"].as_u64().unwrap_or(3) as usize),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    if let Some(regions) = fixture.get("parallel_regions") {
+        *model.execution.parallel_regions.borrow_mut() =
+            serde_json::from_value(regions.clone()).unwrap();
+    }
+    model
+        .execution
+        .parallel_gate_first
+        .set(fixture["parallel_gate_first"].as_bool().unwrap_or(false));
+    if fixture.get("parallel_priority").is_some() {
+        *model.execution.parallel_priority.borrow_mut() = fixture["parallel_priority"]
+            .as_str()
+            .unwrap_or("off")
+            .to_owned();
+    }
+    let mut rows = vec![];
+    let mut deterministic = BTreeMap::new();
+    for (case, source) in sources.iter().enumerate() {
+        for repetition in 0..=repetitions {
+            let tracing = fixture["nsys"].as_bool() == Some(true) && case == 0 && repetition == 1;
+            if tracing {
+                // SAFETY: Current CUDA context; Nsight owns collection for this diagnostic.
+                unsafe {
+                    crate::cuda::check(
+                        cudarc::driver::sys::cuProfilerStart(),
+                        "start diagnostic trace",
+                    )
+                    .unwrap();
+                }
+            }
+            let started = Instant::now();
+            let mut request = model
+                .start_request(
+                    GenerationInput {
+                        input_tokens: source.input_tokens.clone(),
+                        images: source.images.clone(),
+                        max_new_tokens: source.max_new_tokens,
+                        sampling: source.sampling.clone(),
+                        prefix_hints: source.prefix_hints.clone(),
+                    },
+                    &|| false,
+                )
+                .unwrap();
+            let mut tokens = vec![];
+            let mut arrivals = vec![];
+            let mut first = None;
+            let mut first_count = 0;
+            let mut ended = false;
+            while !request.is_finished() && !ended {
+                // Equal proposal widths isolate kernel arithmetic from the
+                // normal latency-adaptive profile selection during validation.
+                if fixture["fixed_speculation"].as_bool() == Some(true) {
+                    request.speculation_costs.clear();
+                }
+                let steps = model
+                    .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                    .unwrap();
+                for step in steps {
+                    if step.tokens.is_empty() {
+                        continue;
+                    }
+                    let elapsed = started.elapsed().as_secs_f64();
+                    if first.is_none() {
+                        first = Some(elapsed);
+                        first_count = step.tokens.len();
+                    }
+                    ended |= step.tokens.iter().any(|token| eos.contains(token));
+                    arrivals.push(json!({"elapsed_s":elapsed,"tokens":step.tokens.len()}));
+                    tokens.extend(step.tokens);
+                }
+            }
+            assert!(!tokens.is_empty());
+            if repetition > 0 && prefix_cache_bytes > 0 {
+                assert!(request.prefix.statistics.cached_tokens > 0);
+            }
+            if prefix_cache_bytes == 0 {
+                assert_eq!(request.prefix.statistics.cached_tokens, 0);
+            }
+            if fixture["mtp_drafts"].as_u64() == Some(0) {
+                assert_eq!(request.mtp.rounds, 0);
+            }
+            if let Some(previous) = deterministic.get(&case) {
+                assert_eq!(&tokens, previous, "Cached generation changed seeded output");
+            } else {
+                deterministic.insert(case, tokens.clone());
+            }
+            let wall_s = started.elapsed().as_secs_f64();
+            if tracing {
+                // SAFETY: The timed request completed; stop diagnostic collection.
+                unsafe {
+                    crate::cuda::check(
+                        cudarc::driver::sys::cuProfilerStop(),
+                        "stop diagnostic trace",
+                    )
+                    .unwrap();
+                }
+            }
+            let last = arrivals.last().unwrap()["elapsed_s"].as_f64().unwrap();
+            let decode_s = last - first.unwrap();
+            let decode_tokens = tokens.len() - first_count;
+            // Download after the timed generation. Compare every live cached
+            // KV/GDN/conv/PLE/MTP range across arithmetic-preserving packages.
+            let state_hashes = (fixture["state_hashes"].as_bool() == Some(true)).then(|| {
+                model.execution.sync().unwrap();
+                let position = model.read_control(&model.manifest.position).unwrap() as usize;
+                crate::runtime::mtp_gpu_tests::complete_prefix_state(&model, position)
+            });
+            let row = json!({"case":case,"repetition":repetition,"warmup":repetition==0,
+                "prompt_tokens":source.input_tokens.len(),"output_tokens":tokens,
+                "first_step_tokens":first_count,"decode_tokens":decode_tokens,
+                "decode_s":decode_s,"decode_tps":(decode_s>0.).then(||decode_tokens as f64/decode_s),
+                "wall_s":wall_s,"ttft_s":first,"arrivals":arrivals,
+                "prompt_through_first_token_tps":source.input_tokens.len() as f64/first.unwrap(),
+                "prefix":request.prefix.statistics,"mtp":request.mtp,
+                "sampling":source.sampling,"state_hashes":state_hashes,
+                "finish_reason":if ended {"stop"}else{"length"}});
+            eprintln!(
+                "cached generation case={case} repetition={repetition}: {} TPS",
+                row["decode_tps"]
+            );
+            rows.push(row);
+            model.finish_request(&mut request, true).unwrap();
+            std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,
+                "scope":"Real full autoregressive requests with fixture-selected prefix cache and MTP, normal scheduler. Committed tokens only; decode excludes the complete first emitted step. Prompt throughput includes request setup and first token selection. Warmup excluded; seeded output equality checked."})).unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
 #[ignore = "Requires real model and exclusive GPU experiment lock"]
 fn profile_speculative_verification() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
@@ -431,6 +684,16 @@ fn profile_prefill_stages() {
         model
             .upload_ids(&model.manifest.input, &source.input_tokens[base..])
             .unwrap();
+        model
+            .prepare_inputs(&source.input_tokens[base..], &source.input_tokens[..base])
+            .unwrap();
+        model
+            .upload_ids(&model.manifest.position, &[base as u32])
+            .unwrap();
+        model
+            .execution
+            .ensure_sequence_program(0, &program)
+            .unwrap();
         let plan: Vec<_> = model.manifest.programs[&program]
             .iter()
             .cloned()
@@ -602,12 +865,21 @@ fn profile_continuous_decode() {
         }
         let mut walls = vec![];
         let mut phases: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let live_events = model.execution.profile_events(2).unwrap();
+        model.execution.live_graph_ms.borrow_mut().clear();
+        if count == 1 {
+            model
+                .execution
+                .live_graph_events
+                .set(Some([live_events[0], live_events[1]]));
+        }
         for _ in 0..64 {
             MARKS.with(|m| *m.borrow_mut() = Some(vec![]));
             let started = Instant::now();
             let steps = model
                 .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
                 .unwrap();
+            mark("iteration_end");
             walls.push(started.elapsed().as_secs_f64() * 1000.);
             assert_eq!(steps.iter().map(|s| s.tokens.len()).sum::<usize>(), count);
             let marks = MARKS.with(|m| m.borrow_mut().take().unwrap());
@@ -617,6 +889,24 @@ fn profile_continuous_decode() {
                     .or_default()
                     .push(pair[1].1.duration_since(pair[0].1).as_secs_f64() * 1000.);
             }
+        }
+        model.execution.live_graph_events.set(None);
+        if fixture["live_only"].as_bool() == Some(true) {
+            let gpu: Vec<_> = model
+                .execution
+                .live_graph_ms
+                .borrow()
+                .iter()
+                .copied()
+                .map(f64::from)
+                .collect();
+            assert_eq!(gpu.len(), walls.len());
+            rows.push(json!({"batch":count,"iterations":walls.len(),
+                "wall_mean_ms":walls.iter().sum::<f64>()/walls.len() as f64,
+                "live_graph_mean_ms":gpu.iter().sum::<f64>()/gpu.len() as f64,
+                "phases_mean_ms":phases.iter().map(|(k,v)|(k.clone(),v.iter().sum::<f64>()/v.len() as f64)).collect::<BTreeMap<_,_>>() }));
+            model.finish_request(&mut requests[0], false).unwrap();
+            continue;
         }
         let segments: Vec<_> = requests
             .iter()
@@ -657,7 +947,15 @@ fn profile_continuous_decode() {
         };
         let trials = model.execution.profile_graph_operations(&plan).unwrap();
         let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+        let mut operations = Vec::with_capacity(plan.len());
         for (index, op) in plan.iter().enumerate() {
+            let name = match &op.operation {
+                crate::model::Operation::Kernel { name } => name.clone(),
+                _ => category(&model, op),
+            };
+            operations.push(json!({"name":name,"median_ms":median(
+                &trials.iter().map(|t|f64::from(t[index])).collect::<Vec<_>>()
+            )}));
             let values = groups
                 .entry(category(&model, op))
                 .or_insert(vec![0.; trials.len()]);
@@ -665,11 +963,36 @@ fn profile_continuous_decode() {
                 values[trial] += f64::from(times[index]);
             }
         }
+        let mut subsets = BTreeMap::new();
+        if let Some(filters) = fixture["kernel_subsets"].as_object() {
+            // Isolated diagnostic graphs have stale inputs. Their times are
+            // neither additive nor valid model executions; do this last.
+            for (label, names) in filters {
+                let names: BTreeSet<String> = serde_json::from_value(names.clone()).unwrap();
+                let selected: Vec<_> = plan.iter().filter(|op| matches!(
+                    &op.operation, crate::model::Operation::Kernel { name } if names.contains(name)
+                )).cloned().collect();
+                assert_eq!(selected.len(), names.len(), "Unknown subset kernel");
+                assert!(!selected.is_empty());
+                let times: Vec<_> = model
+                    .execution
+                    .profile_invocations_hot(&selected, 8)
+                    .unwrap()
+                    .into_iter()
+                    .skip(1)
+                    .map(f64::from)
+                    .collect();
+                subsets.insert(label.clone(), json!({"operations":selected.len(),
+                    "median_ms":median(&times), "scope":"Isolated real kernels with stale inputs and two external timing events; diagnostic only, not additive and not model inference."}));
+            }
+        }
         let row = json!({"batch":count,"iterations":64,"wall_median_ms":median(&walls),
             "target_tokens_per_second":count as f64*1000./(walls.iter().sum::<f64>()/walls.len() as f64),
             "phases_median_ms":phases.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>(),
             "hot_graph_gpu_median_ms":median(&gpu),"operation_count":plan.len(),
             "instrumented_graph_gpu_median_ms":median(&trials.iter().map(|t| t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
+            "gpu_operations":operations,
+            "isolated_subsets":subsets,
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>()});
         eprintln!("PROFILE {row}");
         rows.push(row);
@@ -677,5 +1000,8 @@ fn profile_continuous_decode() {
         for request in &mut requests {
             model.finish_request(request, false).unwrap();
         }
+    }
+    if fixture["live_only"].as_bool() == Some(true) {
+        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"Live autoregressive iterations; two graph timing events, CPU stage timestamps; diagnostic only.","rows":rows})).unwrap()).unwrap();
     }
 }

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +18,17 @@ class PackageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+
+        def build_library(package, bindings, directory, engine=None):
+            library = Path(directory) / "lib/model.so"
+            library.parent.mkdir(parents=True, exist_ok=True)
+            if not library.exists():
+                shutil.copyfile(self.library, library)
+            return package["execution"]
+
+        builder = patch("tools.model.catalog.build_library", side_effect=build_library)
+        builder.start()
+        self.addCleanup(builder.stop)
         header = bytearray(20)
         header[:6] = b"\x7fELF\x02\x01"
         header[16:20] = bytes((3, 0, 183, 0))
@@ -82,6 +94,11 @@ class PackageTests(unittest.TestCase):
         kernels = [
             dict(
                 name=n,
+                symbol="main",
+                grid=[1, 1, 1],
+                block=[32, 1, 1],
+                shared_memory_bytes=0,
+                cooperative=False,
                 module=asset,
                 source=asset,
                 host_abi=asset,

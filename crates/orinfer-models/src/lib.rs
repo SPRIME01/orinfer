@@ -2,6 +2,7 @@
 //! Only the public SDK links this library to the runtime; no engine dependency.
 pub use orinfer_model_sdk::{artifact, execution, model, operators};
 mod adapter;
+mod bindings;
 mod flash_next;
 mod policy;
 mod qwen3_5;
@@ -13,6 +14,7 @@ use orinfer_model_sdk::{
 };
 struct Models {
     adapter: Box<dyn adapter::Adapter>,
+    programs: std::collections::BTreeMap<String, Vec<model::Operation>>,
 }
 impl ModelImplementation for Models {
     fn prepare(
@@ -33,9 +35,28 @@ impl ModelImplementation for Models {
             compute_policies: registry::policies(),
         }
     }
-    fn create(request: CreateRequest) -> artifact::Result<(Self, CreatedPlan)> {
-        let (adapter, plan) = registry::create(request)?;
-        Ok((Self { adapter }, plan))
+    fn create(mut request: CreateRequest) -> artifact::Result<(Self, CreatedPlan)> {
+        let native = request.catalog.is_some();
+        if let Some(catalog) = &request.catalog {
+            request.kernel_contracts = bindings::kernels(catalog, request.expert_contracts)?;
+            request.metadata.dynamic_batch_kernels = bindings::dynamic(catalog)?;
+        }
+        let (adapter, mut plan) = registry::create(request)?;
+        let programs = if native {
+            std::mem::take(&mut plan.metadata.programs)
+        } else {
+            plan.metadata.programs.clone()
+        };
+        if native {
+            plan.metadata.dynamic_batch_kernels.clear();
+        }
+        Ok((Self { adapter, programs }, plan))
+    }
+    fn execution(&self) -> artifact::Result<abi::plans::Execution> {
+        Ok(abi::plans::Execution {
+            kernels: bindings::export()?,
+            programs: self.programs.clone(),
+        })
     }
     fn batch(
         &self,
@@ -84,6 +105,24 @@ static INPUT_API: abi::inputs::Api = abi::inputs::Api {
 pub extern "C" fn orinfer_model_inputs_v1(version: u32) -> *const abi::inputs::Api {
     if version == 1 {
         &INPUT_API
+    } else {
+        std::ptr::null()
+    }
+}
+static PLAN_API: abi::plans::Api = abi::plans::Api {
+    version: 1,
+    struct_size: std::mem::size_of::<abi::plans::Api>(),
+    kernel_size: std::mem::size_of::<abi::plans::Kernel>(),
+    argument_size: std::mem::size_of::<abi::plans::Argument>(),
+    program_size: std::mem::size_of::<abi::plans::Program>(),
+    command_size: std::mem::size_of::<abi::plans::Command>(),
+    export: abi::plans::export::<Models>,
+    free: abi::plans::free,
+};
+#[unsafe(no_mangle)]
+pub extern "C" fn orinfer_model_plans_v1(version: u32) -> *const abi::plans::Api {
+    if version == 1 {
+        &PLAN_API
     } else {
         std::ptr::null()
     }

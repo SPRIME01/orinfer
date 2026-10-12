@@ -46,7 +46,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                     architecture=architecture,
                     compute_policy="int8_quality",
                     target="sm_87",
-                    kernels=[],
+                    catalog=dict(assets=[], definitions=[], dynamic=[], binding_signature="0" * 64),
                     execution=identity,
                 )
                 raw = json.dumps(manifest).encode()

@@ -6,7 +6,7 @@ import subprocess
 
 import torch
 
-from kernels.model.int8_projection import int8_projection
+from kernels.model.int8_projection import int8_projection, int8_small_projection
 from tools.operators.common import configure, benchmark, export_kernel, error, write_json
 
 
@@ -61,6 +61,54 @@ def main():
                     "changed_input_and_scale_graph": True,
                     "timing": timing,
                     "export": exported,
+                }
+            )
+    for m, n, k in ((1, 48, 2560), (3, 49, 2560), (5, 1, 128), (8, 127, 640), (17, 48, 2560)):
+        for dtype in ("float16", "float32"):
+            x = torch.randint(-128, 128, (m, k), device="cuda", dtype=torch.int8)
+            w = torch.randint(-128, 128, (n, k), device="cuda", dtype=torch.int8)
+            ws = torch.rand(n, device="cuda").half() * 0.017
+            ts = torch.rand(m, device="cuda").half() * 0.009
+            storage = torch.full((m * n + 17,), 99.0, device="cuda", dtype=getattr(torch, dtype))
+            out = storage[: m * n].view(m, n)
+            kernel = int8_small_projection(m, n, k, dtype)
+
+            def run_small():
+                kernel(x.view(torch.int32), w.view(torch.int32), ws, ts, out)
+
+            def oracle():
+                return (
+                    ((x.double() @ w.double().T).float() * ws.float()[None, :])
+                    * ts.float()[:, None]
+                ).to(out.dtype)
+
+            timing, graph = benchmark(run_small, repetitions=8)
+            assert torch.equal(out, oracle()), error(out, oracle())
+            for changed in ("activation", "weight", "scale", "zero"):
+                if changed == "activation":
+                    x.bitwise_not_()
+                elif changed == "weight":
+                    w.bitwise_not_()
+                elif changed == "scale":
+                    ws.mul_(1.5)
+                    ts.mul_(0.75)
+                else:
+                    x.zero_()
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(out, oracle()), error(out, oracle())
+                assert bool((storage[m * n :] == 99).all())
+            cases.append(
+                {
+                    "shape": [m, n, k],
+                    "output_dtype": dtype,
+                    "small_dp4a": True,
+                    "exact_integer_oracle": True,
+                    "tail_guard": True,
+                    "changed_input_weight_and_scale_graph": True,
+                    "timing": timing,
+                    "export": export_kernel(kernel, a.output / f"small-M{m}-N{n}-K{k}-{dtype}"),
                 }
             )
     write_json(a.output / "results.json", {"complete": True, "cases": cases, "scope": __doc__})

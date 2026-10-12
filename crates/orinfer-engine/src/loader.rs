@@ -98,22 +98,17 @@ pub(crate) fn load_with_experts(
         .metadata
         .prefill_batch_profiles
         .clone_from(&package.prefill_batch_profiles);
-    model.metadata.dynamic_batch_kernels = package
-        .dynamic_batch_kernels
-        .iter()
-        .map(|t| (t.name.clone(), t.clone()))
-        .collect();
     model.metadata.greedy_sampling = package.greedy_sampling;
     model.metadata.batch_gdn = package.batch_gdn;
+    // Fork/join order belongs to the native model implementation.
+    model.metadata.graph_branches.clear();
     let (execution_model, built) = crate::model_package::ModelPackage::create(
         &kernel_root,
         &package.execution,
         orinfer_model_sdk::abi::CreateRequest {
-            kernel_contracts: if expert_contracts {
-                package.kernels.clone()
-            } else {
-                vec![]
-            },
+            catalog: Some(package.catalog),
+            expert_contracts,
+            kernel_contracts: vec![],
             model_root: root.display().to_string(),
             verify_weights,
             config,
@@ -128,7 +123,7 @@ pub(crate) fn load_with_experts(
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
     let decode_programs = built.decode_programs;
     let expert_banks = built.expert_banks;
-    model.metadata.kernels = package.kernels;
+    validate_dynamic_contracts(&model.metadata)?;
     model.metadata.validate()?;
     // The descriptor pins the package; configuration also affects generated plans.
     let fingerprint = sha256(&[raw, package_raw, config_raw].concat());
@@ -212,6 +207,32 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
         if scopes.get(name) != Some(&BufferScope::Sequence) {
             return Err(format!("{name}: request reset must target sequence state"));
         }
+    }
+    Ok(())
+}
+
+fn validate_dynamic_contracts(model: &Manifest) -> Result<()> {
+    let kernels: BTreeMap<_, _> = model.kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    for (name, template) in &model.dynamic_batch_kernels {
+        if name != &template.name {
+            return Err("Dynamic launch name differs from binding".into());
+        }
+        template.validate(
+            kernels
+                .get(name.as_str())
+                .ok_or("Missing dynamic batch kernel")?,
+        )?;
+    }
+    if !model.dynamic_batch_kernels.is_empty()
+        && (!model.batch_profiles.contains(&128)
+            || kernels
+                .keys()
+                .filter(|name| {
+                    name.starts_with("batch_m128/") || name.starts_with("batch_gdn_m128/")
+                })
+                .any(|name| !model.dynamic_batch_kernels.contains_key(*name)))
+    {
+        return Err("Incomplete dynamic batch contracts".into());
     }
     Ok(())
 }

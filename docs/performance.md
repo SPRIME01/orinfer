@@ -1,0 +1,93 @@
+# 性能参考
+
+本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考。Flash Next 数据于 2026-10-12 测量，机器为 MAXN 模式、GPU 频率 1300.5 MHz，测试未修改全局功耗或频率设置。结果对应当前开发版本的 Rust release CLI 和匹配的优化执行包；更新 CLI 后还需重建对应执行包。表中的 tokens/s 均按实际 token 数计算。
+
+## Flash Next 配置
+
+使用官方 checkpoint 构建的文本模型：自有整数 E8P Q2A8 专家、Q4A8 输入投影与输出头、W8 输出投影与共享 FFN，精度敏感路径保留 BF16/FP16/FP32。专家全量常驻，KV 为 group-64 INT8，GDN 持续状态为 FP32。测试不含图片、其他并发请求或历史续写草稿。
+
+完整代码生成通过 `orinfer serve` 的流式 Chat Completions API 执行，覆盖实际 chat template、请求调度、状态恢复、MTP 和 CUDA 计算。Python 客户端只发请求、接收 SSE 和计时。服务配置：
+
+```bash
+./target/release/orinfer serve /path/to/optimized-flash-next \
+  --model qwen-flash-next --cuda-graph decode_only \
+  --resident-experts full --mtp-drafts 3 \
+  --prefix-cache-mib 1024 --memory-reserve-mib 512
+```
+
+关闭 MTP 的对照使用相同执行包和配置，只将 `--mtp-drafts` 改为 `0`。草稿长度使用正常的请求级自适应策略，没有固定验证宽度。
+
+请求参数为 `enable_thinking=true`、`reasoning_effort=medium`、`temperature=0`、`seed=20261002`、`thinking_token_budget=16384`、`max_completion_tokens=16384`。思考和代码共享 16K 总输出上限；API 为思考结束标记和至少一个答案 token 预留空间。
+
+场景要求从零实现安全 Rust 流式帧解码器：大端 u32 长度头、任意碎片输入、最大帧限制、复位和标准库单元测试。提示包含与实现无关的仓库参考 helper，以构造不同输入长度。完整请求测试的输入分别为 512、2048、8191 tokens；下方独立 prefill 测试使用严格的 512、2048、8192-token 输入。
+
+## 完整代码生成
+
+每种输入、每个 MTP 配置各运行一次首请求和一次相同提示的完整 prefix 命中请求。下表采用后者的暖态数据，每格为一次完整请求的测量值。生成 6176–7598 tokens，包含思考和代码；所有请求均自然结束，`finish_reason=stop`。
+
+| 输入 tokens | 实际输出 tokens | MTP 关闭 decode TPS | MTP 开启 decode TPS | 加速比 | MTP 思考阶段 TPS | MTP 代码阶段 TPS | 草稿接受率 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 512 | 6276 | 29.72 | 44.99 | 1.51× | 41.46 | 49.37 | 74.8% |
+| 2048 | 6176 | 29.64 | 45.21 | 1.53× | 44.02 | 46.62 | 76.4% |
+| 8191 | 7598 | 29.49 | 45.82 | 1.55× | 43.14 | 49.30 | 77.4% |
+
+Decode TPS 为 `(completion_tokens - 1) / (完整 HTTP 请求耗时 - TTFT)`，包含 Rust 调度、token 传输、同步与 SSE 尾部处理；只统计提交的 tokens，包含思考，不统计被拒绝的草稿。TTFT 从发请求计时，到收到首个有效思考或正文片段。SSE 片段可能合并多个 tokens；阶段 TPS 按 API usage 和思考/正文片段时间边界近似计算，不将片段数当作 token 数。
+
+完整请求的 decode 为约 45 TPS，代码阶段为 46.62–49.37 TPS；这些结果没有达到完整请求 50 TPS，不能用代码阶段吞吐替代包含思考的完整 decode。
+
+两种 MTP 配置下，全部请求的思考文本、代码、token 数和停止原因一致。三个输入长度生成的代码均可编译；512 与 8191-token 场景的生成单元测试全部通过。2048-token 场景有一个生成测试重复输入首个帧头字节，原始结果为 10 通过、1 失败；仅修正该测试输入、保持生成的解码器实现不变后，11 项通过。这验证了本次 MTP 开关的一致性，不替代独立 BF16/FP8 量化质量评估。
+
+## Prefill 与无缓存 API 首 token
+
+执行层通过 `orinfer run-model` 测量，关闭 MTP 和 prefix 复用，每种长度一次预热后取三次测量均值，仅生成首 token。`prefill_s` 包含模型主干、输入传输和同步，输出头与首 token 选择单独计时。
+
+API 测量通过 `orinfer serve`，设置 `--prefix-cache-mib 0`。每种长度一次首请求后取两次测量均值，确认 cached tokens 为 0。为测首 token 而将探针输出上限设为 8 tokens；这些短探针的 decode 或正文阶段速度不用于代码生成性能验收。服务已加载就绪，TTFT 不含模型加载。
+
+| 输入 tokens | 执行层 prefill TPS | API TTFT：MTP 关闭（秒） | API TTFT：MTP 开启（秒） | 输入 / API TTFT：MTP 关闭 TPS | 输入 / API TTFT：MTP 开启 TPS |
+| --- | --- | --- | --- | --- | --- |
+| 512 | 1008.9 | 0.509 | 0.573 | 1005.2 | 893.3 |
+| 2048 | 899.9 | 2.283 | 2.424 | 897.0 | 844.8 |
+| 8192 | 906.8 | 9.053 | 9.544 | 904.9 | 858.4 |
+
+输入 / API TTFT 包含请求处理、prefill、首 token 选择和 MTP 初始草稿预热，不能等同于模型主干 prefill TPS。MTP 增加的 TTFT 分别为 63.8、141.2、490.4 ms；记录的草稿初始预热分别为 63.3、138.0、475.9 ms，占增加时延的约 97%–99%。两条计时路径分开测量，不能把不同运行的阶段耗时直接相加。
+
+另一个固定长度的 `run-model` 短输出基准使用 512-token 输入、128-token 输出，关闭 MTP 和缓存；预热后取三次测量均值，执行层 prefill 为 1008.39 TPS、decode 为 30.43 TPS。此项对应固定 token-ID 请求，独立于上方通过 Chat API 生成数千 tokens 的 thinking 代码场景。
+
+## 完整 prefix 命中
+
+以下来自完整代码生成的重复请求，prefix cache 预算为 1024 MiB，每格一次测量。两种 MTP 配置均命中整个输入；恢复包含 KV、GDN、卷积、PLE、位置及适用的 MTP 状态。
+
+| 命中 tokens | API TTFT：MTP 关闭（ms） | API TTFT：MTP 开启（ms） | MTP 开启时的状态恢复（ms） |
+| --- | --- | --- | --- |
+| 512 | 11.4 | 15.3 | 5.6 |
+| 2048 | 14.1 | 18.3 | 6.4 |
+| 8191 | 26.0 | 29.7 | 9.6 |
+
+API TTFT 还包含请求处理、首 token 选择和短步草稿连接，因此大于单独的状态恢复时间。这是相同提示重复请求的完整命中时延，不能用于推断其他工作负载的 cache hit rate，也不算作冷 prefill 吞吐。
+
+## 27B 历史参考
+
+27B 参考配置开启 MTP 后，Python 归并排序、Rust LRU 缓存和 TypeScript 异步 map 三个代码生成场景的单流 decode 中位数分别为 26.17、25.23、25.95 tokens/s。每个场景测量三次，每次生成 128 tokens；decode 按实际输出 tokens 计时，排除首 token。此处保留历史数据，未在本轮重新测量，输入、输出长度和 thinking 配置也未与上述 Flash Next 场景统一。
+
+模型准备见[Flash Next 构建](../tools/model/flash_next/README.md)，服务参数见[服务使用](serving.md)，计时与并发测量工具见[性能工具](../tools/bench/README.md)，独立量化质量评估见[质量评测](../tools/eval/README.md)。
+
+## 原生绑定目录迁移
+
+同一套 Flash Next 权重与 cubin，迁移前后完整执行 manifest（60,658 条绑定、所有程序、参数、偏移及状态契约）逐字段一致。执行包 JSON 从 61.08 MB 降至 1.57 MB，只保存 1,297 个编译定义、883 份不同 cubin 的身份和 256 个共享动态 launch 模板。逐层张量角色和绑定表编译进原生库，库由 1.94 MB 增至 17.10 MB；完整绑定和程序通过有 owner 的 C 数组导出，不经过 JSON 往返。
+
+Rust release CLI 的同机对照，512-token 输入、128-token 输出，后三次请求取平均：
+
+| 指标 | 迁移前 | 迁移后 |
+| --- | ---: | ---: |
+| 加载到可工作 | 19.14 s | 18.97 s |
+| 首请求 TTFT | 898.5 ms | 594.2 ms |
+| prefill | 1009.02 TPS | 1008.84 TPS |
+| decode，MTP 关闭 | 30.39 TPS | 30.40 TPS |
+| 固定 GPU buffer 分配 | 42,531,274,022 B | 42,531,274,022 B |
+| 进程峰值 RSS | 1013.61 MiB | 1028.82 MiB |
+
+加载和首请求各为一个样本，受文件缓存、驱动初始化和 I/O 波动影响；本次目录缩减没有体现为显著启动提速。稳态吞吐基本持平，GPU 分配不变，宿主峰值 RSS 约增加 15.2 MiB，原生库包含新增的静态绑定表。
+
+真实 SSE Chat 请求另复测 512-token 输入、medium thinking、16K 总输出预算、MTP 3 草稿和 1 GiB prefix cache。实际输出 6,276 token 后自然结束，thinking 与代码内容均和迁移前完全一致；完整稳态 decode 为 45.19 TPS，512-token prefix 全命中 TTFT 为 15.36 ms，状态恢复为 5.66 ms。该独立 API 进程的 Model Ready 为 29.87 s，说明启动存在较大的运行间波动，不能用单次 CLI 对照保证部署提速。
+
+额外通过普通生成的 151 个完整状态范围、MTP/prefix 的 159 个状态范围精确对照，MTP 1–7 草稿及各接受长度、2–31 活跃请求的固定/动态 batch、取消和槽位复用验证；动态 launch 的行数契约覆盖 2–128。通用 C 包夹具也覆盖 off/decode_only/full 三种 Graph 模式和改变输入后的 replay。

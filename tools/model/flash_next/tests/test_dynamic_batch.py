@@ -24,6 +24,40 @@ class DynamicRowsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             factory("unknown-4", 4)
 
+    def test_single_output_gate_keeps_the_dynamic_row_argument(self):
+        for capacity in (8, 128):
+            with self.subTest(capacity=capacity):
+                fn = explicit_rows(factory("bf16-gate-8-2560", capacity))
+                (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+                buffers = {b.name: b for b in fn.buffer_map.values()}
+                self.assertTrue(buffers["A"].shape[0].same_as(rows))
+                self.assertTrue(buffers["Output"].shape[0].same_as(rows))
+                self.assertEqual(int(buffers["Weight"].shape[0]), 1)
+                self.assertEqual(str(buffers["Weight"].dtype), "bfloat16")
+
+    def test_hc_down_cache_and_streaming_keep_symbolic_partial_rows(self):
+        for capacity in (8, 128):
+            with self.subTest(capacity=capacity):
+                fn = explicit_rows(factory("hc-down-partial-8-4", capacity))
+                (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+                buffers = {b.name: b for b in fn.buffer_map.values()}
+                self.assertTrue(buffers["A"].shape[0].same_as(rows))
+                self.assertTrue(buffers["Partials"].shape[1].same_as(rows))
+                self.assertEqual(int(buffers["Partials"].shape[0]), 4)
+                self.assertEqual(str(buffers["Partials"].dtype), "float32")
+
+    def test_small_int8_projection_keeps_dynamic_rows_and_packed_operand_width(self):
+        for capacity in (8, 128):
+            with self.subTest(capacity=capacity):
+                fn = explicit_rows(factory("dense-small-a8-8-48-2560-float16", capacity))
+                (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+                buffers = {b.name: b for b in fn.buffer_map.values()}
+                for name in ("A", "Output", "TokenScale"):
+                    self.assertTrue(buffers[name].shape[0].same_as(rows))
+                self.assertEqual(int(buffers["A"].shape[1]), 640)
+                self.assertEqual(str(buffers["A"].dtype), "int32")
+                self.assertEqual(int(buffers["Weight"].shape[0]), 48)
+
 
 if __name__ == "__main__":
     unittest.main()

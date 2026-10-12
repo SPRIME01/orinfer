@@ -309,13 +309,18 @@ def publish(directory, engine=None):
     )
     library = model_library()
     package["execution"] = execution_identity(library, engine, "qwen3_5", "int8_quality")
-    raw = (json.dumps(package, indent=2, ensure_ascii=False) + "\n").encode()
+    from tools.model.catalog import seal
+
+    with tempfile.TemporaryDirectory(prefix=".native-", dir=cache) as native:
+        package = seal(package, Path(native), engine)
+        compiled_library = (Path(native) / "lib/model.so").read_bytes()
+    raw = (json.dumps(package, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
     digest = hashlib.sha256(raw).hexdigest()
     destination = cache / "packages" / digest
     destination.mkdir(parents=True)
     (destination / "package.json").write_bytes(raw)
     (destination / "lib").mkdir()
-    shutil.copyfile(library, destination / "lib/model.so")
+    (destination / "lib/model.so").write_bytes(compiled_library)
     (cache / "kernels").rename(destination / "kernels")
     # Include project licensing in independently distributed packages.
     repo = Path(__file__).resolve().parents[2]
@@ -409,13 +414,13 @@ def install(archive_path, cache):
         verify_execution(manifest, package)
         checked = set()
         reader = AssetReader(package)
-        for kernel in manifest["kernels"]:
-            for field in ("module", "source", "host_abi"):
-                asset = kernel[field]
-                key = (asset["file"], asset.get("tensor"), asset["sha256"])
-                if key not in checked:
-                    reader.read(asset)
-                    checked.add(key)
+        if "kernels" in manifest or "catalog" not in manifest:
+            raise ValueError("Expected schema 1 compiled kernel catalog with native bindings")
+        for asset in manifest["catalog"]["assets"]:
+            key = (asset["file"], asset.get("tensor"), asset["sha256"])
+            if key not in checked:
+                reader.read(asset)
+                checked.add(key)
         package.rename(cache / digest)
         return digest
     finally:

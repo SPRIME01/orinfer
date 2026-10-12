@@ -22,12 +22,24 @@ def main():
     args = parser.parse_args()
     configure()
     report = {"environment": environment(), "cases": [], "complete": False}
-    for m, e, k in ((1, 512, 10), (8, 512, 10), (17, 37, 10), (512, 512, 10), (3, 5, 5)):
+    for m, e, k in (
+        (1, 512, 10),
+        (8, 512, 10),
+        (17, 37, 10),
+        (512, 512, 10),
+        (3, 5, 5),
+        (1, 1, 1),
+    ):
         logits = torch.randn((m, e), device="cuda", dtype=torch.float32) * 5
         logits[0] = 0  # Exact ties must choose lower expert IDs.
         if m > 1:
             logits[1] = -10000
             logits[1, -1] = 10000
+        if m > 2:
+            # Signed zeros compare equal; ties must still favor the lowest ID.
+            logits[2] = -1
+            logits[2, :k] = 0
+            logits[2, 0] = -0.0
         ids = torch.empty((m, k), device="cuda", dtype=torch.int32)
         prob = torch.empty((m, k), device="cuda")
         for renormalize in (False, True):

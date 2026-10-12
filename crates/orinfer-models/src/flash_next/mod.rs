@@ -1,9 +1,14 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
 mod batching;
+mod decode_fusions;
 mod experts;
+mod hc;
 mod inputs;
 mod mtp;
+mod parallel;
 mod plan;
+mod q4;
+mod routing;
 mod vision;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
 use orinfer_model_sdk::{
@@ -113,6 +118,12 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         return Err("Flash package arithmetic/checkpoint signature mismatch".into());
     }
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
+    q4::build(&mut request.metadata)?;
+    experts::build(&mut request.metadata, &request.kernel_contracts)?;
+    hc::build(&mut request.metadata, &request.kernel_contracts)?;
+    routing::build(&mut request.metadata, &request.kernel_contracts)?;
+    decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
+    parallel::build(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,

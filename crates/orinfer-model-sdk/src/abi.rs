@@ -15,6 +15,8 @@ use std::{
 
 #[path = "inputs.rs"]
 pub mod inputs;
+#[path = "plans.rs"]
+pub mod plans;
 
 pub type StateBindings = Vec<Option<(usize, String)>>;
 pub type BatchPlan = (Vec<Invocation>, StateBindings);
@@ -34,7 +36,11 @@ pub struct PackageInfo {
 }
 #[derive(Deserialize, Serialize)]
 pub struct CreateRequest {
-    /// Immutable kernel bindings available to architecture-owned residency contracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<crate::catalog::Catalog>,
+    #[serde(default)]
+    pub expert_contracts: bool,
+    /// Immutable bindings required by architecture-owned execution and residency contracts.
     #[serde(default)]
     pub kernel_contracts: Vec<crate::artifact::Kernel>,
     #[serde(default)]
@@ -232,6 +238,9 @@ pub trait ModelImplementation: Sized {
         Err("Model package has no visual layout adapter".into())
     }
     fn create(request: CreateRequest) -> Result<(Self, CreatedPlan)>;
+    fn execution(&self) -> Result<plans::Execution> {
+        Err("Model package has no native binding/plan extension".into())
+    }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<BatchPlan>;
 }
 

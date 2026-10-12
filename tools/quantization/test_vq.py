@@ -4,10 +4,96 @@ import unittest
 
 import numpy as np
 
-from tools.quantization.vq import Weights, e8p_decode, e8p_sign_table, rotate, save, load
+from tools.quantization.vq import (
+    Weights,
+    e8p_decode,
+    e8p_nibble_table,
+    e8p_repack_k64,
+    e8p_sign_table,
+    e8p_selector_table,
+    e8p_selector_supports_parity_xor,
+    rotate,
+    save,
+    load,
+)
 
 
 class IntegerVQTests(unittest.TestCase):
+    def test_selector_table_matches_all_codes_and_rejects_other_bases(self):
+        rng = np.random.default_rng(20261002)
+        table = rng.choice(np.array([-10, -6, -2, 0, 2, 6, 10], np.int8), (256, 8))
+        book = e8p_selector_table(table)
+        self.assertEqual(book.shape, (256, 1))
+        self.assertEqual(book.nbytes, 1024)
+        codes = np.arange(65536, dtype=np.uint16)
+        parity = np.array([(int(c) & 255).bit_count() % 2 for c in codes], np.uint32)
+        bases = book[codes >> 8, 0]
+        decoded = np.empty((65536, 8), np.int8)
+        even = np.array([3, 7, 11, 1, -1, -5, -9, 1], np.int8)
+        odd = np.array([1, 5, 9, -1, -3, -7, -11, -1], np.int8)
+        for lane, sign_bit in enumerate([0, 4, 1, 5, 2, 6, 3, 7]):
+            selector = ((bases >> (4 * lane)) & 7) ^ (((codes ^ parity) >> sign_bit & 1) * 4)
+            decoded[:, lane] = np.where(parity, odd[selector], even[selector])
+        np.testing.assert_array_equal(decoded, e8p_decode(codes, table))
+        expanded = e8p_sign_table(table)[None]
+        recovered = np.ascontiguousarray(expanded[0, :256, [0, 2]].T).view(np.int8)
+        np.testing.assert_array_equal(recovered.reshape(256, 8).astype(np.int16) - 1, table)
+        for value in (4, 14, -14):
+            invalid = table.copy()
+            invalid[0, 0] = value
+            with self.assertRaises(ValueError):
+                e8p_selector_table(invalid)
+        with self.assertRaises(ValueError):
+            e8p_selector_table(table.astype(np.int16))
+
+    def test_xor_parity_matches_all_codes_with_nonzero_basis(self):
+        rng = np.random.default_rng(20261002)
+        table = rng.choice(np.array([-10, -6, -2, 2, 6, 10], np.int8), (256, 8))
+        book = e8p_selector_table(table)
+        self.assertTrue(e8p_selector_supports_parity_xor(book))
+        codes = np.arange(65536, dtype=np.uint16)
+        parity = np.array([(int(c) & 255).bit_count() % 2 for c in codes], np.uint32)
+        decoded = np.empty((65536, 8), np.uint8)
+        palette = np.array([3, 7, 11, 1, 255, 251, 247, 1], np.uint8)
+        for lane, sign_bit in enumerate([0, 4, 1, 5, 2, 6, 3, 7]):
+            selector = ((book[codes >> 8, 0] >> (4 * lane)) & 7) ^ (
+                ((codes ^ parity) >> sign_bit & 1) * 4
+            )
+            decoded[:, lane] = palette[selector] ^ (parity * 2).astype(np.uint8)
+        np.testing.assert_array_equal(decoded.view(np.int8), e8p_decode(codes, table))
+        table[0, 7] = 0
+        self.assertFalse(e8p_selector_supports_parity_xor(e8p_selector_table(table)))
+        for invalid in (book.astype(np.int32), book.reshape(-1), book | np.uint32(8)):
+            with self.assertRaises(ValueError):
+                e8p_selector_supports_parity_xor(invalid)
+
+    def test_exact_nibble_decoder_matches_all_codes_and_repacking_is_lossless(self):
+        rng = np.random.default_rng(20261002)
+        table = rng.choice(np.array([-10, -6, -2, 2, 6, 10], np.int8), (256, 8))
+        nibble = e8p_nibble_table(e8p_selector_table(table))[:, 0]
+        codes = np.arange(65536, dtype=np.uint16)
+        parity = np.array([(int(c) & 255).bit_count() & 1 for c in codes], np.uint32)
+        signs = codes.astype(np.uint32) ^ parity
+        selectors = (signs & 0x33) | ((signs & 0xCC) << 6)
+        magic = np.uint32(0xEEE00E00) ^ (parity * np.uint32(0x11111111))
+        mask = np.zeros(65536, np.uint32)
+        for byte in range(4):
+            mask |= ((magic >> (8 * ((selectors >> (4 * byte)) & 15))) & 255) << (8 * byte)
+        words = nibble[codes >> 8] ^ mask
+        y = ((words[:, None] >> np.arange(0, 32, 4, dtype=np.uint32)) & 15).astype(np.int16)
+        y = np.where(y >= 8, y - 16, y)
+        perm = [0, 2, 1, 3, 4, 6, 5, 7]
+        np.testing.assert_array_equal(2 * y + 1, e8p_decode(codes, table)[:, perm])
+        table[0, 0] = 0
+        with self.assertRaisesRegex(ValueError, "nonzero"):
+            e8p_nibble_table(e8p_selector_table(table))
+        source = rng.integers(0, 65536, (2, 3, 17, 16), dtype=np.uint16)
+        packed = e8p_repack_k64(source)
+        restored = packed.reshape(2, 3, 2, 17, 8).transpose(0, 1, 3, 2, 4).reshape(source.shape)
+        np.testing.assert_array_equal(source, restored)
+        self.assertEqual(source.nbytes, packed.nbytes)
+        self.assertTrue(packed.flags.c_contiguous)
+
     def test_short_sign_table_matches_all_codes(self):
         rng = np.random.default_rng(20261002)
         table = (rng.integers(-63, 64, (256, 8)) * 2).astype(np.int8)

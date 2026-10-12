@@ -18,9 +18,12 @@
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
 - Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家bank与路由计数，按需从SSD加载到CUDA VMM页，并共享全局SLRU。有限模式暂关闭CUDA Graph，MTP专家全量常驻；临时路由集合和页粒度不计作严格字节上限，不缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
+- 后续Flash Next构建采用已选定的混合量化方案：专家保留整数E8P Q2A8；主干GDN QKV/Z、QSA Q/gate和target/MTP共享输出头采用signed-block128旋转、输出行scale的Q4A8。GDN/QSA输出投影、共享FFN和MTP草稿Q/O保留W8；其余精度敏感部分维持原混合精度。该策略是后续构建目标，不代表现有部署包已经切换。
 - Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
+- E8P可使用无损K64压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。
 - 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，默认在线校验dtype、shape、物理layout和容器边界；权重payload hash由`--verify-weights`显式开启，`validate-model`始终完整校验。配置签名仍校验，前端资源、CPU资产元数据、原生执行库和kernel身份仍固定并校验hash。模型数据通过execution_package digest固定独立模型执行包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，在线模型数据描述与执行包均保留schema 1，只支持当前原生模型包结构；不提供旧结构或schema 2兼容分支。算子夹具格式独立。
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
+- 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射离线编译进Rust模型库，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
 - Cooperative launch需显式声明并校验occupancy，不假定普通launch可跨block同步。

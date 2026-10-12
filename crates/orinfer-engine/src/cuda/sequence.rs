@@ -683,6 +683,9 @@ impl Executor {
             .ok_or("Invocation address overflow".into())
     }
     fn invoke(&self, invocation: &Invocation) -> Result<()> {
+        self.invoke_on(invocation, self.session.stream)
+    }
+    fn invoke_on(&self, invocation: &Invocation, stream: sys::CUstream) -> Result<()> {
         let address = |name: &str| self.address(name, invocation.sequence, &invocation.views);
         match &invocation.operation {
             Operation::Kernel { name } => {
@@ -731,7 +734,7 @@ impl Executor {
                         .ok_or("Batch kernel was not resolved before submission")?,
                     &mut values,
                     &self.session.driver,
-                    self.session.stream,
+                    stream,
                 )
             }
             Operation::Copy {
@@ -749,7 +752,7 @@ impl Executor {
                             address(destination)?,
                             address(source)?,
                             *bytes,
-                            self.session.stream,
+                            stream,
                         ),
                         "batch copy",
                     )
@@ -760,7 +763,7 @@ impl Executor {
                 // SAFETY: Checked writable range, ordered on the owner stream.
                 unsafe {
                     check(
-                        sys::cuMemsetD8Async(address(destination)?, 0, *bytes, self.session.stream),
+                        sys::cuMemsetD8Async(address(destination)?, 0, *bytes, stream),
                         "batch zero",
                     )
                 }
@@ -793,6 +796,9 @@ impl Executor {
     }
     fn capture(&self, operations: &[Invocation]) -> Result<Handle> {
         self.ensure_invocation_kernels(operations)?;
+        if !self.parallel_regions.borrow().is_empty() {
+            self.ensure_parallel_handles()?;
+        }
         // SAFETY: All bindings and backing allocations outlive graph execution;
         // capture records work, and the worker is the stream's sole submitter.
         unsafe {
@@ -804,7 +810,7 @@ impl Executor {
                 "begin request capture",
             )?;
         }
-        let result = operations.iter().try_for_each(|op| self.invoke(op));
+        let result = self.capture_parallel_operations(operations);
         let mut graph = ptr::null_mut();
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
@@ -822,11 +828,21 @@ impl Executor {
             }
             return Err(error);
         }
+        let flags = match self.prioritize_parallel_graph(graph, operations) {
+            Ok(flags) => flags,
+            Err(error) => {
+                // SAFETY: Local graph has not been instantiated or published.
+                unsafe {
+                    sys::cuGraphDestroy(graph);
+                }
+                return Err(error);
+            }
+        };
         let mut exec = ptr::null_mut();
         // SAFETY: Graph is locally owned until transferred into Session.
         unsafe {
             if let Err(error) = check(
-                sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
+                sys::cuGraphInstantiateWithFlags(&mut exec, graph, flags),
                 "instantiate request graph",
             ) {
                 sys::cuGraphDestroy(graph);
@@ -835,6 +851,252 @@ impl Executor {
         }
         self.session.graphs.borrow_mut().push((graph, exec));
         Ok(exec)
+    }
+    fn prioritize_parallel_graph(
+        &self,
+        graph: sys::CUgraph,
+        operations: &[Invocation],
+    ) -> Result<u64> {
+        #[cfg(test)]
+        let test_policy = self.parallel_priority.borrow();
+        #[cfg(test)]
+        let policy = test_policy.as_str();
+        #[cfg(not(test))]
+        let policy = "small_side";
+        if policy.is_empty() || policy == "off" {
+            return Ok(0);
+        }
+        let regions = self.parallel_regions.borrow();
+        let position: std::collections::BTreeMap<_, _> = operations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                if let Operation::Kernel { name } = &o.operation {
+                    Some((name.as_str(), i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !regions.iter().any(|r| position.contains_key(r[0].as_str())) {
+            return Ok(0);
+        }
+        let kernels = self
+            .direct
+            .as_ref()
+            .ok_or("Missing direct kernels")?
+            .kernels
+            .borrow();
+        let mut preferred = std::collections::BTreeSet::new();
+        for region in regions.iter() {
+            let lo = position[region[0].as_str()];
+            let side = position[region[1].as_str()];
+            let end = position[region[2].as_str()] + 1;
+            let range = if policy == "main" {
+                lo..side
+            } else {
+                side..end
+            };
+            for o in &operations[range] {
+                if let Operation::Kernel { name } = &o.operation {
+                    let k = &kernels[name];
+                    if policy == "main"
+                        || (policy == "small_side" && k.spec.grid.iter().product::<u32>() <= 48)
+                    {
+                        preferred.insert(k.function.ok_or("Unresolved priority kernel")? as usize);
+                    }
+                }
+            }
+        }
+        if !matches!(policy, "main" | "small_side") {
+            return Err("Unknown priority policy".into());
+        }
+        let mut count = 0;
+        // SAFETY: Query node handles owned by this completed, uninstantiated capture.
+        unsafe {
+            check(
+                sys::cuGraphGetNodes(graph, ptr::null_mut(), &mut count),
+                "count graph nodes",
+            )?;
+        }
+        let mut nodes = vec![ptr::null_mut(); count];
+        // SAFETY: Output storage has the queried node capacity.
+        unsafe {
+            check(
+                sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut count),
+                "read graph nodes",
+            )?;
+        }
+        for node in nodes.into_iter().take(count) {
+            let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL;
+            // SAFETY: Node belongs to this graph; output enum initialized.
+            unsafe {
+                check(sys::cuGraphNodeGetType(node, &mut kind), "graph node type")?;
+            }
+            if kind != sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL {
+                continue;
+            }
+            // SAFETY: Valid zero storage for the driver output structure/attribute union.
+            let (mut params, mut attr): (
+                sys::CUDA_KERNEL_NODE_PARAMS_v2,
+                sys::CUkernelNodeAttrValue,
+            ) = unsafe { std::mem::zeroed() };
+            // SAFETY: A kernel node accepts this output parameter structure.
+            unsafe {
+                check(
+                    sys::cuGraphKernelNodeGetParams_v2(node, &mut params),
+                    "graph kernel params",
+                )?;
+            }
+            attr.priority = if preferred.contains(&(params.func as usize)) {
+                -1
+            } else {
+                0
+            };
+            // SAFETY: Priority is a supported scalar node attribute; other union bytes are zero.
+            unsafe {
+                check(
+                    sys::cuGraphKernelNodeSetAttribute(
+                        node,
+                        sys::CUkernelNodeAttrID::CU_LAUNCH_ATTRIBUTE_PRIORITY,
+                        &attr,
+                    ),
+                    "graph priority",
+                )?;
+            }
+        }
+        // CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY, from the installed CUDA header.
+        Ok(8)
+    }
+    fn ensure_parallel_handles(&self) -> Result<(sys::CUstream, sys::CUevent, sys::CUevent)> {
+        let existing = *self.session.parallel_handles.borrow();
+        let handles = if let Some(handles) = existing {
+            handles
+        } else {
+            let mut stream = ptr::null_mut();
+            let mut fork = ptr::null_mut();
+            let mut join = ptr::null_mut();
+            // SAFETY: Current owned context; retain every new handle before capture uses it.
+            let result = unsafe {
+                check(sys::cuStreamCreate(&mut stream, 1), "create side stream")
+                    .and_then(|()| check(sys::cuEventCreate(&mut fork, 2), "create fork"))
+                    .and_then(|()| check(sys::cuEventCreate(&mut join, 2), "create join"))
+            };
+            if let Err(error) = result {
+                // SAFETY: Only successfully created local handles are destroyed.
+                unsafe {
+                    if !fork.is_null() {
+                        sys::cuEventDestroy_v2(fork);
+                    }
+                    if !join.is_null() {
+                        sys::cuEventDestroy_v2(join);
+                    }
+                    if !stream.is_null() {
+                        sys::cuStreamDestroy_v2(stream);
+                    }
+                }
+                return Err(error);
+            }
+            let handles = (stream, fork, join);
+            *self.session.parallel_handles.borrow_mut() = Some(handles);
+            handles
+        };
+        Ok(handles)
+    }
+    fn capture_parallel_operations(&self, operations: &[Invocation]) -> Result<()> {
+        let names: std::collections::BTreeMap<_, _> = operations
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| {
+                if let Operation::Kernel { name } = &op.operation {
+                    Some((name.as_str(), i))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if names.len()
+            != operations
+                .iter()
+                .filter(|op| matches!(op.operation, Operation::Kernel { .. }))
+                .count()
+        {
+            return operations.iter().try_for_each(|op| self.invoke(op));
+        }
+        let configured = self.parallel_regions.borrow();
+        if configured.is_empty() || !configured.iter().any(|r| names.contains_key(r[0].as_str())) {
+            return operations.iter().try_for_each(|op| self.invoke(op));
+        }
+        let mut regions = Vec::new();
+        for r in configured.iter() {
+            let mut indices = [0; 4];
+            for (i, name) in r.iter().enumerate() {
+                indices[i] = *names
+                    .get(name.as_str())
+                    .ok_or("Missing parallel endpoint")?;
+            }
+            let [fork, start, last, join] = indices;
+            if !(fork < start && start <= last && last + 1 == join) {
+                return Err("Invalid fork/join region".into());
+            }
+            regions.push(indices);
+        }
+        regions.sort();
+        if regions.windows(2).any(|p| p[0][3] >= p[1][0]) {
+            return Err("Overlapping fork/join regions".into());
+        }
+        let (side, fork_event, join_event) = self.ensure_parallel_handles()?;
+        for (i, op) in operations.iter().enumerate() {
+            if let Some(&[_, start, last, _]) = regions.iter().find(|r| r[0] == i) {
+                // SAFETY: Capture forks from the main stream's completed prefix;
+                // adapter-certified branches have disjoint writable buffers.
+                unsafe {
+                    check(
+                        sys::cuEventRecord(fork_event, self.session.stream),
+                        "capture fork",
+                    )?;
+                    check(
+                        sys::cuStreamWaitEvent(side, fork_event, 0),
+                        "capture side dependency",
+                    )?;
+                }
+                #[cfg(test)]
+                let gate_first = self.parallel_gate_first.get();
+                #[cfg(not(test))]
+                let gate_first = false;
+                if gate_first {
+                    self.invoke_on(&operations[last], side)?;
+                    for operation in &operations[start..last] {
+                        self.invoke_on(operation, side)?;
+                    }
+                } else {
+                    for operation in &operations[start..=last] {
+                        self.invoke_on(operation, side)?;
+                    }
+                }
+                // SAFETY: The side event follows every producer in the branch.
+                unsafe {
+                    check(
+                        sys::cuEventRecord(join_event, side),
+                        "capture branch completion",
+                    )?;
+                }
+            }
+            if regions.iter().any(|r| r[1] <= i && i <= r[2]) {
+                continue;
+            }
+            if regions.iter().any(|r| r[3] == i) {
+                // SAFETY: Join before consumers and before the next layer reuses scratch.
+                unsafe {
+                    check(
+                        sys::cuStreamWaitEvent(self.session.stream, join_event, 0),
+                        "capture join",
+                    )?;
+                }
+            }
+            self.invoke(op)?;
+        }
+        Ok(())
     }
     pub(super) fn program_graph(&self, name: &str) -> Result<Handle> {
         if let Some(&graph) = self.graphs.borrow().get(name) {
@@ -982,7 +1244,7 @@ impl Executor {
 
 #[cfg(test)]
 impl Executor {
-    fn profile_events(&mut self, count: usize) -> Result<Vec<sys::CUevent>> {
+    pub(crate) fn profile_events(&mut self, count: usize) -> Result<Vec<sys::CUevent>> {
         let mut events = Vec::with_capacity(count);
         for _ in 0..count {
             let mut event = ptr::null_mut();
@@ -1009,6 +1271,18 @@ impl Executor {
                 .ok_or("Missing hot batch graph")?
                 .0
         };
+        self.profile_graph_time(graph, repetitions)
+    }
+    pub(crate) fn profile_invocations_hot(
+        &mut self,
+        operations: &[Invocation],
+        repetitions: usize,
+    ) -> Result<Vec<f32>> {
+        self.sync()?;
+        let graph = self.capture(operations)?;
+        self.profile_graph_time(graph, repetitions)
+    }
+    fn profile_graph_time(&mut self, graph: Handle, repetitions: usize) -> Result<Vec<f32>> {
         let events = self.profile_events(2)?;
         let mut times = vec![];
         for _ in 0..repetitions {

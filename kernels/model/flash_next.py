@@ -53,6 +53,95 @@ def dense_projection(
     return main
 
 
+_BF16_PAIR = """
+#include <tl_templates/cuda/instruction/mma.h>
+template <typename V>
+__device__ __forceinline__ unsigned flash_bf16_pair(V a, V b) {
+    return (unsigned)a.raw() | ((unsigned)b.raw() << 16);
+}
+"""
+
+
+@orin_jit
+def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
+    """Single-output gate, preserving the dense BF16 MMA accumulation order.
+
+    Load only live activation rows and the one weight row into transient shared
+    memory once. One warp executes the same m16n8k16 BF16 instructions; the
+    remaining threads help load operands. No split-K or floating reduction.
+    """
+    if any(type(v) is not int or v <= 0 for v in (M, K)) or K % 64:
+        raise ValueError("Invalid scalar BF16 projection dimensions")
+    tile = min(M, 8)
+    if (tile + 1) * K * 2 > 48 * 1024:
+        raise ValueError("Scalar BF16 projection exceeds shared memory budget")
+    M = row_count(M, dynamic_rows)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), T.float16),
+        Weight: T.Tensor((1, K), T.bfloat16),
+        Output: T.Tensor((M, 1), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(M, tile), threads=128) as block:
+            T.import_source(_BF16_PAIR)
+            a = T.alloc_shared((tile, K), T.bfloat16)
+            w = T.alloc_shared((K,), T.bfloat16)
+            for r, k in T.Parallel(tile, K, coalesced_width=T.int32(1)):
+                a[r, k] = 0
+                if block * tile + r < M:
+                    a[r, k] = T.cast(A[block * tile + r, k], T.bfloat16)
+            T.copy(Weight[0, 0], w)
+            T.sync_threads()
+            tx = T.get_thread_binding()
+            if tx < 32:
+                row, tid = tx // 4, tx % 4
+                ar = T.alloc_local((4,), T.uint32)
+                br = T.alloc_local((2,), T.uint32)
+                acc = T.alloc_local((4,), T.float32)
+                for i in T.unroll(4):
+                    acc[i] = 0
+                for kg in T.serial(K // 64):
+                    for ki in T.unroll(4):
+                        for i in T.unroll(4):
+                            ar[i] = 0
+                            if row + (i % 2) * 8 < tile:
+                                k = kg * 64 + ki * 16 + tid * 2 + (i // 2) * 8
+                                ar[i] = T.call_pure_extern(
+                                    "uint32",
+                                    "flash_bf16_pair",
+                                    a[row + (i % 2) * 8, k],
+                                    a[row + (i % 2) * 8, k + 1],
+                                )
+                        for i in T.unroll(2):
+                            br[i] = 0
+                            if row == 0:
+                                k = kg * 64 + ki * 16 + tid * 2 + i * 8
+                                br[i] = T.call_pure_extern(
+                                    "uint32", "flash_bf16_pair", w[k], w[k + 1]
+                                )
+                        T.ptx_mma(
+                            "float32",
+                            "m16n8k16",
+                            "row",
+                            "col",
+                            "bfloat16",
+                            "bfloat16",
+                            "float32",
+                            ar.data,
+                            0,
+                            br.data,
+                            0,
+                            acc.data,
+                            0,
+                            False,
+                        )
+                if row < tile and block * tile + row < M and tid == 0:
+                    Output[block * tile + row, 0] = acc[0]
+
+    return main
+
+
 @orin_jit
 def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False):
     """Broadcast token embeddings into every independent residual stream."""

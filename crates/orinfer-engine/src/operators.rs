@@ -1,7 +1,7 @@
 //! Versioned, weight-independent model execution packages. Model control flow is supplied by a versioned native library.
 use crate::{
     architecture::{Architecture, ComputePolicy, PrefillProfile},
-    artifact::{Access, Buffer, Dtype, Kernel, Result},
+    artifact::{Access, Buffer, Dtype, Result},
     weights::TensorIdentity,
 };
 use serde::{Deserialize, Serialize};
@@ -51,15 +51,13 @@ pub struct ExecutionPackage {
     #[serde(default)]
     pub batch_profiles: Vec<usize>,
     #[serde(default)]
-    pub dynamic_batch_kernels: Vec<dynamic::DynamicBatchKernel>,
-    #[serde(default)]
     pub prefill_batch_profiles: Vec<PrefillProfile>,
     #[serde(default)]
     pub greedy_sampling: bool,
     #[serde(default)]
     pub batch_gdn: bool,
     pub buffer_contracts: Vec<BufferContract>,
-    pub kernels: Vec<Kernel>,
+    pub catalog: orinfer_model_sdk::catalog::Catalog,
     pub toolchain: BTreeMap<String, String>,
     pub execution: crate::model_package::ExecutionLibrary,
 }
@@ -88,29 +86,7 @@ impl ExecutionPackage {
         {
             return Err("Invalid or duplicate batch profile".into());
         }
-        let kernels: BTreeMap<_, _> = self.kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-        let mut templates = std::collections::BTreeSet::new();
-        for template in &self.dynamic_batch_kernels {
-            if !templates.insert(template.name.as_str()) {
-                return Err("Duplicate dynamic batch template".into());
-            }
-            template.validate(
-                kernels
-                    .get(template.name.as_str())
-                    .ok_or("Missing dynamic batch kernel")?,
-            )?;
-        }
-        if !templates.is_empty()
-            && (!self.batch_profiles.contains(&128)
-                || kernels
-                    .keys()
-                    .filter(|name| {
-                        name.starts_with("batch_m128/") || name.starts_with("batch_gdn_m128/")
-                    })
-                    .any(|name| !templates.contains(name)))
-        {
-            return Err("Incomplete dynamic batch contracts".into());
-        }
+        self.catalog.validate()?;
         seen.clear();
         if self
             .prefill_batch_profiles

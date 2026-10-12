@@ -20,7 +20,7 @@ def main():
     a = p.parse_args()
     configure()
     report = {"complete": False, "hc": [], "gdn": [], "experts": [], "rotation": []}
-    for m in (1, 4, 8):
+    for m in (1, 2, 3, 4, 5, 7, 8):
         h, rank = 2560, 320
         x = (torch.randn(m, 4, h, device="cuda") * 0.3).half()
         wd = (torch.randn(rank, 4 * h, device="cuda") * 0.01).bfloat16()
@@ -28,7 +28,8 @@ def main():
         down, act = (torch.empty(m, rank, device="cuda", dtype=torch.float16) for _ in range(2))
         up = torch.empty_like(x)
         expected = torch.empty(m, h, device="cuda", dtype=torch.float16)
-        actual = torch.empty_like(expected)
+        guarded = torch.full((m + 1, h), 91.0, device="cuda", dtype=torch.float16)
+        actual = guarded[:m]
         fused_act = torch.empty_like(act)
         kd = hc_projection(m, rank, 4 * h, dtype="float16", block_n=32)
         ks = hc_silu(m, rank, dtype="float16")
@@ -56,6 +57,7 @@ def main():
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(act, fused_act) and torch.equal(actual, expected)
+        assert bool((guarded[-1] == 91).all())
         export_kernel(fd, a.output / f"hc-down-{m}")
         export_kernel(fu, a.output / f"hc-up-{m}")
         report["hc"].append(

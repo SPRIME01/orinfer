@@ -61,4 +61,34 @@ typedef struct {
     int32_t (*prepare_program)(void *, OrinferBytes, const uint32_t *, size_t, const uint32_t *, size_t, OrinferInputs *, OrinferOwnedBytes *);
 } OrinferInputApi;
 const OrinferInputApi *orinfer_model_inputs_v1(uint32_t version);
+/* Native execution export. Parameter kinds: buffer, slice, i32, u32, i64,
+ * u64, f32 = 0..6. Signed integers/floats use their exact unsigned bit pattern.
+ * Definition/dynamic indices refer to the validated catalog; SIZE_MAX means
+ * no dynamic specialization. All strings and nested arrays live until free. */
+typedef struct { uint32_t kind; OrinferBytes name; size_t offset; uint64_t scalar; } OrinferPlanArgument;
+typedef struct {
+    OrinferBytes name;
+    size_t definition;
+    uint32_t grid[3];
+    const OrinferPlanArgument *arguments;
+    size_t argument_count, dynamic;
+    uint32_t plan_contract;
+} OrinferPlanKernel;
+typedef struct { uint32_t kind; OrinferBytes name, destination; size_t bytes; } OrinferPlanCommand;
+typedef struct { OrinferBytes name; const OrinferPlanCommand *commands; size_t command_count; } OrinferPlanProgram;
+typedef struct {
+    void *owner;
+    const OrinferPlanKernel *kernels;
+    size_t kernel_count;
+    const OrinferPlanProgram *programs;
+    size_t program_count;
+} OrinferPlans;
+typedef struct {
+    uint32_t version;
+    size_t struct_size;
+    size_t kernel_size, argument_size, program_size, command_size;
+    int32_t (*export_plans)(void *, OrinferPlans *, OrinferOwnedBytes *);
+    void (*free)(OrinferPlans);
+} OrinferPlanApi;
+const OrinferPlanApi *orinfer_model_plans_v1(uint32_t version);
 #endif

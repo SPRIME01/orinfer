@@ -456,6 +456,7 @@ fn validate_joint_prefill_requests() {
             let mut kl = 0.;
             let mut nll = 0.;
             let mut top3 = 0;
+            let mut teacher_history = source.input_tokens.clone();
             for (step, &token) in output[i].iter().enumerate() {
                 let reference = floats(
                     &model
@@ -476,6 +477,9 @@ fn validate_joint_prefill_requests() {
                 ranked.select_nth_unstable_by(3, |a, b| b.1.total_cmp(a.1));
                 top3 += usize::from(ranked[..3].iter().any(|(id, _)| *id == token as usize));
                 if step + 1 < output[i].len() {
+                    model.prepare_inputs(&[token], &teacher_history).unwrap();
+                    model.upload_segment_controls(1).unwrap();
+                    teacher_history.push(token);
                     model.upload_ids(&model.manifest.token, &[token]).unwrap();
                     model
                         .launch_program("decode", ExecutionPhase::Decode)
@@ -658,7 +662,10 @@ fn validate_continuous_requests() {
     let mut reused = model
         .start_request(input(&fixture.cases[1], 16), &|| false)
         .unwrap();
-    assert_eq!(other.slot, reused.slot);
+    // The allocator chooses the idle arena with the lowest mapping cost;
+    // an already-mapped free slot can beat the just-cancelled large arena.
+    assert_ne!(survivor.slot, reused.slot);
+    assert_eq!(model.reserved_requests.len(), 2);
     assert_eq!(
         before,
         state(&mut model, &mut survivor),
@@ -769,6 +776,7 @@ fn validate_continuous_requests() {
         let mut kl = 0.;
         let mut nll_delta = 0.;
         let mut top3 = 0;
+        let mut teacher_history = source.input_tokens.clone();
         for (step, &token) in output[i].iter().enumerate() {
             let target = floats(
                 &model
@@ -790,6 +798,9 @@ fn validate_continuous_requests() {
             ranked.select_nth_unstable_by(3, |a, b| b.1.total_cmp(a.1));
             top3 += usize::from(ranked[..3].iter().any(|(id, _)| *id == token as usize));
             if step + 1 < output[i].len() {
+                model.prepare_inputs(&[token], &teacher_history).unwrap();
+                model.upload_segment_controls(1).unwrap();
+                teacher_history.push(token);
                 model.upload_ids(&model.manifest.token, &[token]).unwrap();
                 model
                     .launch_program("decode", ExecutionPhase::Decode)
@@ -803,7 +814,10 @@ fn validate_continuous_requests() {
         eprintln!("teacher-forced quality {row}");
         // Distribution drift and token agreement are diagnostics: different
         // valid token choices are allowed by the quality acceptance policy.
-        assert!(kl.is_finite(), "Nonfinite batch distribution drift: {row}");
+        assert!(
+            kl.is_finite() && kl / count < 0.05 && top3 as f64 / count >= 0.9,
+            "Batch distribution/token quality degraded: {row}"
+        );
         assert!(
             nll_delta / count < 0.05,
             "Batch degraded target likelihood: {row}"
