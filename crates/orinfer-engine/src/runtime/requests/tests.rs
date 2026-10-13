@@ -16,6 +16,12 @@ struct Fixture {
     batches: Vec<usize>,
     #[serde(default)]
     mtp_drafts: Option<usize>,
+    #[serde(default = "numerical_tokens")]
+    numerical_tokens: usize,
+}
+
+fn numerical_tokens() -> usize {
+    4
 }
 
 fn partial_prefix_boundaries() -> Vec<usize> {
@@ -538,6 +544,9 @@ fn validate_continuous_requests() {
         LoadOptions {
             cuda_graph: fixture.cuda_graph.parse().unwrap(),
             prefix_cache_bytes: 2 << 30,
+            // Compare one target distribution per position. Speculative
+            // draft/verification/commit equivalence has dedicated GPU tests.
+            mtp_drafts: Some(0),
             ..LoadOptions::default()
         },
     )
@@ -612,29 +621,78 @@ fn validate_continuous_requests() {
         }
         let mut requests: Vec<_> = (0..count)
             .map(|i| {
-                model
-                    .start_request(input(&fixture.cases[i % fixture.cases.len()], 16), &|| {
-                        false
-                    })
-                    .unwrap()
+                let source = input(&fixture.cases[i % fixture.cases.len()], 16);
+                model.start_request(source, &|| false).unwrap()
             })
             .collect();
         let mut output = vec![vec![]; count];
+        let mut scores = vec![vec![]; count];
         while requests.iter().any(|r| !r.is_finished()) {
             let mut active: Vec<_> = requests.iter_mut().collect();
             for step in model.advance_requests(&mut active, &options).unwrap() {
+                assert_eq!(step.tokens.len(), 1);
                 output[step.request].extend(step.tokens);
+                scores[step.request]
+                    .push(flash_batch::distribution(&mut model, active[step.request]));
             }
         }
-        assert_eq!(
-            output, reference,
-            "Greedy batch differs for {count} independent lanes"
-        );
         for request in &mut requests {
             model.finish_request(request, true).unwrap();
         }
-        rows.push(json!({"batch":count,"tokens_equal":true}));
-        eprintln!("batch {count}: serial output comparison passed");
+        let mut max_kl: f64 = 0.;
+        let mut max_delta: f64 = 0.;
+        let mut total_delta = 0.;
+        let mut selected_top3 = 0;
+        let mut positions = 0;
+        for lane in 0..count {
+            let source = input(&fixture.cases[lane % fixture.cases.len()], 16);
+            let mut baseline = model.start_request(source, &|| false).unwrap();
+            while baseline.prefilling {
+                model
+                    .advance_requests(&mut [&mut baseline], &options)
+                    .unwrap();
+            }
+            for (step, &token) in output[lane].iter().enumerate() {
+                let b = flash_batch::distribution(&mut model, &mut baseline);
+                let a = &scores[lane][step];
+                let kl: f64 = b.iter().zip(a).map(|(b, a)| b.exp() * (b - a)).sum();
+                let delta = b[token as usize] - a[token as usize];
+                assert!(
+                    kl.is_finite() && kl < 0.05,
+                    "Batch {count}, lane {lane}, step {step}: KL {kl}, NLL delta {delta}"
+                );
+                max_kl = max_kl.max(kl);
+                max_delta = max_delta.max(delta.abs());
+                total_delta += delta;
+                selected_top3 +=
+                    usize::from(b.iter().filter(|&&p| p > b[token as usize]).count() < 3);
+                positions += 1;
+                if step + 1 < output[lane].len() {
+                    *baseline.history.last_mut().unwrap() = token;
+                    model
+                        .with_request(&mut baseline, |m, _| {
+                            m.upload_ids(&m.manifest.token, &[token])
+                        })
+                        .unwrap();
+                    model
+                        .advance_requests(&mut [&mut baseline], &options)
+                        .unwrap();
+                }
+            }
+            model.finish_request(&mut baseline, false).unwrap();
+        }
+        let mean_delta = total_delta / positions as f64;
+        let top3_rate = selected_top3 as f64 / positions as f64;
+        // Same quality policy as cold mixed prefill below. Record absolute
+        // drift; an increased selected-token likelihood is not degradation.
+        assert!(
+            mean_delta < 0.05 && top3_rate >= 0.9,
+            "Batch {count}: NLL delta {mean_delta}, reference top3 rate {top3_rate}"
+        );
+        rows.push(json!({"batch":count,"tokens_equal":output==reference,"max_same_history_kl":max_kl,"max_abs_nll_delta":max_delta,"mean_nll_delta":mean_delta,"selected_in_reference_top3":top3_rate}));
+        eprintln!(
+            "batch {count}: same-history distribution comparison passed; max KL {max_kl}, NLL delta {max_delta}"
+        );
     }
     // Starting and cancelling another request must not reset a survivor's
     // FP32 recurrent state, convolution history or position. Reuse its slot.

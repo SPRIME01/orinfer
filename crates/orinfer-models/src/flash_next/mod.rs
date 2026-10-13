@@ -176,6 +176,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
     mixed::operands(&mut request.metadata, &request.kernel_contracts)?;
     q4::build(&mut request.metadata)?;
+    q4::prerequisites(&mut request.metadata, &request.kernel_contracts)?;
     experts::build(&mut request.metadata, &request.kernel_contracts)?;
     hc::build(&mut request.metadata, &request.kernel_contracts)?;
     routing::build(&mut request.metadata, &request.kernel_contracts)?;

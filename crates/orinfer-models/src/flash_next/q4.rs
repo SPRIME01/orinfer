@@ -1,6 +1,6 @@
 //! Row-Q4 input transforms are part of the registered Flash execution recipe.
 use crate::{
-    artifact::{Access, Dtype, Result},
+    artifact::{Access, Argument, Dtype, Kernel, Result},
     model::{Manifest, Operation},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -210,9 +210,147 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
+/// Attach transforms published by the shared compute lowering. Recipe slot
+/// counts describe logical operators; implementations can add prerequisites
+/// without duplicating the model's single/batch/mixed execution recipes.
+pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
+    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let executed: BTreeSet<_> = manifest
+        .programs
+        .values()
+        .flatten()
+        .filter_map(|op| {
+            if let Operation::Kernel { name } = op {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut pending = BTreeMap::new();
+    for rotation in kernels {
+        let Some(projection) = rotation.name.strip_suffix("/q4_rotation") else {
+            continue;
+        };
+        if executed.contains(rotation.name.as_str()) {
+            continue;
+        }
+        let target = contracts
+            .get(projection)
+            .ok_or("Missing Q4 projection contract")?;
+        if !(4..=5).contains(&rotation.args.len()) || !(5..=6).contains(&target.args.len()) {
+            return Err("Unexpected Q4 prerequisite ABI".into());
+        }
+        for index in 0..2 {
+            if !matches!((&rotation.args[index], &target.args[index]),
+                (Argument::Buffer {name: a}, Argument::Buffer {name: b}) if a == b)
+            {
+                return Err("Q4 transform/projection workspace mismatch".into());
+            }
+        }
+        let Argument::Buffer { name: signs } = &rotation.args[2] else {
+            return Err("Missing Q4 rotation signs".into());
+        };
+        let Argument::Buffer { name: packed } = &target.args[4] else {
+            return Err("Missing Q4 projection weights".into());
+        };
+        if !signs.starts_with("Q4_")
+            || !signs.ends_with("_signs")
+            || !packed.starts_with("Q4_")
+            || !packed.ends_with("_packed")
+        {
+            return Err("Invalid Q4 prerequisite operands".into());
+        }
+        pending.insert(projection.to_owned(), rotation.name.clone());
+    }
+    for operations in manifest.programs.values_mut() {
+        let mut expanded = Vec::with_capacity(operations.len());
+        for operation in std::mem::take(operations) {
+            if let Operation::Kernel { name } = &operation
+                && let Some(rotation) = pending.remove(name)
+            {
+                expanded.push(Operation::Kernel { name: rotation });
+            }
+            expanded.push(operation);
+        }
+        *operations = expanded;
+    }
+    if !pending.is_empty() {
+        return Err("Unregistered Q4 prerequisite".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn contract(name: &str, args: &[&str]) -> Kernel {
+        let asset = serde_json::json!({"file":"test.cubin","sha256":"0".repeat(64)});
+        serde_json::from_value(serde_json::json!({
+            "name":name,"symbol":"main_kernel","module":asset,"source":asset,"host_abi":asset,
+            "grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,
+            "args":args.iter().map(|name| serde_json::json!({"kind":"buffer","name":name})).collect::<Vec<_>>()
+        })).unwrap()
+    }
+
+    #[test]
+    fn shared_lowering_expands_fixed_dynamic_and_mixed_recipes() {
+        for section in [
+            "flash_batch_m2/layer0/pre",
+            "flash_dynamic_m4/layer0/pre",
+            "flash_mixed_m128/layer0/pre",
+        ] {
+            let mut m = manifest(0);
+            m.programs.clear();
+            let projection = format!("{section}/k6");
+            let rotation = format!("{projection}/q4_rotation");
+            m.programs.insert(
+                section.into(),
+                vec![Operation::Kernel {
+                    name: projection.clone(),
+                }],
+            );
+            let mut kernels = vec![
+                contract(
+                    &projection,
+                    &[
+                        "A",
+                        "AS",
+                        "Out",
+                        "Q4_blk.0.attn_qkv_scale",
+                        "Q4_blk.0.attn_qkv_packed",
+                    ],
+                ),
+                contract(&rotation, &["A", "AS", "Q4_blk.0.attn_gate_signs", "Input"]),
+            ];
+            prerequisites(&mut m, &kernels).unwrap();
+            assert!(
+                matches!(&m.programs[section][0], Operation::Kernel {name} if name == &rotation)
+            );
+            assert!(
+                matches!(&m.programs[section][1], Operation::Kernel {name} if name == &projection)
+            );
+            prerequisites(&mut m, &kernels).unwrap();
+            assert_eq!(m.programs[section].len(), 2);
+            m.programs.get_mut(section).unwrap().remove(0);
+            kernels[1].args[0] = Argument::Buffer {
+                name: "wrong".into(),
+            };
+            assert!(
+                prerequisites(&mut m, &kernels)
+                    .unwrap_err()
+                    .contains("workspace mismatch")
+            );
+            kernels[1].args[0] = Argument::Buffer { name: "A".into() };
+            m.programs.clear();
+            assert!(
+                prerequisites(&mut m, &kernels)
+                    .unwrap_err()
+                    .contains("Unregistered")
+            );
+        }
+    }
+
     fn manifest(layer: usize) -> Manifest {
         let mut m: Manifest = serde_json::from_value(serde_json::json!({
             "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,

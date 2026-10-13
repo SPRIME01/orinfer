@@ -31,9 +31,24 @@ def factory(label, capacity):
     from kernels.model.int8_swiglu import int8_swiglu
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.greedy import greedy_partials, greedy_merge
+    from kernels.model.q4_projection import q4_projection
+    from kernels.model.bf16_single import bf16_single
 
     opts = dict(dynamic_rows=True)
     parts = label.split("-")
+    if label.startswith("bf16-r"):
+        n, groups = int(parts[2][1:]), int(parts[3][1:])
+        return bf16_single.__wrapped__(n, 2560, groups, rows=capacity, **opts)
+    if label.startswith("q4-"):
+        n = next(int(p[1:]) for p in parts if p.startswith("n") and p[1:].isdigit())
+        k = next(int(p[1:]) for p in parts if p.startswith("k") and p[1:].isdigit())
+        dtype = next((p for p in parts if p in ("float16", "float32")), "float16")
+        return q4_projection.__wrapped__(capacity, n, k, output_dtype=dtype, **opts)
+    if label.startswith("rotate-r"):
+        k = next(int(p[1:]) for p in parts if p.startswith("k") and p[1:].isdigit())
+        return rotate_activation_a8.__wrapped__(capacity, k, **opts)
+    if label.startswith(("exact-r", "split-r")):
+        return None
     if label.startswith("initialize-"):
         return f.hc_initialize.__wrapped__(capacity, **opts)
     if label.startswith("hc-norm-"):
@@ -227,6 +242,9 @@ def upgrade(model, destination, output):
         print("DYNAMIC", k["name"], label, flush=True)
     package["kernels"].extend(additions)
     package["dynamic_batch_kernels"] = contracts
+    from tools.model.flash_next.lowering import lower
+
+    lower(data, package, operator, output)
     path = operator / "lib/model.so"
     path.unlink()
     shutil.copyfile(model_library(), path)

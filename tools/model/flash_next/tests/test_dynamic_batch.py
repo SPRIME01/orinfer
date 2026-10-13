@@ -7,6 +7,27 @@ from tools.model.flash_next.dynamic_batch import factory
 
 
 class DynamicRowsTests(unittest.TestCase):
+    def test_lowered_q4_retains_explicit_live_rows(self):
+        fn = explicit_rows(factory("q4-gemv-r4-n6144-k2560-d0", 4))
+        (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+        buffers = {b.name: b for b in fn.buffer_map.values()}
+        for name in ("A", "AS", "Out"):
+            self.assertTrue(buffers[name].shape[0].same_as(rows))
+        self.assertEqual(int(buffers["W"].shape[1]), 640)
+
+    def test_lowered_head_keeps_fp32_logits(self):
+        fn = explicit_rows(factory("q4-gemv-r4-n248320-k2560-float32-d0", 4))
+        buffers = {b.name: b for b in fn.buffer_map.values()}
+        self.assertEqual(str(buffers["Out"].dtype), "float32")
+
+    def test_direct_bf16_rows_do_not_change_private_split_layout(self):
+        fn = explicit_rows(factory("bf16-r4-n320-g4-d0", 4))
+        (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+        buffers = {b.name: b for b in fn.buffer_map.values()}
+        self.assertTrue(buffers["A"].shape[0].same_as(rows))
+        self.assertTrue(buffers["Output"].shape[1].same_as(rows))
+        self.assertEqual(int(buffers["Output"].shape[0]), 4)
+
     def test_large_route_histograms_keep_capacity_strides_and_live_assignment_rows(self):
         for label in ("histogram-local-1024", "histogram-finish-1024"):
             fn = explicit_rows(factory(label, 1024))

@@ -472,6 +472,9 @@ def upgrade(model, destination, output):
             if identity not in checked:
                 assets.read(asset)
                 checked.add(identity)
+    from tools.model.flash_next.lowering import lower
+
+    lower(data, package, operator, output)
     commit_package(destination, operator, data, package)
 
 

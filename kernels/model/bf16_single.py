@@ -7,12 +7,13 @@ expanded representation is created. FP32 accumulates in the original K16 order.
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.bf16_mma import SOURCE
+from kernels.model.rows import row_count
 
 
 @orin_jit(
     pass_configs={"tl.disable_thread_storage_sync": True, "tl.disable_shared_memory_reuse": True}
 )
-def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3):
+def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3, *, rows=1, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (N, K, groups, block_n, block_k, stages))
         or groups not in (1, 4)
@@ -25,14 +26,17 @@ def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3):
         raise ValueError("Unsupported single-token BF16 projection geometry")
     bn, bk = block_n, block_k
     threads = bn * 2
+    if type(rows) is not int or not 1 <= rows <= 8:
+        raise ValueError("Unsupported BF16 decode rows")
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def main(
-        A: T.Tensor((groups, K), T.float16),
+        A: T.Tensor((rows, groups, K), T.float16),
         Weight: T.Tensor((N, groups * K // 2), T.uint32),
-        Output: T.Tensor((groups, N), T.float32),
+        Output: T.Tensor((groups, rows, N), T.float32),
     ):
-        with T.Kernel(N // bn, groups, threads=threads) as (bx, group):
+        with T.Kernel(N // bn, groups, rows, threads=threads) as (bx, group, row):
             T.import_source(SOURCE)
             tid = T.get_thread_binding()
             lane = tid % 32
@@ -58,7 +62,7 @@ def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3):
                     )
                 T.ptx_commit_group()
             for j in T.Parallel(K):
-                live[j] = A[group, j]
+                live[j] = A[row, group, j]
             for step in T.serial(K // bk):
                 slot = step % stages
                 if stages == 4:
@@ -126,6 +130,6 @@ def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3):
                 T.sync_threads()
             if lane % 4 == 0:
                 for rr in T.unroll(2):
-                    Output[group, bx * bn + warp * 16 + lane // 4 + rr * 8] = acc[rr * 2]
+                    Output[group, row, bx * bn + warp * 16 + lane // 4 + rr * 8] = acc[rr * 2]
 
     return main.with_attr("global_symbol", "bf16_single")

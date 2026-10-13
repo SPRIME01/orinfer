@@ -13,6 +13,17 @@ ORINFER_CHECKPOINT_DIR=/path/to/native-model \
   --model /path/to/native-model --model-output artifacts/models/flash-decode
 ```
 
+共享计算策略位于 `kernel_policy.py`，`lowering.py` 按实际权重角色和导出 ABI 生成实现及前置步骤。Q4 权重存在时，保留的 W8 参考权重不会覆盖它；行数只决定 GEMV/Tensor Core 和 tile。经过认证的 K64 E8P bank 在小 batch 上使用完整 A8 位平面分解，其他形状读取同一压缩 bank 的 INT8 路径。固定 batch、动态 batch 和混合 prefill/decode 构建都执行此 lowering，Rust 模型适配器把旋转与位平面拆分插入原有算子位置，私有因果状态不进入共享策略。
+
+并发数值验收固定 seed，并在相同 teacher-forced 历史下逐步比较概率分布和 NLL；greedy token 一致率单独记录。近似浮点路径不以逐字相同为通过条件，取消、恢复、状态隔离和提交仍分别验证。`validate_flash_decode_batches` 的夹具可用 `numerical_tokens` 指定 4–64 个输出位置，包括提前 EOS 后的强制历史。
+
+已有执行包可在不修改权重的情况下重新生成全部形状：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/lowering.py artifacts/flash-policy-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-policy
+```
+
 ## 权重准备
 
 CPU 工具使用 `make python-env` 创建的 uv 环境，GPU 转换与验证使用固定编译镜像及 GPU 锁。固定原始 checkpoint revision，流式读取 BF16，不需要保存完整原始模型：

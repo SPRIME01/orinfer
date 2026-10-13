@@ -8,6 +8,7 @@ weights without group scale operations inside the dot-product loop.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 MAGNITUDES = (3, 10, 19, 31, 46, 67, 93, 127)
@@ -94,11 +95,25 @@ def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES):
 
 
 @orin_jit
-def q4_projection(M, N, K, BN=64, BK=128, output_dtype="float16", magnitudes=MAGNITUDES):
+def q4_projection(
+    M,
+    N,
+    K,
+    BN=64,
+    BK=128,
+    output_dtype="float16",
+    magnitudes=MAGNITUDES,
+    *,
+    block_m=8,
+    dynamic_rows=False,
+):
     validate_shape(M, N, K)
     if BN not in (32, 64, 128) or BK % 128 or K % BK:
         raise ValueError("Invalid Q4 Tensor Core tile")
-    BM = 8
+    if block_m not in (8, 16, 32, 64):
+        raise ValueError("Invalid Q4 row tile")
+    BM = block_m
+    M = row_count(M, dynamic_rows)
     threads = 64 if BN == 32 else 128
     source = decode_source(magnitudes)
 

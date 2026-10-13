@@ -2,10 +2,41 @@
 
 import unittest
 
-from tools.model.flash_next.kernel_policy import expert_tile_config, expert_projection_config
+from tools.model.flash_next.kernel_policy import (
+    expert_tile_config,
+    expert_projection_config,
+    expert_implementation,
+    projection_policies,
+)
 
 
 class ExpertTilePolicyTests(unittest.TestCase):
+    def test_selected_storage_overrides_retained_w8_for_all_shapes(self):
+        buffers = {
+            "Q4_blk.0.attn_gate_packed": dict(dtype="u16", shape=[6144, 640]),
+            "Q4_blk.0.attn_gate_scale": dict(dtype="f16", shape=[6144]),
+            "Q4_blk.0.attn_gate_signs": dict(dtype="i8", shape=[2560]),
+            "Q4_blk.0.attn_qkv_packed": dict(dtype="u16", shape=[10240, 640]),
+            "Q4_blk.0.attn_qkv_scale": dict(dtype="f16", shape=[10240]),
+            "W_blk.0.attn_qkv.weight_weight": dict(dtype="i8", shape=[10240, 2560]),
+        }
+        policy = projection_policies(buffers)["W_blk.0.attn_qkv.weight_weight"]
+        self.assertEqual(policy.signs, "Q4_blk.0.attn_gate_signs")
+        for rows in (1, 2, 4, 8, 16, 128, 512, 4096):
+            self.assertEqual(policy.packed, "Q4_blk.0.attn_qkv_packed")
+            self.assertEqual(policy.implementation(rows), "gemv" if rows <= 8 else "tensor_core")
+            self.assertEqual(policy.implementation(rows, True), "tensor_core")
+        del buffers[policy.signs]
+        with self.assertRaisesRegex(ValueError, "operand"):
+            projection_policies(buffers)
+
+    def test_exact_a8_is_not_restricted_to_a_named_single_program(self):
+        for rows in (1, 2, 3, 4, 5, 8):
+            self.assertEqual(expert_implementation(rows, 64, nibble_book=True), "exact_a8")
+            self.assertEqual(expert_implementation(rows, 64, nibble_book=False), "int8")
+            self.assertEqual(expert_implementation(rows, 128, nibble_book=True), "int8")
+        self.assertEqual(expert_implementation(16, 64, nibble_book=True), "int8")
+
     def test_single_token_uses_register_mma_and_exact_sign_table(self):
         config = expert_tile_config(1)
         self.assertEqual(config["block_m"], 8)

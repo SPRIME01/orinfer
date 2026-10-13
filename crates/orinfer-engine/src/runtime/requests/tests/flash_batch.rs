@@ -8,6 +8,7 @@ fn validate_flash_decode_batches() {
     ))
     .unwrap();
     assert!(!fixture.output.exists());
+    assert!((4..=64).contains(&fixture.numerical_tokens));
     let mut model = ModelRuntime::load_with_options(
         &fixture.model,
         LoadOptions {
@@ -140,7 +141,10 @@ fn validate_flash_decode_batches() {
         eprintln!("Numerical batch {count}: admitting and prefilling");
         let mut requests = vec![];
         for i in 0..count {
-            let item = input(&fixture.cases[i % fixture.cases.len()], 4);
+            let item = input(
+                &fixture.cases[i % fixture.cases.len()],
+                fixture.numerical_tokens,
+            );
             if !model.can_admit_request(&item, &options).unwrap() {
                 break;
             }
@@ -198,7 +202,13 @@ fn validate_flash_decode_batches() {
         }
         for i in 0..count {
             let mut baseline = model
-                .start_request(input(&fixture.cases[i % fixture.cases.len()], 4), &|| false)
+                .start_request(
+                    input(
+                        &fixture.cases[i % fixture.cases.len()],
+                        fixture.numerical_tokens,
+                    ),
+                    &|| false,
+                )
                 .unwrap();
             while baseline.prefilling {
                 model
@@ -208,11 +218,17 @@ fn validate_flash_decode_batches() {
             let mut kl = 0.;
             let mut nll_delta = 0.;
             let mut top3 = 0;
+            let mut max_kl: f64 = 0.;
+            let mut max_nll_delta: f64 = 0.;
             for (step, &token) in outputs[i].iter().enumerate() {
                 let b = distribution(&mut model, &mut baseline);
                 let a = &scores[i][step];
-                kl += b.iter().zip(a).map(|(b, a)| b.exp() * (b - a)).sum::<f64>();
-                nll_delta += b[token as usize] - a[token as usize];
+                let step_kl = b.iter().zip(a).map(|(b, a)| b.exp() * (b - a)).sum::<f64>();
+                let step_delta = b[token as usize] - a[token as usize];
+                kl += step_kl;
+                nll_delta += step_delta;
+                max_kl = max_kl.max(step_kl);
+                max_nll_delta = max_nll_delta.max(step_delta.abs());
                 let mut ranked: Vec<_> = b.iter().enumerate().collect();
                 ranked.select_nth_unstable_by(3, |a, b| b.1.total_cmp(a.1));
                 top3 += usize::from(ranked[..3].iter().any(|(id, _)| *id == token as usize));
@@ -230,10 +246,10 @@ fn validate_flash_decode_batches() {
             }
             model.finish_request(&mut baseline, false).unwrap();
             let n = outputs[i].len() as f64;
-            let row = json!({"batch":count,"lane":i,"case":i % fixture.cases.len(),"same_history_mean_kl":kl/n,"mean_nll_delta":nll_delta/n,"selected_in_reference_top3":top3 as f64/n,"tokens":outputs[i]});
+            let row = json!({"batch":count,"lane":i,"case":i % fixture.cases.len(),"same_history_mean_kl":kl/n,"mean_nll_delta":nll_delta/n,"max_kl":max_kl,"max_abs_nll_delta":max_nll_delta,"selected_in_reference_top3":top3 as f64/n,"tokens":outputs[i]});
             eprintln!("{row}");
             assert!(
-                kl / n < 0.05 && (nll_delta / n).abs() < 0.1,
+                max_kl.is_finite() && max_kl < 0.05 && max_nll_delta < 0.1,
                 "Batch changed target distribution: {row}"
             );
             rows.push(row);
@@ -310,7 +326,7 @@ fn validate_flash_decode_batches() {
     std::fs::write(fixture.output,serde_json::to_vec_pretty(&json!({"cases":rows,"cancel_reuse_state_equal":true,"batch_to_mtp":mtp_tested,"mtp_scheduler":mtp_statistics,"scheduler":model.scheduling_statistics()})).unwrap()).unwrap();
 }
 
-fn distribution(model: &mut ModelRuntime, request: &mut RequestState) -> Vec<f64> {
+pub(super) fn distribution(model: &mut ModelRuntime, request: &mut RequestState) -> Vec<f64> {
     let raw = model
         .with_request(request, |m, _| {
             m.execution

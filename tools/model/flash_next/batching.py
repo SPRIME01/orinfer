@@ -445,6 +445,9 @@ def upgrade(model, destination, output):
         {k: v for k, v in b.items() if k != "data"} for b in metadata["buffers"]
     ]
     from tools.model.package import model_library
+    from tools.model.flash_next.lowering import lower
+
+    lower(data, package, operator, output)
 
     library = model_library()
     path = operator / "lib/model.so"
@@ -463,7 +466,12 @@ def upgrade(model, destination, output):
     )
     registered = json.loads((output / "registered-plan.json").read_text())["manifest"]["programs"]
     for name, ops in programs.items():
-        if registered.get(name) != ops:
+        lowered = [
+            op
+            for op in registered.get(name, [])
+            if not op.get("name", "").endswith(("/q4_rotation", "/a8_split"))
+        ]
+        if lowered != ops:
             raise ValueError(f"Registered Flash batch stage differs from export: {name}")
 
 
