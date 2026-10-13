@@ -132,6 +132,7 @@ pub(crate) struct Session {
     pub(crate) buffers: Vec<u64>,
     pub(crate) virtual_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) expert_buffers: std::cell::RefCell<virtual_memory::Reservations>,
+    pub(crate) prefix_buffers: std::cell::RefCell<virtual_memory::Reservations>,
     pub(crate) modules: std::cell::RefCell<Vec<sys::CUmodule>>,
     pub(crate) events: Vec<sys::CUevent>,
     pub(crate) graph: sys::CUgraph,
@@ -152,6 +153,7 @@ impl Session {
             buffers: vec![],
             virtual_buffers: Default::default(),
             expert_buffers: Default::default(),
+            prefix_buffers: Default::default(),
             modules: Default::default(),
             events: vec![],
             graph: ptr::null_mut(),
@@ -212,6 +214,7 @@ impl Session {
             for (_, mut buffer) in std::mem::take(self.virtual_buffers.get_mut())
                 .into_iter()
                 .chain(std::mem::take(self.expert_buffers.get_mut()))
+                .chain(std::mem::take(self.prefix_buffers.get_mut()))
             {
                 if let Err(e) = buffer.release_slabs(&self.driver) {
                     eprintln!("CUDA KV cleanup: {e}");

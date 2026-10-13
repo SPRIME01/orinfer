@@ -321,6 +321,377 @@ fn distribution(model: &mut ModelRuntime, request: &mut RequestState) -> Vec<f64
 }
 
 #[test]
+#[ignore = "Requires native batched verification package and exclusive GPU lock"]
+fn validate_flash_batched_verification() {
+    use super::super::speculation::Preparation;
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !model
+            .manifest
+            .mtp
+            .as_ref()
+            .unwrap()
+            .batch_verification_tokens
+            .is_empty()
+    );
+    let spec = model.manifest.mtp.as_ref().unwrap().clone();
+    let options = scheduler::Options::default();
+    let mut results = vec![];
+    for count in [2, 4, 8, 2, 4, 8] {
+        let inputs = |lane| {
+            let mut request = input(&fixture.cases[lane % fixture.cases.len()], 32);
+            request.input_tokens.push((32 + lane) as u32);
+            request
+        };
+        let mut references = vec![];
+        let mut candidates = vec![];
+        for lane in 0..count {
+            let mut request = model.start_request(inputs(lane), &|| false).unwrap();
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &options)
+                    .unwrap();
+            }
+            let Preparation::Round(round) = model
+                .with_request(&mut request, |m, r| m.prepare_speculative_round(r, 4))
+                .unwrap()
+            else {
+                panic!("Expected initialized MTP round")
+            };
+            candidates.push(round.verification.clone());
+            model
+                .with_request(&mut request, |m, r| m.verify_single_round(r, &round))
+                .unwrap();
+            let raw = model
+                .with_request(&mut request, |m, _| {
+                    m.execution
+                        .download_bytes(&spec.verification_logits, 4 * m.manifest.vocab * 4)
+                })
+                .unwrap();
+            let scores: Vec<_> = floats(&raw, crate::artifact::Dtype::F32)
+                .chunks_exact(model.manifest.vocab)
+                .map(log_probabilities)
+                .collect();
+            references.push(scores);
+            model
+                .with_request(&mut request, |m, r| m.commit_verified_round(r, round))
+                .unwrap();
+            model.finish_request(&mut request, false).unwrap();
+        }
+        let mut requests = vec![];
+        let mut rounds = vec![];
+        for (lane, candidate) in candidates.iter().enumerate() {
+            let mut request = model.start_request(inputs(lane), &|| false).unwrap();
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &options)
+                    .unwrap();
+            }
+            let Preparation::Round(round) = model
+                .with_request(&mut request, |m, r| m.prepare_speculative_round(r, 4))
+                .unwrap()
+            else {
+                panic!("Expected MTP round")
+            };
+            assert_eq!(&round.verification, candidate);
+            model
+                .execution
+                .ensure_sequence_program(request.slot, &round.plan.program)
+                .unwrap();
+            model
+                .upload_ids(&model.manifest.input, &round.verification)
+                .unwrap();
+            model
+                .prepare_inputs(
+                    &round.verification,
+                    &request.history[..request.history.len() - 1],
+                )
+                .unwrap();
+            model.upload_segment_controls(4).unwrap();
+            rounds.push(round);
+            requests.push(request);
+        }
+        let segments: Vec<_> = requests
+            .iter()
+            .map(|r| BatchSegment {
+                slot: r.slot,
+                tokens: 4,
+            })
+            .collect();
+        let (plan, bindings) = model
+            .model_package
+            .batch_operation(
+                &segments,
+                orinfer_model_sdk::abi::BatchOperation::Verification,
+                true,
+            )
+            .unwrap();
+        assert!(bindings.is_empty());
+        let at = Instant::now();
+        model
+            .execution
+            .execute_batch_operation(
+                orinfer_model_sdk::abi::BatchOperation::Verification,
+                segments.iter().map(|s| (s.slot, s.tokens)).collect(),
+                &plan,
+                true,
+                true,
+            )
+            .unwrap();
+        let seconds = at.elapsed().as_secs_f64();
+        let mut metrics = vec![];
+        for (lane, round) in rounds.into_iter().enumerate() {
+            let raw = model
+                .with_request(&mut requests[lane], |m, _| {
+                    m.execution
+                        .download_bytes(&spec.verification_logits, 4 * m.manifest.vocab * 4)
+                })
+                .unwrap();
+            for (row, actual) in floats(&raw, crate::artifact::Dtype::F32)
+                .chunks_exact(model.manifest.vocab)
+                .map(log_probabilities)
+                .enumerate()
+            {
+                let reference = &references[lane][row];
+                let kl: f64 = reference
+                    .iter()
+                    .zip(&actual)
+                    .map(|(p, q)| p.exp() * (p - q))
+                    .sum();
+                let token = actual
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0;
+                let higher = reference.iter().filter(|&&p| p > reference[token]).count();
+                let delta = reference[token] - actual[token];
+                assert!(
+                    kl.is_finite() && kl < 0.05 && higher < 3,
+                    "Batch {count}, lane {lane}, row {row}: KL {kl}, selected rank {higher}"
+                );
+                metrics.push(json!({"lane":lane,"row":row,"kl":kl,"nll_delta":delta,"top3":true}));
+            }
+            let output = model
+                .with_request(&mut requests[lane], |m, r| {
+                    m.commit_verified_round(r, round)
+                })
+                .unwrap();
+            assert!(!output.is_empty());
+            assert_eq!(
+                model
+                    .with_request(&mut requests[lane], |m, _| Ok(m
+                        .read_control(&m.manifest.position)?
+                        as usize))
+                    .unwrap(),
+                requests[lane].input.len() + requests[lane].generated - 1
+            );
+            while !requests[lane].is_finished() {
+                model
+                    .advance_requests(&mut [&mut requests[lane]], &options)
+                    .unwrap();
+            }
+            assert!(requests[lane].failure().is_none());
+            model.finish_request(&mut requests[lane], false).unwrap();
+        }
+        eprintln!("batched verification {count}: {seconds:.6}s");
+        results.push(json!({"requests":count,"verification_s":seconds,"metrics":metrics}));
+    }
+    model.execution.reclaim_idle_graphs().unwrap();
+    model.execution.reclaim_idle_state().unwrap();
+    assert!(model.reserved_requests.is_empty());
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({"seed":20261002,"cases":results})).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "Requires native Flash mixed package and exclusive GPU experiment lock"]
+fn validate_flash_mixed_decoder_groups() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = scheduler::Options::default();
+    let mut rows = vec![];
+    let collect = std::env::var_os("ORINFER_COLLECT_MIXED_REFERENCE").is_some();
+    let paired: Option<Vec<Vec<Vec<f64>>>> = std::env::var_os("ORINFER_MIXED_REFERENCE")
+        .map(|path| crate::model::read(&PathBuf::from(path)).unwrap());
+    let mut distributions = vec![];
+    let mut cases = vec![
+        (2, 128),
+        (3, 128),
+        (4, 128),
+        (8, 128),
+        (2, 512),
+        (3, 512),
+        (4, 512),
+        (8, 512),
+        (2, 128),
+        (3, 128),
+        (4, 128),
+        (8, 128),
+    ];
+    let shared_graphs = fixture.cuda_graph == "full";
+    if shared_graphs {
+        cases.push((2, 128));
+    }
+    for (count, chunk) in cases {
+        // Retain spare leases on repeated geometries so the stateless pieces
+        // must survive a real membership change instead of reusing a slot graph.
+        let mut spare = vec![];
+        if shared_graphs && rows.len() >= 8 {
+            for _ in 0..(rows.len() - 7) {
+                spare.push(
+                    model
+                        .start_request(input(&fixture.cases[0], 1), &|| false)
+                        .unwrap(),
+                );
+            }
+        }
+        let request_input = |lane| {
+            let mut request = input(&fixture.cases[0], 4);
+            // Distinct histories expose state-table aliasing across lanes.
+            request.input_tokens.push(32 + lane as u32);
+            request
+        };
+        let mut reference = vec![];
+        for lane in 0..count {
+            let mut request = model.start_request(request_input(lane), &|| false).unwrap();
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &options)
+                    .unwrap();
+            }
+            model
+                .advance_requests(&mut [&mut request], &options)
+                .unwrap();
+            reference.push(distribution(&mut model, &mut request));
+            model.finish_request(&mut request, false).unwrap();
+        }
+        let mut requests = vec![];
+        for lane in 0..count {
+            let mut request = model.start_request(request_input(lane), &|| false).unwrap();
+            while request.prefilling {
+                model
+                    .advance_requests(&mut [&mut request], &options)
+                    .unwrap();
+            }
+            requests.push(request);
+        }
+        requests.push(
+            model
+                .start_request(input(&fixture.cases[1], 4), &|| false)
+                .unwrap(),
+        );
+        let selected: Vec<_> = (0..count)
+            .map(|i| (i, 1))
+            .chain(std::iter::once((count, chunk)))
+            .collect();
+        let mut output = vec![];
+        let at = Instant::now();
+        model
+            .execute_selected(
+                &mut requests.iter_mut().collect::<Vec<_>>(),
+                &selected,
+                &mut output,
+            )
+            .unwrap();
+        let elapsed = at.elapsed().as_secs_f64();
+        assert_eq!(requests[count].offset, chunk);
+        let mut scores = vec![];
+        let mut group_distributions = vec![];
+        for (lane, baseline) in reference.iter().enumerate() {
+            assert!(output.iter().any(|s| s.request == lane));
+            let actual = distribution(&mut model, &mut requests[lane]);
+            let baseline = paired
+                .as_ref()
+                .map_or(baseline, |r| &r[rows.len() % r.len()][lane]);
+            let kl: f64 = baseline
+                .iter()
+                .zip(&actual)
+                .map(|(b, a)| b.exp() * (b - a))
+                .sum();
+            let token = *requests[lane].history.last().unwrap() as usize;
+            let delta = baseline[token] - actual[token];
+            assert!(
+                collect || (kl.is_finite() && kl < 0.05 && delta.abs() < 0.1),
+                "Group {count}, chunk {chunk}, lane {lane}: KL {kl}, NLL delta {delta}"
+            );
+            scores.push(json!({"lane":lane,"same_history_kl":kl,"nll_delta":delta}));
+            group_distributions.push(actual);
+        }
+        let row = json!({"decoders":count,"chunk":chunk,"mixed_s":elapsed,"scores":scores});
+        eprintln!("mixed decoder group {row}");
+        rows.push(row);
+        distributions.push(group_distributions);
+        model.finish_request(&mut requests[count], false).unwrap();
+        for request in &mut requests[..count] {
+            while !request.is_finished() {
+                model.advance_requests(&mut [request], &options).unwrap();
+            }
+            assert!(request.failure().is_none());
+            model.finish_request(request, false).unwrap();
+        }
+        for request in &mut spare {
+            model.finish_request(request, false).unwrap();
+        }
+    }
+    if shared_graphs {
+        let stats = model.execution.batch_statistics.get();
+        assert!(
+            stats.shared_graph_captures > 0 && stats.shared_graph_hits > 0,
+            "Shared pieces must replay across membership changes: {stats:?}"
+        );
+    }
+    model.execution.reclaim_idle_graphs().unwrap();
+    model.execution.reclaim_idle_state().unwrap();
+    assert!(model.reserved_requests.is_empty());
+    if collect {
+        std::fs::write(
+            fixture.output.with_extension("distributions.json"),
+            serde_json::to_vec(&distributions).unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(
+            &json!({"seed":20261002,"cases":rows,"cancellation_passed":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires native Flash mixed package and exclusive GPU experiment lock"]
 fn validate_flash_mixed_segments() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(

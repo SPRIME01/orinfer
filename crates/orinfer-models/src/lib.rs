@@ -65,6 +65,15 @@ impl ModelImplementation for Models {
     ) -> artifact::Result<abi::BatchPlan> {
         self.adapter.batch(segments, include_plan)
     }
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+        include_plan: bool,
+    ) -> artifact::Result<abi::BatchPlan> {
+        self.adapter
+            .batch_operation(segments, operation, include_plan)
+    }
     fn visual(
         &self,
         tokens: &[u32],

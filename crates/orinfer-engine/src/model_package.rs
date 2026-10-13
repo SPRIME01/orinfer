@@ -36,6 +36,13 @@ struct Header {
 type BindingCache = std::cell::RefCell<
     std::collections::VecDeque<(Vec<(usize, usize)>, std::rc::Rc<abi::StateBindings>)>,
 >;
+type CachedBatch = (
+    std::rc::Rc<Vec<Invocation>>,
+    std::rc::Rc<abi::StateBindings>,
+);
+type PlanCache = std::cell::RefCell<
+    std::collections::VecDeque<(abi::BatchOperation, Vec<(usize, usize)>, CachedBatch, usize)>,
+>;
 
 pub(crate) struct ModelPackage {
     handle: *mut c_void,
@@ -45,6 +52,8 @@ pub(crate) struct ModelPackage {
     // Retain code until the opaque model and all of its buffers are destroyed.
     _library: Library,
     bindings: BindingCache,
+    batch_plans: PlanCache,
+    kernel_buffers: BTreeMap<String, Vec<String>>,
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
@@ -82,6 +91,8 @@ impl ModelPackage {
             plan_contracts: Default::default(),
             _library: library,
             bindings: Default::default(),
+            batch_plans: Default::default(),
+            kernel_buffers: Default::default(),
         })
     }
     fn describe(&self) -> Result<abi::PackageInfo> {
@@ -170,6 +181,20 @@ impl ModelPackage {
             serde_json::from_slice(&bytes).map_err(|e| format!("Model plan: {e}"))?;
         if let Some(catalog) = &request.catalog {
             model.export_execution(catalog, &mut plan.metadata)?;
+        }
+        for kernel in &plan.metadata.kernels {
+            let mut buffers: Vec<_> = kernel
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    crate::artifact::Argument::Buffer { name }
+                    | crate::artifact::Argument::BufferSlice { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            buffers.sort_unstable();
+            buffers.dedup();
+            model.kernel_buffers.insert(kernel.name.clone(), buffers);
         }
         Ok((model, plan))
     }
@@ -447,13 +472,76 @@ impl ModelPackage {
         result
     }
     pub(crate) fn batch_plan(&self, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
-        self.batch(segments, true).map(|(plan, _)| plan)
+        self.cached_batch(segments, abi::BatchOperation::Ordinary)
+            .map(|(plan, _)| (*plan).clone())
+    }
+    pub(crate) fn cached_batch(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+    ) -> Result<CachedBatch> {
+        let key: Vec<_> = segments.iter().map(|s| (s.slot, s.tokens)).collect();
+        let mut cache = self.batch_plans.borrow_mut();
+        if let Some(index) = cache
+            .iter()
+            .position(|(kind, k, _, _)| *kind == operation && *k == key)
+        {
+            let entry = cache.remove(index).expect("cached batch plan");
+            let result = entry.2.clone();
+            cache.push_back(entry);
+            return Ok(result);
+        }
+        let (plan, bindings) = self.batch_operation(segments, operation, true)?;
+        let bytes: usize = plan
+            .iter()
+            .map(|op| {
+                let strings = match &op.operation {
+                    Operation::Kernel { name } => name.len(),
+                    Operation::Copy {
+                        source,
+                        destination,
+                        ..
+                    } => source.len() + destination.len(),
+                    Operation::Zero { destination, .. } => destination.len(),
+                };
+                std::mem::size_of::<Invocation>()
+                    + strings
+                    + op.views
+                        .iter()
+                        .map(|(name, view)| {
+                            std::mem::size_of::<(String, BufferView)>()
+                                + 32
+                                + name.len()
+                                + view.buffer.len()
+                        })
+                        .sum::<usize>()
+            })
+            .sum();
+        let result = (std::rc::Rc::new(plan), std::rc::Rc::new(bindings));
+        const BUDGET: usize = 16 << 20;
+        if bytes <= BUDGET {
+            while cache.len() >= 32
+                || cache.iter().map(|(_, _, _, bytes)| bytes).sum::<usize>() + bytes > BUDGET
+            {
+                cache.pop_front();
+            }
+            cache.push_back((operation, key, result.clone(), bytes));
+        }
+        Ok(result)
     }
     pub(crate) fn state_bindings(
         &self,
         segments: &[BatchSegment],
     ) -> Result<std::rc::Rc<abi::StateBindings>> {
         let key: Vec<_> = segments.iter().map(|s| (s.slot, s.tokens)).collect();
+        if let Some((_, _, (_, bindings), _)) = self
+            .batch_plans
+            .borrow()
+            .iter()
+            .find(|(kind, k, _, _)| *kind == abi::BatchOperation::Ordinary && *k == key)
+        {
+            return Ok(std::rc::Rc::clone(bindings));
+        }
         let mut cache = self.bindings.borrow_mut();
         if let Some(index) = cache.iter().position(|(k, _)| k == &key) {
             let entry = cache.remove(index).expect("existing bindings");
@@ -469,6 +557,14 @@ impl ModelPackage {
         Ok(bindings)
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
+        self.batch_operation(segments, abi::BatchOperation::Ordinary, include_plan)
+    }
+    pub(crate) fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+        include_plan: bool,
+    ) -> Result<abi::BatchPlan> {
         let mut output = BatchOutput::default();
         let mut error = OwnedBytes::default();
         // SAFETY: this live model and borrowed segments are retained for the call.
@@ -477,7 +573,7 @@ impl ModelPackage {
                 self.handle,
                 segments.as_ptr(),
                 segments.len(),
-                u32::from(include_plan),
+                ((operation as u32) << 1) | u32::from(include_plan),
                 &mut output,
                 &mut error,
             )
@@ -489,7 +585,7 @@ impl ModelPackage {
                 String::from_utf8_lossy(&message)
             ))
         } else {
-            Self::decode_batch(&output)
+            self.decode_batch(&output)
         };
         // SAFETY: output belongs to this library and is released exactly once.
         unsafe {
@@ -497,7 +593,7 @@ impl ModelPackage {
         }
         result
     }
-    fn decode_batch(output: &BatchOutput) -> Result<abi::BatchPlan> {
+    fn decode_batch(&self, output: &BatchOutput) -> Result<abi::BatchPlan> {
         let mut plan = vec![];
         for command in span(output.commands, output.command_count, 1_000_000)? {
             let operation = match command.kind {
@@ -516,18 +612,37 @@ impl ModelPackage {
                 _ => return Err("Unknown model package command".into()),
             };
             let mut views = BTreeMap::new();
+            let mut seen = std::collections::BTreeSet::new();
             for view in span(command.views, command.view_count, 256)? {
-                if views
-                    .insert(
-                        string(view.name)?,
+                let name = borrowed_string(view.name)?;
+                let buffer = borrowed_string(view.buffer)?;
+                if !seen.insert(name) {
+                    return Err("Duplicate model package buffer view".into());
+                }
+                // Adapters may give a whole boundary table to each operation.
+                // Retain only its actual operands, including slices and copies.
+                // This avoids cloning thousands of irrelevant view strings and
+                // makes complete mixed/MTP plans fit the bounded CPU cache.
+                let needed = match &operation {
+                    Operation::Kernel { name: kernel } => self
+                        .kernel_buffers
+                        .get(kernel)
+                        .is_none_or(|args| args.binary_search_by(|a| a.as_str().cmp(name)).is_ok()),
+                    Operation::Copy {
+                        source,
+                        destination,
+                        ..
+                    } => name == source || name == destination,
+                    Operation::Zero { destination, .. } => name == destination,
+                };
+                if needed {
+                    views.insert(
+                        name.to_owned(),
                         BufferView {
-                            buffer: string(view.buffer)?,
+                            buffer: buffer.to_owned(),
                             offset: view.offset,
                         },
-                    )
-                    .is_some()
-                {
-                    return Err("Duplicate model package buffer view".into());
+                    );
                 }
             }
             let launch = match command.has_launch {
@@ -574,9 +689,10 @@ fn span<'a, T>(data: *const T, len: usize, limit: usize) -> Result<&'a [T]> {
     Ok(unsafe { slice::from_raw_parts(data, len) })
 }
 fn string(value: Bytes) -> Result<String> {
-    std::str::from_utf8(span(value.data, value.len, 65536)?)
-        .map(str::to_owned)
-        .map_err(|e| e.to_string())
+    borrowed_string(value).map(str::to_owned)
+}
+fn borrowed_string<'a>(value: Bytes) -> Result<&'a str> {
+    std::str::from_utf8(span(value.data, value.len, 65536)?).map_err(|e| e.to_string())
 }
 impl Drop for ModelPackage {
     fn drop(&mut self) {
@@ -647,6 +763,98 @@ mod tests {
                 prefill_profiles: vec![],
             },
         )
+    }
+    #[test]
+    fn batch_views_keep_only_operands_and_still_reject_unused_duplicates() {
+        let (root, spec, request) = fixture();
+        let (mut model, _) = ModelPackage::create(&root, &spec, request).unwrap();
+        model
+            .kernel_buffers
+            .insert("projection".into(), vec!["Input".into()]);
+        let bytes = |s: &'static str| Bytes {
+            data: s.as_ptr(),
+            len: s.len(),
+        };
+        let views = [
+            abi::View {
+                name: bytes("Input"),
+                buffer: bytes("Scratch"),
+                offset: 128,
+            },
+            abi::View {
+                name: bytes("Unused"),
+                buffer: bytes("Other"),
+                offset: 0,
+            },
+            abi::View {
+                name: bytes("Unused"),
+                buffer: bytes("Other"),
+                offset: 0,
+            },
+        ];
+        let mut command = abi::Command {
+            kind: 0,
+            name: bytes("projection"),
+            destination: bytes(""),
+            bytes: 0,
+            sequence: usize::MAX,
+            has_launch: 0,
+            grid: [0; 3],
+            arguments: ptr::null(),
+            argument_count: 0,
+            views: views.as_ptr(),
+            view_count: 2,
+        };
+        let decode = |command: &abi::Command| {
+            model.decode_batch(&BatchOutput {
+                owner: ptr::null_mut(),
+                commands: command,
+                command_count: 1,
+                bindings: ptr::null(),
+                binding_count: 0,
+            })
+        };
+        let plan = decode(&command).unwrap().0;
+        assert_eq!(plan[0].views.len(), 1);
+        assert_eq!(plan[0].views["Input"].offset, 128);
+        command.kind = 1;
+        command.name = bytes("Unused");
+        command.destination = bytes("Input");
+        assert_eq!(decode(&command).unwrap().0[0].views.len(), 2);
+        command.view_count = 3;
+        assert!(decode(&command).is_err());
+    }
+    #[test]
+    fn cached_batch_retains_owned_plans_and_isolates_phases_and_membership() {
+        let (root, spec, request) = fixture();
+        let (model, _) = ModelPackage::create(&root, &spec, request).unwrap();
+        let segments = [
+            BatchSegment { slot: 0, tokens: 2 },
+            BatchSegment { slot: 3, tokens: 2 },
+        ];
+        let (a, _) = model
+            .cached_batch(&segments, abi::BatchOperation::Ordinary)
+            .unwrap();
+        let (b, _) = model
+            .cached_batch(&segments, abi::BatchOperation::Ordinary)
+            .unwrap();
+        assert!(std::rc::Rc::ptr_eq(&a, &b));
+        let (verify, _) = model
+            .cached_batch(&segments, abi::BatchOperation::Verification)
+            .unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&a, &verify));
+        let (changed, _) = model
+            .cached_batch(
+                &[BatchSegment { slot: 1, tokens: 2 }],
+                abi::BatchOperation::Ordinary,
+            )
+            .unwrap();
+        assert!(!std::rc::Rc::ptr_eq(&a, &changed));
+        drop(model);
+        // Data outlives the native output owner, free callback and library.
+        assert_eq!(a[0].sequence, Some(7));
+        assert_eq!(a[0].views["Input"].offset, 128);
+        assert_eq!(a[0].launch.as_ref().unwrap().arguments, [(2, 3)]);
     }
     #[test]
     fn native_bulk_export_preserves_parameter_bits_and_program_commands() {

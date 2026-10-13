@@ -182,6 +182,7 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             .retain(|name| !draft_kv.contains(name));
     }
     let mut disabled = BTreeSet::from([spec.draft_program]);
+    disabled.extend(spec.batch_programs);
     disabled.extend(spec.draft_snapshot_program);
     disabled.extend(spec.draft_restore_program);
     for p in spec.warm_plans {

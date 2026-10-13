@@ -141,13 +141,15 @@ pub fn select_waiting(requests: &[Waiting]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-/// EWMA plus an error allowance, rather than treating a mean as a deadline
-/// guarantee. Invalid measurements never poison subsequent scheduling.
+/// EWMA plus a rolling positive-residual P95 allowance. This is a soft deadline
+/// estimate, not a guarantee; invalid measurements never poison later decisions.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Estimate {
     pub mean: f64,
     error: f64,
     pub samples: usize,
+    residuals: [f64; 32],
+    residual_cursor: usize,
 }
 impl Estimate {
     pub fn observe(&mut self, seconds: f64) {
@@ -157,13 +159,24 @@ impl Estimate {
         if self.samples == 0 {
             self.mean = seconds;
         } else {
+            self.residuals[self.residual_cursor % self.residuals.len()] =
+                (seconds - self.mean).max(0.);
+            self.residual_cursor += 1;
             self.error = self.error * 0.8 + (seconds - self.mean).abs() * 0.2;
             self.mean = self.mean * 0.8 + seconds * 0.2;
         }
         self.samples += 1;
     }
     pub fn upper(self) -> f64 {
-        self.mean + 2. * self.error
+        let count = self.residual_cursor.min(self.residuals.len());
+        let percentile = if count == 0 {
+            0.
+        } else {
+            let mut values = self.residuals;
+            values[..count].sort_unstable_by(f64::total_cmp);
+            values[(count * 95).div_ceil(100).saturating_sub(1)]
+        };
+        self.mean + (2. * self.error).max(percentile)
     }
 }
 
@@ -219,6 +232,8 @@ pub struct BatchExecutionStatistics {
     pub graph_misses: usize,
     pub graph_evictions: usize,
     pub graph_invalidations: usize,
+    pub shared_graph_hits: usize,
+    pub shared_graph_captures: usize,
     pub captured_operations: usize,
     pub capture_s: f64,
     pub eviction_s: f64,
@@ -368,6 +383,24 @@ mod tests {
             ..Default::default()
         };
         assert!(options.validate().is_err());
+    }
+    #[test]
+    fn tail_margin_remembers_stalls_and_expires_after_a_bounded_window() {
+        let mut estimate = Estimate::default();
+        for _ in 0..40 {
+            estimate.observe(0.1);
+        }
+        estimate.observe(0.9);
+        estimate.observe(0.9);
+        for _ in 0..12 {
+            estimate.observe(0.1);
+        }
+        assert!(estimate.upper() > 0.65);
+        for _ in 0..40 {
+            estimate.observe(0.1);
+        }
+        assert!(estimate.upper() < 0.11);
+        assert_eq!(estimate.residuals.len(), 32);
     }
     #[test]
     fn queue_locality_never_crosses_image_identity_or_model_owners() {

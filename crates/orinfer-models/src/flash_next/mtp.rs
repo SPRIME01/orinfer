@@ -6,7 +6,12 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
-fn verification_layer(program: &str, layer: usize, tokens: usize) -> Vec<Operation> {
+fn verification_layer(program: &str, layer: usize, tokens: usize, shared: bool) -> Vec<Operation> {
+    let saved = if shared {
+        "VerifyShared".into()
+    } else {
+        format!("VerifyM{tokens}")
+    };
     let count = match layer {
         0 => 44,
         1 => 53,
@@ -26,12 +31,12 @@ fn verification_layer(program: &str, layer: usize, tokens: usize) -> Vec<Operati
                     )),
                     n if n == history + 2 => Some((
                         format!("VerifyM{tokens}_Keys"),
-                        format!("VerifyM{tokens}_Saved_{layer}_gdn_K"),
+                        format!("{saved}_Saved_{layer}_gdn_K"),
                         tokens * 16 * 128 * 2,
                     )),
                     n if n == history + 3 => Some((
                         format!("VerifyM{tokens}_Gates"),
-                        format!("VerifyM{tokens}_Saved_{layer}_gdn_G"),
+                        format!("{saved}_Saved_{layer}_gdn_G"),
                         tokens * 48 * 4,
                     )),
                     _ => None,
@@ -132,7 +137,12 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         );
         let mut commit = vec![];
         for layer in 0..48 {
-            ops.extend(verification_layer(&program, layer, p.tokens));
+            ops.extend(verification_layer(
+                &program,
+                layer,
+                p.tokens,
+                spec.shared_verification_state,
+            ));
             commit.extend(section(
                 &restore,
                 &format!("layer{layer}"),
@@ -219,5 +229,5 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 .collect(),
         },
     );
-    Ok(())
+    super::draft_batch::register(manifest)
 }

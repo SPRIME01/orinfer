@@ -187,3 +187,21 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_hc.py artifacts/flash-m
 混合片段支持 16、128、512 token，拼接容量最高 1024 行；独立长 prefill 继续使用原有 2048/4096 档。BF16 HC 操作数在矩阵乘法前准备，保留原来的 FP16 舍入边界。kernel 首次装载、graph capture 和 prefill 完成时的 head/cache/MTP 预热分别计时，避免影响后续普通批次的耗时预测；请求总时延仍包含这些开销。
 
 Orin 上可用 `--prefill-budget-ms 350 --target-tpot-ms 400` 起步调优。350 ms 是混合批次的预测预算，400 ms 是 decode 间隔的软目标；首次加载算子仍可能超过目标。MTP 验证继续使用现有独立执行计划，普通 decode 可与 prefill 合并。
+
+
+### 批量 MTP
+
+在已经具备混合 HC 和私有地址表的包上增加共享目标验证，再增加独立草稿与接受后的批量预热：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/mixed_verify.py artifacts/flash-verify-build \
+  --model /path/to/flash-mixed-hc --model-output artifacts/models/flash-verify
+bash tools/operators/run.sh tools/model/flash_next/mixed_draft.py artifacts/flash-draft-build \
+  --model artifacts/models/flash-verify --model-output artifacts/models/flash-draft
+```
+
+共享验证支持每请求 2–8 行，保留每个候选位置的 logits 和精确提交因子。草稿共享 2/4/8 行的投影、HC、专家与 Q4 输出头；QSA、KV、索引和 pending 保持请求私有。接受后按真实的整段移位 token 拼接预热，单个包最多 8 行，只为每个请求的端点计算草稿头。CLI 对 2–8 个 decoder 按完整轮次成本自适应选择，其他配置仍可使用普通 target batch。
+
+新增的 CUDA 编译只包含因子保存和完整行 Q4 草稿头等必要 kernel，其余复用现有 cubin。权重不重新量化；新增执行逻辑需要重建原生库、校验完整计划并重新进行 GPU/CLI 验收。程序声明属于模型包，关闭 MTP 时一并移除其专用 batch 程序。在线格式和 C ABI 表保持版本 1。
+
+各验证宽度的临时 prefix/提交因子在同一请求内复用最大容量，不共享请求之间的状态；验证和接受提交完成后才复用。当前布局由每请求 115.07 MiB 降为 26.30 MiB，不改变原 kernel 的形状、索引或复制长度。

@@ -6,6 +6,15 @@
 #include <stdint.h>
 #define ORINFER_MODEL_ABI 1
 #define ORINFER_RUNTIME_ABI 1
+/* batch flags: low bit exports the plan; upper bits select the operation.
+ * Ordinary values 0/1 retain their original meaning. Unsupported phases fail. */
+#define ORINFER_BATCH_INCLUDE_PLAN 1
+#define ORINFER_BATCH_ORDINARY 0
+#define ORINFER_BATCH_VERIFICATION 2
+#define ORINFER_BATCH_DRAFT 4
+#define ORINFER_BATCH_COMMIT 6
+#define ORINFER_BATCH_WARM 8
+#define ORINFER_BATCH_DRAFT_HEAD 10
 typedef struct { const uint8_t *data; size_t len; } OrinferBytes;
 typedef struct { uint8_t *data; size_t len; } OrinferOwnedBytes;
 typedef struct { size_t slot, tokens; } OrinferSegment;

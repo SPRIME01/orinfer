@@ -194,7 +194,8 @@ pub(super) fn state_bindings(
     }
     if segments.iter().any(|s| s.tokens != 1) {
         super::mixed::validate_segments(m, segments)?;
-        return Ok(vec![]);
+        let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
+        return state_bindings(m, &decoders);
     }
     if segments.len() > 128
         || segments
@@ -613,14 +614,152 @@ mod tests {
                 assert_eq!(private.sequence, Some(segment.slot));
                 assert_eq!(
                     private.views["FlashMixedResidual"].offset,
-                    if segment.slot == 7 { 0 } else { 128 * 20480 }
+                    if segment.slot == 7 { 20480 } else { 0 }
                 );
             }
         }
         let endpoints: Vec<_> = plan.iter().filter(|i| matches!(&i.operation, Operation::Copy { source,destination,bytes:20480 } if source=="FlashMixedResidual" && destination=="FlashMixedHeadResidual")).map(|i| i.views["FlashMixedResidual"].offset).collect();
-        assert_eq!(endpoints, [127 * 20480, 128 * 20480]);
+        assert_eq!(endpoints, [0, 128 * 20480]);
         assert!(plan.iter().any(|i| matches!(&i.operation,Operation::Kernel {name} if name.starts_with("flash_mixed_head_m2/head/"))));
         assert!(!plan.iter().any(|i| matches!(&i.operation,Operation::Kernel {name} if name.starts_with("prefill_m128/layer") || name.starts_with("decode/layer"))));
+    }
+    #[test]
+    fn mixed_decoder_subgroups_share_private_kernels_and_preserve_table_ownership() {
+        use crate::operators::dynamic::{DynamicBatchKernel, RowExpression};
+        let mut m = mixed_manifest();
+        for (role, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
+            let name = format!("FlashMixed_{role}");
+            if !m.buffers.iter().any(|b| b.name == name) {
+                m.buffers.push(
+                    serde_json::from_value(serde_json::json!({
+                        "name":name,"dtype":"u8","shape":[1024*stride],"layout":"native_contiguous",
+                        "alignment":256,"access":"read_write","data":null
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
+        for (name, dtype, shape) in [
+            ("Position", "i32", vec![1]),
+            (POINTERS, "u64", vec![128, 48, 1]),
+        ] {
+            m.buffers.push(
+                serde_json::from_value(serde_json::json!({
+                    "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write","data":null
+                }))
+                .unwrap(),
+            );
+        }
+        register(&mut m).unwrap();
+        for layer in 0..48 {
+            for op in &m.programs[&format!("flash_private_m4/layer{layer}")] {
+                if let Operation::Kernel { name } = op {
+                    m.dynamic_batch_kernels.insert(
+                        name.clone(),
+                        DynamicBatchKernel {
+                            name: name.clone(),
+                            capacity: 4,
+                            grid: [
+                                RowExpression::Constant { value: 1 },
+                                RowExpression::Constant { value: 1 },
+                                RowExpression::Rows,
+                            ],
+                            arguments: vec![],
+                        },
+                    );
+                }
+            }
+        }
+        for count in [2usize, 3, 4, 8] {
+            let segments: Vec<_> = std::iter::once(BatchSegment {
+                slot: 99,
+                tokens: 128,
+            })
+            .chain((0..count).map(|lane| BatchSegment {
+                slot: 20 + lane,
+                tokens: 1,
+            }))
+            .collect();
+            let bindings = state_bindings(&m, &segments).unwrap();
+            assert_eq!(bindings.len(), count.next_power_of_two() * 48);
+            for lane in 0..count {
+                assert_eq!(bindings[lane * 48], Some((20 + lane, "Position".into())));
+            }
+            assert!(bindings[count * 48..].iter().all(Option::is_none));
+            let plan = plan(&m, &segments).unwrap();
+            let private: Vec<_> = plan.iter().filter(|i| matches!(&i.operation, Operation::Kernel {name} if name.starts_with("flash_private_"))).collect();
+            assert_eq!(private.len(), 36 * 3 + 12 * 19);
+            assert!(private.iter().all(|i| i.sequence.is_none()));
+            assert!(private.iter().all(|i| {
+                i.views[&format!("BatchM{}_M1_Embedding", count.next_power_of_two())].offset == 0
+            }));
+            assert!(private.iter().all(|i| if count == 3 {
+                i.launch.as_ref().unwrap().grid[2] == 3
+            } else {
+                i.launch.is_none()
+            }));
+            assert!(!plan.iter().any(|i| matches!(&i.operation, Operation::Kernel {name} if name.starts_with("flash_segment_m1/layer") && name.contains("/private/"))));
+            let prefill = plan.iter().find(|i| matches!(&i.operation, Operation::Kernel {name} if name=="flash_segment_m128/layer0/private/k0")).unwrap();
+            assert_eq!(prefill.sequence, Some(99));
+            assert_eq!(prefill.views["FlashMixedResidual"].offset, count * 20480);
+        }
+    }
+    #[test]
+    fn verification_batches_keep_all_candidate_heads_and_private_commit_factors() {
+        let mut m = mixed_manifest();
+        m.mtp=Some(serde_json::from_value(serde_json::json!({
+            "position":"MtpPosition","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
+            "verification_tokens":"VerificationTokens","verification_status":"VerificationStatus",
+            "draft_logits":"DraftLogits","verification_logits":"VerificationLogits","feature_index":null,
+            "accepted_inputs":"AcceptedInputs","target_length":"PositionOut","draft_program":"mtp_draft",
+            "default_verification_tokens":4,"warm_plans":[],"capture_plans":[],"verification_plans":[],
+            "batch_verification_tokens":[2,3,4,5,6,7,8]
+        })).unwrap());
+        register(&mut m).unwrap();
+        let segments = [
+            BatchSegment { slot: 7, tokens: 4 },
+            BatchSegment { slot: 3, tokens: 2 },
+        ];
+        let p = super::super::mixed::verification_plan(&m, &segments).unwrap();
+        let copies:Vec<_>=p.iter().filter(|i|matches!(&i.operation,Operation::Copy {destination,..} if destination=="FlashMixedHeadResidual")).collect();
+        assert_eq!(copies.len(), 2);
+        assert!(matches!(
+            copies[0].operation,
+            Operation::Copy { bytes: 81920, .. }
+        ));
+        assert!(matches!(
+            copies[1].operation,
+            Operation::Copy { bytes: 40960, .. }
+        ));
+        assert_eq!(copies[1].views["FlashMixedHeadResidual"].offset, 81920);
+        assert!(p.iter().any(|i|matches!(&i.operation,Operation::Copy {destination,bytes,..} if destination=="VerificationLogits" && *bytes==4*m.vocab*4) && i.sequence==Some(7)));
+        assert!(p.iter().any(
+            |i| matches!(&i.operation,Operation::Kernel {name} if name=="verify_m2/head/k8")
+                && i.sequence == Some(3)
+        ));
+        let conv=p.iter().position(|i|matches!(&i.operation,Operation::Copy {destination,..} if destination=="State_0_conv") && i.sequence==Some(7)).unwrap();
+        assert!(
+            matches!(&p[conv-1].operation,Operation::Kernel {name} if name=="flash_verify_segment_m4/layer0/private/k1")
+        );
+        assert!(p.iter().any(|i|matches!(&i.operation,Operation::Kernel {name} if name=="flash_verify_segment_m4/layer0/private/k3") && i.sequence==Some(7)));
+        for bad in [
+            vec![segments[0]],
+            vec![segments[0], segments[0]],
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 16,
+                },
+                segments[0],
+            ],
+            (0..17)
+                .map(|slot| BatchSegment { slot, tokens: 8 })
+                .collect(),
+        ] {
+            assert!(super::super::mixed::verification_plan(&m, &bad).is_err());
+        }
     }
     #[test]
     fn mixed_segments_reject_invalid_shapes_aliases_and_capacity() {

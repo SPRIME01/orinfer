@@ -21,6 +21,31 @@ pub mod plans;
 pub type StateBindings = Vec<Option<(usize, String)>>;
 pub type BatchPlan = (Vec<Invocation>, StateBindings);
 
+/// The low bit requests commands; upper bits select model-owned execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum BatchOperation {
+    Ordinary = 0,
+    Verification = 1,
+    Draft = 2,
+    Commit = 3,
+    Warm = 4,
+    DraftHead = 5,
+}
+impl BatchOperation {
+    pub fn from_flags(flags: u32) -> Result<Self> {
+        match flags >> 1 {
+            0 => Ok(Self::Ordinary),
+            1 => Ok(Self::Verification),
+            2 => Ok(Self::Draft),
+            3 => Ok(Self::Commit),
+            4 => Ok(Self::Warm),
+            5 => Ok(Self::DraftHead),
+            _ => Err("Unknown batch operation".into()),
+        }
+    }
+}
+
 pub const ABI_VERSION: u32 = 1;
 pub const RUNTIME_ABI: u32 = 1;
 pub const ENTRYPOINT: &[u8] = b"orinfer_model_v1\0";
@@ -242,6 +267,17 @@ pub trait ModelImplementation: Sized {
         Err("Model package has no native binding/plan extension".into())
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<BatchPlan>;
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: BatchOperation,
+        include_plan: bool,
+    ) -> Result<BatchPlan> {
+        if operation != BatchOperation::Ordinary {
+            return Err("Model package does not provide this batch operation".into());
+        }
+        self.batch(segments, include_plan)
+    }
 }
 
 struct BatchStorage {
@@ -392,7 +428,7 @@ pub unsafe extern "C" fn batch<M: ModelImplementation>(
     handle: *mut c_void,
     input: *const BatchSegment,
     len: usize,
-    include_plan: u32,
+    flags: u32,
     result: *mut BatchOutput,
     error: *mut OwnedBytes,
 ) -> i32 {
@@ -401,7 +437,7 @@ pub unsafe extern "C" fn batch<M: ModelImplementation>(
             || input.is_null()
             || !(1..=128).contains(&len)
             || result.is_null()
-            || include_plan > 1
+            || flags > 11
         {
             return Err("Invalid batch arguments".into());
         }
@@ -414,7 +450,8 @@ pub unsafe extern "C" fn batch<M: ModelImplementation>(
         {
             return Err("Invalid segment geometry".into());
         }
-        let (ops, bindings) = model.batch(segments, include_plan != 0)?;
+        let (ops, bindings) =
+            model.batch_operation(segments, BatchOperation::from_flags(flags)?, flags & 1 != 0)?;
         // SAFETY: writable result slot; free_batch is the sole owner of its buffers.
         unsafe {
             ptr::write(result, BatchStorage::export(ops, bindings));
@@ -517,6 +554,38 @@ mod tests {
     use super::*;
     use crate::{execution::BufferView, operators::dynamic::RowLaunch};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn operation_flags_preserve_ordinary_calls_and_reject_unknown_modes() {
+        for flag in [0, 1] {
+            assert_eq!(
+                BatchOperation::from_flags(flag).unwrap(),
+                BatchOperation::Ordinary
+            );
+        }
+        for flag in [2, 3] {
+            assert_eq!(
+                BatchOperation::from_flags(flag).unwrap(),
+                BatchOperation::Verification
+            );
+        }
+        assert_eq!(BatchOperation::from_flags(8).unwrap(), BatchOperation::Warm);
+        assert_eq!(
+            BatchOperation::from_flags(11).unwrap(),
+            BatchOperation::DraftHead
+        );
+        assert!(BatchOperation::from_flags(12).is_err());
+        assert!(BatchOperation::from_flags(u32::MAX).is_err());
+        assert!(
+            TestModel
+                .batch_operation(
+                    &[BatchSegment { slot: 7, tokens: 3 }],
+                    BatchOperation::Verification,
+                    true
+                )
+                .is_err()
+        );
+    }
 
     struct TestModel;
     impl ModelImplementation for TestModel {

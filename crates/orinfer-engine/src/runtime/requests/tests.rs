@@ -266,6 +266,7 @@ fn validate_mtp_partial_prefix() {
         );
         let mut restored = model.start_request(input(&branch, 16), &|| false).unwrap();
         assert_eq!(restored.prefix.statistics.cached_tokens, checkpoint);
+        let shared_kv_bytes = model.execution.shared_kv_bytes();
         assert_eq!(restored.warm.tokens, checkpoint);
         let mut actual = vec![];
         while !restored.is_finished() {
@@ -332,6 +333,7 @@ fn validate_mtp_partial_prefix() {
             "changed_continuation_tokens_equal":true,"gdn_and_conv_state_equal":true,
             "target_and_draft_kv_equal":true,"target_position":target_position,
             "draft_position":draft_position,
+            "shared_kv_bytes":shared_kv_bytes,
             "restore_s":restore_s}));
     }
     std::fs::write(

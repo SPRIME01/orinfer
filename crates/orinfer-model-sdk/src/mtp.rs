@@ -36,6 +36,22 @@ pub struct Spec {
     pub warm_plans: Vec<WarmPlan>,
     pub capture_plans: Vec<CapturePlan>,
     pub verification_plans: Vec<VerificationPlan>,
+    /// Shapes whose target verification can share one batch forward.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_verification_tokens: Vec<usize>,
+    /// Independent one-token draft packets; a padded fixed capacity is allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_draft_profiles: Vec<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub batch_commit: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub batch_warm: bool,
+    /// Architecture-owned speculative batch programs to retire when MTP is off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch_programs: Vec<String>,
+    /// Prefix/factor capacity is shared between widths within each owner arena.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared_verification_state: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -117,6 +133,37 @@ impl Spec {
         }
         if !verify_sizes.contains(&self.default_verification_tokens) {
             return Err("Missing default MTP verification shape".into());
+        }
+        if self
+            .batch_verification_tokens
+            .windows(2)
+            .any(|p| p[0] >= p[1])
+            || self
+                .batch_verification_tokens
+                .iter()
+                .any(|n| !verify_sizes.contains(n))
+        {
+            return Err("Invalid batched MTP verification shapes".into());
+        }
+        if self.batch_draft_profiles.windows(2).any(|p| p[0] >= p[1])
+            || self
+                .batch_draft_profiles
+                .iter()
+                .any(|n| !(2..=128).contains(n))
+        {
+            return Err("Invalid batched MTP draft profiles".into());
+        }
+        if (self.batch_warm && self.batch_draft_profiles.is_empty())
+            || (self.batch_commit && self.batch_verification_tokens.is_empty())
+        {
+            return Err("Batched MTP warm/commit lacks execution profiles".into());
+        }
+        let mut batch_programs = BTreeSet::new();
+        for name in &self.batch_programs {
+            if !batch_programs.insert(name) {
+                return Err("Duplicate MTP batch program".into());
+            }
+            program(name)?;
         }
         let max_warm = *warm_sizes.last().ok_or("No MTP warm plans")?;
         let max_verify = *verify_sizes.last().ok_or("No MTP verification plans")?;

@@ -1,6 +1,7 @@
 """Rebuilt native launch order must preserve buffer slices and reject scalars."""
 
 import unittest
+from tools.model.flash_next.mixed_verify import share_verification_state
 
 from tools.model.flash_next.optimize_decode import (
     pointer_bindings,
@@ -11,6 +12,43 @@ from tools.model.flash_next.optimize_decode import (
 
 
 class DecodePackageTests(unittest.TestCase):
+    def test_verification_profiles_share_capacity_without_changing_shapes_or_lengths(self):
+        data = dict(
+            metadata=dict(
+                mtp={},
+                buffers=[
+                    dict(name="VerifyM2_Saved_0_gdn_K", dtype="f16", shape=[16, 2, 128]),
+                    dict(name="VerifyM8_Saved_0_gdn_K", dtype="f16", shape=[16, 8, 128]),
+                    dict(name="State_0_gdn", dtype="f32", shape=[48, 128, 128]),
+                ],
+                reset_buffers=["VerifyM2_Saved_0_gdn_K"],
+            ),
+            buffer_scopes={
+                "VerifyM2_Saved_0_gdn_K": "workspace",
+                "VerifyM8_Saved_0_gdn_K": "workspace",
+                "State_0_gdn": "sequence",
+            },
+        )
+        package = dict(
+            kernels=[
+                dict(args=[dict(kind="buffer_slice", name="VerifyM2_Saved_0_gdn_K", offset=256)])
+            ]
+        )
+        share_verification_state(data, package)
+        self.assertTrue(data["metadata"]["mtp"]["shared_verification_state"])
+        self.assertEqual(len(data["metadata"]["buffers"]), 2)
+        shared = next(
+            b for b in data["metadata"]["buffers"] if b["name"].startswith("VerifyShared")
+        )
+        self.assertEqual(shared["shape"], [16, 8, 128])
+        self.assertEqual(
+            package["kernels"][0]["args"],
+            [dict(kind="buffer_slice", name=shared["name"], offset=256)],
+        )
+        self.assertEqual(data["metadata"]["reset_buffers"], [shared["name"]])
+        share_verification_state(data, package)
+        self.assertEqual(len(data["metadata"]["buffers"]), 2)
+
     def test_explicit_dynamic_binding_retains_offsets_and_validates_row_scalars(self):
         original = dict(
             name="joined",

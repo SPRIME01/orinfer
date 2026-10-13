@@ -152,6 +152,35 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
                 .insert(name.clone(), super::plan::section(&name, "body", 1, None));
         }
     }
+    if let Some(spec) = &m.mtp {
+        for &tokens in &spec.batch_verification_tokens {
+            if !(2..=8).contains(&tokens) {
+                return Err("Unsupported Flash verification segment".into());
+            }
+            let prefix = format!("flash_verify_segment_m{tokens}");
+            for layer in 0..48 {
+                let section = format!("layer{layer}/private");
+                m.programs.insert(
+                    format!("{prefix}/{section}"),
+                    super::plan::section(
+                        &prefix,
+                        &section,
+                        if layer % 4 == 3 { 20 } else { 4 },
+                        None,
+                    ),
+                );
+            }
+            m.programs.insert(
+                format!("{prefix}/layer1/ple"),
+                super::plan::section(&prefix, "layer1/ple", 3, None),
+            );
+            let capture = format!("flash_verify_capture_m{tokens}");
+            m.programs.insert(
+                capture.clone(),
+                super::plan::section(&capture, "body", 1, None),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -208,8 +237,64 @@ fn append(
 }
 
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
-    let rows = validate_segments(m, segments)?;
+    plan_kind(m, segments, false)
+}
+
+pub(super) fn verification_plan(
+    m: &Manifest,
+    segments: &[BatchSegment],
+) -> Result<Vec<Invocation>> {
+    plan_kind(m, segments, true)
+}
+
+fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Vec<Invocation>> {
+    let rows = if verify {
+        let spec = m.mtp.as_ref().ok_or("Missing batched MTP adapter")?;
+        let mut slots = BTreeSet::new();
+        let total = segments.iter().try_fold(0usize, |total, s| {
+            if !spec.batch_verification_tokens.contains(&s.tokens) || !slots.insert(s.slot) {
+                return Err("Invalid batched verification segment".to_string());
+            }
+            total
+                .checked_add(s.tokens)
+                .ok_or("Verification row overflow".to_string())
+        })?;
+        if !(2..=128).contains(&segments.len()) || total > 128 {
+            return Err("Verification batch exceeds endpoint head capacity".into());
+        }
+        CAPACITIES
+            .into_iter()
+            .find(|&n| n >= total)
+            .ok_or("Missing verification row body")?
+    } else {
+        validate_segments(m, segments)?
+    };
     let layout = m.batch_layout.as_ref().unwrap();
+    // Put single-token rows first so the existing request-table mixers can
+    // consume a contiguous subgroup without gathering projections or state.
+    let ordered: Vec<_> = segments
+        .iter()
+        .filter(|s| s.tokens == 1)
+        .chain(segments.iter().filter(|s| s.tokens != 1))
+        .cloned()
+        .collect();
+    let segments = ordered.as_slice();
+    let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
+    let parallel = !verify && decoders >= 2 && !layout.state_columns.is_empty();
+    let private_capacity = decoders.next_power_of_two().max(2);
+    let private_views: BTreeMap<_, _> = layout
+        .row_strides
+        .keys()
+        .filter_map(|role| {
+            let buffer = format!("FlashMixed_{role}");
+            m.buffers.iter().any(|b| b.name == buffer).then(|| {
+                (
+                    format!("BatchM{private_capacity}_{role}"),
+                    BufferView { buffer, offset: 0 },
+                )
+            })
+        })
+        .collect();
     let prefix = format!("flash_mixed_m{rows}");
     let dynamic = m
         .dynamic_batch_kernels
@@ -220,7 +305,9 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
     let mut start = 0;
     for s in segments {
         let width = super::plan::arena_width(s.tokens);
-        let program = if s.tokens == 1 {
+        let program = if verify {
+            format!("verify_m{}", s.tokens)
+        } else if s.tokens == 1 {
             "decode".into()
         } else {
             format!("prefill_m{}", s.tokens)
@@ -300,7 +387,15 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                 append(
                     &mut out,
                     m,
-                    &format!("flash_segment_m{}/layer1/ple", s.tokens),
+                    &format!(
+                        "{}_m{}/layer1/ple",
+                        if verify {
+                            "flash_verify_segment"
+                        } else {
+                            "flash_segment"
+                        },
+                        s.tokens
+                    ),
                     Some(s.slot),
                     views,
                 )?;
@@ -343,11 +438,39 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                 ));
             }
         }
-        for (s, (_, _, views)) in segments.iter().zip(&starts) {
-            let private = &m.programs[&format!("flash_segment_m{}/layer{layer}/private", s.tokens)];
+        if parallel {
+            let program = format!("flash_private_m{private_capacity}/layer{layer}");
+            append(&mut out, m, &program, None, &private_views)?;
+            for invocation in out.iter_mut().rev().take(m.programs[&program].len()) {
+                if private_capacity != decoders
+                    && let Operation::Kernel { name } = &invocation.operation
+                {
+                    invocation.launch = Some(
+                        m.dynamic_batch_kernels
+                            .get(name)
+                            .ok_or("Missing mixed decoder subgroup launch")?
+                            .launch(decoders)?,
+                    );
+                }
+            }
+        }
+        for (s, (_, _, views)) in segments
+            .iter()
+            .zip(&starts)
+            .filter(|(s, _)| !parallel || s.tokens != 1)
+        {
+            let private = &m.programs[&format!(
+                "{}_m{}/layer{layer}/private",
+                if verify {
+                    "flash_verify_segment"
+                } else {
+                    "flash_segment"
+                },
+                s.tokens
+            )];
             for (i, op) in private.iter().enumerate() {
                 out.push(invoke(op.clone(), Some(s.slot), views));
-                if layer % 4 != 3 && i == 0 {
+                if layer % 4 != 3 && i == usize::from(verify) {
                     out.push(invoke(
                         Operation::Copy {
                             source: format!("M{}_HistoryOut", super::plan::arena_width(s.tokens)),
@@ -368,23 +491,24 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             &empty,
         )?;
     }
+    let head_used = if verify { start } else { segments.len() };
     let head_rows = *m
         .batch_profiles
         .iter()
-        .find(|&&n| n >= segments.len())
+        .find(|&&n| n >= head_used)
         .ok_or("Missing Flash endpoint head")?;
-    if head_rows > segments.len() {
+    if head_rows > head_used {
         let pad = BTreeMap::from([(
             HEAD_RESIDUAL.into(),
             BufferView {
                 buffer: HEAD_RESIDUAL.into(),
-                offset: segments.len() * 20480,
+                offset: head_used * 20480,
             },
         )]);
         out.push(invoke(
             Operation::Zero {
                 destination: HEAD_RESIDUAL.into(),
-                bytes: (head_rows - segments.len()) * 20480,
+                bytes: (head_rows - head_used) * 20480,
             },
             None,
             &pad,
@@ -402,7 +526,11 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             append(
                 &mut out,
                 m,
-                &format!("flash_mixed_capture_m{}", s.tokens),
+                &format!(
+                    "flash_{}_capture_m{}",
+                    if verify { "verify" } else { "mixed" },
+                    s.tokens
+                ),
                 Some(s.slot),
                 views,
             )?;
@@ -412,14 +540,14 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
                 RESIDUAL.into(),
                 BufferView {
                     buffer: RESIDUAL.into(),
-                    offset: (first + s.tokens - 1) * 20480,
+                    offset: (first + if verify { 0 } else { s.tokens - 1 }) * 20480,
                 },
             ),
             (
                 HEAD_RESIDUAL.into(),
                 BufferView {
                     buffer: HEAD_RESIDUAL.into(),
-                    offset: lane * 20480,
+                    offset: (if verify { *first } else { lane }) * 20480,
                 },
             ),
         ]);
@@ -427,7 +555,7 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             Operation::Copy {
                 source: RESIDUAL.into(),
                 destination: HEAD_RESIDUAL.into(),
-                bytes: 20480,
+                bytes: if verify { s.tokens * 20480 } else { 20480 },
             },
             Some(s.slot),
             &copy,
@@ -440,7 +568,58 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
         None,
         &empty,
     )?;
+    let mut head_lane = 0;
     for (lane, s) in segments.iter().enumerate() {
+        if verify {
+            let spec = m.mtp.as_ref().unwrap();
+            let views = BTreeMap::from([
+                (
+                    format!("BatchM{head_rows}_Logits"),
+                    BufferView {
+                        buffer: format!("BatchM{head_rows}_Logits"),
+                        offset: head_lane * m.vocab * 4,
+                    },
+                ),
+                (
+                    format!("BatchM{head_rows}_Selected"),
+                    BufferView {
+                        buffer: format!("BatchM{head_rows}_Selected"),
+                        offset: head_lane * 8,
+                    },
+                ),
+            ]);
+            for (source, destination, bytes) in [
+                (
+                    format!("BatchM{head_rows}_Logits"),
+                    spec.verification_logits.clone(),
+                    s.tokens * m.vocab * 4,
+                ),
+                (
+                    format!("BatchM{head_rows}_Selected"),
+                    "VerificationPairs".into(),
+                    s.tokens * 8,
+                ),
+            ] {
+                out.push(invoke(
+                    Operation::Copy {
+                        source,
+                        destination,
+                        bytes,
+                    },
+                    Some(s.slot),
+                    &views,
+                ));
+            }
+            out.push(invoke(
+                Operation::Kernel {
+                    name: format!("verify_m{}/head/k8", s.tokens),
+                },
+                Some(s.slot),
+                &empty,
+            ));
+            head_lane += s.tokens;
+            continue;
+        }
         let mut views = BTreeMap::from([(
             format!("BatchM{head_rows}_Logits"),
             BufferView {

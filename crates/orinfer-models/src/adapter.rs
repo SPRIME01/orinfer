@@ -11,6 +11,17 @@ pub(crate) trait Adapter {
         Ok(vec![])
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan>;
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+        include_plan: bool,
+    ) -> Result<abi::BatchPlan> {
+        if operation != abi::BatchOperation::Ordinary {
+            return Err("Model adapter does not provide this batch operation".into());
+        }
+        self.batch(segments, include_plan)
+    }
     fn visual(
         &self,
         _tokens: &[u32],

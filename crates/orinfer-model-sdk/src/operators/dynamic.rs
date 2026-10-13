@@ -75,7 +75,7 @@ pub struct DynamicBatchKernel {
 fn default_capacity() -> usize {
     128
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowLaunch {
     pub grid: [u32; 3],
     pub arguments: Vec<(usize, i32)>,

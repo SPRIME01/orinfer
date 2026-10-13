@@ -1,7 +1,34 @@
 use super::*;
 use crate::execution::{CudaGraphMode, ExecutionPhase, LoadOptions};
 use std::cell::RefCell;
-pub(super) type BatchGraphCache = BTreeMap<Vec<(usize, usize)>, (Handle, u64, usize, u64)>;
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct BatchGraphKey {
+    pub operation: orinfer_model_sdk::abi::BatchOperation,
+    pub segments: Vec<(usize, usize)>,
+}
+impl From<Vec<(usize, usize)>> for BatchGraphKey {
+    fn from(segments: Vec<(usize, usize)>) -> Self {
+        Self {
+            operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            segments,
+        }
+    }
+}
+impl BatchGraphKey {
+    pub fn iter(&self) -> std::slice::Iter<'_, (usize, usize)> {
+        self.segments.iter()
+    }
+}
+pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize, u64)>;
+
+/// Shared pieces are keyed by program and resolved addresses, never membership.
+/// Address identity also prevents replay after a workspace growth/replacement.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SharedGraphKey {
+    pub operations: Vec<crate::execution::Invocation>,
+    pub addresses: Vec<u64>,
+}
+pub(super) type SharedGraphCache = BTreeMap<SharedGraphKey, (Handle, u64)>;
 
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
@@ -44,9 +71,12 @@ pub(crate) struct Executor {
     pub(super) sequences: Vec<super::sequence::Sequence>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
+    pub(super) sequence_names: std::collections::BTreeSet<String>,
     pub(super) sequence_strides: BTreeMap<String, usize>,
     pub(super) batch_graphs: RefCell<BatchGraphCache>,
-    pub(super) batch_graph_trials: RefCell<BTreeMap<Vec<(usize, usize)>, usize>>,
+    pub(super) batch_graph_trials: RefCell<BTreeMap<BatchGraphKey, usize>>,
+    pub(super) shared_graphs: RefCell<SharedGraphCache>,
+    pub(super) shared_graph_trials: RefCell<BTreeMap<SharedGraphKey, usize>>,
     pub(super) batch_graph_clock: std::cell::Cell<u64>,
     pub(crate) batch_statistics: std::cell::Cell<crate::scheduler::BatchExecutionStatistics>,
 }
@@ -464,9 +494,17 @@ impl Executor {
                 .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
                 .cloned()
                 .collect(),
+            sequence_names: manifest
+                .buffers
+                .iter()
+                .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
+                .map(|b| b.name.clone())
+                .collect(),
             sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
             batch_graphs: Default::default(),
             batch_graph_trials: Default::default(),
+            shared_graphs: Default::default(),
+            shared_graph_trials: Default::default(),
             batch_statistics: Default::default(),
             batch_graph_clock: std::cell::Cell::new(0),
         };
@@ -520,7 +558,11 @@ impl Executor {
         // Clear retained pages before reuse; larger contexts release their slabs.
         for (name, buffer) in self.session.virtual_buffers.borrow_mut().iter_mut() {
             if self.sequence_strides.contains_key(name) {
-                if reuse && buffer.mapped != 0 && buffer.mapped <= buffer.granularity {
+                if reuse
+                    && buffer.mapped != 0
+                    && buffer.mapped <= buffer.granularity
+                    && !buffer.has_shared_slabs()
+                {
                     // SAFETY: Completed stream, owned mapping and full mapped range.
                     unsafe {
                         check(
@@ -595,6 +637,7 @@ impl Executor {
         {
             return Err("Copy exceeds buffer".into());
         }
+        self.ensure_writable_range(destination, offset, bytes)?;
         // SAFETY: The validated ranges refer to live allocations owned by this
         // executor and the transfer is ordered with graph work on the same stream.
         unsafe {
@@ -635,6 +678,19 @@ impl Executor {
     /// Submit the same registered program without adding synchronization points.
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.ensure_kv(name)?;
+        if let Some(operations) = self.direct.as_ref().and_then(|d| d.programs.get(name)) {
+            for operation in operations {
+                match operation {
+                    crate::model::Operation::Copy {
+                        destination, bytes, ..
+                    }
+                    | crate::model::Operation::Zero { destination, bytes } => {
+                        self.ensure_writable_range(destination, 0, *bytes)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
         if self.cuda_graph.uses_graph(phase) {
             // Capture resolves all functions once; replay retains its modules
             // and addresses. KV growth above invalidates captures before reuse.
@@ -807,8 +863,14 @@ impl Executor {
         let mut additional = 0usize;
         for name in &growth.buffers {
             let b = buffers.get(name).ok_or("Missing demand KV buffer")?;
+            let start = position.checked_mul(b.stride).ok_or("KV write overflow")?;
+            let bytes = growth
+                .tokens
+                .checked_mul(b.stride)
+                .ok_or("KV write overflow")?;
             additional = additional
                 .checked_add(b.extent(tokens)?.saturating_sub(b.mapped))
+                .and_then(|n| n.checked_add(b.writable_bytes(start, bytes).ok()?))
                 .ok_or("KV growth sum overflow")?;
         }
         if additional == 0 {
@@ -826,10 +888,18 @@ impl Executor {
             return Err(format!("KV growth needs {additional} bytes, free {free}"));
         }
         for name in &growth.buffers {
-            buffers
-                .get_mut(name)
-                .ok_or("Missing KV reservation")?
-                .grow(&self.session, tokens)?;
+            let buffer = buffers.get_mut(name).ok_or("Missing KV reservation")?;
+            buffer.make_writable(
+                &self.session,
+                position
+                    .checked_mul(buffer.stride)
+                    .ok_or("KV write overflow")?,
+                growth
+                    .tokens
+                    .checked_mul(buffer.stride)
+                    .ok_or("KV write overflow")?,
+            )?;
+            buffer.grow(&self.session, tokens)?;
         }
         let scratch = buffers
             .iter()
@@ -838,10 +908,25 @@ impl Executor {
             .sum::<usize>();
         self.peak_prefill_workspace_bytes
             .set(self.peak_prefill_workspace_bytes.get().max(scratch));
-        let resident = buffers.values().map(|b| b.mapped).sum::<usize>() - scratch;
+        let resident = buffers.values().map(|b| b.physical_bytes()).sum::<usize>() - scratch;
         self.peak_kv_bytes
             .set(self.peak_kv_bytes.get().max(resident));
         self.sync()
+    }
+    pub(super) fn ensure_writable_range(
+        &self,
+        name: &str,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let mut buffers = self.session.virtual_buffers.borrow_mut();
+        if let Some(buffer) = buffers.get_mut(name)
+            && buffer.writable_bytes(offset, bytes)? != 0
+        {
+            self.sync()?;
+            buffer.make_writable(&self.session, offset, bytes)?;
+        }
+        Ok(())
     }
     pub(crate) fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         if ids.len() * 4 > self.sizes[name] {
@@ -873,6 +958,7 @@ impl Executor {
         if bytes.len() > *size {
             return Err("Image upload exceeds buffer".into());
         }
+        self.ensure_writable_range(name, 0, bytes.len())?;
         self.sync()?;
         // SAFETY: The synchronized destination is live and covers the borrowed bytes.
         unsafe {

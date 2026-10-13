@@ -1,6 +1,7 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
 mod batching;
 mod decode_fusions;
+mod draft_batch;
 mod experts;
 mod hc;
 mod inputs;
@@ -21,6 +22,60 @@ struct Flash {
     inputs: inputs::Inputs,
 }
 impl Adapter for Flash {
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+        include_plan: bool,
+    ) -> Result<abi::BatchPlan> {
+        match operation {
+            abi::BatchOperation::Ordinary => self.batch(segments, include_plan),
+            abi::BatchOperation::Verification => {
+                let plan = mixed::verification_plan(&self.manifest, segments)?;
+                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            }
+            abi::BatchOperation::Draft
+            | abi::BatchOperation::Warm
+            | abi::BatchOperation::DraftHead => {
+                let plan = draft_batch::plan(&self.manifest, segments, operation)?;
+                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            }
+            abi::BatchOperation::Commit => {
+                let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
+                let mut owners = std::collections::BTreeSet::new();
+                if segments.len() < 2 || segments.len() > 128 {
+                    return Err("Invalid MTP commit packet size".into());
+                }
+                let mut plan = vec![];
+                for segment in segments {
+                    if !owners.insert(segment.slot)
+                        || !spec.batch_verification_tokens.contains(&segment.tokens)
+                    {
+                        return Err("Invalid or repeated MTP commit segment".into());
+                    }
+                    let restore = spec
+                        .verification_plans
+                        .iter()
+                        .find(|p| p.tokens == segment.tokens)
+                        .ok_or("Missing MTP commit profile")?;
+                    if include_plan {
+                        plan.extend(
+                            self.manifest.programs[&restore.restore_program]
+                                .iter()
+                                .cloned()
+                                .map(|operation| orinfer_model_sdk::execution::Invocation {
+                                    operation,
+                                    sequence: Some(segment.slot),
+                                    launch: None,
+                                    views: Default::default(),
+                                }),
+                        );
+                    }
+                }
+                Ok((plan, vec![]))
+            }
+        }
+    }
     fn visual(
         &self,
         tokens: &[u32],

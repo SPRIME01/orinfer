@@ -12,7 +12,7 @@ const BATCH_GRAPH_NODES: usize = 12288;
 fn batch_graph_victim(
     cache: &super::executor::BatchGraphCache,
     incoming: usize,
-) -> Option<Vec<(usize, usize)>> {
+) -> Option<super::executor::BatchGraphKey> {
     if cache.len() < 16
         && cache.values().map(|(_, _, nodes, _)| nodes).sum::<usize>() + incoming
             <= BATCH_GRAPH_NODES
@@ -471,14 +471,32 @@ impl Executor {
                 .map(|r| r.mapped)
                 .sum::<usize>()
     }
+    #[cfg(test)]
+    pub(crate) fn shared_kv_bytes(&self) -> usize {
+        self.session
+            .virtual_buffers
+            .borrow()
+            .iter()
+            .filter(|(n, _)| self.sequence_strides.contains_key(*n))
+            .map(|(_, v)| v.mapped.saturating_sub(v.physical_bytes()))
+            .sum::<usize>()
+            + self
+                .sequences
+                .iter()
+                .flat_map(|s| s.reservations.values())
+                .map(|v| v.mapped.saturating_sub(v.physical_bytes()))
+                .sum::<usize>()
+    }
     pub(crate) fn active_kv_bytes(&self) -> usize {
+        // Shared pages are cache-owned. Retain the private replacement budget
+        // until the request finishes, including worst-case COW writes.
         let current = if self.sequences[self.active_sequence].leased {
             self.session
                 .virtual_buffers
                 .borrow()
                 .iter()
                 .filter(|(name, _)| self.sequence_strides.contains_key(*name))
-                .map(|(_, r)| r.mapped)
+                .map(|(_, r)| r.physical_bytes())
                 .sum()
         } else {
             0
@@ -489,7 +507,7 @@ impl Executor {
                 .iter()
                 .filter(|s| s.leased)
                 .flat_map(|s| s.reservations.values())
-                .map(|r| r.mapped)
+                .map(|r| r.physical_bytes())
                 .sum::<usize>()
     }
     pub(crate) fn additional_kv_bytes(
@@ -795,8 +813,11 @@ impl Executor {
         Ok(())
     }
     fn capture(&self, operations: &[Invocation]) -> Result<Handle> {
+        self.capture_with_parallel(operations, true)
+    }
+    fn capture_with_parallel(&self, operations: &[Invocation], parallel: bool) -> Result<Handle> {
         self.ensure_invocation_kernels(operations)?;
-        if !self.parallel_regions.borrow().is_empty() {
+        if parallel && !self.parallel_regions.borrow().is_empty() {
             self.ensure_parallel_handles()?;
         }
         // SAFETY: All bindings and backing allocations outlive graph execution;
@@ -810,7 +831,11 @@ impl Executor {
                 "begin request capture",
             )?;
         }
-        let result = self.capture_parallel_operations(operations);
+        let result = if parallel {
+            self.capture_parallel_operations(operations)
+        } else {
+            operations.iter().try_for_each(|op| self.invoke(op))
+        };
         let mut graph = ptr::null_mut();
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
@@ -828,7 +853,11 @@ impl Executor {
             }
             return Err(error);
         }
-        let flags = match self.prioritize_parallel_graph(graph, operations) {
+        let flags = match if parallel {
+            self.prioritize_parallel_graph(graph, operations)
+        } else {
+            Ok(0)
+        } {
             Ok(flags) => flags,
             Err(error) => {
                 // SAFETY: Local graph has not been instantiated or published.
@@ -1136,15 +1165,259 @@ impl Executor {
     pub(crate) fn has_batch_graph(&self, key: &[(usize, usize)], decode: bool) -> bool {
         (self.cuda_graph == crate::execution::CudaGraphMode::Full
             || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
-            && self.batch_graphs.borrow().contains_key(key)
+            && self
+                .batch_graphs
+                .borrow()
+                .contains_key(&key.to_vec().into())
     }
     pub(crate) fn execute_batch(
-        &self,
+        &mut self,
         key: Vec<(usize, usize)>,
         operations: &[Invocation],
         decode: bool,
         allow_capture: bool,
     ) -> Result<()> {
+        self.execute_batch_operation(
+            orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            key,
+            operations,
+            decode,
+            allow_capture,
+        )
+    }
+    fn reserve_graph_nodes(&self, incoming: usize, shared: bool) -> Result<()> {
+        use super::executor::{BatchGraphKey, SharedGraphKey};
+        enum Victim {
+            Batch(BatchGraphKey),
+            Shared(SharedGraphKey),
+        }
+        loop {
+            let victim = {
+                let batches = self.batch_graphs.borrow();
+                let pieces = self.shared_graphs.borrow();
+                let oldest_piece = || {
+                    pieces
+                        .iter()
+                        .min_by_key(|(_, (_, last))| *last)
+                        .map(|(key, _)| Victim::Shared(key.clone()))
+                };
+                if !shared && let Some(key) = batch_graph_victim(&batches, incoming) {
+                    Some(Victim::Batch(key))
+                } else if shared && pieces.len() >= 256 {
+                    oldest_piece()
+                } else if batches.values().map(|(_, _, n, _)| n).sum::<usize>()
+                    + pieces.keys().map(|k| k.operations.len()).sum::<usize>()
+                    + incoming
+                    <= BATCH_GRAPH_NODES
+                {
+                    None
+                } else {
+                    let oldest_batch = batches.iter().min_by_key(|(_, (_, last, _, _))| *last);
+                    let oldest_shared = pieces.iter().min_by_key(|(_, (_, last))| *last);
+                    match (oldest_batch, oldest_shared) {
+                        (Some((key, (_, last, _, _))), Some((_, (_, plast)))) if last <= plast => {
+                            Some(Victim::Batch(key.clone()))
+                        }
+                        (_, Some((key, _))) => Some(Victim::Shared(key.clone())),
+                        (Some((key, _)), None) => Some(Victim::Batch(key.clone())),
+                        (None, None) => return Err("Oversized graph node reservation".into()),
+                    }
+                }
+            };
+            let Some(victim) = victim else { return Ok(()) };
+            let at = Instant::now();
+            self.sync()?;
+            let graph = match victim {
+                Victim::Batch(key) => self.batch_graphs.borrow_mut().remove(&key).unwrap().0,
+                Victim::Shared(key) => self.shared_graphs.borrow_mut().remove(&key).unwrap().0,
+            };
+            self.destroy_graphs(&[graph])?;
+            let mut stats = self.batch_statistics.get();
+            stats.graph_evictions += 1;
+            stats.eviction_s += at.elapsed().as_secs_f64();
+            self.batch_statistics.set(stats);
+        }
+    }
+    fn shared_addresses(&self, op: &Invocation) -> Result<Option<Vec<u64>>> {
+        if op.sequence.is_some() {
+            return Ok(None);
+        }
+        let names: Vec<&str> = match &op.operation {
+            Operation::Kernel { name } => {
+                let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
+                let kernels = direct.kernels.borrow();
+                let kernel = kernels.get(name).ok_or("Missing shared kernel")?;
+                let mut addresses = vec![];
+                for argument in &kernel.spec.args {
+                    if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = argument
+                    {
+                        let target = op
+                            .views
+                            .get(name)
+                            .map_or(name.as_str(), |v| v.buffer.as_str());
+                        if self.sequence_names.contains(target) {
+                            return Ok(None);
+                        }
+                        addresses.push(self.address(name, None, &op.views)?);
+                    }
+                }
+                return Ok(Some(addresses));
+            }
+            Operation::Copy {
+                source,
+                destination,
+                ..
+            } => vec![source, destination],
+            Operation::Zero { destination, .. } => vec![destination],
+        };
+        if names.iter().any(|name| {
+            let target = op.views.get(*name).map_or(*name, |v| v.buffer.as_str());
+            self.sequence_names.contains(target)
+        }) {
+            return Ok(None);
+        }
+        names
+            .into_iter()
+            .map(|name| self.address(name, None, &op.views))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+    /// Share stateless pieces across changing request membership. Private stages
+    /// remain direct; pointer-table contents are uploaded before any replay.
+    fn invoke_shared_pieces(&self, operations: &[Invocation], allow_capture: bool) -> Result<()> {
+        use super::executor::SharedGraphKey;
+        let mut cursor = 0;
+        while cursor < operations.len() {
+            let start = cursor;
+            let mut addresses = vec![];
+            while cursor < operations.len() {
+                let Some(mut pointers) = self.shared_addresses(&operations[cursor])? else {
+                    break;
+                };
+                addresses.append(&mut pointers);
+                cursor += 1;
+            }
+            if cursor == start {
+                self.invoke(&operations[cursor])?;
+                cursor += 1;
+                continue;
+            }
+            let piece = &operations[start..cursor];
+            // Tiny pieces do not amortize instantiation or an extra graph launch.
+            if !(8..=BATCH_GRAPH_NODES).contains(&piece.len()) {
+                for op in piece {
+                    self.invoke(op)?;
+                }
+                continue;
+            }
+            let key = SharedGraphKey {
+                operations: piece.to_vec(),
+                addresses,
+            };
+            let tick = self.batch_graph_clock.get().wrapping_add(1);
+            self.batch_graph_clock.set(tick);
+            let cached = self
+                .shared_graphs
+                .borrow_mut()
+                .get_mut(&key)
+                .map(|(graph, last)| {
+                    *last = tick;
+                    *graph
+                });
+            let graph = if let Some(graph) = cached {
+                Some(graph)
+            } else {
+                let count = {
+                    let mut trials = self.shared_graph_trials.borrow_mut();
+                    if trials.len() >= 512 && !trials.contains_key(&key) {
+                        trials.clear();
+                    }
+                    let count = trials.entry(key.clone()).or_default();
+                    *count += 1;
+                    *count
+                };
+                if !allow_capture || count < 2 {
+                    None
+                } else {
+                    self.reserve_graph_nodes(piece.len(), true)?;
+                    let at = Instant::now();
+                    let graph = self.capture_with_parallel(piece, false)?;
+                    let mut stats = self.batch_statistics.get();
+                    stats.capture_s += at.elapsed().as_secs_f64();
+                    stats.captured_operations += piece.len();
+                    stats.graph_misses += 1;
+                    stats.shared_graph_captures += 1;
+                    self.batch_statistics.set(stats);
+                    self.shared_graphs.borrow_mut().insert(key, (graph, tick));
+                    Some(graph)
+                }
+            };
+            if let Some(graph) = graph {
+                // SAFETY: All piece addresses are weights/workspace, retained by
+                // the session. Current resolved addresses are part of the key.
+                unsafe {
+                    check(
+                        sys::cuGraphLaunch(graph, self.session.stream),
+                        "shared batch piece",
+                    )?;
+                }
+                let mut stats = self.batch_statistics.get();
+                stats.graph_hits += usize::from(cached.is_some());
+                stats.shared_graph_hits += usize::from(cached.is_some());
+                self.batch_statistics.set(stats);
+            } else {
+                for op in piece {
+                    self.invoke(op)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn execute_batch_operation(
+        &mut self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: Vec<(usize, usize)>,
+        operations: &[Invocation],
+        decode: bool,
+        allow_capture: bool,
+    ) -> Result<()> {
+        // Copy/zero destinations can also write KV (e.g. state restoration).
+        // Prepare COW before graph capture/replay, including inactive arenas.
+        for invocation in operations {
+            let (destination, bytes) = match &invocation.operation {
+                Operation::Copy {
+                    destination, bytes, ..
+                }
+                | Operation::Zero { destination, bytes } => (destination, *bytes),
+                _ => continue,
+            };
+            let view = invocation.views.get(destination);
+            let name = view.map_or(destination.as_str(), |v| v.buffer.as_str());
+            let offset = view.map_or(0, |v| v.offset);
+            if let Some(slot) = invocation.sequence
+                && slot != self.active_sequence
+            {
+                if self
+                    .sequences
+                    .get(slot)
+                    .and_then(|s| s.reservations.get(name))
+                    .is_some_and(|v| v.has_shared_slabs())
+                {
+                    self.sync()?;
+                    self.sequences[slot]
+                        .reservations
+                        .get_mut(name)
+                        .unwrap()
+                        .make_writable(&self.session, offset, bytes)?;
+                }
+            } else {
+                self.ensure_writable_range(name, offset, bytes)?;
+            }
+        }
+        let key = super::executor::BatchGraphKey {
+            operation,
+            segments,
+        };
         self.ensure_invocation_kernels(operations)?;
         let dynamic = operations.iter().any(|op| op.launch.is_some());
         let configured = (self.cuda_graph == crate::execution::CudaGraphMode::Full
@@ -1191,18 +1464,7 @@ impl Executor {
                 self.batch_statistics.set(statistics);
                 // Bound graph cache size; varying slot memberships cannot retain
                 // unbounded captures. Stream is synchronized before destruction.
-                loop {
-                    let victim = batch_graph_victim(&self.batch_graphs.borrow(), operations.len());
-                    let Some(key) = victim else { break };
-                    let at = Instant::now();
-                    self.sync()?;
-                    let graph = self.batch_graphs.borrow_mut().remove(&key).unwrap().0;
-                    self.destroy_graphs(&[graph])?;
-                    let mut statistics = self.batch_statistics.get();
-                    statistics.graph_evictions += 1;
-                    statistics.eviction_s += at.elapsed().as_secs_f64();
-                    self.batch_statistics.set(statistics);
-                }
+                self.reserve_graph_nodes(operations.len(), false)?;
                 let at = Instant::now();
                 let graph = self.capture(operations)?;
                 let mut statistics = self.batch_statistics.get();
@@ -1229,8 +1491,12 @@ impl Executor {
             self.batch_statistics.set(statistics);
         } else {
             let at = Instant::now();
-            for op in operations {
-                self.invoke(op)?;
+            if configured {
+                self.invoke_shared_pieces(operations, allow_capture)?;
+            } else {
+                for op in operations {
+                    self.invoke(op)?;
+                }
             }
             self.sync()?;
             let mut statistics = self.batch_statistics.get();
@@ -1267,7 +1533,7 @@ impl Executor {
         } else {
             self.batch_graphs
                 .borrow()
-                .get(key)
+                .get(&super::executor::BatchGraphKey::from(key.to_vec()))
                 .ok_or("Missing hot batch graph")?
                 .0
         };
@@ -1434,22 +1700,38 @@ impl Drop for Executor {
 mod graph_cache_tests {
     use super::*;
     #[test]
+    fn verification_graphs_cannot_alias_ordinary_batches() {
+        use super::super::executor::BatchGraphKey;
+        use orinfer_model_sdk::abi::BatchOperation;
+        let ordinary = BatchGraphKey::from(vec![(2, 4), (3, 4)]);
+        let verification = BatchGraphKey {
+            operation: BatchOperation::Verification,
+            segments: ordinary.segments.clone(),
+        };
+        let mut cache = super::super::executor::BatchGraphCache::new();
+        cache.insert(ordinary.clone(), (ptr::null_mut(), 1, 1, 1));
+        assert!(!cache.contains_key(&verification));
+        cache.insert(verification, (ptr::null_mut(), 2, 1, 1));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&ordinary));
+    }
+    #[test]
     fn node_budget_evicts_coldest_before_entry_limit() {
         let mut cache = super::super::executor::BatchGraphCache::new();
-        cache.insert(vec![(2, 1)], (ptr::null_mut(), 8, 8000, 1));
-        cache.insert(vec![(0, 1)], (ptr::null_mut(), 3, 3000, 1));
+        cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, 8000, 1));
+        cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, 3000, 1));
         assert_eq!(batch_graph_victim(&cache, 1288), None);
-        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(0, 1)]));
-        cache.get_mut(&vec![(0, 1)]).unwrap().3 = 10;
-        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(2, 1)]));
-        cache.remove(&vec![(0, 1)]);
+        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(0, 1)].into()));
+        cache.get_mut(&vec![(0, 1)].into()).unwrap().3 = 10;
+        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(2, 1)].into()));
+        cache.remove(&vec![(0, 1)].into());
         assert_eq!(batch_graph_victim(&cache, 4000), None);
     }
     #[test]
     fn entry_limit_bounds_small_graphs() {
         let cache = (0..16)
-            .map(|slot| (vec![(slot, 1)], (ptr::null_mut(), slot as u64, 1, 1)))
+            .map(|slot| (vec![(slot, 1)].into(), (ptr::null_mut(), slot as u64, 1, 1)))
             .collect();
-        assert_eq!(batch_graph_victim(&cache, 1), Some(vec![(0, 1)]));
+        assert_eq!(batch_graph_victim(&cache, 1), Some(vec![(0, 1)].into()));
     }
 }

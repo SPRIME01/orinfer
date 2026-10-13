@@ -168,15 +168,17 @@ Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512
 
 拒绝时恢复私有 GDN、卷积、位置和有效 KV 状态。固定 seed 控制采样随机流；自适应验证长度受实测耗时影响，不保证随机输出逐 token 复现。随机 MTP 与普通 decode 保持相同目标分布，不要求同 seed 下逐 token 相同。输出尾部不足一个验证块时执行普通 decode。
 
-单请求使用 MTP；2–4 个 decoder 按实测每提交 token 成本选择 MTP 或 target batch，更大并发和混合 prefill 使用 target batch。草稿长度在 CLI 上限内按请求选择，各档先采集预热和稳定执行样本，首次执行耗时不进入稳定估计；每 64 个已提交 token 复测一个旧档位（普通 decode 也计入间隔），以适应 thinking 与代码段的接受率变化。所有探索仍受其他请求的 decode 时间预算约束。收益取决于接受率及采样开销。构建方法见[模型工具](../tools/model/README.md)。
+单请求使用 MTP；包含批量草稿/验证能力的 Flash 包支持 2–8 个 decoder 共享草稿投影、主模型验证与接受状态提交，接受后的移位 token 按真实因果段成组预热，各请求只在自己的端点产生下一轮草稿。卷积、GDN、QSA、位置、采样与约束解析器保持私有。其他并发、混合 prefill 或输出尾部使用普通 target batch；缺少批量 MTP 能力的包保留逐请求选择。
+
+草稿长度在 CLI 上限内按整轮耗时和实际提交量选择，包含草稿、验证、提交和预热。多请求先测普通 target batch 的成本，再判断 MTP 是否更快；跨上下文档位保留低收益结论，通过同一个有界探测周期复测，避免反复重新探索。各档先采集预热与稳定样本，CUDA 模块加载、Graph 捕获不进入稳定估计；低收益时退回普通 batch，按已提交 token 数定期复测。探索仍受其他请求的 decode 时间预算约束。收益取决于接受率与并发规模，短请求可能尚未完成调优。构建方法见[模型工具](../tools/model/README.md)。
 
 ### Prefix cache
 
 `--prefix-cache-mib` 默认 12288，单位 MiB，0 关闭复用；按需分配，不在加载时预占。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。
 
-KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执行 GPU 复制到 Graph 绑定地址。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。保存输出前缀时保留它所属的最长可复用提示；预算不足则跳过这次输出快照。正常内存回收仍可驱逐提示。模型重载后缓存清空。
+KV 区间不可变并按引用共享，持续状态单独保存。完整对齐的 KV 区间通过 CUDA VMM 共享物理内存，恢复后保留各请求的 Graph 虚拟地址；边界片段和 GDN、卷积、PLE、未完成压缩块等状态仍逐请求复制。共享区间只读，写入前复制为请求私有内存，复用 arena 前解除共享映射。创建新检查点仍需保存一份前缀数据。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。保存输出前缀时保留它所属的最长可复用提示；预算不足则跳过这次输出快照。正常内存回收仍可驱逐提示。模型重载后缓存清空。
 
-命中免除对应文本主干计算，视觉编码、剩余提示和生成继续执行。`usage.prompt_tokens_details.cached_tokens` 报告实际恢复长度，SSE 需请求 usage。缓存不是 paged attention 或零复制映射，不保证接近满上下文时命中完整提示；内存不足会驱逐或跳过保存。
+命中免除对应文本主干计算，视觉编码、剩余提示和生成继续执行。`usage.prompt_tokens_details.cached_tokens` 报告实际恢复长度，SSE 需请求 usage。VMM 映射无需把完整对齐区间复制到每个请求，但仍需恢复边界和持续状态；不保证接近满上下文时命中完整提示，内存不足会驱逐或跳过保存。
 
 接受 1–64 字符的 `prompt_cache_key` 和 `prompt_cache_retention=in-memory|24h` 作为路由、保留偏好。当前单 worker 不需要路由，缓存仍按精确 token 和图片身份匹配，key 不划分缓存或改变模型输出。缓存是可驱逐的内存缓存，`24h` 不预留容量、不写 SSD，也不保证 24 小时命中；`/health.chat_capabilities.prompt_cache` 声明这些限制。未传这些字段也自动复用前缀。
 
@@ -186,7 +188,9 @@ KV 区间不可变并按引用共享，持续状态单独保存；恢复仍执�
 
 单请求冷 prefill 使用大块计划；兼容的多个短请求可联合执行。与 decode 混合时，按预测耗时选择小块 prefill。常见 batch 可使用固定形状 kernel，其余 2–128 行可由支持动态行数的 AOT 包执行，线上不编译。请求按迭代加入和结束；不为凑 batch 额外等待。
 
-Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 专用档；附加动态回退包后，其他数量复用邻近容量的 AOT 算子，按真实行数执行。未附加动态回退的包仍补零到下一档。冷 prefill 保留单请求大块路径；有 decoder 等待时，根据 `--target-tpot-ms` 的剩余时间，预留下一轮 decode 的预计耗时，再在 `--prefill-budget-ms` 上限内选择真实 prefill 小块。该包不合并不同请求的 prompt chunk；两轮 decode 之间的独立 prefill 耗时跨迭代累计；每次 decode 后允许一个受预算限制的块，额外 prefill 还受预计 decode 耗时约束。预算是预测软目标，冷启动、长上下文和 checkpoint 可能超出；预算不足时允许最小有效块（最多 16 tokens），避免退化为反复读取权重的逐 token prefill，尾部仍按真实长度执行。预算控制文本主干分块，视觉编码器仍独立执行。调度统计提供 `prefill_chunk_histogram`、`bounded_prefill_iterations` 和 `max_bounded_prefill_s`；`batch_execution` 中的 `dynamic_graph_captures`、`dynamic_direct_iterations` 与 `graph_hits` 可用于核对动态回退和重放。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
+Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 档；支持动态行数的包让其他数量复用邻近容量的 AOT 算子，按真实行数执行。包含混合执行能力的包会把 decode 行和真实 prefill 片段拼接，共享 HC、投影与专家计算；单 token decoder 子组继续使用批量 GDN/QSA，较长因果段各自推进。独立长 prefill 保留大块路径。
+
+有 decoder 时，选择能容纳完整混合迭代的最大已编译 prefill 块；预测包含输入准备、MTP 预热、缓存检查点和首 token 收尾。耗时估计按上下文建立单调上界，并采用滚动 P95 正向误差和 EWMA 误差余量。冷启动、长上下文和检查点仍可能超出软预算；最小有效块保证 prefill 进展，尾部只处理真实 token。视觉编码器独立执行。`prefill_chunk_histogram`、`max_bounded_prefill_s`、`decode_budget_overruns` 可用于核对实际行为。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
 
 包含私有地址表的 Flash 包在每层用一套 GDN/QSA kernel 并行处理全部请求，包含临时缓冲区的隔离和批量卷积历史提交。请求地址在 Graph 重放前更新，补零行的地址为空；单请求仍走 M1 程序。
 
@@ -196,7 +200,7 @@ Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，G
 
 prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少而获得更多服务。有 decoder 时根据距上次提交 token 的时间决定下一轮工作；至少定期推进一个 prefill token，目标不可满足时计入 `prefill_progress_overrides`。`--target-tpot-ms` 是软目标，不限制客户端输出预算，不保证视觉编码、缓存保存或冷启动期间的最大流式间隔。`max_decode_gap_s` 和 `decode_budget_overruns` 记录引擎提交 token 的间隔，HTTP chunk 间隔需另行测量。
 
-实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新 batch 成员组合时直接执行，重复出现且仍有足够输出预算时再捕获；已有图可用于最后几步。MTP 在算子包和 CLI 草稿上限内比较真实轮次耗时与有效提交量，选择验证长度；这是请求级在线探索，不能保证短请求已经完成调优。
+实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新成员组合时直接执行，重复出现且仍有输出预算时捕获；已有图可用于最后几步。共享计算段还可按算子、行数、视图和实际地址复用 Graph，私有状态段按请求执行，换成员前更新地址表。整批与共享段共用 12288 个操作节点的缓存预算；CPU 执行计划有独立的有界缓存，并只保留各算子实际使用的缓冲视图。`batch_execution.shared_graph_hits` 与 `shared_graph_captures` 报告共享段复用。`decode_only` 仍只在 decode/MTP 阶段使用 Graph，混合 prefill 的图需要 `full`。
 
 模型包决定实际上下文容量，上限可配置为 262144 tokens。长提示分块计算，首次 dense attention 的复杂度不变。INT8 group-64 KV 包含 FP16 scale，CUDA VMM 按已执行位置映射物理页，同时保持 Graph 地址稳定；prefill 的单层 FP16 临时 KV workspace 可共享并按需增长。持续 GDN 状态保持 FP32。上下文扩展、KV 优化和验证见[模型构建](../tools/model/README.md)。
 

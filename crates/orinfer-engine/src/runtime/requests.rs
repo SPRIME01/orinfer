@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod profile;
 mod prompt_lookup;
 mod speculation;
+pub(super) use speculation::Profile as SpeculationProfile;
 #[cfg(test)]
 mod tests;
 
@@ -118,6 +119,7 @@ pub struct StepOutput {
 
 enum Work {
     Speculative(usize, usize, bool),
+    SpeculativeBatch(speculation::BatchChoice),
     Prefill(usize, Option<f64>),
     Batch(Vec<(usize, usize)>),
     Idle,
@@ -805,6 +807,18 @@ impl ModelRuntime {
         }
         Ok((chunk, tokens))
     }
+    fn batch_speculation_key(
+        requests: &[&mut RequestState],
+        selected: &[(usize, usize)],
+    ) -> (usize, usize, usize, usize) {
+        let mut key = Self::iteration_key(requests, selected);
+        // Distinguish heterogeneous short chains with equal total token rows.
+        key.3 = selected
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (lane, (_, n))| bits | ((n - 2) << (lane * 3)));
+        key
+    }
     fn iteration_key(
         requests: &[&mut RequestState],
         selected: &[(usize, usize)],
@@ -823,7 +837,25 @@ impl ModelRuntime {
             selected
                 .iter()
                 .filter(|(i, _)| requests[*i].prefilling)
-                .count(),
+                .count()
+                | (selected
+                    .iter()
+                    .filter(|(i, n)| {
+                        requests[*i].prefilling
+                            && requests[*i].offset + n == requests[*i].input.len()
+                    })
+                    .count()
+                    << 8)
+                | (selected
+                    .iter()
+                    .filter(|(i, n)| {
+                        requests[*i].prefilling
+                            && requests[*i]
+                                .checkpoints
+                                .contains(&(requests[*i].offset + n))
+                    })
+                    .count()
+                    << 16),
         )
     }
     fn predict_iteration(
@@ -832,8 +864,14 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
     ) -> f64 {
         let key = Self::iteration_key(requests, selected);
-        if let Some(estimate) = self.iteration_costs.get(&key) {
-            return estimate.upper();
+        if let Some(upper) = self
+            .iteration_costs
+            .range((key.0, key.1, 0, 0)..=(key.0, key.1, key.2, usize::MAX))
+            .filter(|(k, _)| k.3 == key.3)
+            .map(|(_, e)| e.upper())
+            .max_by(f64::total_cmp)
+        {
+            return upper;
         }
         if selected.iter().any(|(_, n)| *n > 1) {
             // Joined projections/expert tiles pay one weight pass. A cold
@@ -845,7 +883,19 @@ impl ModelRuntime {
                 .map(|(i, n)| self.prefill_costs.chunk_upper(*n, requests[*i].offset + n))
                 .sum();
             let decode_rows = selected.iter().filter(|(_, n)| *n == 1).count();
-            return prompt_s + decode_rows as f64 * 0.005;
+            // The window covers complete execution, including shifted MTP warm
+            // and endpoint/cache work; these costs do not vanish in a joint body.
+            let endpoints = (key.3 >> 8) & 255;
+            let checkpoints = key.3 >> 16;
+            let warm = if self.manifest.mtp.is_some() {
+                (key.3 & 255) as f64 * 0.015
+            } else {
+                0.
+            };
+            return prompt_s
+                + decode_rows as f64 * 0.005
+                + warm
+                + (endpoints + checkpoints) as f64 * 0.02;
         }
         let kv: usize = selected
             .iter()
@@ -946,6 +996,47 @@ impl ModelRuntime {
             self.unmerged_prefill_s = 0.;
         }
         match self.select_work(requests, options, &initialized)? {
+            Work::SpeculativeBatch(choice) => {
+                let selected = choice.selected;
+                if choice.exploring {
+                    for &(i, _) in &selected {
+                        requests[i].speculation_probe_token = requests[i].generated;
+                    }
+                }
+                let key = Self::batch_speculation_key(requests, &selected);
+                let began = Instant::now();
+                let stats_before = self.execution.batch_statistics.get();
+                let before = output.iter().map(|s| s.tokens.len()).sum::<usize>();
+                self.speculative_batch_step(requests, &selected, &mut output)?;
+                let tokens = output.iter().map(|s| s.tokens.len()).sum::<usize>() - before;
+                if self.batch_speculation_costs.len() >= 256
+                    && !self.batch_speculation_costs.contains_key(&key)
+                {
+                    self.batch_speculation_costs.clear();
+                }
+                let progress = selected.iter().map(|&(i, _)| requests[i].generated).sum();
+                let stats_after = self.execution.batch_statistics.get();
+                let cold_s = stats_after.kernel_load_s - stats_before.kernel_load_s
+                    + stats_after.capture_s
+                    - stats_before.capture_s
+                    + stats_after.sequence_capture_s
+                    - stats_before.sequence_capture_s;
+                self.batch_speculation_costs
+                    .entry(key)
+                    .or_default()
+                    .observe_steady(
+                        (began.elapsed().as_secs_f64() - cold_s).max(0.000001),
+                        tokens,
+                        progress,
+                    );
+                self.scheduler_statistics.speculative_iterations += 1;
+                *self
+                    .scheduler_statistics
+                    .batch_histogram
+                    .entry(selected.len())
+                    .or_default() += 1;
+                self.unmerged_prefill_s = 0.;
+            }
             Work::Speculative(i, rows, exploring) => {
                 self.unmerged_prefill_s = 0.;
                 if exploring {
@@ -1061,7 +1152,33 @@ impl ModelRuntime {
             .map(|(i, _)| i)
             .collect();
         let target: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
+        let batch_speculation = prefill.is_none()
+            && (2..=8).contains(&decode.len())
+            && self
+                .manifest
+                .mtp
+                .as_ref()
+                .is_some_and(|s| !s.batch_verification_tokens.is_empty());
+        // A cold prior cannot tell whether speculation beats a fast target
+        // batch. Measure ordinary execution before evaluating either drafter.
+        let baseline_ready = self
+            .iteration_costs
+            .get(&Self::iteration_key(requests, &target))
+            .is_some_and(|e| e.samples >= 3);
+        if batch_speculation
+            && baseline_ready
+            && let Some(selected) = self.select_speculative_batch(
+                requests,
+                &decode,
+                options,
+                self.predict_iteration(requests, &target),
+                self.iteration_costs[&Self::iteration_key(requests, &target)].mean,
+            )
+        {
+            return Ok(Work::SpeculativeBatch(selected));
+        }
         let prefer_mtp = prefill.is_none()
+            && (!batch_speculation || baseline_ready)
             && options.max_batch_tokens >= 2
             && self.manifest.mtp.is_some()
             && !decode.is_empty()
@@ -1332,9 +1449,11 @@ impl ModelRuntime {
         let decode_only = selected.iter().all(|(i, _)| !requests[*i].prefilling);
         let graph_key: Vec<_> = segments.iter().map(|s| (s.slot, s.tokens)).collect();
         let plan = if self.execution.has_batch_graph(&graph_key, decode_only) {
-            Vec::new()
+            std::rc::Rc::new(Vec::new())
         } else {
-            self.model_package.batch_plan(&segments)?
+            self.model_package
+                .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)?
+                .0
         };
         #[cfg(test)]
         profile::mark("plan");
@@ -1378,7 +1497,7 @@ impl ModelRuntime {
         self.iteration_costs
             .entry(key)
             .or_default()
-            .observe((seconds - capture_s - load_s - commit_s).max(0.000001));
+            .observe((seconds - capture_s - load_s).max(0.000001));
         let rows: usize = selected.iter().map(|(_, n)| n).sum();
         for &(i, chunk) in selected {
             requests[i].credit_s -= seconds * chunk as f64 / rows as f64;
@@ -1449,8 +1568,7 @@ impl ModelRuntime {
             self.prepare_inputs(tokens, history)?;
         }
         if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
-            segments.iter().map(|s| s.tokens).sum::<usize>() <= table.max_rows
-                && segments.iter().any(|s| s.tokens == 1)
+            segments.len() <= table.max_rows && segments.iter().any(|s| s.tokens == 1)
         }) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,

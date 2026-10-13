@@ -1,6 +1,6 @@
 //! CUDA VMM ownership: graph pointers stay fixed while physical slabs grow.
 use super::{Driver, Result, Session, check, sys};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, rc::Rc};
 
 use sys::{CUmemAccessDesc as AccessDesc, CUmemAllocationProp as AllocationProp};
 
@@ -43,6 +43,7 @@ impl Reservation {
             bytes: self.granularity,
             handle,
             mapped: false,
+            shared: None,
         });
         let slab = self.slabs.last_mut().unwrap();
         let result = (|| {
@@ -81,7 +82,11 @@ impl Reservation {
         Ok(())
     }
     pub(crate) fn physical_bytes(&self) -> usize {
-        self.slabs.iter().map(|p| p.bytes).sum()
+        self.slabs
+            .iter()
+            .filter(|p| p.shared.is_none())
+            .map(|p| p.bytes)
+            .sum()
     }
     pub(crate) fn reserve(s: &Session, bytes: usize, stride: usize) -> Result<Self> {
         let prop = properties(s.device);
@@ -127,10 +132,16 @@ impl Reservation {
         round_up(raw, self.granularity)
     }
     pub(crate) fn grow(&mut self, s: &super::Session, tokens: usize) -> Result<()> {
+        self.grow_bytes(s, self.extent(tokens)?)
+    }
+    pub(crate) fn grow_bytes(&mut self, s: &Session, bytes: usize) -> Result<()> {
         if self.poisoned {
             return Err("KV reservation is quarantined after a failed transition".into());
         }
-        let extent = self.extent(tokens)?;
+        let extent = round_up(bytes, self.granularity)?;
+        if extent > self.bytes {
+            return Err("KV growth exceeds reserved context".into());
+        }
         if extent <= self.mapped {
             return Ok(());
         }
@@ -159,6 +170,7 @@ impl Reservation {
             bytes,
             handle,
             mapped: false,
+            shared: None,
         };
         let result = (|| {
             // SAFETY: Reserved VA extent and live physical allocation do not overlap prior slabs.
@@ -192,6 +204,146 @@ impl Reservation {
         self.mapped = extent;
         Ok(())
     }
+    pub(crate) fn allocation_handle(&self) -> Result<u64> {
+        match self.slabs.as_slice() {
+            [slab] if slab.offset == 0 && slab.bytes == self.mapped && slab.shared.is_none() => {
+                Ok(slab.handle)
+            }
+            _ => Err("Shared allocation must have one complete owned mapping".into()),
+        }
+    }
+    pub(crate) fn has_shared_slabs(&self) -> bool {
+        self.slabs.iter().any(|p| p.shared.is_some())
+    }
+    /// Append a whole immutable allocation; CUDA currently requires handle offset zero.
+    pub(crate) fn map_shared(
+        &mut self,
+        s: &Session,
+        offset: usize,
+        allocation: Rc<super::snapshot::Allocation>,
+    ) -> Result<()> {
+        let handle = allocation
+            .handle
+            .ok_or("Prefix allocation is not VMM backed")?;
+        let bytes = allocation.bytes;
+        if self.poisoned
+            || offset != self.mapped
+            || !offset.is_multiple_of(self.granularity)
+            || !bytes.is_multiple_of(self.granularity)
+            || offset.checked_add(bytes).is_none_or(|end| end > self.bytes)
+        {
+            return Err("Invalid shared prefix mapping".into());
+        }
+        self.slabs.push(Slab {
+            offset,
+            bytes,
+            handle,
+            mapped: false,
+            shared: Some(allocation),
+        });
+        let slab = self.slabs.last_mut().unwrap();
+        let access = AccessDesc {
+            location: properties(s.device).location,
+            flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READ,
+        };
+        // SAFETY: The retained immutable allocation covers this whole unmapped extent.
+        let result = unsafe {
+            check(
+                sys::cuMemMap(self.address + offset as u64, bytes, 0, handle, 0),
+                "map shared prefix",
+            )
+            .and_then(|()| {
+                slab.mapped = true;
+                check(
+                    sys::cuMemSetAccess(self.address + offset as u64, bytes, &access, 1),
+                    "shared prefix read access",
+                )
+            })
+        };
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result?;
+        self.mapped += bytes;
+        Ok(())
+    }
+    pub(crate) fn writable_bytes(&self, start: usize, bytes: usize) -> Result<usize> {
+        let end = start.checked_add(bytes).ok_or("KV write extent overflow")?;
+        self.slabs
+            .iter()
+            .filter(|p| p.shared.is_some() && overlaps(start, end, p.offset, p.bytes))
+            .try_fold(0usize, |sum, p| {
+                sum.checked_add(p.bytes)
+                    .ok_or("KV COW budget overflow".into())
+            })
+    }
+    /// Complete the caller's stream before replacing mappings. Graph VAs stay stable.
+    pub(crate) fn make_writable(&mut self, s: &Session, start: usize, bytes: usize) -> Result<()> {
+        if self.poisoned {
+            return Err("KV reservation is quarantined".into());
+        }
+        let end = start.checked_add(bytes).ok_or("KV write extent overflow")?;
+        for slab in &mut self.slabs {
+            if !overlaps(start, end, slab.offset, slab.bytes) {
+                continue;
+            }
+            let Some(source) = slab.shared.clone() else {
+                continue;
+            };
+            let mut handle = 0;
+            // SAFETY: Owner synchronized consumers; preserve the immutable source until copy finishes.
+            unsafe {
+                check(
+                    sys::cuMemCreate(&mut handle, slab.bytes, &properties(s.device), 0),
+                    "create private prefix copy",
+                )?;
+                if let Err(error) = unsafe_unmap(&s.driver, self.address, slab) {
+                    // The new handle has never been mapped. Keep it owned if release fails.
+                    if unsafe_release(&s.driver, handle).is_err() {
+                        self.slabs.push(Slab {
+                            offset: self.bytes,
+                            bytes: 0,
+                            handle,
+                            mapped: false,
+                            shared: None,
+                        });
+                    }
+                    self.poisoned = true;
+                    return Err(error);
+                }
+                // The shared handle belongs to the snapshot registry, not this alias.
+                slab.handle = handle;
+                slab.shared = None;
+                slab.mapped = false;
+                let address = self.address + slab.offset as u64;
+                let result = (|| {
+                    check(
+                        sys::cuMemMap(address, slab.bytes, 0, handle, 0),
+                        "map private prefix copy",
+                    )?;
+                    slab.mapped = true;
+                    let access = AccessDesc {
+                        location: properties(s.device).location,
+                        flags: sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+                    };
+                    check(
+                        sys::cuMemSetAccess(address, slab.bytes, &access, 1),
+                        "private prefix copy access",
+                    )?;
+                    check(
+                        sys::cuMemcpyDtoDAsync_v2(address, source.address, slab.bytes, s.stream),
+                        "copy immutable prefix before write",
+                    )?;
+                    check(sys::cuStreamSynchronize(s.stream), "finish prefix COW")
+                })();
+                if result.is_err() {
+                    self.poisoned = true;
+                }
+                result?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn release_slabs(&mut self, driver: &Driver) -> Result<()> {
         let result = release_owned(
             &mut self.slabs,
@@ -216,6 +368,10 @@ struct Slab {
     bytes: usize,
     handle: u64,
     mapped: bool,
+    shared: Option<Rc<super::snapshot::Allocation>>,
+}
+fn overlaps(start: usize, end: usize, offset: usize, bytes: usize) -> bool {
+    start < end && start < offset.saturating_add(bytes) && offset < end
 }
 fn unsafe_unmap(_driver: &Driver, address: u64, slab: &Slab) -> Result<()> {
     // SAFETY: The caller owns this mapped extent and synchronized its stream.
@@ -244,7 +400,9 @@ fn release_owned(
             }
             slab.mapped = false;
         }
-        if let Err(e) = release(slab.handle) {
+        if slab.shared.is_none()
+            && let Err(e) = release(slab.handle)
+        {
             errors.push(e);
             return true;
         }
@@ -288,12 +446,142 @@ pub(crate) type Reservations = BTreeMap<String, Reservation>;
 mod tests {
     use super::*;
     #[test]
+    fn shared_mapping_cleanup_never_releases_snapshot_owned_handle() {
+        let allocation = Rc::new(super::super::snapshot::Allocation {
+            address: 0,
+            bytes: 8192,
+            handle: Some(7),
+        });
+        let mut slabs = vec![Slab {
+            offset: 0,
+            bytes: 8192,
+            handle: 7,
+            mapped: true,
+            shared: Some(Rc::clone(&allocation)),
+        }];
+        assert_eq!(Rc::strong_count(&allocation), 2);
+        release_owned(
+            &mut slabs,
+            |_| Ok(()),
+            |_| panic!("snapshot registry owns the handle"),
+        )
+        .unwrap();
+        assert_eq!(Rc::strong_count(&allocation), 1);
+        assert!(!overlaps(8192, 9000, 0, 8192));
+        assert!(overlaps(8191, 8192, 0, 8192));
+        assert!(!overlaps(0, 0, 0, 8192));
+    }
+    #[test]
+    #[ignore = "Requires exclusive GPU experiment lock"]
+    fn vmm_shared_prefix_cow_and_graph_replay() {
+        let mut s = Session::new(Driver::load().unwrap());
+        // SAFETY: Test exclusively owns a context reference and its CUDA resources.
+        unsafe {
+            check(sys::cuInit(0), "init").unwrap();
+            check(sys::cuDeviceGet(&mut s.device, 0), "device").unwrap();
+            check(sys::cuCtxGetCurrent(&mut s.previous), "previous").unwrap();
+            let mut context = std::ptr::null_mut();
+            check(
+                sys::cuDevicePrimaryCtxRetain(&mut context, s.device),
+                "retain",
+            )
+            .unwrap();
+            s.retained = true;
+            check(sys::cuCtxSetCurrent(context), "current").unwrap();
+            check(sys::cuStreamCreate(&mut s.stream, 1), "stream").unwrap();
+        }
+        let mut source = Reservation::reserve(&s, 4 << 20, 1).unwrap();
+        let bytes = source.granularity * 2;
+        source.grow_bytes(&s, bytes).unwrap();
+        let source_address = source.address;
+        let allocation = Rc::new(super::super::snapshot::Allocation {
+            address: source.address,
+            bytes,
+            handle: Some(source.allocation_handle().unwrap()),
+        });
+        s.prefix_buffers.get_mut().insert("source".into(), source);
+        let mut left = Reservation::reserve(&s, bytes * 2, 1).unwrap();
+        let mut right = Reservation::reserve(&s, bytes * 2, 1).unwrap();
+        let left_address = left.address;
+        let right_address = right.address;
+        // Capture a writer before replacing physical backing at the same VA.
+        left.grow_bytes(&s, bytes).unwrap();
+        // SAFETY: Captured memset targets a live owned mapping; all source writes finish first.
+        unsafe {
+            check(
+                sys::cuMemsetD8Async(source_address, 37, bytes, s.stream),
+                "source initialization",
+            )
+            .unwrap();
+            check(sys::cuStreamSynchronize(s.stream), "init sync").unwrap();
+            check(
+                sys::cuStreamBeginCapture_v2(
+                    s.stream,
+                    sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL,
+                ),
+                "capture",
+            )
+            .unwrap();
+            s.capturing = true;
+            check(
+                sys::cuMemsetD8Async(left_address, 91, 4, s.stream),
+                "record write",
+            )
+            .unwrap();
+            check(
+                sys::cuStreamEndCapture(s.stream, &mut s.graph),
+                "capture end",
+            )
+            .unwrap();
+            s.capturing = false;
+            check(
+                sys::cuGraphInstantiateWithFlags(&mut s.exec, s.graph, 0),
+                "instantiate",
+            )
+            .unwrap();
+        }
+        left.release_slabs(&s.driver).unwrap();
+        left.map_shared(&s, 0, Rc::clone(&allocation)).unwrap();
+        right.map_shared(&s, 0, Rc::clone(&allocation)).unwrap();
+        assert_eq!(left.physical_bytes() + right.physical_bytes(), 0);
+        assert_eq!(left.writable_bytes(bytes, 4).unwrap(), 0);
+        assert_eq!(left.writable_bytes(0, 4).unwrap(), bytes);
+        left.make_writable(&s, 0, 4).unwrap();
+        assert_eq!(left.address, left_address);
+        assert_eq!(left.physical_bytes(), bytes);
+        assert_eq!(right.physical_bytes(), 0);
+        // SAFETY: The graph uses unchanged VAs; synchronized downloads cover four bytes.
+        unsafe {
+            check(sys::cuGraphLaunch(s.exec, s.stream), "COW replay").unwrap();
+            check(sys::cuStreamSynchronize(s.stream), "replay sync").unwrap();
+            for (address, expected) in [
+                (left_address, 91u8),
+                (right_address, 37),
+                (source_address, 37),
+            ] {
+                let mut values = [0u8; 4];
+                check(
+                    sys::cuMemcpyDtoH_v2(values.as_mut_ptr().cast(), address, values.len()),
+                    "verify sharing isolation",
+                )
+                .unwrap();
+                assert_eq!(values, [expected; 4]);
+            }
+        }
+        right.grow_bytes(&s, bytes + 1).unwrap();
+        assert_eq!(right.physical_bytes(), right.granularity);
+        s.virtual_buffers.get_mut().insert("left".into(), left);
+        s.virtual_buffers.get_mut().insert("right".into(), right);
+        s.cleanup().unwrap();
+    }
+    #[test]
     fn cleanup_retries_preserve_mapping_and_handle_ownership() {
         let mut slabs = vec![Slab {
             offset: 0,
             bytes: 4096,
             handle: 7,
             mapped: true,
+            shared: None,
         }];
         let mut releases = 0;
         assert!(
