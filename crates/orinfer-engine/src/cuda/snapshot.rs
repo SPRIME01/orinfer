@@ -2,8 +2,10 @@
 use super::executor::Executor;
 use super::{Result, check, sys};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
+    time::Instant,
 };
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,18 @@ pub(crate) struct Snapshot {
     pub bytes: usize,
     state: Vec<Piece>,
     pub kv: Vec<Piece>,
+}
+/// Private, reusable backing for a live shared-workspace continuation. It is
+/// never published to the immutable prefix cache or cloned as a Snapshot.
+pub(crate) struct Workspace {
+    snapshot: Snapshot,
+    resident: bool,
+    saved_s: f64,
+}
+impl Workspace {
+    pub(crate) fn bytes(&self) -> usize {
+        self.snapshot.bytes
+    }
 }
 pub(crate) struct Plan {
     state: BTreeMap<String, Range>,
@@ -175,6 +189,13 @@ impl Executor {
         Ok(Some(Snapshot { bytes, state, kv }))
     }
     fn save_ranges(&mut self, ranges: BTreeMap<String, Range>) -> Result<Option<Vec<Piece>>> {
+        self.allocate_ranges(ranges, true)
+    }
+    fn allocate_ranges(
+        &mut self,
+        ranges: BTreeMap<String, Range>,
+        copy: bool,
+    ) -> Result<Option<Vec<Piece>>> {
         let bytes = size(&ranges)?;
         if bytes == 0 {
             return Ok(Some(vec![]));
@@ -206,18 +227,20 @@ impl Executor {
         let (mut pieces, mut source) = (vec![], 0);
         for (name, range) in ranges {
             if range.bytes != 0 {
-                // SAFETY: Source/destination extents are validated; one stream
-                // orders all writes before the immutable snapshot is published.
-                unsafe {
-                    check(
-                        sys::cuMemcpyDtoDAsync_v2(
-                            address + source as u64,
-                            self.pointers[&name] + range.offset as u64,
-                            range.bytes,
-                            self.session.stream,
-                        ),
-                        "save prefix extent",
-                    )?;
+                if copy {
+                    // SAFETY: Source/destination extents are validated; one stream
+                    // orders all writes before the immutable snapshot is published.
+                    unsafe {
+                        check(
+                            sys::cuMemcpyDtoDAsync_v2(
+                                address + source as u64,
+                                self.pointers[&name] + range.offset as u64,
+                                range.bytes,
+                                self.session.stream,
+                            ),
+                            "save prefix extent",
+                        )?;
+                    }
                 }
                 let count = range.bytes;
                 pieces.push(Piece {
@@ -230,6 +253,100 @@ impl Executor {
             }
         }
         Ok(Some(pieces))
+    }
+    pub(crate) fn reserve_workspace(
+        &mut self,
+        ranges: BTreeMap<String, Range>,
+    ) -> Result<Option<Rc<RefCell<Workspace>>>> {
+        let plan = self.plan_snapshot(ranges, &BTreeSet::new(), &[])?;
+        self.collect_snapshots()?;
+        let Some(state) = self.allocate_ranges(plan.state, false)? else {
+            return Ok(None);
+        };
+        let bytes = state.iter().map(|p| p.range.bytes).sum();
+        Ok(Some(Rc::new(RefCell::new(Workspace {
+            snapshot: Snapshot {
+                bytes,
+                state,
+                kv: vec![],
+            },
+            resident: true,
+            saved_s: 0.,
+        }))))
+    }
+    pub(crate) fn retain_workspace(&mut self, workspace: &Rc<RefCell<Workspace>>) -> Result<()> {
+        if self
+            .live_workspace
+            .as_ref()
+            .and_then(|(_, w)| w.upgrade())
+            .is_some()
+        {
+            return Err("Shared workspace already has a live continuation".into());
+        }
+        self.live_workspace = Some((self.active_sequence, Rc::downgrade(workspace)));
+        Ok(())
+    }
+    pub(super) fn save_live_workspace(&mut self) -> Result<()> {
+        let Some((owner, weak)) = &self.live_workspace else {
+            return Ok(());
+        };
+        let Some(workspace) = weak.upgrade() else {
+            self.live_workspace = None;
+            return Ok(());
+        };
+        if *owner != self.active_sequence {
+            return Err("Live workspace belongs to an inactive sequence".into());
+        }
+        let at = Instant::now();
+        let mut workspace = workspace.borrow_mut();
+        if !workspace.resident {
+            return Err("Live workspace has already been saved".into());
+        }
+        for p in &workspace.snapshot.state {
+            // SAFETY: The backing and source extents were validated at reserve;
+            // they are private, live, and ordered with preceding layer writes.
+            unsafe {
+                check(
+                    sys::cuMemcpyDtoDAsync_v2(
+                        p.allocation.address + p.source as u64,
+                        self.pointers[&p.name] + p.range.offset as u64,
+                        p.range.bytes,
+                        self.session.stream,
+                    ),
+                    "save live workspace",
+                )?;
+            }
+        }
+        self.sync()?;
+        workspace.resident = false;
+        let seconds = at.elapsed().as_secs_f64();
+        workspace.saved_s += seconds;
+        self.workspace_save_s += seconds;
+        self.live_workspace = None;
+        Ok(())
+    }
+    pub(crate) fn resume_workspace(&mut self, workspace: &Rc<RefCell<Workspace>>) -> Result<f64> {
+        if let Some((_, live)) = &self.live_workspace
+            && live
+                .upgrade()
+                .is_some_and(|live| Rc::ptr_eq(&live, workspace))
+        {
+            self.live_workspace = None;
+        } else {
+            self.save_live_workspace()?;
+        }
+        let mut workspace = workspace.borrow_mut();
+        let at = Instant::now();
+        let seconds = if workspace.resident {
+            0.
+        } else {
+            self.restore_snapshot(&workspace.snapshot)?;
+            workspace.resident = true;
+            let seconds = at.elapsed().as_secs_f64();
+            self.workspace_restore_s += seconds;
+            seconds
+        };
+        Ok(seconds + std::mem::take(&mut workspace.saved_s))
     }
     fn save_kv_ranges(&mut self, ranges: &BTreeMap<String, Range>) -> Result<Option<Vec<Piece>>> {
         let (mut pieces, mut copied) = (vec![], BTreeMap::new());

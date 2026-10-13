@@ -340,6 +340,7 @@ impl Executor {
         if slot == self.active_sequence {
             return Ok(());
         }
+        self.save_live_workspace()?;
         self.sync()?;
         let buffers = self.session.virtual_buffers.get_mut();
         for name in self.sequence_strides.keys() {
@@ -1381,6 +1382,8 @@ impl Executor {
         decode: bool,
         allow_capture: bool,
     ) -> Result<()> {
+        // Batch kernels can address inactive sequences without activating them.
+        self.save_live_workspace()?;
         // Copy/zero destinations can also write KV (e.g. state restoration).
         // Prepare COW before graph capture/replay, including inactive arenas.
         for invocation in operations {

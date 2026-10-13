@@ -68,6 +68,9 @@ pub(crate) struct Executor {
     #[cfg(test)]
     pub(crate) live_graph_ms: RefCell<Vec<f32>>,
     pub(crate) snapshot_allocations: Vec<std::rc::Rc<super::snapshot::Allocation>>,
+    pub(super) live_workspace: Option<(usize, std::rc::Weak<RefCell<super::snapshot::Workspace>>)>,
+    pub(crate) workspace_save_s: f64,
+    pub(crate) workspace_restore_s: f64,
     pub(super) sequences: Vec<super::sequence::Sequence>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
@@ -487,6 +490,9 @@ impl Executor {
                 .map(|kv| kv.prefill_workspace.keys().cloned().collect())
                 .unwrap_or_default(),
             sequences: vec![super::sequence::Sequence::default()],
+            live_workspace: None,
+            workspace_save_s: 0.,
+            workspace_restore_s: 0.,
             active_sequence: 0,
             sequence_specs: manifest
                 .buffers

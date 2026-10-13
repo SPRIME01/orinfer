@@ -1,23 +1,20 @@
 //! Resume a large forward pass at model-registered layer boundaries. Tokens
 //! become committed only after its target body and shifted draft warm complete.
 use super::*;
-use crate::cuda::snapshot::{Range, Snapshot};
+use crate::cuda::snapshot::{Range, Workspace};
+use std::{cell::RefCell, rc::Rc};
 
 pub(super) struct Frame {
     pub plan: crate::model::PrefillPlan,
     next: usize,
-    snapshot: Option<Snapshot>,
+    workspace: Option<Rc<RefCell<Workspace>>>,
     regular_s: f64,
 }
 
 impl ModelRuntime {
     pub(super) fn release_prefill_frame(&mut self, req: &mut RequestState) -> Result<()> {
-        if let Some(mut frame) = req.prefill_frame.take()
-            && let Some(snapshot) = frame.snapshot.take()
-        {
-            self.execution.release_snapshot(snapshot)?;
-        }
-        Ok(())
+        drop(req.prefill_frame.take());
+        self.execution.collect_snapshots()
     }
     pub(super) fn prefill_stage_cost(&self, req: &RequestState, chunk: usize) -> f64 {
         let plan = req.prefill_frame.as_ref().map(|f| &f.plan).or_else(|| {
@@ -91,16 +88,12 @@ impl ModelRuntime {
             Frame {
                 plan,
                 next: 0,
-                snapshot: None,
+                workspace: None,
                 regular_s: at.elapsed().as_secs_f64(),
             }
         };
-        if let Some(snapshot) = frame.snapshot.take() {
-            let resume = Instant::now();
-            self.execution.restore_snapshot(&snapshot)?;
-            self.execution.release_snapshot(snapshot)?;
-            self.scheduler_statistics.prefill_resume_s += resume.elapsed().as_secs_f64();
-            frame.regular_s += resume.elapsed().as_secs_f64();
+        if let Some(workspace) = &frame.workspace {
+            frame.regular_s += self.execution.resume_workspace(workspace)?;
         }
         // OOM while saving a continuation falls back to completing the same
         // forward pass, never to recomputing already-mutated recurrent layers.
@@ -154,32 +147,31 @@ impl ModelRuntime {
                 self.scheduler_statistics.bounded_prefill_iterations += 1;
             }
             if frame.next < frame.plan.stages.len() {
-                let suspend = Instant::now();
-                let ranges = frame
-                    .plan
-                    .live_buffers
-                    .iter()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            Range {
-                                offset: 0,
-                                bytes: self.execution.sizes[name],
-                            },
-                        )
-                    })
-                    .collect();
-                let snapshot_plan = self
-                    .execution
-                    .plan_snapshot(ranges, &BTreeSet::new(), &[])?;
-                if let Some(snapshot) = self.execution.snapshot(&snapshot_plan)? {
-                    self.scheduler_statistics.prefill_suspend_s += suspend.elapsed().as_secs_f64();
+                if frame.workspace.is_none() {
+                    let reserve = Instant::now();
+                    let ranges = frame
+                        .plan
+                        .live_buffers
+                        .iter()
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                Range {
+                                    offset: 0,
+                                    bytes: self.execution.sizes[name],
+                                },
+                            )
+                        })
+                        .collect();
+                    frame.workspace = self.execution.reserve_workspace(ranges)?;
+                    frame.regular_s += reserve.elapsed().as_secs_f64();
+                }
+                if let Some(workspace) = &frame.workspace {
+                    self.execution.retain_workspace(workspace)?;
                     self.scheduler_statistics.peak_prefill_frame_bytes = self
                         .scheduler_statistics
                         .peak_prefill_frame_bytes
-                        .max(snapshot.bytes);
-                    frame.regular_s += suspend.elapsed().as_secs_f64();
-                    frame.snapshot = Some(snapshot);
+                        .max(workspace.borrow().bytes());
                     req.prefill_frame = Some(frame);
                     self.observe_prefill_step(
                         chunk,
@@ -192,6 +184,11 @@ impl ModelRuntime {
                     return Ok((0, vec![]));
                 }
                 continue;
+            }
+            // The target body no longer needs the shared continuation buffers.
+            // MTP warm and endpoint commit operate on request-private state.
+            if frame.workspace.take().is_some() {
+                self.execution.collect_snapshots()?;
             }
             let end = req.offset + chunk;
             let warm_end =

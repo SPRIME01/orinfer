@@ -47,6 +47,7 @@ fn validate_flash_layered_prefill() {
     model.finish_request(&mut reference, false).unwrap();
     let mut rows = vec![];
     for interruption in [false, true] {
+        let before = model.scheduling_statistics();
         let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
         let mut short = input(&source, 1024);
         short.input_tokens.truncate(512);
@@ -87,9 +88,38 @@ fn validate_flash_layered_prefill() {
             .sum();
         assert!(kl.abs() < 1e-7, "Layer boundary changed logits: {kl}");
         assert_eq!(hash_state(&mut model, &mut req), expected_state);
-        rows.push(json!({"interruption":interruption,"steps":steps,"kl":kl,"state_equal":true}));
+        let after = model.scheduling_statistics();
+        let save_s = after.prefill_suspend_s - before.prefill_suspend_s;
+        let resume_s = after.prefill_resume_s - before.prefill_resume_s;
+        if interruption {
+            assert!(save_s > 0. && resume_s > 0.);
+        } else {
+            assert_eq!(save_s, 0.);
+            assert_eq!(resume_s, 0.);
+        }
+        rows.push(json!({"interruption":interruption,"steps":steps,"kl":kl,"state_equal":true,"save_s":save_s,"resume_s":resume_s}));
         model.finish_request(&mut req, false).unwrap();
         model.finish_request(&mut decoder, false).unwrap();
+    }
+    // Two paused forwards must keep independent backing even though both use
+    // the same large scratch arena and alternate at every layer boundary.
+    let mut peers = [
+        model.start_request(input(&source, 1), &|| false).unwrap(),
+        model.start_request(input(&source, 1), &|| false).unwrap(),
+    ];
+    while peers.iter().any(|r| r.prefilling) {
+        for req in &mut peers {
+            if req.prefilling {
+                model
+                    .with_request(req, |m, r| m.advance_prefill_step(r, chunk, true))
+                    .unwrap();
+            }
+        }
+    }
+    for req in &mut peers {
+        assert_eq!(hash_state(&mut model, req), expected_state);
+        assert_eq!(distribution(&mut model, req), expected);
+        model.finish_request(req, false).unwrap();
     }
     let mut cancelled = model.start_request(input(&source, 1), &|| false).unwrap();
     model
@@ -106,10 +136,19 @@ fn validate_flash_layered_prefill() {
         .unwrap();
     assert_eq!(hash_state(&mut model, &mut reused), expected_state);
     model.finish_request(&mut reused, false).unwrap();
+    let mut abandoned = model.start_request(input(&source, 1), &|| false).unwrap();
+    model
+        .with_request(&mut abandoned, |m, r| {
+            m.advance_prefill_step(r, chunk, true)
+        })
+        .unwrap();
+    drop(abandoned);
+    model.reap_abandoned().unwrap();
+    assert_eq!(model.execution.snapshot_resident_bytes(), 0);
     std::fs::write(
         fixture.output,
         serde_json::to_vec_pretty(&json!({
-            "chunk_tokens":chunk,"cases":rows,"cancel_reuse_state_equal":true,"scheduler":model.scheduler_statistics
+            "chunk_tokens":chunk,"cases":rows,"cancel_reuse_state_equal":true,"alternating_prefill_state_equal":true,"abandoned_frame_released":true,"scheduler":model.scheduling_statistics()
         }))
         .unwrap(),
     )

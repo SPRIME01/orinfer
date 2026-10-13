@@ -63,6 +63,8 @@ impl ModelRuntime {
     pub(crate) fn scheduling_statistics(&self) -> crate::scheduler::Statistics {
         let mut statistics = self.scheduler_statistics.clone();
         statistics.batch_execution = self.execution.batch_statistics.get();
+        statistics.prefill_suspend_s = self.execution.workspace_save_s;
+        statistics.prefill_resume_s = self.execution.workspace_restore_s;
         statistics
     }
     #[cfg(test)]
