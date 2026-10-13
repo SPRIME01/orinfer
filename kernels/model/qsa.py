@@ -10,6 +10,7 @@ All arithmetic is TileLang; allocations and request positions belong to callers.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.logical_rows import bind, extent, guard
 
 
 def geometry(m, capacity):
@@ -19,7 +20,8 @@ def geometry(m, capacity):
 
 
 @orin_jit
-def index_query(m: int, capacity: int = 0):
+def index_query(m: int, capacity: int = 0, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     mrope = capacity > 0
 
     @T.macro
@@ -80,18 +82,19 @@ def index_query(m: int, capacity: int = 0):
         ):
             prepare(QK, Weight, Position, Query, Position)
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
-def index_compress(m: int, capacity: int, mrope: bool = False):
+def index_compress(m: int, capacity: int, mrope: bool = False, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
 
     @T.macro
     def prepare(QK, Pending, Weight, Position, Cache, Coordinates):
         with T.Kernel(T.ceildiv(m + 3, 4), threads=128) as group:
             block = Position[0] // 4 + group
-            if (block + 1) * 4 <= Position[0] + m:
+            if (block + 1) * 4 <= Position[0] + count:
                 x = T.alloc_fragment((128,), T.float32)
                 square = T.alloc_fragment((128,), T.float32)
                 total = T.alloc_fragment((1,), T.float32)
@@ -157,11 +160,12 @@ def index_compress(m: int, capacity: int, mrope: bool = False):
         ):
             prepare(QK, Pending, Weight, Position, Cache, Position)
 
-    return main
+    return bind(main, control, logical_rows)
 
 
 @orin_jit
-def index_pending(m: int):
+def index_pending(m: int, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     """Run after compression. One owner per ring slot, including arbitrary chunks."""
 
     @T.prim_func
@@ -171,17 +175,18 @@ def index_pending(m: int):
         Pending: T.Tensor((4, 128), T.float16),
     ):
         with T.Kernel(4, threads=128) as slot:
-            last = Position[0] + m - 1
+            last = Position[0] + count - 1
             token = last - (last - slot) % 4
             if token >= Position[0]:
                 for d in T.Parallel(128):
                     Pending[slot, d] = QK[token - Position[0], 4, d]
 
-    return main
+    return bind(main, control, logical_rows)
 
 
 @orin_jit
-def index_scores(m: int, capacity: int):
+def index_scores(m: int, capacity: int, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     stripes = min((blocks + 63) // 64, 8 if m >= 16 else 64)
 
@@ -201,7 +206,7 @@ def index_scores(m: int, capacity: int):
             # Stable graph/workspace addresses, but only live causal tiles run.
             for turn in T.serial(
                 T.ceildiv(
-                    T.max(0, T.ceildiv((Position[0] + T.min(m, qr * 4 + 4)) // 4, 64) - stripe),
+                    T.max(0, T.ceildiv((Position[0] + T.min(count, qr * 4 + 4)) // 4, 64) - stripe),
                     stripes,
                 )
             ):
@@ -209,11 +214,11 @@ def index_scores(m: int, capacity: int):
                 T.clear(reduced)
                 for i, d in T.Parallel(16, 128):
                     q[i, d] = 0
-                    if qr * 4 + i // 4 < m:
+                    if qr * 4 + i // 4 < count:
                         q[i, d] = Query[qr * 4 + i // 4, i % 4, d]
                 for i, d in T.Parallel(64, 128):
                     k[i, d] = 0
-                    if kb * 64 + i < (Position[0] + m) // 4:
+                    if kb * 64 + i < (Position[0] + count) // 4:
                         k[i, d] = Cache[kb * 64 + i, d]
                 T.gemm(q, k, acc, transpose_B=True, clear_accum=True)
                 for i, j in T.Parallel(16, 64):
@@ -223,11 +228,14 @@ def index_scores(m: int, capacity: int):
                     if qr * 4 + i < m and kb * 64 + j < (Position[0] + qr * 4 + i + 1) // 4:
                         Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
 
-    return main
+    return bind(guard(main, control, "x", 4), control, True) if logical_rows else main
 
 
 @orin_jit
-def radix_histogram(m: int, capacity: int, shift: int, tile: int = 1024):
+def radix_histogram(
+    m: int, capacity: int, shift: int, tile: int = 1024, logical_rows: bool = False
+):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
@@ -256,11 +264,12 @@ def radix_histogram(m: int, capacity: int, shift: int, tile: int = 1024):
                             T.atomic_add(hist[(key >> shift) & 255], 1)
                 T.copy(hist, Hist[row, segment, :])
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
-def radix_choose(m: int, capacity: int, shift: int, tile: int = 1024):
+def radix_choose(m: int, capacity: int, shift: int, tile: int = 1024, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
 
@@ -299,11 +308,12 @@ def radix_choose(m: int, capacity: int, shift: int, tile: int = 1024):
                 Prefix[row] = prefix
                 Remaining[row] = remain
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
-def selection_counts(m: int, capacity: int, tile: int = 1024):
+def selection_counts(m: int, capacity: int, tile: int = 1024, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
@@ -338,11 +348,12 @@ def selection_counts(m: int, capacity: int, tile: int = 1024):
                     Counts[row, 0, segment] = g[0]
                     Counts[row, 1, segment] = e[0]
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
-def selection_offsets(m: int, capacity: int, tile: int = 1024):
+def selection_offsets(m: int, capacity: int, tile: int = 1024, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     padded = 1 << (segments - 1).bit_length()
@@ -380,11 +391,12 @@ def selection_offsets(m: int, capacity: int, tile: int = 1024):
                 if i >= T.min(full, 512) * 4 and i < T.min(full, 512) * 4 + tail:
                     Selected[row, i] = full * 4 + i - T.min(full, 512) * 4
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
-def selection_scatter(m: int, capacity: int, tile: int = 1024):
+def selection_scatter(m: int, capacity: int, tile: int = 1024, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
@@ -430,7 +442,7 @@ def selection_scatter(m: int, capacity: int, tile: int = 1024):
                         for offset in T.unroll(4):
                             Selected[row, rank * 4 + offset] = (segment * tile + i) * 4 + offset
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main
 
 
 @orin_jit
@@ -570,7 +582,9 @@ def sparse_attention(m: int, capacity: int, splits: int = 8):
 
 
 @orin_jit
-def sparse_merge(m: int, splits: int = 8):
+def sparse_merge(m: int, splits: int = 8, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
+
     @T.prim_func
     def main(
         Max: T.Tensor((m, 24, splits), T.float32),
@@ -580,31 +594,36 @@ def sparse_merge(m: int, splits: int = 8):
         Output: T.Tensor((m, 24, 256), T.float16),
     ):
         with T.Kernel(m, 24, threads=128) as (row, head):
-            maximum = T.alloc_local((1,), T.float32)
-            den = T.alloc_local((1,), T.float32)
-            acc = T.alloc_fragment((256,), T.float32)
-            maximum[0] = -3.402823466e38
-            den[0] = 0
-            T.clear(acc)
-            for s in T.serial(splits):
-                maximum[0] = T.max(maximum[0], Max[row, head, s])
-            for s in T.serial(splits):
-                scale = T.exp(Max[row, head, s] - maximum[0])
-                den[0] += Den[row, head, s] * scale
+            if row < count:
+                maximum = T.alloc_local((1,), T.float32)
+                den = T.alloc_local((1,), T.float32)
+                acc = T.alloc_fragment((256,), T.float32)
+                maximum[0] = -3.402823466e38
+                den[0] = 0
+                T.clear(acc)
+                for s in T.serial(splits):
+                    maximum[0] = T.max(maximum[0], Max[row, head, s])
+                for s in T.serial(splits):
+                    scale = T.exp(Max[row, head, s] - maximum[0])
+                    den[0] += Den[row, head, s] * scale
+                    for d in T.Parallel(256):
+                        acc[d] += Out[row, head, s, d] * scale
                 for d in T.Parallel(256):
-                    acc[d] += Out[row, head, s, d] * scale
-            for d in T.Parallel(256):
-                Output[row, head, d] = (
-                    acc[d]
-                    / T.max(den[0], 1e-30)
-                    / (1 + T.exp(-T.cast(Gate[row, head, d], T.float32)))
-                )
+                    Output[row, head, d] = (
+                        acc[d]
+                        / T.max(den[0], 1e-30)
+                        / (1 + T.exp(-T.cast(Gate[row, head, d], T.float32)))
+                    )
+            else:
+                for d in T.Parallel(256):
+                    Output[row, head, d] = 0
 
-    return main
+    return bind(main, control, logical_rows)
 
 
 @orin_jit
-def kv_store(m: int, capacity: int):
+def kv_store(m: int, capacity: int, logical_rows: bool = False):
+    count, control = extent(m, logical_rows)
     """Group-64 symmetric INT8 K/V; quantize the exact prepared FP16 values."""
     geometry(m, capacity)
 
@@ -657,4 +676,4 @@ def kv_store(m: int, capacity: int):
                         T.max(-127.0, T.min(127.0, T.round(vr))), T.int8
                     )
 
-    return main
+    return bind(guard(main, control, "x"), control, True) if logical_rows else main

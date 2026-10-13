@@ -143,10 +143,17 @@ def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
 
 
 @orin_jit
-def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False):
+def hc_initialize(
+    M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False, logical_rows: bool = False
+):
     """Broadcast token embeddings into every independent residual stream."""
     if any(type(v) is not int or v <= 0 for v in (M, H, streams)):
         raise ValueError("Invalid residual dimensions")
+    from kernels.model.logical_rows import bind, extent
+
+    if logical_rows and dynamic_rows:
+        raise ValueError("Logical prefill requires a fixed storage capacity")
+    count, control = extent(M, logical_rows)
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -156,9 +163,11 @@ def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = 
         with T.Kernel(M, streams, T.ceildiv(H, 256), threads=128) as (row, branch, block):
             for j in T.Parallel(256):
                 if block * 256 + j < H:
-                    Residual[row, branch, block * 256 + j] = Embedding[row, block * 256 + j]
+                    Residual[row, branch, block * 256 + j] = T.if_then_else(
+                        row < count, Embedding[row, block * 256 + j], 0
+                    )
 
-    return main
+    return bind(main, control, logical_rows)
 
 
 @orin_jit
@@ -261,6 +270,7 @@ def qsa_prepare(
     is_neox_style: bool = False,
     staged: bool = False,
     mrope: bool = False,
+    logical_rows: bool = False,
 ):
     """Normalize Q/K, text RoPE, append private KV and copy gate.
 
@@ -391,6 +401,11 @@ def qsa_prepare(
                 QGate, Key, Value, QWeight, KWeight, Position, Query, KCache, VCache, Gate, Position
             )
 
+    if logical_rows:
+        from kernels.model.logical_rows import bind, extent, guard
+
+        _, control = extent(M, True)
+        return bind(guard(main, control, "x"), control, True)
     return main
 
 

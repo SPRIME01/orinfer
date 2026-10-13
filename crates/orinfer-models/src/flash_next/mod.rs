@@ -98,7 +98,14 @@ impl Adapter for Flash {
         tokens: &[u32],
         history: &[u32],
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        self.inputs.prepare_for(program, tokens, history)
+        let capacity = if program == "target" {
+            self.manifest
+                .prefill_plan(tokens.len())
+                .map_or(tokens.len(), |p| p.chunk_tokens)
+        } else {
+            tokens.len()
+        };
+        self.inputs.prepare_for(program, tokens, history, capacity)
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
         Ok((

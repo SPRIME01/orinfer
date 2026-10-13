@@ -234,6 +234,18 @@ QSA 的选中 KV 固定按 256-token 区间归约，再按固定顺序合并八�
 
 ### 可暂停的大块前向
 
+512 行的前向可接受 129–512 个真实 tokens，复用投影和专家 cubin；GDN、PLE 历史、QSA、位置推进和 MTP capture 按设备上的真实长度执行。填充行不进入专家计数和 dispatch，输出头选取最后一个真实 token。输入层只生成真实 token 的 embedding/PLE，不添加虚构 token。当前其他容量仍按精确长度执行。
+
+从包含精确小尾块、规范归约和可暂停阶段的包构建：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/prefill_tails.py /path/to/build-output \
+  --model /path/to/flash-layered --model-output /path/to/flash-logical \
+  --logical-512
+```
+
+构建复用权重和未变化的算子，并生成匹配的原生模型库。执行包 profile 的可选 `min_tokens` 声明真实长度范围；缺省时只接受精确长度，外部包仍为 schema 1。新增输出头工作区仅 5 KiB。
+
 当前模型库为 512/2048/4096-token 前向注册按层切分的阶段，边界在全部融合和 Q4 前置转换完成后生成。阶段引用现有操作和 cubin；运行时在切换序列或执行 batch 前保存仍存活的 HC/PLE 工作区，插入 decode/MTP 后恢复。同一请求连续执行时不复制工作区，备份分配在块内复用。不发布尚未完成所有层的 prefix 状态。MTP warm 也按已有 warm profile 分步执行。
 
 对已完成上述数值与尾块构建的模型，重建原生执行包即可启用：

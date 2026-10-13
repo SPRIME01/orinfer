@@ -385,6 +385,7 @@ pub(super) fn build(
             b.emit(HEAD, &head, "body", profile.tokens, 0)?,
         );
         manifest.prefill_plans.push(crate::model::PrefillPlan {
+            min_tokens: 0,
             chunk_tokens: profile.tokens,
             prefill_program: prefill,
             head_program: head,
@@ -598,6 +599,7 @@ pub(super) fn build(
             kv.growth.insert(
                 program.clone(),
                 crate::model::KvGrowth {
+                    length: None,
                     position,
                     tokens,
                     buffers,

@@ -194,6 +194,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         kv.growth.insert(
             p.program.clone(),
             KvGrowth {
+                length: None,
                 position: manifest.position.clone(),
                 tokens: p.tokens,
                 buffers: kv
@@ -210,6 +211,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         kv.growth.insert(
             p.program.clone(),
             KvGrowth {
+                length: None,
                 position: spec.position.clone(),
                 tokens: p.tokens,
                 buffers: kv
@@ -225,6 +227,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     kv.growth.insert(
         spec.draft_program.clone(),
         KvGrowth {
+            length: None,
             position: spec.position,
             tokens: 1,
             buffers: kv

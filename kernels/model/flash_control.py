@@ -2,6 +2,7 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.logical_rows import bind, extent
 
 
 @orin_jit
@@ -40,10 +41,11 @@ def selections(rows: int):
 
 
 @orin_jit
-def capture(rows: int, width: int, ring: int = 512):
+def capture(rows: int, width: int, ring: int = 512, logical_rows: bool = False):
     """Preserve raw Flash HC branches after advancing the target cursor."""
     if not 1 <= rows <= ring or width <= 0:
         raise ValueError("Target capture must fit the hidden ring")
+    count, control = extent(rows, logical_rows)
 
     @T.prim_func
     def kernel(
@@ -54,14 +56,16 @@ def capture(rows: int, width: int, ring: int = 512):
         with T.Kernel(rows, T.ceildiv(width, 256), threads=128) as (row, block):
             for j in T.Parallel(256):
                 col = block * 256 + j
-                if col < width:
-                    Ring[(Position[0] - rows + row) % ring, col] = Hidden[row, col]
+                if col < width and row < count:
+                    Ring[(Position[0] - count + row) % ring, col] = Hidden[row, col]
 
-    return kernel
+    return bind(kernel, control, logical_rows)
 
 
 @orin_jit
-def last_hidden(rows: int, width: int):
+def last_hidden(rows: int, width: int, logical_rows: bool = False):
+    count, control = extent(rows, logical_rows)
+
     @T.prim_func
     def kernel(
         Hidden: T.Tensor((rows, width), T.float16), Condition: T.Tensor((1, width), T.float16)
@@ -70,9 +74,9 @@ def last_hidden(rows: int, width: int):
             for j in T.Parallel(256):
                 col = block * 256 + j
                 if col < width:
-                    Condition[0, col] = Hidden[rows - 1, col]
+                    Condition[0, col] = Hidden[count - 1, col]
 
-    return kernel
+    return bind(kernel, control, logical_rows)
 
 
 @orin_jit

@@ -96,6 +96,8 @@ pub struct KvCache {
 pub struct KvGrowth {
     pub position: String,
     pub tokens: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<String>,
     pub buffers: Vec<String>,
 }
 
@@ -104,6 +106,8 @@ pub struct KvGrowth {
 #[serde(deny_unknown_fields)]
 pub struct PrefillPlan {
     pub chunk_tokens: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_tokens: usize,
     pub prefill_program: String,
     pub head_program: String,
     /// Ordered, resumable pieces of the same forward pass. Empty means atomic.
@@ -112,6 +116,17 @@ pub struct PrefillPlan {
     /// Workspace values that remain live between stages; never model state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live_buffers: Vec<String>,
+}
+
+pub(crate) fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+impl PrefillPlan {
+    pub fn accepts(&self, tokens: usize) -> bool {
+        tokens == self.chunk_tokens
+            || (self.min_tokens > 0 && (self.min_tokens..=self.chunk_tokens).contains(&tokens))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -226,6 +241,12 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
 }
 
 impl Manifest {
+    pub fn prefill_plan(&self, tokens: usize) -> Option<&PrefillPlan> {
+        self.prefill_plans
+            .iter()
+            .filter(|p| p.accepts(tokens))
+            .min_by_key(|p| p.chunk_tokens)
+    }
     pub fn validate<'a>(&'a self) -> Result<usize> {
         if self.schema_version != 2
             || self.target != "sm_87"
@@ -433,6 +454,8 @@ impl Manifest {
         let mut plan_sizes = BTreeSet::new();
         for plan in &self.prefill_plans {
             if plan.chunk_tokens == 0
+                || plan.min_tokens > plan.chunk_tokens
+                || (plan.min_tokens > 0 && self.segment_controls.is_none())
                 || plan.chunk_tokens > self.chunk_tokens
                 || !plan_sizes.insert(plan.chunk_tokens)
                 || plan.prefill_program == "decode"
@@ -497,6 +520,21 @@ impl Manifest {
             }
         }
         validate_graph_branches(self, &self.kernels)?;
+        if let Some(kv) = &self.kv_cache {
+            for growth in kv.growth.values() {
+                if let Some(name) = &growth.length {
+                    let control = lookup(name)?;
+                    if growth.tokens == 0
+                        || control.dtype != crate::artifact::Dtype::I32
+                        || control.bytes()? != 4
+                        || control.data.is_some()
+                        || control.access == Access::Read
+                    {
+                        return Err("Invalid logical KV length control".into());
+                    }
+                }
+            }
+        }
         if !self.reset_buffers.contains(&self.position) {
             return Err("Position must reset between requests".into());
         }
@@ -561,6 +599,9 @@ impl Manifest {
             }
             return Ok((self.chunk_tokens, "prefill", "head"));
         }
+        if let Some(plan) = self.prefill_plan(tokens).filter(|p| p.min_tokens > 0) {
+            return Ok((tokens, &plan.prefill_program, &plan.head_program));
+        }
         let plan = self
             .prefill_plans
             .iter()
@@ -593,6 +634,26 @@ pub struct Request {
 #[cfg(test)]
 mod branch_tests {
     use super::*;
+    #[test]
+    fn logical_prefill_keeps_capacity_and_rejects_uncovered_rows() {
+        let plan: PrefillPlan = serde_json::from_value(serde_json::json!({
+            "chunk_tokens":512, "min_tokens":129,
+            "prefill_program":"body", "head_program":"head"
+        }))
+        .unwrap();
+        for tokens in 129..=512 {
+            assert!(plan.accepts(tokens));
+        }
+        for tokens in [0, 1, 128, 513] {
+            assert!(!plan.accepts(tokens));
+        }
+        let exact: PrefillPlan = serde_json::from_value(serde_json::json!({
+            "chunk_tokens":128, "prefill_program":"body", "head_program":"head"
+        }))
+        .unwrap();
+        assert!(exact.accepts(128));
+        assert!(!exact.accepts(127));
+    }
     fn fixture() -> (Manifest, Vec<Kernel>) {
         let identity = serde_json::json!({"file":"k.cubin","sha256":"0".repeat(64)});
         let kernels: Vec<Kernel> = [

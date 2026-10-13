@@ -33,6 +33,7 @@ def sparse_attention(
     threads: int = 128,
     single_buffer: bool = False,
     split_size: int | None = 256,
+    logical_rows: bool = False,
 ):
     geometry(m, capacity)
     if splits not in (1, 2, 4, 8):
@@ -274,4 +275,9 @@ def sparse_attention(
                     Max[row, kh * 12 + i, split] = maximum[i]
                     Den[row, kh * 12 + i, split] = denom[i]
 
+    if logical_rows:
+        from kernels.model.logical_rows import bind, extent, guard
+
+        _, control = extent(m, True)
+        return bind(guard(main, control, "x"), control, True)
     return main

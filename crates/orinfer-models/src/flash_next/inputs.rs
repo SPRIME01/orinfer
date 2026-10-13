@@ -362,19 +362,23 @@ impl Inputs {
         tokens: &[u32],
         history: &[u32],
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        self.prepare_for("target", tokens, history)
+        self.prepare_for("target", tokens, history, tokens.len())
     }
     pub(super) fn prepare_for(
         &self,
         program: &str,
         tokens: &[u32],
         history: &[u32],
+        capacity: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let draft = program.starts_with("mtp_warm_m") || program == "mtp_draft";
         if !draft && program != "target" {
             return Err("Unknown Flash input program".into());
         }
-        if !matches!(tokens.len(), 1..=16 | 128 | 512 | 2048 | 4096)
+        if tokens.is_empty()
+            || tokens.len() > capacity
+            || !matches!(capacity, 1..=16 | 128 | 512 | 2048 | 4096)
+            || (draft && capacity != tokens.len())
             || tokens
                 .iter()
                 .chain(history)
@@ -437,13 +441,10 @@ impl Inputs {
         }
         Ok(vec![
             (
-                format!("M{}_Embedding", super::plan::arena_width(tokens.len())),
+                format!("M{}_Embedding", super::plan::arena_width(capacity)),
                 embedding,
             ),
-            (
-                format!("M{}_Ple", super::plan::arena_width(tokens.len())),
-                ple,
-            ),
+            (format!("M{}_Ple", super::plan::arena_width(capacity)), ple),
         ])
     }
 }

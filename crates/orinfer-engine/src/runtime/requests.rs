@@ -756,18 +756,14 @@ impl ModelRuntime {
         if chunk == 0 || chunk > remaining {
             return Err("Invalid selected prefill extent".into());
         }
-        let plan = self
-            .manifest
-            .prefill_plans
-            .iter()
-            .find(|p| p.chunk_tokens == chunk);
+        let plan = self.manifest.prefill_plan(chunk);
         if chunk != 1 && plan.is_none() {
             return Err("Missing selected prefill shape".into());
         }
         let (chunk, program, head) = plan
             .map(|p| {
                 (
-                    p.chunk_tokens,
+                    chunk,
                     p.prefill_program.clone(),
                     Some(p.head_program.clone()),
                 )
@@ -790,7 +786,11 @@ impl ModelRuntime {
         self.upload_segment_controls(chunk)?;
         self.launch_program(&program, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
-            self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+            self.mtp_capture(
+                spec,
+                plan.map_or(chunk, |p| p.chunk_tokens),
+                ExecutionPhase::Prefill,
+            )?;
         }
         let regular_s = at.elapsed().as_secs_f64()
             - (self.execution.batch_statistics.get().kernel_load_s - load_before);
@@ -989,13 +989,15 @@ impl ModelRuntime {
         progress_due: bool,
     ) -> Option<usize> {
         if let Some(frame) = &requests[i].prefill_frame {
-            return (self.prefill_stage_cost(requests[i], frame.plan.chunk_tokens) <= budget_s
+            return (self.prefill_stage_cost(requests[i], frame.tokens) <= budget_s
                 || progress_due)
-                .then_some(frame.plan.chunk_tokens);
+                .then_some(frame.tokens);
         }
         let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
-        let shapes =
-            std::iter::once(1).chain(self.manifest.prefill_plans.iter().map(|p| p.chunk_tokens));
+        let shapes = std::iter::once(1).chain(self.manifest.prefill_plans.iter().filter_map(|p| {
+            let n = p.chunk_tokens.min(remaining);
+            p.accepts(n).then_some(n)
+        }));
         let fitting = shapes
             .filter(|&n| n <= remaining)
             .filter(|&n| {
@@ -1003,7 +1005,7 @@ impl ModelRuntime {
                     .manifest
                     .prefill_plans
                     .iter()
-                    .any(|p| p.chunk_tokens == n && !p.stages.is_empty());
+                    .any(|p| p.accepts(n) && !p.stages.is_empty());
                 (if staged {
                     self.prefill_stage_cost(requests[i], n)
                 } else {
@@ -1161,7 +1163,7 @@ impl ModelRuntime {
                     .manifest
                     .prefill_plans
                     .iter()
-                    .any(|p| p.chunk_tokens == chunk && !p.stages.is_empty())
+                    .any(|p| p.accepts(chunk) && !p.stages.is_empty())
                 {
                     self.iteration_costs
                         .entry(key)

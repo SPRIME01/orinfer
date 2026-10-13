@@ -862,18 +862,20 @@ impl Executor {
         self.sync()?;
         let position = usize::try_from(self.read_control(&growth.position)?)
             .map_err(|_| "Negative KV write position")?;
-        let tokens = position
-            .checked_add(growth.tokens)
-            .ok_or("KV position overflow")?;
+        let count = match &growth.length {
+            Some(name) => usize::try_from(self.read_control(name)?)
+                .ok()
+                .filter(|&n| n > 0 && n <= growth.tokens)
+                .ok_or("Invalid logical KV write length")?,
+            None => growth.tokens,
+        };
+        let tokens = position.checked_add(count).ok_or("KV position overflow")?;
         let mut buffers = self.session.virtual_buffers.borrow_mut();
         let mut additional = 0usize;
         for name in &growth.buffers {
             let b = buffers.get(name).ok_or("Missing demand KV buffer")?;
             let start = position.checked_mul(b.stride).ok_or("KV write overflow")?;
-            let bytes = growth
-                .tokens
-                .checked_mul(b.stride)
-                .ok_or("KV write overflow")?;
+            let bytes = count.checked_mul(b.stride).ok_or("KV write overflow")?;
             additional = additional
                 .checked_add(b.extent(tokens)?.saturating_sub(b.mapped))
                 .and_then(|n| n.checked_add(b.writable_bytes(start, bytes).ok()?))
@@ -900,8 +902,7 @@ impl Executor {
                 position
                     .checked_mul(buffer.stride)
                     .ok_or("KV write overflow")?,
-                growth
-                    .tokens
+                count
                     .checked_mul(buffer.stride)
                     .ok_or("KV write overflow")?,
             )?;

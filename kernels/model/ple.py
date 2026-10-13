@@ -108,7 +108,9 @@ def ple_conv(M: int, C: int, taps: int = 4, dilation: int = 3, dtype: str = "flo
 
 
 @orin_jit
-def ple_history(M: int, C: int, history: int = 9, dtype: str = "float16"):
+def ple_history(
+    M: int, C: int, history: int = 9, dtype: str = "float16", logical_rows: bool = False
+):
     """(Normed[M,C], State[history,C], NextState), permitting State aliasing.
 
     One thread owns each channel and copies time rows in increasing order.
@@ -118,6 +120,9 @@ def ple_history(M: int, C: int, history: int = 9, dtype: str = "float16"):
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, C, history)):
         raise ValueError("Invalid PLE history dimensions")
+    from kernels.model.logical_rows import bind, extent
+
+    count, control = extent(M, logical_rows)
 
     @T.prim_func
     def main(
@@ -130,9 +135,9 @@ def ple_history(M: int, C: int, history: int = 9, dtype: str = "float16"):
                 col = block * 256 + j
                 if col < C:
                     for row in T.serial(history):
-                        position = M - history + row
+                        position = count - history + row
                         NextState[row, col] = T.if_then_else(
-                            position >= 0, Normed[position, col], State[M + row, col]
+                            position >= 0, Normed[position, col], State[count + row, col]
                         )
 
-    return main
+    return bind(main, control, logical_rows)

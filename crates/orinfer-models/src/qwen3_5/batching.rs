@@ -813,6 +813,7 @@ mod tests {
     fn dense_joint_prefill_shares_projections_but_keeps_chunk_state_private() {
         let mut m = manifest();
         m.prefill_batch_profiles = vec![PrefillProfile {
+            min_tokens: 0,
             tokens: 2048,
             kind: "chunk_expanded".into(),
         }];

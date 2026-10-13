@@ -6,6 +6,7 @@ use std::{cell::RefCell, rc::Rc};
 
 pub(super) struct Frame {
     pub plan: crate::model::PrefillPlan,
+    pub tokens: usize,
     next: usize,
     workspace: Option<Rc<RefCell<Workspace>>>,
     regular_s: f64,
@@ -17,12 +18,11 @@ impl ModelRuntime {
         self.execution.collect_snapshots()
     }
     pub(super) fn prefill_stage_cost(&self, req: &RequestState, chunk: usize) -> f64 {
-        let plan = req.prefill_frame.as_ref().map(|f| &f.plan).or_else(|| {
-            self.manifest
-                .prefill_plans
-                .iter()
-                .find(|p| p.chunk_tokens == chunk)
-        });
+        let plan = req
+            .prefill_frame
+            .as_ref()
+            .map(|f| &f.plan)
+            .or_else(|| self.manifest.prefill_plan(chunk));
         if let Some(plan) = plan.filter(|p| !p.stages.is_empty()) {
             if let Some(frame) = &req.prefill_frame {
                 return self.prefill_costs.stage_upper(
@@ -59,17 +59,17 @@ impl ModelRuntime {
             .prefill_frame
             .as_ref()
             .map(|f| f.plan.clone())
-            .or_else(|| {
-                self.manifest
-                    .prefill_plans
-                    .iter()
-                    .find(|p| p.chunk_tokens == chunk)
-                    .cloned()
-            });
+            .or_else(|| self.manifest.prefill_plan(chunk).cloned());
         let Some(plan) = plan.filter(|p| !p.stages.is_empty()) else {
             return self.advance_prefill(req, chunk, bounded);
         };
-        if chunk != plan.chunk_tokens || chunk > Self::prefill_boundary(req) - req.offset {
+        if !plan.accepts(chunk)
+            || req
+                .prefill_frame
+                .as_ref()
+                .is_some_and(|f| f.tokens != chunk)
+            || chunk > Self::prefill_boundary(req) - req.offset
+        {
             return Err("Invalid resumed prefill extent".into());
         }
         let at = Instant::now();
@@ -87,6 +87,7 @@ impl ModelRuntime {
             )?;
             Frame {
                 plan,
+                tokens: chunk,
                 next: 0,
                 workspace: None,
                 regular_s: at.elapsed().as_secs_f64(),
@@ -110,7 +111,7 @@ impl ModelRuntime {
                     - (self.execution.batch_statistics.get().kernel_load_s - load_before);
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
-                        self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
+                        self.mtp_capture(spec, frame.plan.chunk_tokens, ExecutionPhase::Prefill)?;
                     }
                     if req.offset + chunk == req.input.len()
                         || req.checkpoints.contains(&(req.offset + chunk))

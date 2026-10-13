@@ -10,6 +10,7 @@ Convolution history, position, and attention KV require separate handling.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.logical_rows import bind, extent
 
 HK, HV, DK, DV = 16, 48, 128, 128
 
@@ -22,10 +23,14 @@ def _gdn_sequence(
     in_place: bool = False,
     compact: bool = False,
     prefetch_qk: bool = False,
+    logical_rows: bool = False,
 ):
     assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
+    if logical_rows and not in_place:
+        raise ValueError("Logical rows require in-place prefill")
+    count, control = extent(tokens, logical_rows)
     if (
         type(prefetch_qk) is not bool
         or prefetch_qk
@@ -101,6 +106,10 @@ def _gdn_sequence(
             predicted = T.alloc_fragment((value_tile,), T.float32)
             result = T.alloc_fragment((value_tile,), T.float32)
             update = T.alloc_fragment((value_tile,), T.float32)
+            if logical_rows:
+                for t, j in T.Parallel(tokens, value_tile):
+                    if t >= count:
+                        Out[t, h * DV + bv * value_tile + j] = 0
             for i, j in T.Parallel(DK, value_tile):
                 state[i, j] = State[h, i, bv * value_tile + j]
             if prefetch_qk:
@@ -124,11 +133,11 @@ def _gdn_sequence(
                     T.ptx_cp_async(T.access_ptr(gs[0], "w", 1), T.access_ptr(G[0, h], "r", 1), 1)
                     T.ptx_cp_async(T.access_ptr(bs[0], "w", 1), T.access_ptr(Beta[0, h], "r", 1), 1)
                 T.ptx_commit_group()
-            for t in T.serial(tokens):
+            for t in T.serial(count):
                 if prefetch_qk:
                     T.ptx_wait_group(0)
                     T.sync_warp()
-                    if t + 1 < tokens:
+                    if t + 1 < count:
                         T.ptx_cp_async(
                             T.access_ptr(qs[(t + 1) % 2, tid * 4], "w", 4),
                             T.access_ptr(Q[kh, t + 1, tid * 4], "r", 4),
@@ -189,14 +198,14 @@ def _gdn_sequence(
                 T.reduce_sum(product, result, dim=0)
                 for i, j in T.Parallel(DK, value_tile):
                     if in_place:
-                        if t == tokens - 1:
+                        if t == count - 1:
                             State[h, i, bv * value_tile + j] = state[i, j]
                     elif not compact:
                         Prefix[t, h, i, bv * value_tile + j] = state[i, j]
                 for j in T.Parallel(value_tile):
                     Out[t, h * DV + bv * value_tile + j] = result[j]
 
-    return main
+    return bind(main, control, logical_rows)
 
 
 _compile_sequence = orin_jit(_gdn_sequence)
@@ -217,6 +226,7 @@ def gdn_sequence(
     in_place: bool = False,
     compact: bool = False,
     prefetch_qk: bool = False,
+    logical_rows: bool = False,
 ):
     """Preserve the recurrence and reductions while overlapping input reads.
 
@@ -224,7 +234,9 @@ def gdn_sequence(
     slots. Its explicit wait and warp barrier protect every slot reuse.
     """
     compiler = _compile_prefetch if prefetch_qk else _compile_sequence
-    return compiler(tokens, q_scale, value_tile, threads, in_place, compact, prefetch_qk)
+    return compiler(
+        tokens, q_scale, value_tile, threads, in_place, compact, prefetch_qk, logical_rows
+    )
 
 
 @orin_jit

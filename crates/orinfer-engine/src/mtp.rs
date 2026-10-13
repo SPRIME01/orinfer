@@ -257,6 +257,7 @@ mod tests {
             model.programs.insert(name.into(), ops.clone());
         }
         model.prefill_plans.push(crate::model::PrefillPlan {
+            min_tokens: 0,
             chunk_tokens: 8,
             prefill_program: "execute".into(),
             head_program: "shared_head".into(),

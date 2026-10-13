@@ -5,7 +5,7 @@ from tools.operators.common import orin_jit
 
 
 @orin_jit
-def overlay(rows: int, hidden: int, capacity: int, features: int):
+def overlay(rows: int, hidden: int, capacity: int, features: int, logical_rows: bool = False):
     if not 1 <= rows <= capacity or hidden <= 0 or features <= 0:
         raise ValueError("Invalid visual embedding dimensions")
 
@@ -24,4 +24,9 @@ def overlay(rows: int, hidden: int, capacity: int, features: int):
                     for column in T.Parallel(hidden):
                         Embedding[row, column] = Features[feature, column]
 
+    if logical_rows:
+        from kernels.model.logical_rows import bind, extent, guard
+
+        _, control = extent(rows, True)
+        return bind(guard(main, control, "x"), control, True)
     return main

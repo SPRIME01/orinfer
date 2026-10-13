@@ -124,7 +124,18 @@ pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel
         let residual = kernels
             .iter()
             .find(|k| k.name == initialize)
-            .and_then(|kernel| kernel.args.get(1))
+            .and_then(|kernel| {
+                if plan.min_tokens == 0 {
+                    kernel.args.get(1)
+                } else {
+                    kernel.args.iter().find(|arg| {
+                        matches!(
+                            arg, crate::artifact::Argument::Buffer { name }
+                            if name != "Length" && name != "M4096_Embedding"
+                        )
+                    })
+                }
+            })
             .and_then(|a| match a {
                 crate::artifact::Argument::Buffer { name } => Some(name.clone()),
                 _ => None,
@@ -216,7 +227,10 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
             .iter()
             .any(|n| !base.contains(n) && !(2..16).contains(n))
         || widths.len() != profiles.len()
-        || profiles.iter().any(|p| p.kind != "flash_recurrent")
+        || profiles.iter().any(|p| {
+            p.kind != "flash_recurrent"
+                || (p.min_tokens != 0 && (p.tokens != 512 || p.min_tokens != 129))
+        })
     {
         return Err(
             "Flash package needs registered 16/128/512/2048/4096 recurrent profiles".into(),
@@ -306,11 +320,24 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
             ops.extend(section(&program, &format!("layer{layer}"), count, history));
         }
         ops.extend(section(&program, "end", 1, None));
-        let head_ops = section(&head, "body", r.head, None);
+        let mut head_ops = section(&head, "body", r.head, None);
+        let min_tokens = profiles
+            .iter()
+            .find(|p| p.tokens == tokens)
+            .map_or(0, |p| p.min_tokens);
+        if min_tokens > 0 {
+            head_ops.insert(
+                4,
+                Operation::Kernel {
+                    name: format!("{head}/body/logical_gather"),
+                },
+            );
+        }
         if tokens == 1 {
             ops.extend(head_ops.clone());
         } else {
             manifest.prefill_plans.push(PrefillPlan {
+                min_tokens,
                 chunk_tokens: tokens,
                 prefill_program: program.clone(),
                 head_program: head.clone(),
@@ -398,6 +425,10 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         kv.growth.insert(
             name,
             KvGrowth {
+                length: profiles
+                    .iter()
+                    .any(|p| p.tokens == tokens && p.min_tokens > 0)
+                    .then(|| "Length".to_owned()),
                 position: manifest.position.clone(),
                 tokens,
                 buffers: kv

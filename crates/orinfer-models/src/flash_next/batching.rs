@@ -577,6 +577,7 @@ mod tests {
         m.prefill_batch_profiles = [256, 1024]
             .into_iter()
             .map(|tokens| orinfer_model_sdk::architecture::PrefillProfile {
+                min_tokens: 0,
                 tokens,
                 kind: "flash_mixed".into(),
             })

@@ -1,6 +1,108 @@
 use super::*;
 
 #[test]
+#[ignore = "Requires logical Flash prefill package and exclusive GPU lock"]
+fn validate_flash_logical_prefill() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: fixture.mtp_drafts,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let profile = model
+        .manifest
+        .prefill_plans
+        .iter()
+        .position(|p| p.min_tokens == 129)
+        .unwrap();
+    let mut rows = vec![];
+    for tokens in [129, 255, 257, 409, 421, 511, 8613] {
+        let mut source = input(fixture.cases.last().unwrap(), 1);
+        assert!(source.input_tokens.len() >= tokens);
+        source.input_tokens.truncate(tokens);
+        let hash = |m: &mut ModelRuntime, req: &mut RequestState| {
+            m.with_request(req, |m, _| {
+                m.prefix_ranges(tokens)?
+                    .into_iter()
+                    .map(|(name, range)| {
+                        let raw = m
+                            .execution
+                            .download_bytes(&name, range.offset + range.bytes)?;
+                        Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+            })
+            .unwrap()
+        };
+        // Use only exact causal profiles. Avoid the numerically different M1
+        // decode path by splitting a remainder of one as 15+2, for example.
+        model.manifest.prefill_plans[profile].min_tokens = 0;
+        let mut reference = model.start_request(input(&source, 1), &|| false).unwrap();
+        if tokens == 8613 {
+            reference.checkpoints.extend([8192, 8601]);
+        }
+        while reference.prefilling {
+            let remaining = ModelRuntime::prefill_boundary(&reference) - reference.offset;
+            let n = model
+                .manifest
+                .prefill_plans
+                .iter()
+                .map(|p| p.chunk_tokens)
+                .filter(|&n| n <= remaining && remaining - n != 1)
+                .max()
+                .unwrap();
+            model
+                .with_request(&mut reference, |m, r| m.advance_prefill(r, n, false))
+                .unwrap();
+        }
+        let expected = distribution(&mut model, &mut reference);
+        let expected_state = hash(&mut model, &mut reference);
+        model.finish_request(&mut reference, false).unwrap();
+        model.manifest.prefill_plans[profile].min_tokens = 129;
+        let mut actual = model.start_request(input(&source, 1), &|| false).unwrap();
+        if tokens == 8613 {
+            actual.checkpoints.extend([8192, 8601]);
+        }
+        let mut steps = 0;
+        while actual.prefilling {
+            model
+                .advance_requests(&mut [&mut actual], &scheduler::Options::default())
+                .unwrap();
+            steps += 1;
+            assert!(steps < 2000);
+        }
+        let scores = distribution(&mut model, &mut actual);
+        let kl: f64 = expected
+            .iter()
+            .zip(&scores)
+            .map(|(a, b)| a.exp() * (a - b))
+            .sum();
+        assert!(kl.abs() < 1e-7, "{tokens}: logical prefill KL {kl}");
+        let state = hash(&mut model, &mut actual);
+        assert_eq!(state, expected_state, "{tokens}: logical state differs");
+        rows.push(json!({"tokens":tokens,"steps":steps,"kl":kl,"state_equal":true}));
+        model.finish_request(&mut actual, false).unwrap();
+    }
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({
+            "cases":rows,"scheduler":model.scheduling_statistics()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires layered Flash package and exclusive GPU experiment lock"]
 fn validate_flash_layered_prefill() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
@@ -19,7 +121,12 @@ fn validate_flash_layered_prefill() {
     )
     .unwrap();
     let chunk: usize = std::env::var("ORINFER_LAYERED_CHUNK").map_or(4096, |s| s.parse().unwrap());
-    assert!([512, 2048, 4096].contains(&chunk));
+    assert!(
+        model
+            .manifest
+            .prefill_plan(chunk)
+            .is_some_and(|p| !p.stages.is_empty())
+    );
     let mut source = input(fixture.cases.last().unwrap(), 1);
     assert!(source.input_tokens.len() >= chunk);
     source.input_tokens.truncate(chunk);
@@ -50,10 +157,13 @@ fn validate_flash_layered_prefill() {
         let before = model.scheduling_statistics();
         let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
         let mut short = input(&source, 1024);
-        short.input_tokens.truncate(512);
+        let short_chunk = chunk.min(512);
+        short.input_tokens.truncate(short_chunk);
         let mut decoder = model.start_request(short, &|| false).unwrap();
         model
-            .with_request(&mut decoder, |m, r| m.advance_prefill(r, 512, false))
+            .with_request(&mut decoder, |m, r| {
+                m.advance_prefill(r, short_chunk, false)
+            })
             .unwrap();
         let mut steps = 0;
         while req.prefilling {
@@ -69,11 +179,11 @@ fn validate_flash_layered_prefill() {
                 // Overwrite the shared large arena during the first suspension.
                 if steps == 1 {
                     let mut another = input(&source, 1);
-                    another.input_tokens.truncate(512);
+                    another.input_tokens.truncate(short_chunk);
                     another.input_tokens[0] = source.input_tokens[1];
                     let mut other = model.start_request(another, &|| false).unwrap();
                     model
-                        .with_request(&mut other, |m, r| m.advance_prefill(r, 512, false))
+                        .with_request(&mut other, |m, r| m.advance_prefill(r, short_chunk, false))
                         .unwrap();
                     model.finish_request(&mut other, false).unwrap();
                 }

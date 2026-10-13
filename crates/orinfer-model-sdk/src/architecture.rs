@@ -8,6 +8,10 @@ pub type PrefillKind = String;
 #[serde(deny_unknown_fields)]
 pub struct PrefillProfile {
     pub tokens: usize,
+    /// Zero means exact shape; otherwise stateful kernels accept logical rows
+    /// down to this minimum while tensor strides retain the physical capacity.
+    #[serde(default, skip_serializing_if = "crate::model::is_zero")]
+    pub min_tokens: usize,
     pub kind: PrefillKind,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]

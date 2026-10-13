@@ -445,6 +445,7 @@ mod tests {
         m.chunk_tokens = 8;
         m.prefill_plans = vec![
             PrefillPlan {
+                min_tokens: 0,
                 chunk_tokens: 2,
                 prefill_program: "prefill".into(),
                 head_program: "head".into(),
@@ -452,6 +453,7 @@ mod tests {
                 live_buffers: vec![],
             },
             PrefillPlan {
+                min_tokens: 0,
                 chunk_tokens: 8,
                 prefill_program: "prefill".into(),
                 head_program: "head".into(),
