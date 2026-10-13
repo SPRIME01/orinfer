@@ -72,4 +72,6 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
 
 `validate_flash_heterogeneous_scheduling` 使用相同夹具格式，第一条 case 的输入须至少 4096 tokens，第二条为短请求。它分别检查两条 cold prefill 和已开始 decode 的短请求与长 prefill 混跑，确认长请求保留原生大块、活跃 decoder 期间块长受限、连续 decode 有推进，以及相同分块和 teacher-forced 历史下的 KL/NLL/top3；同样需要独占 GPU 锁。独立最大块与中断分块的首 token 分布差异另行记录，不当作状态隔离或 BF16 量化质量验收。`validate_flash_bounded_prefill` 接受按成本选择的联合或独立路径，不要求每轮都混合。
 
+`validate_flash_long_generation_reuse` 使用相同夹具格式，前两条 case 为压力提示和后续验证提示；后者须包含原生 4096-token prefill。它先记录后续提示的冷请求 logits 与完整已提交状态，再强制执行 16384 个 decode tokens（含 MTP）、保存生成缓存并复用槽位，检查冷请求和完整 prefix 命中与参考的分块、logits、KV/GDN/卷积/PLE/MTP 状态一致。引擎测试刻意继续处理 EOS 来保证压力长度，任务输出正确性另用真实 Chat API 验证；同样需要独占 GPU 锁。
+
 固定到达时间的混合请求验收使用 `python -m tools.bench.scheduling --requests TRACE.json --output RESULT.json`。输入为 `{"requests":[{"id":"short-1","at_s":0.1,"request":{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}}]}`，最多 128 条；同一时刻可提交多条请求。到达时间不依赖前一请求是否完成，报告客户端到达误差、TTFT、整请求耗时和最大流式 chunk 间隔的 P50/P95/P99，以及失败数、有效输出吞吐、成功请求的 prefix 请求/token 命中率和调度统计。chunk 间隔不能当成 token ITL。比较调度版本时使用相同 trace、模型包、缓存/MTP/Graph 配置，分别测试冷缓存与预热后的缓存。

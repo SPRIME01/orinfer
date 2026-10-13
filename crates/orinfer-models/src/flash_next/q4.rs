@@ -221,7 +221,7 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         .flatten()
         .filter_map(|op| {
             if let Operation::Kernel { name } = op {
-                Some(name.as_str())
+                Some(name.clone())
             } else {
                 None
             }
@@ -232,9 +232,6 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         let Some(projection) = rotation.name.strip_suffix("/q4_rotation") else {
             continue;
         };
-        if executed.contains(rotation.name.as_str()) {
-            continue;
-        }
         let target = contracts
             .get(projection)
             .ok_or("Missing Q4 projection contract")?;
@@ -264,18 +261,32 @@ pub(super) fn prerequisites(manifest: &mut Manifest, kernels: &[Kernel]) -> Resu
         pending.insert(projection.to_owned(), rotation.name.clone());
     }
     for operations in manifest.programs.values_mut() {
+        // Aliases are independent programs. A prerequisite executed in one
+        // program must never suppress the transform in another alias.
+        let existing: BTreeSet<_> = operations
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
         let mut expanded = Vec::with_capacity(operations.len());
         for operation in std::mem::take(operations) {
             if let Operation::Kernel { name } = &operation
-                && let Some(rotation) = pending.remove(name)
+                && let Some(rotation) = pending.get(name)
+                && !existing.contains(rotation)
             {
-                expanded.push(Operation::Kernel { name: rotation });
+                expanded.push(Operation::Kernel {
+                    name: rotation.clone(),
+                });
             }
             expanded.push(operation);
         }
         *operations = expanded;
     }
-    if !pending.is_empty() {
+    if pending.iter().any(|(projection, rotation)| {
+        !executed.contains(projection.as_str()) && !executed.contains(rotation.as_str())
+    }) {
         return Err("Unregistered Q4 prerequisite".into());
     }
     Ok(())
@@ -291,6 +302,46 @@ mod tests {
             "grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,
             "args":args.iter().map(|name| serde_json::json!({"kind":"buffer","name":name})).collect::<Vec<_>>()
         })).unwrap()
+    }
+
+    #[test]
+    fn prerequisites_cover_every_program_alias_and_are_idempotent() {
+        let mut m = manifest(0);
+        m.programs.clear();
+        let projection = "prefill_m4096/layer0/k6";
+        let rotation = format!("{projection}/q4_rotation");
+        let kernels = vec![
+            contract(
+                projection,
+                &["A", "AS", "Out", "Q4_test_scale", "Q4_test_packed"],
+            ),
+            contract(&rotation, &["A", "AS", "Q4_test_signs", "Input"]),
+        ];
+        for preinstalled in [false, true] {
+            m.programs.clear();
+            // Cover both destructive lookup across aliases and the case where
+            // just one alias already contains its prerequisite.
+            for program in ["prefill", "prefill_m2048", "prefill_m4096"] {
+                let mut ops = vec![];
+                if preinstalled && program == "prefill" {
+                    ops.push(Operation::Kernel {
+                        name: rotation.clone(),
+                    });
+                }
+                ops.push(Operation::Kernel {
+                    name: projection.into(),
+                });
+                m.programs.insert(program.into(), ops);
+            }
+            for _ in 0..2 {
+                prerequisites(&mut m, &kernels).unwrap();
+                for ops in m.programs.values() {
+                    assert_eq!(ops.len(), 2);
+                    assert!(matches!(&ops[0], Operation::Kernel { name } if name == &rotation));
+                    assert!(matches!(&ops[1], Operation::Kernel { name } if name == projection));
+                }
+            }
+        }
     }
 
     #[test]

@@ -1181,3 +1181,119 @@ fn validate_flash_heterogeneous_scheduling() {
     )
     .unwrap();
 }
+
+#[test]
+#[ignore = "Requires native Flash package, 16K decode stress and exclusive GPU lock"]
+fn validate_flash_long_generation_reuse() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    assert!(fixture.cases.len() >= 2);
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 2 << 30,
+            mtp_drafts: Some(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = scheduler::Options::default();
+    let endpoint = |m: &mut ModelRuntime, source: &GenerationInput| {
+        let mut request = m.start_request(input(source, 16384), &|| false).unwrap();
+        let mut chunks = vec![];
+        while request.prefilling {
+            let offset = request.offset;
+            m.advance_requests(&mut [&mut request], &options).unwrap();
+            if request.offset > offset {
+                chunks.push(request.offset - offset);
+            }
+        }
+        let scores = distribution(m, &mut request);
+        let ranges = m.prefix_ranges(request.input.len()).unwrap();
+        let state = m
+            .with_request(&mut request, |m, _| {
+                ranges
+                    .iter()
+                    .map(|(name, range)| {
+                        let raw = m
+                            .execution
+                            .download_bytes(name, range.offset + range.bytes)?;
+                        Ok((name.clone(), raw[range.offset..].to_vec()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+            })
+            .unwrap();
+        (request, chunks, scores, state)
+    };
+    let (mut reference, expected_chunks, expected_scores, expected_state) =
+        endpoint(&mut model, &fixture.cases[1]);
+    assert!(expected_chunks.contains(&4096));
+    model.finish_request(&mut reference, false).unwrap();
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    let mut stress = model
+        .start_request(input(&fixture.cases[0], 16384), &|| false)
+        .unwrap();
+    // The engine has no transport EOS policy: continuing through EOS is
+    // deliberate here so a successful answer still exercises all 16K steps.
+    while !stress.is_finished() {
+        model
+            .advance_requests(&mut [&mut stress], &options)
+            .unwrap();
+        if stress.generated / 2048 != (stress.generated.saturating_sub(4)) / 2048 {
+            eprintln!("long reuse stress: {} committed tokens", stress.generated);
+        }
+    }
+    assert_eq!(stress.generated, 16384);
+    assert!(stress.failure().is_none());
+    let rounds = stress.mtp.rounds;
+    assert!(rounds > 0);
+    model.finish_request(&mut stress, true).unwrap();
+    let mut rows = vec![];
+    for cached in [false, true] {
+        let (mut request, chunks, scores, actual_state) = endpoint(&mut model, &fixture.cases[1]);
+        if cached {
+            assert_eq!(request.prefix.statistics.cached_tokens, request.input.len());
+        } else {
+            assert_eq!(request.prefix.statistics.cached_tokens, 0);
+            assert_eq!(chunks, expected_chunks);
+        }
+        let kl: f64 = expected_scores
+            .iter()
+            .zip(&scores)
+            .map(|(a, b)| a.exp() * (a - b))
+            .sum();
+        let changed: Vec<_> = expected_state
+            .iter()
+            .filter(|(name, bytes)| actual_state.get(*name) != Some(*bytes))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let row = json!({"cached":cached,"chunks":chunks,"kl":kl,"changed_state":changed});
+        eprintln!("long generation reuse {row}");
+        assert!(
+            kl.is_finite() && kl.abs() < 1e-8,
+            "Reuse changed target law: {row}"
+        );
+        assert!(changed.is_empty(), "Reuse changed committed state: {row}");
+        rows.push(row);
+        model.finish_request(&mut request, true).unwrap();
+    }
+    for snapshot in model.prefix_cache.clear() {
+        model.execution.release_snapshot(snapshot).unwrap();
+    }
+    model.execution.reclaim_idle_graphs().unwrap();
+    model.execution.reclaim_idle_state().unwrap();
+    assert!(model.reserved_requests.is_empty());
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({"stress_tokens":16384,"mtp_rounds":rounds,
+            "cases":rows,"committed_state_equal":true,"cleanup_passed":true}))
+        .unwrap(),
+    )
+    .unwrap();
+}
