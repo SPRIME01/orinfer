@@ -182,6 +182,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     routing::build(&mut request.metadata, &request.kernel_contracts)?;
     decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
+    plan::stages(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,

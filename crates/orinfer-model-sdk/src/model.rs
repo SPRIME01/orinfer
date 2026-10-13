@@ -106,6 +106,12 @@ pub struct PrefillPlan {
     pub chunk_tokens: usize,
     pub prefill_program: String,
     pub head_program: String,
+    /// Ordered, resumable pieces of the same forward pass. Empty means atomic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<String>,
+    /// Workspace values that remain live between stages; never model state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_buffers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -437,6 +443,29 @@ impl Manifest {
                     .any(|name| self.programs.get(*name).is_none_or(Vec::is_empty))
             {
                 return Err("Invalid/duplicate prefill plan or missing program".into());
+            }
+            if !plan.stages.is_empty() {
+                let mut flattened = Vec::new();
+                for stage in &plan.stages {
+                    let ops = self
+                        .programs
+                        .get(stage)
+                        .filter(|ops| !ops.is_empty())
+                        .ok_or("Missing resumable prefill stage")?;
+                    flattened.extend_from_slice(ops);
+                }
+                if flattened != self.programs[&plan.prefill_program] {
+                    return Err("Prefill stages must exactly partition their forward pass".into());
+                }
+            } else if !plan.live_buffers.is_empty() {
+                return Err("Atomic prefill cannot declare continuation buffers".into());
+            }
+            let mut live = BTreeSet::new();
+            for name in &plan.live_buffers {
+                let buffer = lookup(name)?;
+                if !live.insert(name) || buffer.data.is_some() || buffer.access == Access::Read {
+                    return Err("Invalid prefill continuation buffer".into());
+                }
             }
         }
         for ops in self.programs.values() {

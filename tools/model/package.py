@@ -238,7 +238,8 @@ def validate_plan(directory, source, mapping, engine):
         text=True,
     )
     plan = json.loads(completed.stdout)["manifest"]
-    if set(plan["programs"]) != set(source["programs"]):
+    stages = {stage for profile in plan["prefill_plans"] for stage in profile.get("stages", [])}
+    if set(plan["programs"]) != set(source["programs"]) | stages:
         raise ValueError("Registered architecture does not cover all source programs")
     before = {k["name"]: k for k in source["kernels"]}
     after = {k["name"]: k for k in plan["kernels"]}

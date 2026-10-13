@@ -448,15 +448,27 @@ mod tests {
                 chunk_tokens: 2,
                 prefill_program: "prefill".into(),
                 head_program: "head".into(),
+                stages: vec![],
+                live_buffers: vec![],
             },
             PrefillPlan {
                 chunk_tokens: 8,
                 prefill_program: "prefill".into(),
                 head_program: "head".into(),
+                stages: vec![],
+                live_buffers: vec![],
             },
         ];
         assert!(m.validate().is_ok());
         assert_eq!(m.select_prefill_plan(8).unwrap().0, 8);
+        m.prefill_plans[0].stages = vec!["prefill".into()];
+        assert!(m.validate().is_ok());
+        m.prefill_plans[0].stages.push("prefill".into());
+        assert!(m.validate().is_err());
+        m.prefill_plans[0].stages.clear();
+        m.prefill_plans[0].live_buffers.push("Input".into());
+        assert!(m.validate().is_err());
+        m.prefill_plans[0].live_buffers.clear();
         assert_eq!(m.select_prefill_plan(6).unwrap().0, 2);
         assert!(m.select_prefill_plan(3).is_err());
         assert!(m.select_prefill_plan(0).is_err());

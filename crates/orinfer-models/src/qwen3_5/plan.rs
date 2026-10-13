@@ -388,6 +388,8 @@ pub(super) fn build(
             chunk_tokens: profile.tokens,
             prefill_program: prefill,
             head_program: head,
+            stages: vec![],
+            live_buffers: vec![],
         });
     }
     if !sizes.contains(&manifest.chunk_tokens) {

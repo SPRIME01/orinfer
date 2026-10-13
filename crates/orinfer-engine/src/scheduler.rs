@@ -264,6 +264,10 @@ pub struct BatchExecutionStatistics {
 
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Statistics {
+    pub layered_prefill_iterations: usize,
+    pub prefill_suspend_s: f64,
+    pub prefill_resume_s: f64,
+    pub peak_prefill_frame_bytes: usize,
     pub iterations: usize,
     pub batch_histogram: std::collections::BTreeMap<usize, usize>,
     pub prefill_batch_histogram: std::collections::BTreeMap<usize, usize>,

@@ -3,6 +3,7 @@
 use super::*;
 use crate::{architecture::BatchSegment, prefix::Media, scheduler};
 use std::collections::{BTreeMap, BTreeSet};
+mod prefill;
 #[cfg(test)]
 mod profile;
 mod prompt_lookup;
@@ -36,6 +37,7 @@ pub struct RequestState {
     media: Media,
     warm: super::speculation::PrefillWarm,
     checkpoints: BTreeSet<usize>,
+    prefill_frame: Option<prefill::Frame>,
     prefix: super::prefix::Context,
     mtp: crate::mtp::Statistics,
     generated: usize,
@@ -311,7 +313,7 @@ impl ModelRuntime {
         if common == req.input.len() || req.checkpoints.contains(&common) {
             return Ok(true);
         }
-        if common <= req.offset {
+        if common <= req.offset || req.prefill_frame.is_some() {
             return Ok(false);
         }
         if self.admit_prefix_checkpoint(
@@ -593,6 +595,7 @@ impl ModelRuntime {
                 media,
                 warm,
                 checkpoints,
+                prefill_frame: None,
                 prefix,
                 mtp: Default::default(),
                 generated: 0,
@@ -942,6 +945,9 @@ impl ModelRuntime {
         };
         let mut used: usize = selected.iter().map(|(_, n)| n).sum();
         for &i in candidates {
+            if requests[i].prefill_frame.is_some() {
+                continue;
+            }
             if used == cap {
                 break;
             }
@@ -982,12 +988,28 @@ impl ModelRuntime {
         budget_s: f64,
         progress_due: bool,
     ) -> Option<usize> {
+        if let Some(frame) = &requests[i].prefill_frame {
+            return (self.prefill_stage_cost(requests[i], frame.plan.chunk_tokens) <= budget_s
+                || progress_due)
+                .then_some(frame.plan.chunk_tokens);
+        }
         let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
         let shapes =
             std::iter::once(1).chain(self.manifest.prefill_plans.iter().map(|p| p.chunk_tokens));
         let fitting = shapes
             .filter(|&n| n <= remaining)
-            .filter(|&n| self.predict_iteration(requests, &[(i, n)]) <= budget_s)
+            .filter(|&n| {
+                let staged = self
+                    .manifest
+                    .prefill_plans
+                    .iter()
+                    .any(|p| p.chunk_tokens == n && !p.stages.is_empty());
+                (if staged {
+                    self.prefill_stage_cost(requests[i], n)
+                } else {
+                    self.predict_iteration(requests, &[(i, n)])
+                }) <= budget_s
+            })
             .max();
         // A soft deadline must not turn an overloaded prefill into endless
         // one-token weight passes. Force only a minimum useful native tile.
@@ -1130,15 +1152,22 @@ impl ModelRuntime {
                 let key = Self::iteration_key(requests, &[(i, chunk)]);
                 let before = self.execution.batch_statistics.get();
                 let (_, tokens) = self.with_request(requests[i], |model, req| {
-                    model.advance_prefill(req, chunk, bounded)
+                    model.advance_prefill_step(req, chunk, bounded)
                 })?;
                 let after = self.execution.batch_statistics.get();
                 let cold_s = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
                     - before.sequence_capture_s;
-                self.iteration_costs
-                    .entry(key)
-                    .or_default()
-                    .observe((at.elapsed().as_secs_f64() - cold_s).max(0.000001));
+                if !self
+                    .manifest
+                    .prefill_plans
+                    .iter()
+                    .any(|p| p.chunk_tokens == chunk && !p.stages.is_empty())
+                {
+                    self.iteration_costs
+                        .entry(key)
+                        .or_default()
+                        .observe((at.elapsed().as_secs_f64() - cold_s).max(0.000001));
+                }
                 requests[i].served = self.scheduler_statistics.iterations;
                 requests[i].credit_s -= at.elapsed().as_secs_f64();
                 if has_decoders {
@@ -1782,6 +1811,7 @@ impl ModelRuntime {
             }
             Ok(())
         });
+        self.release_prefill_frame(req)?;
         self.execution
             .release_sequence(req.slot, &self.manifest.reset_buffers)?;
         req.prefix.kv.clear();

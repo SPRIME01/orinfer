@@ -173,3 +173,21 @@ GPU 对照覆盖 2/3/4/8 路独立草稿、共享目标验证、各接受长度�
 本轮解决分块数值漂移、真实尾块执行和映射完整性，没有观察到冷 prefill 的显著提速。完整命中主请求的 8,223-token prefix 恢复约 9 ms；thinking 和 decode 仍使首个可见内容晚于首个流式 token。标题关闭 thinking 的行是请求参数对照，服务仍默认开启 thinking。
 
 全部 2–15 尾块另通过 `full` Graph 回放对照。真实 API 的 8K 上下文 Python 归并排序请求开启 medium thinking、MTP 3 和 16K 总输出预算；三个请求的生成函数均通过输入不变、空列表、负数、重复值和固定 seed 随机列表检查。8,195-token 请求冷态 TTFT 为 12.007 s，完整命中为 34.66 ms；两次均自然结束并输出相同的 597 tokens（其中思考 437），完整稳态 decode 分别为 44.63/47.80 TPS。这里的 decode 为首 token 后剩余 tokens / 剩余 HTTP 耗时，包含流式传输与收尾。
+
+## 可暂停的大块 prefill
+
+Flash Next 的 512/2048/4096-token 前向提供按层切分的可恢复阶段，复用原 cubin 和权重。暂停帧保留残差、跨层 HC 融合仍需读取的 FFN 输出/注入，以及提前生成的 PLE INT8 激活与 scale。每个帧目前占 110.04 MiB，按实际暂停请求分配；所有 target 层及分步 MTP warm 完成后才提交该块的位置和缓存状态。调度按阶段的实测成本选择大块，计入工作区保存/恢复开销。
+
+2026-10-13，以真实 Rust release CLI 流式 Chat API 对照完整前向和可暂停前向。输入为捕获的 OpenCode 主请求（8613 tokens）及标题请求（588 tokens），temperature 0、seed 20261002、默认 thinking、MTP 3、decode-only Graph、12 GiB prefix cache。每个冷场景重启服务；以下为单次对照，首 token 包含 thinking，所有主请求均输出相同的 39 tokens。
+
+| 场景及被测请求 | 完整前向 TTFT | 可暂停前向 TTFT |
+| --- | ---: | ---: |
+| 独立冷主请求 | 15.00 s | 15.18 s |
+| 标题提前 0.85 s 到达：主请求 | 18.29 s | 18.04 s |
+| 主请求启动 0.5 s 后标题到达：标题 | 7.33 s | 3.24 s |
+| 同上：主请求 | 18.57 s | 18.99 s |
+| 主请求完整 prefix 命中 | 57.33 ms | 56.19 ms |
+
+后到标题的完整回复由 9.80 s 降至 5.61 s；其输出长度分别为 45/53 tokens，不能把完整耗时差全部归因于调度。标题提前到达的场景仍未显著改善主请求 TTFT，8K 冷请求的计算成本仍需算子优化。阶段边界也不是硬 TPOT 保证：该对照出现约 0.75 s 的最大 decode 间隔，单个昂贵层仍可能超过软预算。
+
+4096-token 固定输入分别通过 off（MTP 关闭）、decode_only 和 full（MTP 3）验证；512/2048-token 输入另通过 decode_only、MTP 3 对照。逐阶段插入 decode/MTP，并让另一请求的 512-token 前向覆盖共享工作区后，最终 logits KL 为 0，完整已提交状态逐字节一致；中途取消和槽位复用同样一致。这里验证的是执行重组，对照同一量化模型，不代替 BF16/FP8 质量评测。

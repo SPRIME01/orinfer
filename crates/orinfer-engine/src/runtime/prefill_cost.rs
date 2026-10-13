@@ -7,6 +7,7 @@ pub(super) struct Costs {
     weight_pass_s: f64,
     contexts: BTreeMap<(usize, usize), crate::scheduler::Estimate>,
     restore_s_per_byte: f64,
+    stages: BTreeMap<(usize, usize, usize), crate::scheduler::Estimate>,
 }
 impl Costs {
     pub fn new(shapes: impl IntoIterator<Item = usize>) -> Self {
@@ -18,6 +19,7 @@ impl Costs {
             weight_pass_s: 0.1,
             contexts: Default::default(),
             restore_s_per_byte: 1.0 / 20e9,
+            stages: Default::default(),
         }
     }
     pub fn observe(&mut self, chunk: usize, seconds: f64) {
@@ -44,6 +46,20 @@ impl Costs {
             .get(&(chunk, context.next_power_of_two()))
             .map(|e| e.upper())
             .unwrap_or_else(|| self.chunk_cost(chunk) * 1.2)
+    }
+    pub fn observe_stage(&mut self, chunk: usize, stage: usize, context: usize, seconds: f64) {
+        if seconds.is_finite() && seconds > 0. {
+            self.stages
+                .entry((chunk, stage, context.next_power_of_two()))
+                .or_default()
+                .observe(seconds);
+        }
+    }
+    pub fn stage_upper(&self, chunk: usize, stage: usize, context: usize, count: usize) -> f64 {
+        self.stages
+            .get(&(chunk, stage, context.next_power_of_two()))
+            .map(|e| e.upper())
+            .unwrap_or_else(|| (self.chunk_upper(chunk, context) / count.max(1) as f64).max(0.02))
     }
     pub fn bounded_chunk_at(&self, remaining: usize, context: usize, budget_ms: f64) -> usize {
         let fitting = self

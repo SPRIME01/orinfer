@@ -260,6 +260,8 @@ mod tests {
             chunk_tokens: 8,
             prefill_program: "execute".into(),
             head_program: "shared_head".into(),
+            stages: vec![],
+            live_buffers: vec![],
         });
         model.mtp = Some(mtp);
         crate::execution::LoadOptions {

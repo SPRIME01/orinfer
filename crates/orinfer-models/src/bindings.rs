@@ -20,6 +20,19 @@ fn arguments(index: usize) -> Result<Vec<crate::artifact::Argument>> {
         .map(|a| a.bind(generated::ROLES))
         .collect()
 }
+pub(crate) fn buffer_argument(name: &str, position: usize) -> Result<String> {
+    match kernel_arguments(name)?.get(position) {
+        Some(crate::artifact::Argument::Buffer { name }) => Ok(name.clone()),
+        _ => Err("Continuation must bind a whole mutable buffer".into()),
+    }
+}
+pub(crate) fn kernel_arguments(name: &str) -> Result<Vec<crate::artifact::Argument>> {
+    let binding = generated::BINDINGS
+        .iter()
+        .find(|b| b.name == name)
+        .ok_or_else(|| format!("Missing native continuation binding {name}"))?;
+    arguments(binding.arguments)
+}
 fn check(catalog: &Catalog) -> Result<()> {
     use sha2::{Digest, Sha256};
     catalog.validate()?;

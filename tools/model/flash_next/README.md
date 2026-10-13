@@ -231,3 +231,17 @@ bash tools/operators/run.sh tools/model/flash_next/prefill_tails.py artifacts/fl
 QSA 的选中 KV 固定按 256-token 区间归约，再按固定顺序合并八份 FP32 部分结果；最后一份同时覆盖不足四 token 的 pending 尾部。GDN 固定 FP32 归约布局，HC down 按四路 stream 分别累加后依次求和。这些数值边界不随 batch 或 prefill 大小改变；权重、INT8 KV 和 Tensor Core 精度保持原配置。
 
 2–15-token prefill 尾块复用 16 行的投影与专家 cubin，只为真实长度编译因果算子。填充行不推进 KV、GDN、卷积、PLE、MTP 历史或位置，输出头选最后一条真实残差。尾块捕获和 MTP 验证使用独立的程序名。此改动需要新的执行包；更新 CLI 本身不会改变已发布 cubin 的行为。
+
+### 可暂停的大块前向
+
+当前模型库为 512/2048/4096-token 前向注册按层切分的阶段，边界在全部融合和 Q4 前置转换完成后生成。阶段引用现有操作和 cubin；运行时保存仍存活的 HC/PLE 工作区，插入 decode/MTP 后恢复，不发布尚未完成所有层的 prefix 状态。MTP warm 也按已有 warm profile 分步执行。
+
+对已完成上述数值与尾块构建的模型，重建原生执行包即可启用：
+
+```bash
+make build
+PYTHONPATH=. .venv/bin/python -m tools.model.catalog \
+  --model /path/to/flash-exact --output /path/to/flash-layered
+```
+
+该命令重新生成匹配 catalog 的模型库，复用权重和 cubin。只替换 CLI 不会为旧执行包增加阶段。`/health` 的 `layered_prefill_iterations`、`prefill_suspend_s`、`prefill_resume_s` 和 `peak_prefill_frame_bytes` 可用于确认实际执行及开销。

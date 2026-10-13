@@ -1,6 +1,122 @@
 use super::*;
 
 #[test]
+#[ignore = "Requires layered Flash package and exclusive GPU experiment lock"]
+fn validate_flash_layered_prefill() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: fixture.mtp_drafts,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chunk: usize = std::env::var("ORINFER_LAYERED_CHUNK").map_or(4096, |s| s.parse().unwrap());
+    assert!([512, 2048, 4096].contains(&chunk));
+    let mut source = input(fixture.cases.last().unwrap(), 1);
+    assert!(source.input_tokens.len() >= chunk);
+    source.input_tokens.truncate(chunk);
+    let hash_state = |model: &mut ModelRuntime, req: &mut RequestState| {
+        model
+            .with_request(req, |m, _| {
+                m.prefix_ranges(chunk)?
+                    .into_iter()
+                    .map(|(name, range)| {
+                        let raw = m
+                            .execution
+                            .download_bytes(&name, range.offset + range.bytes)?;
+                        Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+            })
+            .unwrap()
+    };
+    let mut reference = model.start_request(input(&source, 1), &|| false).unwrap();
+    model
+        .with_request(&mut reference, |m, r| m.advance_prefill(r, chunk, false))
+        .unwrap();
+    let expected = distribution(&mut model, &mut reference);
+    let expected_state = hash_state(&mut model, &mut reference);
+    model.finish_request(&mut reference, false).unwrap();
+    let mut rows = vec![];
+    for interruption in [false, true] {
+        let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
+        let mut short = input(&source, 1024);
+        short.input_tokens.truncate(512);
+        let mut decoder = model.start_request(short, &|| false).unwrap();
+        model
+            .with_request(&mut decoder, |m, r| m.advance_prefill(r, 512, false))
+            .unwrap();
+        let mut steps = 0;
+        while req.prefilling {
+            model
+                .with_request(&mut req, |m, r| m.advance_prefill_step(r, chunk, true))
+                .unwrap();
+            steps += 1;
+            assert!(steps < 1000);
+            if interruption && req.prefilling {
+                model
+                    .advance_requests(&mut [&mut decoder], &scheduler::Options::default())
+                    .unwrap();
+                // Overwrite the shared large arena during the first suspension.
+                if steps == 1 {
+                    let mut another = input(&source, 1);
+                    another.input_tokens.truncate(512);
+                    another.input_tokens[0] = source.input_tokens[1];
+                    let mut other = model.start_request(another, &|| false).unwrap();
+                    model
+                        .with_request(&mut other, |m, r| m.advance_prefill(r, 512, false))
+                        .unwrap();
+                    model.finish_request(&mut other, false).unwrap();
+                }
+            }
+        }
+        assert!(steps >= 48);
+        let scores = distribution(&mut model, &mut req);
+        let kl: f64 = expected
+            .iter()
+            .zip(&scores)
+            .map(|(a, b)| a.exp() * (a - b))
+            .sum();
+        assert!(kl.abs() < 1e-7, "Layer boundary changed logits: {kl}");
+        assert_eq!(hash_state(&mut model, &mut req), expected_state);
+        rows.push(json!({"interruption":interruption,"steps":steps,"kl":kl,"state_equal":true}));
+        model.finish_request(&mut req, false).unwrap();
+        model.finish_request(&mut decoder, false).unwrap();
+    }
+    let mut cancelled = model.start_request(input(&source, 1), &|| false).unwrap();
+    model
+        .with_request(&mut cancelled, |m, r| {
+            m.advance_prefill_step(r, chunk, true)
+        })
+        .unwrap();
+    assert!(cancelled.prefill_frame.is_some());
+    model.finish_request(&mut cancelled, false).unwrap();
+    assert!(cancelled.prefill_frame.is_none());
+    let mut reused = model.start_request(input(&source, 1), &|| false).unwrap();
+    model
+        .with_request(&mut reused, |m, r| m.advance_prefill(r, chunk, false))
+        .unwrap();
+    assert_eq!(hash_state(&mut model, &mut reused), expected_state);
+    model.finish_request(&mut reused, false).unwrap();
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({
+            "chunk_tokens":chunk,"cases":rows,"cancel_reuse_state_equal":true,"scheduler":model.scheduler_statistics
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires exact Flash tails and exclusive GPU experiment lock"]
 fn validate_flash_prefill_tails() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(

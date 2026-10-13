@@ -68,6 +68,117 @@ fn recipe(tokens: usize) -> Result<Recipe> {
         _ => return Err("Unsupported Flash prefill width".into()),
     })
 }
+
+/// Freeze layer boundaries only after every fusion and prerequisite has been
+/// inserted. A stage refers to the exact same operations as the full program.
+pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel]) -> Result<()> {
+    for plan in &mut manifest.prefill_plans {
+        if plan.chunk_tokens < 512 {
+            continue;
+        }
+        let program = &plan.prefill_program;
+        let operations = &manifest.programs[program];
+        let mut starts = vec![0];
+        let mut layer = 0;
+        for (index, operation) in operations.iter().enumerate() {
+            let Operation::Kernel { name } = operation else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix(&format!("{program}/layer")) else {
+                continue;
+            };
+            let Some(number) = suffix
+                .split('/')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if number != layer {
+                if number != layer + 1 {
+                    return Err("Non-contiguous prefill layer order".into());
+                }
+                starts.push(index);
+                layer = number;
+            }
+        }
+        if starts.len() != 48 {
+            return Err("Incomplete Flash prefill layer partition".into());
+        }
+        starts.push(operations.len());
+        let stages: Vec<_> = starts
+            .windows(2)
+            .enumerate()
+            .map(|(i, span)| {
+                (
+                    format!("{program}/stage{i}"),
+                    operations[span[0]..span[1]].to_vec(),
+                )
+            })
+            .collect();
+        plan.stages = stages.iter().map(|(name, _)| name.clone()).collect();
+        let initialize = format!(
+            "{program}/begin/k{}",
+            usize::from(manifest.vision.is_some())
+        );
+        let residual = kernels
+            .iter()
+            .find(|k| k.name == initialize)
+            .and_then(|kernel| kernel.args.get(1))
+            .and_then(|a| match a {
+                crate::artifact::Argument::Buffer { name } => Some(name.clone()),
+                _ => None,
+            })
+            .map(Ok)
+            .unwrap_or_else(|| crate::bindings::buffer_argument(&initialize, 1))?;
+        plan.live_buffers.push(residual);
+        for (_, operations) in stages.iter().skip(1) {
+            let Some(Operation::Kernel { name }) = operations.first() else {
+                return Err("Prefill continuation must begin with a layer kernel".into());
+            };
+            let args = kernels
+                .iter()
+                .find(|k| &k.name == name)
+                .map(|k| Ok(k.args.clone()))
+                .unwrap_or_else(|| crate::bindings::kernel_arguments(name))?;
+            let indices: &[usize] = if name.contains("/layer1/") {
+                // PLE's input A8 projection is prepared in the preceding
+                // section. Its row scales remain live with the activation.
+                &[0, 2]
+            } else {
+                // HC fuses the previous FFN's injection into the next layer's
+                // normalization. Its Block/Inject operands cross this cut.
+                match args.len() {
+                    3 => &[1],
+                    4 => &[2],
+                    6 => &[0, 1, 4],
+                    7 => &[0, 1, 5],
+                    _ => return Err("Unsupported HC continuation boundary".into()),
+                }
+            };
+            for &index in indices {
+                let Some(crate::artifact::Argument::Buffer { name }) = args.get(index) else {
+                    return Err("Missing HC/PLE continuation operand".into());
+                };
+                plan.live_buffers.push(name.clone());
+            }
+        }
+        plan.live_buffers.push("Length".into());
+        plan.live_buffers.sort();
+        plan.live_buffers.dedup();
+        // Position, MRope coordinates, and visual assets already belong to the
+        // request's private arena. Only shared cross-layer values need copying.
+        let kv = manifest
+            .kv_cache
+            .as_mut()
+            .ok_or("Missing prefill state growth")?;
+        for (name, operations) in stages {
+            kv.growth.insert(name.clone(), kv.growth[program].clone());
+            manifest.programs.insert(name, operations);
+        }
+    }
+    Ok(())
+}
 pub(super) fn section(
     program: &str,
     name: &str,
@@ -203,6 +314,8 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
                 chunk_tokens: tokens,
                 prefill_program: program.clone(),
                 head_program: head.clone(),
+                stages: vec![],
+                live_buffers: vec![],
             });
         }
         programs.insert(program, ops);
