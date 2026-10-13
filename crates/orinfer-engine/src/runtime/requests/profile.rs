@@ -1,4 +1,4 @@
-//! Ignored diagnostic: full real-model decode iterations and hot GPU graphs.
+//! Ignored diagnostics: real-model kernel captures, partition state and GPU graphs.
 use super::*;
 use crate::execution::Invocation;
 use serde_json::json;
@@ -1003,5 +1003,153 @@ fn profile_continuous_decode() {
     }
     if fixture["live_only"].as_bool() == Some(true) {
         std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"Live autoregressive iterations; two graph timing events, CPU stage timestamps; diagnostic only.","rows":rows})).unwrap()).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "Captures real prefill partition intermediates; requires exclusive GPU lock"]
+fn capture_prefill_partitions() {
+    let spec: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(spec["output"].as_str().unwrap());
+    std::fs::create_dir(&output).unwrap();
+    let source: GenerationInput = serde_json::from_value(spec["case"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(spec["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::Off,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut results = vec![];
+    for partition in spec["partitions"].as_array().unwrap() {
+        let label = partition["name"].as_str().unwrap();
+        let chunks: Vec<usize> = serde_json::from_value(partition["chunks"].clone()).unwrap();
+        assert_eq!(chunks.iter().sum::<usize>(), source.input_tokens.len());
+        let mut req = model
+            .start_request(
+                GenerationInput {
+                    input_tokens: source.input_tokens.clone(),
+                    images: source.images.clone(),
+                    max_new_tokens: 1,
+                    sampling: source.sampling.clone(),
+                    prefix_hints: vec![],
+                },
+                &|| false,
+            )
+            .unwrap();
+        let directory = output.join(label);
+        std::fs::create_dir(&directory).unwrap();
+        let mut captures = vec![];
+        for (index, &chunk) in chunks.iter().enumerate() {
+            if index != 0 && index + 1 != chunks.len() {
+                model
+                    .with_request(&mut req, |m, r| m.advance_prefill(r, chunk, false))
+                    .unwrap();
+                continue;
+            }
+            let phase = if index == 0 { "first" } else { "last" };
+            model
+                .with_request(&mut req, |m, r| {
+                    let (program, head) = if chunk == 1 {
+                        ("decode".to_owned(), None)
+                    } else {
+                        let (_, program, head) = m.manifest.select_prefill_plan(chunk)?;
+                        (program.to_owned(), Some(head.to_owned()))
+                    };
+                    m.upload_ids(
+                        if chunk == 1 {
+                            &m.manifest.token
+                        } else {
+                            &m.manifest.input
+                        },
+                        &r.input[r.offset..r.offset + chunk],
+                    )?;
+                    m.prepare_inputs(&r.input[r.offset..r.offset + chunk], &r.input[..r.offset])?;
+                    m.upload_segment_controls(chunk)?;
+                    m.execution.ensure_sequence_program(r.slot, &program)?;
+                    for operation in m.manifest.programs[&program].clone() {
+                        let name = match &operation {
+                            crate::model::Operation::Kernel { name } => Some(name.clone()),
+                            _ => None,
+                        };
+                        m.execution.execute_batch(
+                            vec![],
+                            &[Invocation {
+                                operation,
+                                sequence: None,
+                                launch: None,
+                                views: BTreeMap::new(),
+                            }],
+                            false,
+                            false,
+                        )?;
+                        if let Some(watches) = name
+                            .as_ref()
+                            .and_then(|n| spec["watches"].get(n))
+                            .and_then(|v| v.as_array())
+                        {
+                            for watch in watches {
+                                let buffer = watch["buffer"].as_str().unwrap();
+                                let offset = watch["offset"].as_u64().unwrap_or(0) as usize;
+                                let bytes = watch["bytes"].as_u64().unwrap() as usize;
+                                let raw = m.execution.download_bytes(buffer, offset + bytes)?;
+                                let file =
+                                    format!("{phase}-{}.bin", watch["name"].as_str().unwrap());
+                                std::fs::write(directory.join(&file), &raw[offset..])
+                                    .map_err(|e| e.to_string())?;
+                                captures.push(
+                                    json!({"phase":phase,"kernel":name,"watch":watch,"file":file}),
+                                );
+                            }
+                        }
+                    }
+                    if r.offset + chunk == r.input.len()
+                        && let Some(head) = head
+                    {
+                        m.launch_program(&head, ExecutionPhase::Prefill)?;
+                    }
+                    m.after_prefill(r, chunk)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let raw = model
+            .with_request(&mut req, |m, _| {
+                m.execution
+                    .download_bytes(&m.manifest.logits, m.manifest.vocab * 4)
+            })
+            .unwrap();
+        std::fs::write(directory.join("logits.f32"), raw).unwrap();
+        let state = if spec["capture_state"].as_bool() == Some(true) {
+            model
+                .with_request(&mut req, |m, _| {
+                    m.prefix_ranges(source.input_tokens.len())?
+                        .into_iter()
+                        .map(|(name, range)| {
+                            let raw = m
+                                .execution
+                                .download_bytes(&name, range.offset + range.bytes)?;
+                            Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                        })
+                        .collect::<Result<BTreeMap<_, _>>>()
+                })
+                .unwrap()
+        } else {
+            BTreeMap::new()
+        };
+        model.finish_request(&mut req, false).unwrap();
+        results.push(json!({"name":label,"chunks":chunks,"captures":captures,"state":state}));
+        std::fs::write(
+            output.join("capture.json"),
+            serde_json::to_vec_pretty(&json!({"cases":results,"seed":20261002})).unwrap(),
+        )
+        .unwrap();
+        eprintln!("prefill capture complete: {label}");
     }
 }

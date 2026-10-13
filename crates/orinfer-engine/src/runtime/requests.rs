@@ -314,7 +314,13 @@ impl ModelRuntime {
         if common <= req.offset {
             return Ok(false);
         }
-        if self.admit_prefix_checkpoint(common, req.input.len(), req.offset, &req.checkpoints)? {
+        if self.admit_prefix_checkpoint(
+            common,
+            req.input.len(),
+            req.offset,
+            &req.checkpoints,
+            true,
+        )? {
             req.checkpoints.insert(common);
             return Ok(true);
         }
@@ -555,6 +561,7 @@ impl ModelRuntime {
                             input.input_tokens.len(),
                             offset,
                             &checkpoints,
+                            hint == prefix.statistics.matched_tokens,
                         )?
                     {
                         checkpoints.insert(hint);

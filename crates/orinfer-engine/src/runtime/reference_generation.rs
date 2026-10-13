@@ -82,14 +82,14 @@ impl ModelRuntime {
         if self.prefix_cache.budget != 0 {
             checkpoints.extend((8192..input.len()).step_by(8192));
             for hint in hints.into_iter().filter(|&p| p > offset && p < input.len()) {
-                if self.admit_prefix_checkpoint(hint, input.len(), offset, &checkpoints)? {
+                if self.admit_prefix_checkpoint(hint, input.len(), offset, &checkpoints, false)? {
                     checkpoints.insert(hint);
                 }
             }
             let branch = prefix.statistics.matched_tokens;
             if branch > offset
                 && branch < input.len()
-                && self.admit_prefix_checkpoint(branch, input.len(), offset, &checkpoints)?
+                && self.admit_prefix_checkpoint(branch, input.len(), offset, &checkpoints, true)?
             {
                 checkpoints.insert(branch);
             }

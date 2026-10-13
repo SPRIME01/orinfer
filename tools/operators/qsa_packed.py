@@ -85,7 +85,7 @@ def main():
             partial = torch.empty((m, 24, splits, 256), device="cuda")
             guarded = torch.full((m + 1, 24, 256), 91.0, device="cuda", dtype=torch.float16)
             out = guarded[:m]
-            kernel = sparse_attention(m, capacity, splits, packed)
+            kernel = sparse_attention(m, capacity, splits, packed, split_size=2048 // splits)
             merge = sparse_merge(m, splits)
             kk, vv = (k.view(torch.uint32), v.view(torch.uint32)) if packed else (k, v)
 

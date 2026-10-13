@@ -63,6 +63,7 @@ impl Costs {
         let minimum = self
             .shapes
             .keys()
+            .rev()
             .copied()
             .find(|&n| n > 1 && n <= 16 && n <= remaining);
         minimum
@@ -123,6 +124,7 @@ impl Costs {
         // A complete head-bearing checkpoint always avoids model execution.
         (prefix == end || cost < self.remaining(0, end) * 0.95).then_some(cost)
     }
+    #[cfg(test)]
     pub fn admit(
         &self,
         prefix: usize,
@@ -130,6 +132,17 @@ impl Costs {
         bytes: usize,
         start: usize,
         checkpoints: &BTreeSet<usize>,
+    ) -> bool {
+        self.admit_with_reuse(prefix, end, bytes, start, checkpoints, false)
+    }
+    pub fn admit_with_reuse(
+        &self,
+        prefix: usize,
+        end: usize,
+        bytes: usize,
+        start: usize,
+        checkpoints: &BTreeSet<usize>,
+        reused: bool,
     ) -> bool {
         if prefix <= start || self.score(prefix, end, bytes).is_none() {
             return false;
@@ -150,13 +163,38 @@ impl Costs {
         // large chunk. Periodic checkpoints are already chunk boundaries.
         // Account from the restored endpoint and include already admitted
         // boundaries, rather than evaluating each split against a cold run.
-        split - baseline <= (baseline * 0.1).max(0.05)
+        let extra = (split - baseline).max(0.);
+        extra <= (baseline * 0.1).max(0.05)
+            || (reused
+                && baseline - self.remaining(prefix, end) > extra + self.restore_cost(bytes) * 2.)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_reuse_pays_for_a_checkpoint_but_not_an_unprofitable_split() {
+        let mut costs = Costs::new((2..=16).chain([128, 512, 2048, 4096]));
+        for n in 1..16 {
+            costs.observe(n, 0.1);
+        }
+        for (n, seconds) in [
+            (16, 0.075),
+            (128, 0.21),
+            (512, 0.6),
+            (2048, 1.7),
+            (4096, 3.),
+        ] {
+            costs.observe(n, seconds);
+        }
+        let checkpoints = BTreeSet::from([8192]);
+        assert!(!costs.admit(3584, 8223, 160 << 20, 0, &checkpoints));
+        assert!(costs.admit_with_reuse(3584, 8223, 160 << 20, 0, &checkpoints, true));
+        assert!(!costs.admit_with_reuse(2403, 8223, 160 << 20, 0, &checkpoints, true));
+        costs.observe_restore(160 << 20, 100.);
+        assert!(!costs.admit_with_reuse(3584, 8223, 160 << 20, 0, &checkpoints, true));
+    }
     #[test]
     fn rejects_small_prefixes_that_destroy_large_chunks() {
         let costs = Costs::new([2, 4, 8, 512, 2048]);
@@ -223,5 +261,15 @@ mod tests {
         assert_eq!(costs.bounded_chunk_at(512, 0, 1000.), 128);
         costs.observe_at(16, 16, 5.);
         assert_eq!(costs.bounded_chunk_at(512, 0, 1.), 1);
+    }
+    #[test]
+    fn exact_tail_profiles_do_not_turn_soft_budget_fallback_into_tiny_passes() {
+        let mut costs = Costs::new((2..=16).chain([128]));
+        for n in 2..=16 {
+            costs.observe_at(n, n, 0.4);
+        }
+        assert_eq!(costs.bounded_chunk_at(512, 0, 1.), 16);
+        assert_eq!(costs.bounded_chunk_at(15, 0, 1.), 15);
+        assert_eq!(costs.bounded_chunk_at(1, 0, 1.), 1);
     }
 }

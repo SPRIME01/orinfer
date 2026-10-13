@@ -32,10 +32,24 @@ def sparse_attention(
     block_size: int = 32,
     threads: int = 128,
     single_buffer: bool = False,
+    split_size: int | None = 256,
 ):
     geometry(m, capacity)
     if splits not in (1, 2, 4, 8):
         raise ValueError("Invalid QSA splits")
+    # Selected contains at most 512 four-token blocks plus three pending
+    # tokens. Fixed boundaries make each query's FP16 probability rounding
+    # independent of prefill extent and request batching. The final slot
+    # includes the pending tail; no split boundary follows a launch heuristic.
+    # None retains balanced partitioning only for offline numerical references;
+    # zero is the single-split reference using the same output ABI.
+    if split_size is not None and (
+        type(split_size) is not int
+        or split_size not in (0, 256, 512, 1024, 2048)
+        or split_size > 0
+        and splits * split_size < 2048
+    ):
+        raise ValueError("Fixed QSA partitions must cover all selected blocks")
     if (
         block_size not in (32, 64)
         or threads not in (128, 256)
@@ -91,9 +105,19 @@ def sparse_attention(
                 if i < 12:
                     q[i, d] = Query[row, kh * 12 + i, d]
             length = T.min((Position[0] + row + 1) // 4, 512) * 4 + (Position[0] + row + 1) % 4
-            count = T.ceildiv(length, splits)
+            count = (
+                T.ceildiv(length, splits)
+                if split_size is None
+                else length
+                if split_size == 0
+                else split_size
+            )
             start = split * count
-            end = T.min(start + count, length)
+            end = (
+                T.if_then_else(split == splits - 1, length, T.min(start + count, length))
+                if split_size
+                else T.min(start + count, length)
+            )
             for tile in T.serial(T.ceildiv(T.max(0, end - start), block)):
                 # Retire all readers before reusing metadata for another tile.
                 # Prefetch once instead of serializing each channel on the

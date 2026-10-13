@@ -1,6 +1,105 @@
 use super::*;
 
 #[test]
+#[ignore = "Requires exact Flash tails and exclusive GPU experiment lock"]
+fn validate_flash_prefill_tails() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut source = input(&fixture.cases[0], 1);
+    assert!(source.input_tokens.len() >= 528);
+    source.input_tokens.truncate(528);
+    assert!(source.images.is_empty());
+    let mut captures = vec![];
+    // Start with 14, before any M16 plan can incidentally map its shared
+    // index workspace. This catches a missing growth rule for an exact tail.
+    for tail in std::iter::once(14)
+        .chain(std::iter::once(16))
+        .chain((2..=15).filter(|&n| n != 14))
+    {
+        let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
+        let chunks = if tail == 16 {
+            vec![512, 16]
+        } else {
+            vec![512, tail, 16 - tail]
+        };
+        for &chunk in &chunks {
+            model
+                .with_request(&mut req, |m, r| m.advance_prefill(r, chunk, false))
+                .unwrap();
+        }
+        let scores = distribution(&mut model, &mut req);
+        let state = model
+            .with_request(&mut req, |m, _| {
+                m.prefix_ranges(528)?
+                    .into_iter()
+                    .map(|(name, range)| {
+                        let raw = m
+                            .execution
+                            .download_bytes(&name, range.offset + range.bytes)?;
+                        Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()
+            })
+            .unwrap();
+        model.finish_request(&mut req, false).unwrap();
+        captures.push((tail, chunks, scores, state));
+    }
+    let reference = &captures[1];
+    let mut rows = vec![];
+    for (tail, chunks, scores, state) in &captures {
+        let kl: f64 = reference
+            .2
+            .iter()
+            .zip(scores)
+            .map(|(a, b)| a.exp() * (a - b))
+            .sum();
+        let token = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        let nll_delta = reference.2[token] - scores[token];
+        let top3 = reference
+            .2
+            .iter()
+            .filter(|&&p| p > reference.2[token])
+            .count()
+            < 3;
+        assert!(
+            kl.is_finite() && kl < 0.05 && nll_delta.abs() < 0.1 && top3,
+            "Exact tail {tail} changed token quality: KL={kl}, NLL delta={nll_delta}"
+        );
+        let changed: Vec<_> = reference
+            .3
+            .iter()
+            .filter(|(name, hash)| state.get(*name) != Some(*hash))
+            .map(|(name, _)| name.clone())
+            .collect();
+        rows.push(
+            json!({"tail":tail,"chunks":chunks,"kl":kl,"nll_delta":nll_delta,
+            "selected_in_reference_top3":top3,"changed_state":changed}),
+        );
+    }
+    std::fs::write(fixture.output, serde_json::to_vec_pretty(&json!({
+        "seed":20261002,"scope":"Same quantized weights, real causal tail lengths; not BF16 quantization acceptance", "cases":rows
+    })).unwrap()).unwrap();
+}
+
+#[test]
 #[ignore = "Requires native Flash batch package and exclusive GPU experiment lock"]
 fn validate_flash_decode_batches() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
@@ -1128,10 +1227,14 @@ fn validate_flash_heterogeneous_scheduling() {
             .map(|(b, a)| b.exp() * (b - a))
             .sum();
         eprintln!("heterogeneous cross-partition first-token KL {cross_partition_kl}");
+        assert!(
+            cross_partition_kl.is_finite() && cross_partition_kl < 0.05,
+            "Interrupted prefill changed the distribution: {cross_partition_kl}, chunks={chunks:?}"
+        );
         model.finish_request(&mut baseline, false).unwrap();
         // Match numerical chunk boundaries to isolate request interleaving.
-        // Largest-tile versus interrupted-prefill drift is reported separately;
-        // it is not a state-isolation comparison or a BF16 quality reference.
+        // The cross-partition check above and this interleaving check cover
+        // different failure modes; neither is a BF16 quantization reference.
         let mut baseline = model
             .start_request(input(&fixture.cases[0], 4), &|| false)
             .unwrap();

@@ -57,7 +57,7 @@ def _gdn_sequence(
                 bs = T.alloc_shared((2,), T.float32)
             state = T.alloc_fragment((DK, value_tile), T.float32)
             product = T.alloc_fragment((DK, value_tile), T.float32)
-            if tokens <= 8 and threads == 128 and value_tile == 32:
+            if threads == 128 and value_tile == 32:
                 # Permute thread ownership without changing each lane's eight
                 # K partials or the sixteen-lane reduction tree. Both dot
                 # products now reduce within a warp rather than through a
@@ -77,6 +77,24 @@ def _gdn_sequence(
                                 (j // 8) * 32 + (i % 16) * 2 + (j // 4) % 2
                             ),
                             forward_index_fn=lambda i, j: (i // 16) * 4 + j % 4,
+                        ),
+                    }
+                )
+            elif threads == 32 and value_tile == 16:
+                # Use the same eight K partials and sixteen-lane reduction as
+                # decode. A warp owns sixteen value columns instead of eight;
+                # changing prefill extent must not change the recurrent state.
+                T.annotate_layout(
+                    {
+                        state: tilelang.Fragment(
+                            (DK, value_tile),
+                            forward_thread_fn=lambda i, j: (i % 16) * 2 + j // 8,
+                            forward_index_fn=lambda i, j: (i // 16) * 8 + j % 8,
+                        ),
+                        product: tilelang.Fragment(
+                            (DK, value_tile),
+                            forward_thread_fn=lambda i, j: (i % 16) * 2 + j // 8,
+                            forward_index_fn=lambda i, j: (i // 16) * 8 + j % 8,
                         ),
                     }
                 )

@@ -225,12 +225,15 @@ def hc_projection(
     streams: int = 4,
     group_m: int = 0,
     dynamic_rows: bool = False,
+    reduction_groups: int = 1,
 ):
     """Build (A[M,K], W[N,K], C[M,N]), stream dtype/BF16/stream dtype.
 
     FP32 accumulation, BF16 Tensor Core arithmetic, explicit output rounding.
     This preserves the original BF16 HC weights. N tails are supported for
     the four-stream injection projection; K must be a multiple of 64.
+    Four reduction groups match the decode HC down partials: accumulate each
+    contiguous stream in FP32, then add streams in order before FP16 rounding.
     """
     _dtype(dtype)
     if (
@@ -243,6 +246,12 @@ def hc_projection(
         raise ValueError("Invalid HC output tile")
     if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
         raise ValueError("Invalid HC row grouping")
+    if (
+        type(reduction_groups) is not int
+        or reduction_groups not in (1, 4)
+        or K % (64 * reduction_groups)
+    ):
+        raise ValueError("Invalid HC reduction grouping")
     threads = 64 if block_n == 16 else 128
     M = row_count(M, dynamic_rows)
 
@@ -251,14 +260,24 @@ def hc_projection(
         a = T.alloc_shared((block_m, 64), T.bfloat16)
         w = T.alloc_shared((block_n, 64), T.bfloat16)
         acc = T.alloc_fragment((block_m, block_n), T.float32)
-        T.clear(acc)
-        for kg in T.Pipelined(K // 64, num_stages=2):
-            for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
-                a[i, j] = T.if_then_else(
-                    by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0
-                )
-            T.copy(W[bx * block_n, kg * 64], w)
-            T.gemm(a, w, acc, transpose_B=True)
+        if reduction_groups == 4:
+            total = T.alloc_fragment((block_m, block_n), T.float32)
+            T.clear(total)
+        for branch in T.serial(reduction_groups):
+            T.clear(acc)
+            for kg in T.Pipelined(K // (64 * reduction_groups), num_stages=2):
+                offset = branch * (K // reduction_groups) + kg * 64
+                for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
+                    a[i, j] = T.if_then_else(
+                        by * block_m + i < M, A[by * block_m + i, offset + j], 0.0
+                    )
+                T.copy(W[bx * block_n, offset], w)
+                T.gemm(a, w, acc, transpose_B=True)
+            if reduction_groups == 4:
+                for i, j in T.Parallel(block_m, block_n):
+                    total[i, j] += acc[i, j]
+        if reduction_groups == 4:
+            T.copy(total, acc)
         if silu:
             for i, j in T.Parallel(block_m, block_n):
                 if by * block_m + i < M and bx * block_n + j < N:

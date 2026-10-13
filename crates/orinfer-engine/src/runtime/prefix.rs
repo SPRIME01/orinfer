@@ -128,11 +128,13 @@ impl ModelRuntime {
         end: usize,
         start: usize,
         checkpoints: &BTreeSet<usize>,
+        reused: bool,
     ) -> Result<bool> {
         let bytes = self.prefix_ranges(prefix)?.values().map(|r| r.bytes).sum();
-        Ok(self
-            .prefill_costs
-            .admit(prefix, end, bytes, start, checkpoints))
+        Ok(bytes <= self.prefix_cache.budget
+            && self
+                .prefill_costs
+                .admit_with_reuse(prefix, end, bytes, start, checkpoints, reused))
     }
     pub(super) fn prefix_ranges(&self, tokens: usize) -> Result<BTreeMap<String, Range>> {
         let m = &self.manifest;

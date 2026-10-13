@@ -13,7 +13,9 @@ pub(super) fn arena_width(tokens: usize) -> usize {
 }
 
 pub(super) fn score_role(tokens: usize, prefix: &str) -> String {
-    let width = if prefix == "Draft" && tokens >= 256 {
+    let width = if prefix == "Target" && (2..16).contains(&tokens) {
+        16
+    } else if prefix == "Draft" && tokens >= 256 {
         512
     } else {
         arena_width(tokens)
@@ -43,7 +45,7 @@ fn recipe(tokens: usize) -> Result<Recipe> {
             last: 54,
             head: 9,
         },
-        16 | 128 => Recipe {
+        2..=16 | 128 => Recipe {
             recurrent: 44,
             attention: 58,
             first: 45,
@@ -97,7 +99,11 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         return Err("Unsupported Flash scheduling/features contract".into());
     }
     let widths: BTreeSet<_> = profiles.iter().map(|p| p.tokens).collect();
-    if widths != BTreeSet::from([16, 128, 512, 2048, 4096])
+    let base = BTreeSet::from([16, 128, 512, 2048, 4096]);
+    if !base.is_subset(&widths)
+        || widths
+            .iter()
+            .any(|n| !base.contains(n) && !(2..16).contains(n))
         || widths.len() != profiles.len()
         || profiles.iter().any(|p| p.kind != "flash_recurrent")
     {
@@ -146,7 +152,7 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
     }
     let mut programs = BTreeMap::new();
     manifest.prefill_plans.clear();
-    for tokens in [1, 16, 128, 512, 2048, 4096] {
+    for tokens in std::iter::once(1).chain(widths.iter().copied()) {
         let r = recipe(tokens)?;
         let history = format!("M{}_HistoryOut", arena_width(tokens));
         if manifest
@@ -272,17 +278,12 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         return Err("Flash column-major score workspace contract differs".into());
     }
     kv.growth.clear();
-    for (name, tokens) in [
-        ("decode", 1),
-        ("prefill_m16", 16),
-        ("prefill_m128", 128),
-        ("prefill_m512", 512),
-        ("prefill_m2048", 2048),
-        ("prefill_m4096", 4096),
-        ("prefill", 4096),
-    ] {
+    for (name, tokens) in std::iter::once(("decode".to_owned(), 1))
+        .chain(widths.iter().map(|&n| (format!("prefill_m{n}"), n)))
+        .chain(std::iter::once(("prefill".to_owned(), 4096)))
+    {
         kv.growth.insert(
-            name.into(),
+            name,
             KvGrowth {
                 position: manifest.position.clone(),
                 tokens,

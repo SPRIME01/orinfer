@@ -163,6 +163,7 @@ def upgrade(model, destination, report, engine=None):
                 group_m=4,
                 silu=True,
                 output_dtype="bfloat16",
+                reduction_groups=4,
             ),
             dict(A=B, W=down["W"], C=D),
         )

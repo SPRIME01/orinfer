@@ -216,3 +216,18 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_draft.py artifacts/flas
 新增的 CUDA 编译只包含因子保存和完整行 Q4 草稿头等必要 kernel，其余复用现有 cubin。权重不重新量化；新增执行逻辑需要重建原生库、校验完整计划并重新进行 GPU/CLI 验收。程序声明属于模型包，关闭 MTP 时一并移除其专用 batch 程序。在线格式和 C ABI 表保持版本 1。
 
 各验证宽度的临时 prefix/提交因子在同一请求内复用最大容量，不共享请求之间的状态；验证和接受提交完成后才复用。当前布局由每请求 115.07 MiB 降为 26.30 MiB，不改变原 kernel 的形状、索引或复制长度。
+
+### 分块数值与真实尾块
+
+生产构建在混合执行包之后追加以下步骤，复用现有权重并重建原生模型库：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/canonical_reductions.py artifacts/flash-canonical-build \
+  --model /path/to/flash-mixed-draft --model-output artifacts/models/flash-canonical
+bash tools/operators/run.sh tools/model/flash_next/prefill_tails.py artifacts/flash-tails-build \
+  --model artifacts/models/flash-canonical --model-output artifacts/models/flash-exact
+```
+
+QSA 的选中 KV 固定按 256-token 区间归约，再按固定顺序合并八份 FP32 部分结果；最后一份同时覆盖不足四 token 的 pending 尾部。GDN 固定 FP32 归约布局，HC down 按四路 stream 分别累加后依次求和。这些数值边界不随 batch 或 prefill 大小改变；权重、INT8 KV 和 Tensor Core 精度保持原配置。
+
+2–15-token prefill 尾块复用 16 行的投影与专家 cubin，只为真实长度编译因果算子。填充行不推进 KV、GDN、卷积、PLE、MTP 历史或位置，输出头选最后一条真实残差。尾块捕获和 MTP 验证使用独立的程序名。此改动需要新的执行包；更新 CLI 本身不会改变已发布 cubin 的行为。

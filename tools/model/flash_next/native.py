@@ -490,6 +490,7 @@ class Model:
                             group_m=gm,
                             silu=silu,
                             streams=c,
+                            reduction_groups=4 if width == c * h and n == rank else 1,
                         ),
                         a,
                         weight,
@@ -657,7 +658,9 @@ class Model:
             empty((m, 2, segments), torch.int32, index=True) for _ in range(2)
         )
         selected = empty((m, 2051), torch.int32)
-        qsa_splits = 2 if m >= 256 else 8
+        # The logical KV reduction is shared by prefill/decode/verification.
+        # Only launch scheduling may depend on the number of query rows.
+        qsa_splits = 8
         qsa_block = 32
         qsa_threads = 128
         sparse_max, sparse_den = (empty((m, 24, qsa_splits), torch.float32) for _ in range(2))

@@ -83,9 +83,12 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     let warm_widths: BTreeSet<_> = spec.warm_plans.iter().map(|p| p.tokens).collect();
     let capture_widths: BTreeSet<_> = spec.capture_plans.iter().map(|p| p.tokens).collect();
     let verify_widths: BTreeSet<_> = spec.verification_plans.iter().map(|p| p.tokens).collect();
+    let expected_capture: BTreeSet<_> = std::iter::once(1)
+        .chain(manifest.prefill_plans.iter().map(|p| p.chunk_tokens))
+        .collect();
     if warm_widths != BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512])
         || warm_widths.len() != spec.warm_plans.len()
-        || capture_widths != BTreeSet::from([1, 16, 128, 512, 2048, 4096])
+        || capture_widths != expected_capture
         || capture_widths.len() != spec.capture_plans.len()
         || verify_widths != (2..=8).collect()
         || verify_widths.len() != spec.verification_plans.len()
@@ -163,7 +166,11 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         programs.insert(capture.clone(), section(&capture, "body", 1, None));
     }
     for p in &spec.capture_plans {
-        let name = format!("mtp_capture_m{}", p.tokens);
+        let name = if (2..16).contains(&p.tokens) {
+            format!("mtp_prefill_capture_m{}", p.tokens)
+        } else {
+            format!("mtp_capture_m{}", p.tokens)
+        };
         if p.program != name {
             return Err("Unknown Flash capture program".into());
         }

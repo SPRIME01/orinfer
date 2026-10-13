@@ -374,7 +374,7 @@ impl Inputs {
         if !draft && program != "target" {
             return Err("Unknown Flash input program".into());
         }
-        if !matches!(tokens.len(), 1..=8 | 16 | 128 | 512 | 2048 | 4096)
+        if !matches!(tokens.len(), 1..=16 | 128 | 512 | 2048 | 4096)
             || tokens
                 .iter()
                 .chain(history)
