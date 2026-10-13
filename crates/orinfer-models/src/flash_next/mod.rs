@@ -34,6 +34,10 @@ impl Adapter for Flash {
                 let plan = mixed::verification_plan(&self.manifest, segments)?;
                 Ok((if include_plan { plan } else { vec![] }, vec![]))
             }
+            abi::BatchOperation::MixedVerification => {
+                let plan = mixed::mixed_verification_plan(&self.manifest, segments)?;
+                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            }
             abi::BatchOperation::Draft
             | abi::BatchOperation::Warm
             | abi::BatchOperation::DraftHead => {
@@ -190,6 +194,25 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
     plan::stages(&mut request.metadata, &request.kernel_contracts)?;
+    if let Some(spec) = &mut request.metadata.mtp {
+        spec.mixed_verification_tokens = if !spec.batch_verification_tokens.is_empty()
+            && !request.metadata.prefill_batch_profiles.is_empty()
+            && request
+                .metadata
+                .prefill_batch_profiles
+                .iter()
+                .all(|p| p.kind == "flash_mixed_grouped")
+            && request
+                .metadata
+                .batch_layout
+                .as_ref()
+                .is_some_and(|layout| !layout.profiles.is_empty())
+        {
+            vec![2]
+        } else {
+            vec![]
+        };
+    }
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,

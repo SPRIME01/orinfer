@@ -89,9 +89,15 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         || layout.small_mixed_shapes != [16, 128, 512]
         || m.prefill_batch_profiles
             .iter()
-            .map(|p| (p.tokens, p.kind.as_str()))
+            .map(|p| p.tokens)
             .collect::<Vec<_>>()
-            != [(256, "flash_mixed"), (1024, "flash_mixed")]
+            != [256, 1024]
+        || m.prefill_batch_profiles
+            .iter()
+            .any(|p| !matches!(p.kind.as_str(), "flash_mixed" | "flash_mixed_grouped"))
+        || m.prefill_batch_profiles
+            .windows(2)
+            .any(|p| p[0].kind != p[1].kind)
         || m.buffers
             .iter()
             .find(|b| b.name == RESIDUAL)
@@ -237,39 +243,93 @@ fn append(
 }
 
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
-    plan_kind(m, segments, false)
+    plan_kind(m, segments, Kind::Ordinary)
 }
 
 pub(super) fn verification_plan(
     m: &Manifest,
     segments: &[BatchSegment],
 ) -> Result<Vec<Invocation>> {
-    plan_kind(m, segments, true)
+    plan_kind(m, segments, Kind::Verification)
 }
 
-fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Vec<Invocation>> {
-    let rows = if verify {
-        let spec = m.mtp.as_ref().ok_or("Missing batched MTP adapter")?;
+pub(super) fn mixed_verification_plan(
+    m: &Manifest,
+    segments: &[BatchSegment],
+) -> Result<Vec<Invocation>> {
+    if !m
+        .mtp
+        .as_ref()
+        .is_some_and(|s| !s.mixed_verification_tokens.is_empty())
+    {
+        return Err("Package lacks mixed prefill/verification".into());
+    }
+    plan_kind(m, segments, Kind::MixedVerification)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Ordinary,
+    Verification,
+    MixedVerification,
+}
+
+fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<Invocation>> {
+    let verified = |s: &BatchSegment| {
+        kind != Kind::Ordinary
+            && m.mtp.as_ref().is_some_and(|spec| {
+                if kind == Kind::MixedVerification {
+                    spec.mixed_verification_tokens.contains(&s.tokens)
+                } else {
+                    spec.batch_verification_tokens.contains(&s.tokens)
+                }
+            })
+    };
+    let head_used: usize = segments
+        .iter()
+        .map(|s| if verified(s) { s.tokens } else { 1 })
+        .sum();
+    let rows = if kind == Kind::Ordinary {
+        validate_segments(m, segments)?
+    } else {
         let mut slots = BTreeSet::new();
+        let mut has_prefill = false;
+        let mut has_verify = false;
         let total = segments.iter().try_fold(0usize, |total, s| {
-            if !spec.batch_verification_tokens.contains(&s.tokens) || !slots.insert(s.slot) {
-                return Err("Invalid batched verification segment".to_string());
+            if !slots.insert(s.slot) {
+                return Err("Repeated mixed sequence".to_string());
+            }
+            if verified(s) {
+                has_verify = true;
+            } else if kind == Kind::MixedVerification
+                && SEGMENTS.contains(&s.tokens)
+                && s.tokens > 1
+            {
+                has_prefill = true;
+            } else {
+                return Err("Invalid mixed verification segment".into());
             }
             total
                 .checked_add(s.tokens)
                 .ok_or("Verification row overflow".to_string())
         })?;
-        if !(2..=128).contains(&segments.len()) || total > 128 {
-            return Err("Verification batch exceeds endpoint head capacity".into());
+        if !(2..=128).contains(&segments.len())
+            || head_used > 128
+            || !has_verify
+            || (kind == Kind::MixedVerification && !has_prefill)
+        {
+            return Err("Invalid mixed verification endpoints".into());
         }
         CAPACITIES
             .into_iter()
             .find(|&n| n >= total)
             .ok_or("Missing verification row body")?
-    } else {
-        validate_segments(m, segments)?
     };
-    let layout = m.batch_layout.as_ref().unwrap();
+    let layout = m
+        .batch_layout
+        .as_ref()
+        .filter(|l| !l.profiles.is_empty())
+        .ok_or("Missing mixed row layout")?;
     // Put single-token rows first so the existing request-table mixers can
     // consume a contiguous subgroup without gathering projections or state.
     let ordered: Vec<_> = segments
@@ -280,7 +340,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
         .collect();
     let segments = ordered.as_slice();
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
-    let parallel = !verify && decoders >= 2 && !layout.state_columns.is_empty();
+    let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
     let private_capacity = decoders.next_power_of_two().max(2);
     let private_views: BTreeMap<_, _> = layout
         .row_strides
@@ -305,7 +365,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
     let mut start = 0;
     for s in segments {
         let width = super::plan::arena_width(s.tokens);
-        let program = if verify {
+        let program = if verified(s) {
             format!("verify_m{}", s.tokens)
         } else if s.tokens == 1 {
             "decode".into()
@@ -389,7 +449,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
                     m,
                     &format!(
                         "{}_m{}/layer1/ple",
-                        if verify {
+                        if verified(s) {
                             "flash_verify_segment"
                         } else {
                             "flash_segment"
@@ -461,7 +521,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
         {
             let private = &m.programs[&format!(
                 "{}_m{}/layer{layer}/private",
-                if verify {
+                if verified(s) {
                     "flash_verify_segment"
                 } else {
                     "flash_segment"
@@ -470,7 +530,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
             )];
             for (i, op) in private.iter().enumerate() {
                 out.push(invoke(op.clone(), Some(s.slot), views));
-                if layer % 4 != 3 && i == usize::from(verify) {
+                if layer % 4 != 3 && i == usize::from(verified(s)) {
                     out.push(invoke(
                         Operation::Copy {
                             source: format!("M{}_HistoryOut", super::plan::arena_width(s.tokens)),
@@ -491,7 +551,6 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
             &empty,
         )?;
     }
-    let head_used = if verify { start } else { segments.len() };
     let head_rows = *m
         .batch_profiles
         .iter()
@@ -514,7 +573,8 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
             &pad,
         ));
     }
-    for (lane, (s, (first, program, views))) in segments.iter().zip(&starts).enumerate() {
+    let mut head_lane = 0;
+    for (s, (first, program, views)) in segments.iter().zip(&starts) {
         out.push(invoke(
             Operation::Kernel {
                 name: format!("{program}/end/k0"),
@@ -528,7 +588,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
                 m,
                 &format!(
                     "flash_{}_capture_m{}",
-                    if verify { "verify" } else { "mixed" },
+                    if verified(s) { "verify" } else { "mixed" },
                     s.tokens
                 ),
                 Some(s.slot),
@@ -540,14 +600,14 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
                 RESIDUAL.into(),
                 BufferView {
                     buffer: RESIDUAL.into(),
-                    offset: (first + if verify { 0 } else { s.tokens - 1 }) * 20480,
+                    offset: (first + if verified(s) { 0 } else { s.tokens - 1 }) * 20480,
                 },
             ),
             (
                 HEAD_RESIDUAL.into(),
                 BufferView {
                     buffer: HEAD_RESIDUAL.into(),
-                    offset: (if verify { *first } else { lane }) * 20480,
+                    offset: head_lane * 20480,
                 },
             ),
         ]);
@@ -555,11 +615,12 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
             Operation::Copy {
                 source: RESIDUAL.into(),
                 destination: HEAD_RESIDUAL.into(),
-                bytes: if verify { s.tokens * 20480 } else { 20480 },
+                bytes: if verified(s) { s.tokens * 20480 } else { 20480 },
             },
             Some(s.slot),
             &copy,
         ));
+        head_lane += if verified(s) { s.tokens } else { 1 };
     }
     append(
         &mut out,
@@ -569,8 +630,8 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
         &empty,
     )?;
     let mut head_lane = 0;
-    for (lane, s) in segments.iter().enumerate() {
-        if verify {
+    for s in segments {
+        if verified(s) {
             let spec = m.mtp.as_ref().unwrap();
             let views = BTreeMap::from([
                 (
@@ -624,7 +685,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
             format!("BatchM{head_rows}_Logits"),
             BufferView {
                 buffer: format!("BatchM{head_rows}_Logits"),
-                offset: lane * m.vocab * 4,
+                offset: head_lane * m.vocab * 4,
             },
         )]);
         out.push(invoke(
@@ -642,7 +703,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
                 name.clone(),
                 BufferView {
                     buffer: name.clone(),
-                    offset: lane * 8 + offset,
+                    offset: head_lane * 8 + offset,
                 },
             );
             out.push(invoke(
@@ -655,6 +716,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], verify: bool) -> Result<Ve
                 &views,
             ));
         }
+        head_lane += 1;
     }
     if dynamic {
         for invocation in &mut out {

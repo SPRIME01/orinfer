@@ -122,6 +122,7 @@ pub struct StepOutput {
 enum Work {
     Speculative(usize, usize, bool),
     SpeculativeBatch(speculation::BatchChoice),
+    MixedSpeculative(Vec<(usize, usize)>),
     Prefill(usize, usize, bool),
     Batch(Vec<(usize, usize)>),
     Idle,
@@ -1066,10 +1067,64 @@ impl ModelRuntime {
         let prefill_work = self.select_work(requests, options, &initialized)?;
         let does_prefill = match &prefill_work {
             Work::Prefill(..) => true,
+            Work::MixedSpeculative(_) => true,
             Work::Batch(selected) => selected.iter().any(|&(i, _)| requests[i].prefilling),
             _ => false,
         };
         match prefill_work {
+            Work::MixedSpeculative(selected) => {
+                let key = Self::iteration_key(requests, &selected);
+                let prefills: Vec<_> = selected
+                    .iter()
+                    .copied()
+                    .filter(|&(i, _)| requests[i].prefilling)
+                    .collect();
+                let progress: usize = selected
+                    .iter()
+                    .filter(|(i, _)| !requests[*i].prefilling)
+                    .map(|(i, _)| requests[*i].generated)
+                    .sum();
+                let began = Instant::now();
+                let before = self.execution.batch_statistics.get();
+                let output_start = output.len();
+                self.speculative_mixed_step(requests, &selected, &mut output)?;
+                let after = self.execution.batch_statistics.get();
+                let tokens = output[output_start..]
+                    .iter()
+                    .filter(|s| !prefills.iter().any(|(i, _)| *i == s.request))
+                    .map(|s| s.tokens.len())
+                    .sum();
+                let cold_s = after.kernel_load_s - before.kernel_load_s + after.capture_s
+                    - before.capture_s
+                    + after.sequence_capture_s
+                    - before.sequence_capture_s;
+                if self.mixed_speculation_costs.len() >= 256
+                    && !self.mixed_speculation_costs.contains_key(&key)
+                {
+                    self.mixed_speculation_costs.clear();
+                }
+                self.mixed_speculation_costs
+                    .entry(key)
+                    .or_default()
+                    .observe_steady(
+                        (began.elapsed().as_secs_f64() - cold_s).max(0.000001),
+                        tokens,
+                        progress + tokens,
+                    );
+                let rows: usize = selected.iter().map(|(_, n)| n).sum();
+                for (i, n) in prefills {
+                    requests[i].served = self.scheduler_statistics.iterations;
+                    requests[i].credit_s -= began.elapsed().as_secs_f64() * n as f64 / rows as f64;
+                    requests[i].last_prefill = Instant::now();
+                }
+                self.unmerged_prefill_s = 0.;
+                self.scheduler_statistics.speculative_iterations += 1;
+                *self
+                    .scheduler_statistics
+                    .batch_histogram
+                    .entry(selected.len())
+                    .or_default() += 1;
+            }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
                 if choice.exploring {
@@ -1441,6 +1496,11 @@ impl ModelRuntime {
                     }
                 }
                 joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+                if let Some(speculative) =
+                    self.select_mixed_speculation(requests, &joint, options, slack_s)
+                {
+                    return Ok(Work::MixedSpeculative(speculative));
+                }
                 return Ok(Work::Batch(joint));
             }
         }

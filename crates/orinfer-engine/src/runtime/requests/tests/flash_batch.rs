@@ -1,6 +1,232 @@
 use super::*;
 
 #[test]
+#[ignore = "Requires mixed MTP Flash package and exclusive GPU experiment lock"]
+fn validate_flash_mixed_speculation() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(7),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        model
+            .manifest
+            .mtp
+            .as_ref()
+            .unwrap()
+            .mixed_verification_tokens,
+        [2]
+    );
+    let options = scheduler::Options {
+        target_tpot_ms: 2000.,
+        memory_reserve_bytes: 0,
+        ..Default::default()
+    };
+    let snapshot = |m: &mut ModelRuntime, r: &mut RequestState| {
+        let end = r.input.len() + r.generated - 1;
+        m.with_request(r, |m, _| {
+            m.prefix_ranges(end)?
+                .into_iter()
+                .map(|(name, range)| {
+                    let raw = m
+                        .execution
+                        .download_bytes(&name, range.offset + range.bytes)?;
+                    Ok((name, crate::artifact::sha256(&raw[range.offset..])))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .unwrap()
+    };
+    let verification = |m: &mut ModelRuntime, r: &mut RequestState, width: usize| {
+        m.with_request(r, |m, _| {
+            let spec = m.manifest.mtp.as_ref().unwrap();
+            let raw = m
+                .execution
+                .download_bytes(&spec.verification_logits, width * m.manifest.vocab * 4)?;
+            let scores: Vec<_> = floats(&raw, crate::artifact::Dtype::F32)
+                .chunks_exact(m.manifest.vocab)
+                .map(log_probabilities)
+                .collect();
+            Ok((scores, m.read_controls(&m.manifest.input, width)?))
+        })
+        .unwrap()
+    };
+    let start_decoder = |m: &mut ModelRuntime, lane: usize| {
+        let mut source = input(fixture.cases.last().unwrap(), 64);
+        source.input_tokens.truncate(128);
+        source.input_tokens[0] = 32 + lane as u32;
+        source.sampling.seed = 20261002;
+        let mut r = m.start_request(source, &|| false).unwrap();
+        m.with_request(&mut r, |m, r| m.advance_prefill(r, 128, false))
+            .unwrap();
+        r
+    };
+    let start_prefill = |m: &mut ModelRuntime, tokens: usize| {
+        let mut source = input(fixture.cases.last().unwrap(), 64);
+        source.input_tokens.truncate(tokens);
+        source.sampling.seed = 20261002;
+        m.start_request(source, &|| false).unwrap()
+    };
+    let mut rows = vec![];
+    for (tokens, width, count) in [
+        (16, 2, 1),
+        (128, 2, 1),
+        (128, 2, 2),
+        (512, 2, 1),
+        (128, 2, 4),
+        (128, 2, 1),
+    ] {
+        let mut p = start_prefill(&mut model, tokens);
+        let at = Instant::now();
+        model
+            .with_request(&mut p, |m, r| m.advance_prefill(r, tokens, false))
+            .unwrap();
+        let mut serial_s = at.elapsed().as_secs_f64();
+        let expected_prefill = distribution(&mut model, &mut p);
+        model.finish_request(&mut p, false).unwrap();
+        let mut expected = vec![];
+        for lane in 0..count {
+            let mut d = start_decoder(&mut model, lane);
+            let at = Instant::now();
+            model
+                .with_request(&mut d, |m, r| m.speculative_request_step(r, width))
+                .unwrap();
+            serial_s += at.elapsed().as_secs_f64();
+            expected.push(verification(&mut model, &mut d, width));
+            model.finish_request(&mut d, false).unwrap();
+        }
+        let mut first_states: Option<Vec<BTreeMap<String, String>>> = None;
+        let mut first_outputs = None;
+        for reverse in [false, true] {
+            let mut p = start_prefill(&mut model, tokens);
+            let mut decoders: Vec<_> = (0..count)
+                .map(|lane| start_decoder(&mut model, lane))
+                .collect();
+            let mut requests = vec![&mut p];
+            requests.extend(decoders.iter_mut());
+            let mut selected = vec![(0, tokens)];
+            selected.extend((1..=count).map(|i| (i, width)));
+            if reverse {
+                selected.reverse();
+            }
+            if tokens == 128 && width == 2 && count == 1 && !reverse {
+                model.decode_until = None;
+                let selected_work = model
+                    .select_work(&mut requests, &options, &BTreeSet::new())
+                    .unwrap();
+                assert!(
+                    matches!(selected_work, Work::MixedSpeculative(_)),
+                    "Mixed MTP scheduler selection missing"
+                );
+            }
+            let mut output = vec![];
+            let at = Instant::now();
+            model
+                .speculative_mixed_step(&mut requests, &selected, &mut output)
+                .unwrap();
+            let seconds = at.elapsed().as_secs_f64();
+            let mut metrics = vec![];
+            for (i, r) in requests.iter_mut().enumerate() {
+                let (actual, reference) = if i == 0 {
+                    (
+                        vec![distribution(&mut model, r)],
+                        vec![expected_prefill.clone()],
+                    )
+                } else {
+                    let (actual, history) = verification(&mut model, r, width);
+                    assert_eq!(
+                        history,
+                        expected[i - 1].1,
+                        "Mixed drafter changed teacher-forced history"
+                    );
+                    (actual, expected[i - 1].0.clone())
+                };
+                for (row, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+                    let kl: f64 = reference
+                        .iter()
+                        .zip(actual)
+                        .map(|(a, b)| a.exp() * (a - b))
+                        .sum();
+                    let token = actual
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .unwrap()
+                        .0;
+                    let rank = reference.iter().filter(|&&p| p > reference[token]).count();
+                    assert!(
+                        kl.is_finite() && kl < 0.05 && rank < 3,
+                        "{tokens}/{width}/{count}/{reverse}/{i}/{row}: KL {kl}, rank {rank}"
+                    );
+                    metrics.push(json!({"request":i,"row":row,"kl":kl,"top3":true}));
+                }
+            }
+            eprintln!(
+                "mixed {tokens}/{width}/{count}/{reverse}: {seconds:.6}s vs serial {serial_s:.6}s; metrics {metrics:?}"
+            );
+            let states: Vec<_> = requests
+                .iter_mut()
+                .map(|r| snapshot(&mut model, r))
+                .collect();
+            output.sort_unstable_by_key(|s| s.request);
+            let tokens_out: Vec<_> = output
+                .iter()
+                .map(|s| (s.request, s.tokens.clone()))
+                .collect();
+            if let Some(reference) = &first_states {
+                for (lane, (actual, expected)) in states.iter().zip(reference).enumerate() {
+                    let changed: Vec<_> = actual
+                        .iter()
+                        .filter(|(name, hash)| expected.get(*name) != Some(*hash))
+                        .map(|(name, _)| name)
+                        .collect();
+                    assert!(
+                        changed.is_empty(),
+                        "Mixed owner/order state differs at lane {lane}: {changed:?}"
+                    );
+                }
+            }
+            if let Some(reference) = &first_outputs {
+                assert_eq!(&tokens_out, reference, "Mixed outputs differ");
+            }
+            first_states = Some(states);
+            first_outputs = Some(tokens_out);
+            drop(requests);
+            // Retire one participant before resuming peers through their next
+            // speculative round, including compact partial/full commit.
+            model.finish_request(&mut p, false).unwrap();
+            for decoder in &mut decoders {
+                model.advance_requests(&mut [decoder], &options).unwrap();
+                assert!(decoder.failure().is_none());
+                model.finish_request(decoder, false).unwrap();
+            }
+            rows.push(json!({"prefill_tokens":tokens,"verification_rows":width,"decoders":count,"reverse":reverse,"serial_round_s":serial_s,"mixed_round_s":seconds,"metrics":metrics,"state_replay_equal":true}));
+        }
+    }
+    assert!(model.reserved_requests.is_empty());
+    model.execution.reclaim_idle_graphs().unwrap();
+    model.execution.reclaim_idle_state().unwrap();
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(
+            &json!({"seed":20261002,"cases":rows,"scheduler":model.scheduling_statistics()}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
 #[ignore = "Requires logical Flash prefill package and exclusive GPU lock"]
 fn validate_flash_logical_prefill() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(

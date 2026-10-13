@@ -46,6 +46,9 @@ pub struct Spec {
     pub batch_commit: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub batch_warm: bool,
+    /// Target row counts validated for joint prefill/speculative execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixed_verification_tokens: Vec<usize>,
     /// Architecture-owned speculative batch programs to retire when MTP is off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub batch_programs: Vec<String>,
@@ -155,8 +158,30 @@ impl Spec {
         }
         if (self.batch_warm && self.batch_draft_profiles.is_empty())
             || (self.batch_commit && self.batch_verification_tokens.is_empty())
+            || (!self.mixed_verification_tokens.is_empty()
+                && self.batch_verification_tokens.is_empty())
         {
             return Err("Batched MTP warm/commit lacks execution profiles".into());
+        }
+        if !self.mixed_verification_tokens.is_empty()
+            && (model.prefill_batch_profiles.is_empty()
+                || model
+                    .batch_layout
+                    .as_ref()
+                    .is_none_or(|l| l.profiles.is_empty()))
+        {
+            return Err("Mixed MTP verification lacks prefill row profiles".into());
+        }
+        if self
+            .mixed_verification_tokens
+            .windows(2)
+            .any(|p| p[0] >= p[1])
+            || self
+                .mixed_verification_tokens
+                .iter()
+                .any(|n| !self.batch_verification_tokens.contains(n))
+        {
+            return Err("Invalid mixed MTP verification shapes".into());
         }
         let mut batch_programs = BTreeSet::new();
         for name in &self.batch_programs {

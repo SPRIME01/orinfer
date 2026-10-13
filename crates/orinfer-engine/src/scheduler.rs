@@ -277,6 +277,7 @@ pub struct Statistics {
     pub max_bounded_prefill_s: f64,
     pub decode_tokens: usize,
     pub mixed_iterations: usize,
+    pub mixed_speculative_iterations: usize,
     pub speculative_iterations: usize,
     pub peak_active: usize,
     pub compute_s: f64,

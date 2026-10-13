@@ -3,9 +3,16 @@
 import unittest
 
 from tools.model.flash_next.optimize_hc import up_rank
+from tools.model.flash_next.mixed_hc import reduction_groups
 
 
 class HcGeometryTests(unittest.TestCase):
+    def test_joined_down_keeps_the_four_stream_accumulation_order(self):
+        self.assertEqual(reduction_groups(320, 10240), 4)
+        self.assertEqual(reduction_groups(10240, 320), 1)
+        with self.assertRaisesRegex(ValueError, "projection"):
+            reduction_groups(320, 2560)
+
     def buffers(self, rank):
         return {
             "w": {"dtype": "bf16", "shape": [10240, rank], "data": {"tensor": "weight"}},

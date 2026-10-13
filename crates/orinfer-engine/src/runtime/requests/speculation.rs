@@ -142,6 +142,101 @@ pub(super) struct BatchChoice {
 }
 
 impl ModelRuntime {
+    pub(super) fn select_mixed_speculation(
+        &self,
+        requests: &[&mut RequestState],
+        joint: &[(usize, usize)],
+        options: &scheduler::Options,
+        slack: f64,
+    ) -> Option<Vec<(usize, usize)>> {
+        let spec = self
+            .manifest
+            .mtp
+            .as_ref()
+            .filter(|s| !s.mixed_verification_tokens.is_empty())?;
+        let decoders = joint
+            .iter()
+            .filter(|(i, _)| !requests[*i].prefilling)
+            .count();
+        if !(1..=8).contains(&decoders) || !joint.iter().any(|(i, _)| requests[*i].prefilling) {
+            return None;
+        }
+        let cap = self
+            .manifest
+            .prefill_batch_profiles
+            .iter()
+            .map(|p| p.tokens)
+            .max()?;
+        let baseline = self.predict_iteration(requests, joint) / decoders as f64;
+        for width in spec
+            .mixed_verification_tokens
+            .iter()
+            .copied()
+            .rev()
+            .filter(|&n| {
+                n <= spec.default_verification_tokens && n * decoders <= options.max_batch_tokens
+            })
+        {
+            let selected: Vec<_> = joint
+                .iter()
+                .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
+                .collect();
+            if selected.iter().map(|(_, n)| n).sum::<usize>() > cap
+                || selected
+                    .iter()
+                    .map(|&(i, n)| if requests[i].prefilling { 1 } else { n })
+                    .sum::<usize>()
+                    > *self.manifest.batch_profiles.iter().max().unwrap_or(&1)
+                || selected.iter().any(|&(i, n)| {
+                    !requests[i].prefilling && n > requests[i].limit - requests[i].generated
+                })
+            {
+                continue;
+            }
+            let key = Self::iteration_key(requests, &selected);
+            let measured = self.mixed_speculation_costs.get(&key);
+            // A cold trial includes an explicit drafter allowance; measured
+            // full rounds include proposal, verification, commit and warm.
+            let upper = measured.map_or_else(
+                || {
+                    self.predict_iteration(requests, &selected)
+                        + self.mtp_seconds_per_token * (width - 1) as f64 * decoders as f64
+                },
+                Profile::upper,
+            );
+            if upper > slack
+                || measured
+                    .and_then(Profile::batch_score)
+                    .is_some_and(|s| s >= baseline)
+            {
+                continue;
+            }
+            return Some(selected);
+        }
+        None
+    }
+
+    pub(super) fn speculative_mixed_step(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
+        let (prefills, decoders): (Vec<_>, Vec<_>) = selected
+            .iter()
+            .copied()
+            .partition(|&(i, _)| requests[i].prefilling);
+        if prefills.is_empty()
+            || decoders.is_empty()
+            || prefills
+                .iter()
+                .any(|&(i, _)| requests[i].prefill_frame.is_some())
+        {
+            return Err("Invalid mixed speculative work".into());
+        }
+        self.speculative_packet_step(requests, &decoders, &prefills, output)
+    }
+
     pub(super) fn select_speculative_batch(
         &self,
         requests: &[&mut RequestState],
@@ -246,6 +341,16 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
+        self.speculative_packet_step(requests, selected, &[], output)
+    }
+
+    fn speculative_packet_step(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        prefills: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
         let mut rounds = vec![];
         let mut drafts = vec![];
         let grouped_draft = self
@@ -299,7 +404,7 @@ impl ModelRuntime {
                 rounds.push((i, Self::finish_drafts(requests[i], build)?));
             }
         }
-        if rounds.len() == 1 {
+        if rounds.len() == 1 && prefills.is_empty() {
             let (i, round) = rounds.pop().unwrap();
             let result = self.with_request(requests[i], |model, req| {
                 model.verify_single_round(req, &round)?;
@@ -315,10 +420,17 @@ impl ModelRuntime {
             return Ok(());
         }
         if rounds.is_empty() {
+            if !prefills.is_empty() {
+                self.execute_selected(requests, prefills, output)?;
+            }
             return Ok(());
         }
         let at = Instant::now();
-        let mut segments = vec![];
+        let mut segments = if prefills.is_empty() {
+            vec![]
+        } else {
+            self.prepare_batch_inputs(requests, prefills)?
+        };
         for (i, round) in &rounds {
             let req = &mut requests[*i];
             self.execution.activate_sequence(req.slot)?;
@@ -332,23 +444,35 @@ impl ModelRuntime {
                 tokens: round.plan.tokens,
             });
         }
-        let (plan, bindings) = self.model_package.cached_batch(
-            &segments,
-            orinfer_model_sdk::abi::BatchOperation::Verification,
-        )?;
+        let operation = if prefills.is_empty() {
+            orinfer_model_sdk::abi::BatchOperation::Verification
+        } else {
+            orinfer_model_sdk::abi::BatchOperation::MixedVerification
+        };
+        let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
         if !bindings.is_empty() {
             return Err("Unexpected verification state table".into());
         }
         self.execution.execute_batch_operation(
-            orinfer_model_sdk::abi::BatchOperation::Verification,
+            operation,
             segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             &plan,
-            true,
+            prefills.is_empty(),
             rounds
                 .iter()
                 .all(|(i, _)| requests[*i].limit - requests[*i].generated >= 2),
         )?;
         let seconds = at.elapsed().as_secs_f64();
+        if !prefills.is_empty() {
+            self.scheduler_statistics.mixed_iterations += 1;
+            self.scheduler_statistics.mixed_speculative_iterations += 1;
+            *self
+                .scheduler_statistics
+                .prefill_batch_histogram
+                .entry(prefills.len())
+                .or_default() += 1;
+            self.commit_batch(requests, prefills, output)?;
+        }
         let total_rows: usize = segments.iter().map(|s| s.tokens).sum();
         let grouped_commit = self.manifest.mtp.as_ref().is_some_and(|s| s.batch_commit);
         let mut committed = vec![];

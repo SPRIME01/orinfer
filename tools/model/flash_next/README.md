@@ -197,7 +197,9 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_hc.py artifacts/flash-m
 
 混合片段支持 16、128、512 token，拼接容量最高 1024 行；独立长 prefill 继续使用原有 2048/4096 档。BF16 HC 操作数在矩阵乘法前准备，保留原来的 FP16 舍入边界。kernel 首次装载、graph capture 和 prefill 完成时的 head/cache/MTP 预热分别计时，避免影响后续普通批次的耗时预测；请求总时延仍包含这些开销。
 
-Orin 上可用 `--prefill-budget-ms 350 --target-tpot-ms 400` 起步调优。350 ms 是混合批次的预测预算，400 ms 是 decode 间隔的软目标；首次加载算子仍可能超过目标。MTP 验证继续使用现有独立执行计划，普通 decode 可与 prefill 合并。
+Orin 上可用 `--prefill-budget-ms 350 --target-tpot-ms 400` 起步调优。350 ms 是混合批次的预测预算，400 ms 是 decode 间隔的软目标；首次加载算子仍可能超过目标。
+
+新版 `mixed_hc.py` 保留 HC down 的四流 FP32 求和顺序，并发布 `flash_mixed_grouped` 执行配置。安装批量 MTP 后，这类包允许 prefill 与两行目标验证（一个草稿）共享层内计算；prefill 只读取末行输出头，验证片段保留两行 logits 和请求私有的提交因子。调度器计入草稿、目标验证、状态提交及预热的完整耗时，超出延迟预算或未带该能力的包继续使用原路径。较长的 MTP 轮次保留独立执行，尚未通过混合路径的数值检查。已生成的混合包可重新运行 `mixed_hc.py` 更新算子和执行库，无需重新量化权重。
 
 
 ### 批量 MTP

@@ -31,6 +31,7 @@ pub enum BatchOperation {
     Commit = 3,
     Warm = 4,
     DraftHead = 5,
+    MixedVerification = 6,
 }
 impl BatchOperation {
     pub fn from_flags(flags: u32) -> Result<Self> {
@@ -41,6 +42,7 @@ impl BatchOperation {
             3 => Ok(Self::Commit),
             4 => Ok(Self::Warm),
             5 => Ok(Self::DraftHead),
+            6 => Ok(Self::MixedVerification),
             _ => Err("Unknown batch operation".into()),
         }
     }
@@ -433,12 +435,7 @@ pub unsafe extern "C" fn batch<M: ModelImplementation>(
     error: *mut OwnedBytes,
 ) -> i32 {
     boundary(error, || {
-        if handle.is_null()
-            || input.is_null()
-            || !(1..=128).contains(&len)
-            || result.is_null()
-            || flags > 11
-        {
+        if handle.is_null() || input.is_null() || !(1..=128).contains(&len) || result.is_null() {
             return Err("Invalid batch arguments".into());
         }
         // SAFETY: caller retains the model and this readable segment array.
@@ -574,7 +571,11 @@ mod tests {
             BatchOperation::from_flags(11).unwrap(),
             BatchOperation::DraftHead
         );
-        assert!(BatchOperation::from_flags(12).is_err());
+        assert_eq!(
+            BatchOperation::from_flags(13).unwrap(),
+            BatchOperation::MixedVerification
+        );
+        assert!(BatchOperation::from_flags(14).is_err());
         assert!(BatchOperation::from_flags(u32::MAX).is_err());
         assert!(
             TestModel
@@ -646,6 +647,20 @@ mod tests {
             };
             Ok((ops, vec![None, Some((7, "recurrent-state".into()))]))
         }
+        fn batch_operation(
+            &self,
+            segments: &[BatchSegment],
+            operation: BatchOperation,
+            include_plan: bool,
+        ) -> Result<BatchPlan> {
+            if !matches!(
+                operation,
+                BatchOperation::Ordinary | BatchOperation::MixedVerification
+            ) {
+                return Err("Unsupported fixture operation".into());
+            }
+            self.batch(segments, include_plan)
+        }
     }
     #[test]
     fn input_extension_retains_upload_names_payload_and_allocation_owner() {
@@ -687,19 +702,13 @@ mod tests {
     fn binary_batch_retains_names_arguments_views_and_private_bindings() {
         let handle = Box::into_raw(Box::new(TestModel)).cast();
         let segments = [BatchSegment { slot: 7, tokens: 3 }];
-        for include_plan in [0, 1] {
+        for flags in [0, 1, 12, 13] {
+            let include_plan = flags & 1;
             let mut output = BatchOutput::default();
             let mut error = OwnedBytes::default();
             // SAFETY: locally owned model/segment/output slots match this implementation.
             let status = unsafe {
-                batch::<TestModel>(
-                    handle,
-                    segments.as_ptr(),
-                    1,
-                    include_plan,
-                    &mut output,
-                    &mut error,
-                )
+                batch::<TestModel>(handle, segments.as_ptr(), 1, flags, &mut output, &mut error)
             };
             assert_eq!(status, 0);
             assert_eq!(output.command_count, include_plan as usize);

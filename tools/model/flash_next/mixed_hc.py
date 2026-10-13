@@ -18,6 +18,14 @@ from tools.model.upgrade_dynamic_batch import contract
 from tools.operators.abi import parse_host
 
 
+def reduction_groups(n, k):
+    if (n, k) == (320, 10240):
+        return 4
+    if (n, k) == (10240, 320):
+        return 1
+    raise ValueError("Unexpected joined HC projection")
+
+
 def upgrade(model, destination, output):
     import tilelang
     from kernels.model.hc_prefill import hc_input_bf16, hc_projection_prefill
@@ -35,6 +43,7 @@ def upgrade(model, destination, output):
     changes = []
     added = []
     dynamic = {k["name"]: k for k in package["dynamic_batch_kernels"]}
+    original = {k["name"]: k for k in package["kernels"]}
 
     def compile_kernel(key, fn):
         if key not in assets:
@@ -107,24 +116,30 @@ def upgrade(model, destination, output):
             data["metadata"]["buffers"].append(b)
             data["buffer_scopes"][role] = "workspace"
             package["buffer_contracts"].append(copy.deepcopy(b))
-        cast_host, cast_assets = compile_kernel(
-            f"cast-m{rows}-k{k}", hc_input_bf16.__wrapped__(rows, k, True)
-        )
-        cast = replace_binding(
-            dict(name=kernel["name"] + "/bf16_input"),
-            cast_host,
-            cast_assets,
-            dict(Input=pointers["A"], Output=dict(kind="buffer", name=role)),
-            dimensions=dimensions,
-        )
-        added.append(cast)
-        dynamic[cast["name"]] = contract(cast, cast_host, rows)
+        cast_name = kernel["name"] + "/bf16_input"
+        if cast_name not in original:
+            if buffers[pointers["A"]["name"]]["dtype"] != "f16":
+                raise ValueError("HC conversion requires the original FP16 operand")
+            cast_host, cast_assets = compile_kernel(
+                f"cast-m{rows}-k{k}", hc_input_bf16.__wrapped__(rows, k, True)
+            )
+            cast = replace_binding(
+                dict(name=cast_name),
+                cast_host,
+                cast_assets,
+                dict(Input=pointers["A"], Output=dict(kind="buffer", name=role)),
+                dimensions=dimensions,
+            )
+            added.append(cast)
+            dynamic[cast_name] = contract(cast, cast_host, rows)
+        elif pointers["A"] != dict(kind="buffer", name=role):
+            raise ValueError("Existing HC operand cast/consumer differs")
         large = rows > 128
         bm = 128 if large and n > 320 else 64 if rows >= 64 else 16
         bn = 128 if large else 64
         gm = 4 if large else 0
         project_host, project_assets = compile_kernel(
-            f"project-m{rows}-n{n}-k{k}",
+            f"project-m{rows}-n{n}-k{k}-g{reduction_groups(n, k)}",
             hc_projection_prefill.__wrapped__(
                 rows,
                 n,
@@ -135,6 +150,7 @@ def upgrade(model, destination, output):
                 group_m=gm,
                 silu=large and n == 320,
                 dynamic_rows=True,
+                reduction_groups=reduction_groups(n, k),
             ),
         )
         replacement = replace_binding(
@@ -154,6 +170,9 @@ def upgrade(model, destination, output):
     package["plan_kernel_contracts"] = sorted(
         set(package.get("plan_kernel_contracts", [])) | {k["name"] for k in added} | set(changes)
     )
+    for profile in data["metadata"]["prefill_batch_profiles"]:
+        profile["kind"] = "flash_mixed_grouped"
+    package["prefill_batch_profiles"] = copy.deepcopy(data["metadata"]["prefill_batch_profiles"])
     commit_package(destination, operator, data, package)
     print("HC OPERANDS READY", len(changes), len(assets), flush=True)
 

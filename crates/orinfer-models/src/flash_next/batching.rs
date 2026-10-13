@@ -707,8 +707,7 @@ mod tests {
             assert_eq!(prefill.views["FlashMixedResidual"].offset, count * 20480);
         }
     }
-    #[test]
-    fn verification_batches_keep_all_candidate_heads_and_private_commit_factors() {
+    fn verification_manifest() -> Manifest {
         let mut m = mixed_manifest();
         m.mtp=Some(serde_json::from_value(serde_json::json!({
             "position":"MtpPosition","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
@@ -718,7 +717,105 @@ mod tests {
             "default_verification_tokens":4,"warm_plans":[],"capture_plans":[],"verification_plans":[],
             "batch_verification_tokens":[2,3,4,5,6,7,8]
         })).unwrap());
+        m.mtp.as_mut().unwrap().mixed_verification_tokens = vec![2, 4];
         register(&mut m).unwrap();
+        m
+    }
+    #[test]
+    fn mixed_verification_shares_body_but_keeps_endpoint_ranges_and_commit_private() {
+        let m = verification_manifest();
+        for segments in [
+            vec![
+                BatchSegment {
+                    slot: 8,
+                    tokens: 128,
+                },
+                BatchSegment { slot: 3, tokens: 4 },
+            ],
+            vec![
+                BatchSegment { slot: 3, tokens: 4 },
+                BatchSegment {
+                    slot: 8,
+                    tokens: 512,
+                },
+                BatchSegment { slot: 6, tokens: 2 },
+            ],
+        ] {
+            let p = super::super::mixed::mixed_verification_plan(&m, &segments).unwrap();
+            let mut start = 0;
+            let mut head = 0;
+            for s in &segments {
+                let verify = s.tokens < 16;
+                let prefix = if verify {
+                    "flash_verify_segment"
+                } else {
+                    "flash_segment"
+                };
+                for layer in 0..48 {
+                    let i = p.iter().find(|i| matches!(&i.operation, Operation::Kernel {name} if name==&format!("{prefix}_m{}/layer{layer}/private/k0",s.tokens))).unwrap();
+                    assert_eq!(i.sequence, Some(s.slot));
+                    assert_eq!(i.views["FlashMixedResidual"].offset, start * 20480);
+                }
+                let i = p.iter().find(|i| i.sequence==Some(s.slot) && matches!(&i.operation, Operation::Copy {destination,..} if destination=="FlashMixedHeadResidual")).unwrap();
+                assert_eq!(
+                    i.views["FlashMixedResidual"].offset,
+                    (start + if verify { 0 } else { s.tokens - 1 }) * 20480
+                );
+                assert_eq!(i.views["FlashMixedHeadResidual"].offset, head * 20480);
+                let logits = p.iter().find(|i| i.sequence==Some(s.slot) && matches!(&i.operation,Operation::Copy {destination,..} if destination==if verify {"VerificationLogits"} else {&m.logits})).unwrap();
+                let capacity = (segments
+                    .iter()
+                    .map(|s| if s.tokens < 16 { s.tokens } else { 1 })
+                    .sum::<usize>())
+                .next_power_of_two();
+                assert_eq!(
+                    logits.views[&format!("BatchM{capacity}_Logits")].offset,
+                    head * m.vocab * 4
+                );
+                start += s.tokens;
+                head += if verify { s.tokens } else { 1 };
+            }
+        }
+        for segments in [
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 128,
+                },
+                BatchSegment { slot: 0, tokens: 4 },
+            ],
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 129,
+                },
+                BatchSegment { slot: 1, tokens: 4 },
+            ],
+            vec![
+                BatchSegment { slot: 0, tokens: 4 },
+                BatchSegment { slot: 1, tokens: 2 },
+            ],
+            vec![
+                BatchSegment {
+                    slot: 0,
+                    tokens: 128,
+                },
+                BatchSegment { slot: 1, tokens: 1 },
+            ],
+            (0..17)
+                .map(|slot| BatchSegment { slot, tokens: 8 })
+                .chain([BatchSegment {
+                    slot: 99,
+                    tokens: 16,
+                }])
+                .collect(),
+        ] {
+            assert!(super::super::mixed::mixed_verification_plan(&m, &segments).is_err());
+        }
+    }
+    #[test]
+    fn verification_batches_keep_all_candidate_heads_and_private_commit_factors() {
+        let m = verification_manifest();
         let segments = [
             BatchSegment { slot: 7, tokens: 4 },
             BatchSegment { slot: 3, tokens: 2 },
