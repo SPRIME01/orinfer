@@ -120,7 +120,7 @@ pub struct StepOutput {
 enum Work {
     Speculative(usize, usize, bool),
     SpeculativeBatch(speculation::BatchChoice),
-    Prefill(usize, Option<f64>),
+    Prefill(usize, usize, bool),
     Batch(Vec<(usize, usize)>),
     Idle,
 }
@@ -739,19 +739,21 @@ impl ModelRuntime {
     fn advance_prefill(
         &mut self,
         req: &mut RequestState,
-        budget_ms: Option<f64>,
+        chunk: usize,
+        bounded: bool,
     ) -> Result<(usize, Vec<u32>)> {
         let remaining = Self::prefill_boundary(req) - req.offset;
-        let maximum = budget_ms.map_or(remaining, |ms| {
-            self.prefill_costs
-                .bounded_chunk_at(remaining, req.offset, ms)
-        });
+        if chunk == 0 || chunk > remaining {
+            return Err("Invalid selected prefill extent".into());
+        }
         let plan = self
             .manifest
             .prefill_plans
             .iter()
-            .filter(|p| p.chunk_tokens <= maximum)
-            .max_by_key(|p| p.chunk_tokens);
+            .find(|p| p.chunk_tokens == chunk);
+        if chunk != 1 && plan.is_none() {
+            return Err("Missing selected prefill shape".into());
+        }
         let (chunk, program, head) = plan
             .map(|p| {
                 (
@@ -800,7 +802,7 @@ impl ModelRuntime {
             .prefill_chunk_histogram
             .entry(chunk)
             .or_default() += 1;
-        if budget_ms.is_some() {
+        if bounded {
             self.scheduler_statistics.bounded_prefill_iterations += 1;
             self.scheduler_statistics.max_bounded_prefill_s =
                 self.scheduler_statistics.max_bounded_prefill_s.max(seconds);
@@ -892,7 +894,7 @@ impl ModelRuntime {
             } else {
                 0.
             };
-            return prompt_s
+            return prompt_s * if selected.len() > 1 { 0.75 } else { 1. }
                 + decode_rows as f64 * 0.005
                 + warm
                 + (endpoints + checkpoints) as f64 * 0.02;
@@ -932,7 +934,6 @@ impl ModelRuntime {
             cap
         };
         let mut used: usize = selected.iter().map(|(_, n)| n).sum();
-        let mut has_prefill = false;
         for &i in candidates {
             if used == cap {
                 break;
@@ -945,17 +946,52 @@ impl ModelRuntime {
                 .filter(|&n| {
                     let mut trial = selected.clone();
                     trial.push((i, n));
-                    (n == 1 && !has_prefill)
-                        || self.predict_iteration(requests, &trial) * 1000. <= budget_ms
+                    self.predict_iteration(requests, &trial) * 1000. <= budget_ms
                 })
                 .max();
             if let Some(chunk) = chunk {
                 selected.push((i, chunk));
                 used += chunk;
-                has_prefill = true;
             }
         }
         Ok(())
+    }
+
+    fn measured_iteration(
+        &self,
+        requests: &[&mut RequestState],
+        selected: &[(usize, usize)],
+    ) -> bool {
+        let key = Self::iteration_key(requests, selected);
+        self.iteration_costs
+            .range((key.0, key.1, 0, 0)..=(key.0, key.1, key.2, usize::MAX))
+            .any(|(k, e)| k.3 == key.3 && e.samples >= 2)
+    }
+
+    fn native_prefill_chunk(
+        &self,
+        requests: &[&mut RequestState],
+        i: usize,
+        budget_s: f64,
+        progress_due: bool,
+    ) -> Option<usize> {
+        let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
+        let shapes =
+            std::iter::once(1).chain(self.manifest.prefill_plans.iter().map(|p| p.chunk_tokens));
+        let fitting = shapes
+            .filter(|&n| n <= remaining)
+            .filter(|&n| self.predict_iteration(requests, &[(i, n)]) <= budget_s)
+            .max();
+        // A soft deadline must not turn an overloaded prefill into endless
+        // one-token weight passes. Force only a minimum useful native tile.
+        if progress_due && fitting.is_none_or(|n| n == 1) {
+            return Some(self.prefill_costs.bounded_chunk_at(
+                remaining,
+                requests[i].offset,
+                budget_s.max(0.) * 1000.,
+            ));
+        }
+        fitting
     }
     pub(crate) fn advance_requests(
         &mut self,
@@ -994,8 +1030,15 @@ impl ModelRuntime {
             .any(|(i, r)| !r.prefilling && !r.is_finished() && !initialized.contains(&i));
         if !has_decoders {
             self.unmerged_prefill_s = 0.;
+            self.decode_until = None;
         }
-        match self.select_work(requests, options, &initialized)? {
+        let prefill_work = self.select_work(requests, options, &initialized)?;
+        let does_prefill = match &prefill_work {
+            Work::Prefill(..) => true,
+            Work::Batch(selected) => selected.iter().any(|&(i, _)| requests[i].prefilling),
+            _ => false,
+        };
+        match prefill_work {
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
                 if choice.exploring {
@@ -1076,10 +1119,19 @@ impl ModelRuntime {
                     .entry(1)
                     .or_default() += 1;
             }
-            Work::Prefill(i, budget_ms) => {
+            Work::Prefill(i, chunk, bounded) => {
+                let key = Self::iteration_key(requests, &[(i, chunk)]);
+                let before = self.execution.batch_statistics.get();
                 let (_, tokens) = self.with_request(requests[i], |model, req| {
-                    model.advance_prefill(req, budget_ms)
+                    model.advance_prefill(req, chunk, bounded)
                 })?;
+                let after = self.execution.batch_statistics.get();
+                let cold_s = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
+                    - before.sequence_capture_s;
+                self.iteration_costs
+                    .entry(key)
+                    .or_default()
+                    .observe((at.elapsed().as_secs_f64() - cold_s).max(0.000001));
                 requests[i].served = self.scheduler_statistics.iterations;
                 requests[i].credit_s -= at.elapsed().as_secs_f64();
                 if has_decoders {
@@ -1097,6 +1149,15 @@ impl ModelRuntime {
                 self.execute_selected(requests, &selected, &mut output)?;
             }
             Work::Idle => {}
+        }
+        if does_prefill && requests.iter().any(|r| !r.prefilling && !r.is_finished()) {
+            self.decode_until = Some(
+                Instant::now()
+                    + std::time::Duration::from_secs_f64(scheduler::decode_quantum_s(
+                        at.elapsed().as_secs_f64(),
+                        options,
+                    )),
+            );
         }
         for step in &output {
             if !step.tokens.is_empty() {
@@ -1133,6 +1194,10 @@ impl ModelRuntime {
         }
         prefills.sort_unstable_by(|&a, &b| {
             let urgent = |i: usize| requests[i].last_prefill.elapsed().as_secs_f64() >= 30.;
+            // Finish short tails before switching to another request's large
+            // native tile. Hard aging still wins over this bounded preference.
+            let near_end =
+                |i: usize| requests[i].input.len() - requests[i].offset <= options.max_batch_tokens;
             let score = |i: usize| {
                 self.prefill_costs
                     .remaining(requests[i].offset, requests[i].input.len())
@@ -1140,6 +1205,7 @@ impl ModelRuntime {
             };
             urgent(b)
                 .cmp(&urgent(a))
+                .then_with(|| near_end(b).cmp(&near_end(a)))
                 .then_with(|| (requests[b].credit_s > 0.).cmp(&(requests[a].credit_s > 0.)))
                 .then_with(|| score(a).total_cmp(&score(b)))
                 .then_with(|| requests[a].slot.cmp(&requests[b].slot))
@@ -1152,7 +1218,20 @@ impl ModelRuntime {
             .map(|(i, _)| i)
             .collect();
         let target: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
-        let batch_speculation = prefill.is_none()
+        let progress_due = prefill.is_some_and(|i| {
+            requests[i].last_prefill.elapsed().as_secs_f64()
+                >= (options.target_tpot_ms / 1000. * 4.).max(2.)
+        });
+        let decode_round = prefill.is_none()
+            || (!decode.is_empty()
+                && !progress_due
+                && self
+                    .decode_until
+                    .is_some_and(|until| Instant::now() < until));
+        if decode_round && prefill.is_some() {
+            self.scheduler_statistics.decode_burst_iterations += 1;
+        }
+        let batch_speculation = decode_round
             && (2..=8).contains(&decode.len())
             && self
                 .manifest
@@ -1177,7 +1256,7 @@ impl ModelRuntime {
         {
             return Ok(Work::SpeculativeBatch(selected));
         }
-        let prefer_mtp = prefill.is_none()
+        let prefer_mtp = decode_round
             && (!batch_speculation || baseline_ready)
             && options.max_batch_tokens >= 2
             && self.manifest.mtp.is_some()
@@ -1248,123 +1327,144 @@ impl ModelRuntime {
                 }
             }
         }
+        let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
+            !layout.small_mixed_shapes.is_empty() || self.manifest.batch_profiles.is_empty()
+        });
         let mut cap = options
             .max_batch_tokens
             .min(*self.manifest.batch_profiles.iter().max().unwrap_or(&1));
-        // Preserve the dense large-chunk path for long cold prompts. Short
-        // tails can share projection weights without reading across histories.
-        let long_joint = decode.is_empty()
-            && prefills.len() > 1
-            && !self.manifest.prefill_batch_profiles.is_empty()
-            && prefills
-                .iter()
-                .any(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset > cap);
-        let long_mixed = !decode.is_empty()
-            && prefill.is_some()
-            && self
-                .manifest
-                .batch_layout
-                .as_ref()
-                .is_some_and(|layout| layout.small_mixed_shapes.iter().any(|&n| n > cap))
-            && !self.manifest.prefill_batch_profiles.is_empty();
-        if long_joint || long_mixed {
+        if mixed && prefill.is_some() {
             cap = self
                 .manifest
                 .prefill_batch_profiles
                 .iter()
                 .map(|p| p.tokens)
                 .max()
-                .unwrap();
+                .unwrap_or(cap)
+                .max(cap);
         }
-        let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
-            !layout.small_mixed_shapes.is_empty() || self.manifest.batch_profiles.is_empty()
-        });
-        let joint_prefill = long_joint
-            || (mixed
-                && decode.is_empty()
-                && prefills.len() > 1
-                && prefills
-                    .iter()
-                    .all(|&i| Self::prefill_boundary(requests[i]) - requests[i].offset <= cap));
-        if decode.is_empty() && !joint_prefill {
-            return Ok(prefill
-                .map(|i| Work::Prefill(i, None))
-                .unwrap_or(Work::Idle));
+        if decode.is_empty() {
+            let Some(i) = prefill else {
+                return Ok(Work::Idle);
+            };
+            let native = self
+                .native_prefill_chunk(requests, i, f64::INFINITY, false)
+                .ok_or("Missing native prefill progress")?;
+            if mixed && prefills.len() > 1 {
+                let mut joint = vec![];
+                self.pack_prefill(requests, &prefills, &mut joint, cap, f64::INFINITY)?;
+                if joint.len() > 1 && self.prefer_joint_prefill(requests, &joint, f64::INFINITY) {
+                    self.scheduler_statistics.joint_prefill_choices += 1;
+                    joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+                    return Ok(Work::Batch(joint));
+                }
+            }
+            self.scheduler_statistics.independent_prefill_choices += 1;
+            return Ok(Work::Prefill(i, native, false));
         }
-        if !decode.is_empty() {
-            let rotate = self.scheduler_cursor % decode.len();
-            decode.rotate_left(rotate);
+        let rotate = self.scheduler_cursor % decode.len();
+        decode.rotate_left(rotate);
+        // Prompt arenas never raise the caller's decoder row limit.
+        decode.truncate(options.max_batch_tokens.min(cap));
+        self.scheduler_cursor = self.scheduler_cursor.wrapping_add(decode.len());
+        let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
+        if decode_round {
+            selected.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+            return Ok(Work::Batch(selected));
         }
-        let decode_s = self.predict_iteration(requests, &target);
+        let decode_s = self.predict_iteration(requests, &selected);
         let slack_s = decode
             .iter()
             .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
             .fold(f64::INFINITY, f64::min);
-        let window_s = scheduler::prefill_window(slack_s, decode_s, options.prefill_budget_ms);
-        // Unmerged prompt kernels spend a separate weight pass. Account across
-        // iterations instead of resetting the prefill allowance on every call.
-        // Permit one bounded block after a decode; further prompt work must
-        // fit within the decoder's predicted step time. Joint kernels already
-        // advance both classes together.
-        let window_s = if mixed || self.unmerged_prefill_s == 0. {
-            window_s
-        } else {
-            window_s.min((decode_s - self.unmerged_prefill_s).max(0.))
-        };
-        let progress_due = prefill.is_some_and(|i| {
-            requests[i].last_prefill.elapsed().as_secs_f64()
-                >= (options.target_tpot_ms / 1000. * 4.).max(2.)
+        let mut window_s = scheduler::prefill_window(slack_s, decode_s, options.prefill_budget_ms);
+        if self.unmerged_prefill_s > 0. {
+            window_s = window_s.min((decode_s - self.unmerged_prefill_s).max(0.));
+        }
+        let native = prefill.and_then(|i| {
+            self.native_prefill_chunk(requests, i, window_s, progress_due)
+                .map(|n| (i, n))
         });
-        let permit_prefill = prefill
-            .is_some_and(|i| self.prefill_costs.chunk_upper(1, requests[i].offset + 1) <= window_s)
-            || progress_due;
-        if let Some(i) = prefill
-            && !mixed
-            && permit_prefill
-        {
-            if progress_due && window_s <= 0. {
+        if mixed && !prefills.is_empty() {
+            let mut joint = selected.clone();
+            self.pack_prefill(
+                requests,
+                &prefills,
+                &mut joint,
+                cap,
+                (decode_s + window_s).min(slack_s).max(0.) * 1000.,
+            )?;
+            if joint.len() > selected.len() && self.prefer_joint_prefill(requests, &joint, window_s)
+            {
+                self.scheduler_statistics.joint_prefill_choices += 1;
+                for &(i, _) in &joint {
+                    if requests[i].prefilling {
+                        requests[i].served = self.scheduler_statistics.iterations;
+                    }
+                }
+                joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+                return Ok(Work::Batch(joint));
+            }
+        }
+        if let Some((i, n)) = native {
+            if progress_due && self.predict_iteration(requests, &[(i, n)]) > window_s {
                 self.scheduler_statistics.prefill_progress_overrides += 1;
             }
-            return Ok(Work::Prefill(i, Some((window_s * 1000.).max(1.))));
+            self.scheduler_statistics.independent_prefill_choices += 1;
+            return Ok(Work::Prefill(i, n, true));
         }
-        if prefill.is_some() && !permit_prefill {
+        if prefill.is_some() {
             self.scheduler_statistics.deadline_decode_iterations += 1;
         }
-        let reserve = usize::from(prefill.is_some() && mixed && permit_prefill && progress_due);
-        // A large prompt arena does not raise the caller's decoder batch limit.
-        decode.truncate((cap - reserve).min(options.max_batch_tokens));
-        self.scheduler_cursor = self.scheduler_cursor.wrapping_add(decode.len());
-        let mut selected: Vec<_> = decode.iter().map(|&i| (i, 1)).collect();
-        self.pack_prefill(
-            requests,
-            if mixed && permit_prefill {
-                &prefills
-            } else {
-                &[]
-            },
-            &mut selected,
-            cap,
-            if joint_prefill {
-                f64::INFINITY
-            } else {
-                // A mixed iteration already contains the reserved decoder
-                // step. Compare its full cost with the full time window.
-                ((decode_s + window_s) * 1000.).max(1.)
-            },
-        )?;
-        for &(i, _) in &selected {
-            if requests[i].prefilling {
-                requests[i].served = self.scheduler_statistics.iterations;
-            }
-        }
-        if selected.is_empty() {
-            return Ok(Work::Idle);
-        }
-        // Membership selection above provides fairness. Canonical execution
-        // order reuses the same graph when the API's active vector is reordered.
         selected.sort_unstable_by_key(|(i, _)| requests[*i].slot);
         Ok(Work::Batch(selected))
     }
+
+    fn prefer_joint_prefill(
+        &self,
+        requests: &[&mut RequestState],
+        joint: &[(usize, usize)],
+        native_budget_s: f64,
+    ) -> bool {
+        let mut loses_large_tile = false;
+        let decoders: Vec<_> = joint
+            .iter()
+            .copied()
+            .filter(|&(i, _)| !requests[i].prefilling)
+            .collect();
+        let mut native_s = if decoders.is_empty() {
+            0.
+        } else {
+            self.predict_iteration(requests, &decoders)
+        };
+        let mut has_native_prefill = false;
+        for &(i, n) in joint {
+            if requests[i].prefilling {
+                let Some(native) = self.native_prefill_chunk(requests, i, native_budget_s, false)
+                else {
+                    // A joint step can still fit when a separate weight pass
+                    // would miss the deadline. Evaluate its complete cost.
+                    continue;
+                };
+                loses_large_tile |= native > n;
+                has_native_prefill = true;
+                native_s +=
+                    self.predict_iteration(requests, &[(i, native)]) * n as f64 / native as f64;
+            }
+        }
+        let joint_s = self.predict_iteration(requests, joint);
+        // There is no independent deadline-safe candidate in this case.
+        if !has_native_prefill {
+            return true;
+        }
+        scheduler::joint_prefill_worthwhile(
+            loses_large_tile,
+            self.measured_iteration(requests, joint),
+            joint_s,
+            native_s,
+        )
+    }
+
     fn execute_selected(
         &mut self,
         requests: &mut [&mut RequestState],

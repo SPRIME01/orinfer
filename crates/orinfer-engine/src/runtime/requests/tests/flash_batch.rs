@@ -880,16 +880,12 @@ fn validate_flash_bounded_prefill() {
         let elapsed = began.elapsed().as_secs_f64();
         assert!(!output.is_empty() && output.len() <= 4);
         assert!(decode_during_prefill > 0);
-        if model
-            .manifest
-            .batch_layout
-            .as_ref()
-            .is_some_and(|l| !l.profiles.is_empty())
-        {
-            assert!(model.scheduler_statistics.mixed_iterations > mixed_before);
-        } else {
-            assert!(model.scheduler_statistics.bounded_prefill_iterations > bounded_before);
-        }
+        // Both joint and independent deadline-bounded execution are valid;
+        // the scheduler chooses by the complete measured iteration cost.
+        assert!(
+            model.scheduler_statistics.mixed_iterations > mixed_before
+                || model.scheduler_statistics.bounded_prefill_iterations > bounded_before
+        );
         // A cold-only 2048/4096 tile must not block an already-live decoder.
         assert!(
             chunks
@@ -1039,6 +1035,149 @@ fn validate_flash_prefix_cache() {
             "seed":20261002,"cases":rows,"cleanup_passed":true
         }))
         .unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+#[ignore = "Requires native Flash package, a long prompt and exclusive GPU experiment lock"]
+fn validate_flash_heterogeneous_scheduling() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    assert!(fixture.cases.len() >= 2 && fixture.cases[0].input_tokens.len() >= 4096);
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = scheduler::Options {
+        prefill_budget_ms: 350.,
+        ..Default::default()
+    };
+    let mut rows = vec![];
+    for live_decoder in [false, true] {
+        let mut long = model
+            .start_request(input(&fixture.cases[0], 4), &|| false)
+            .unwrap();
+        let mut short = model
+            .start_request(input(&fixture.cases[1], 24), &|| false)
+            .unwrap();
+        if live_decoder {
+            while short.prefilling {
+                model.advance_requests(&mut [&mut short], &options).unwrap();
+            }
+        }
+        let mut output = vec![];
+        let mut scores = vec![];
+        let mut chunks = vec![];
+        let before = model.scheduler_statistics.clone();
+        while !long.is_finished() || !short.is_finished() {
+            let offset = long.offset;
+            let decoder = !short.prefilling && !short.is_finished();
+            for step in model
+                .advance_requests(&mut [&mut long, &mut short], &options)
+                .unwrap()
+            {
+                if step.request == 0 {
+                    output.extend(step.tokens);
+                    scores.push(distribution(&mut model, &mut long));
+                }
+            }
+            if long.offset > offset {
+                chunks.push((long.offset - offset, decoder));
+            }
+        }
+        assert!(
+            chunks.iter().any(|&(n, decoder)| n >= 2048 && !decoder),
+            "Native large path lost: {chunks:?}"
+        );
+        assert!(
+            chunks
+                .iter()
+                .filter(|(_, decoder)| *decoder)
+                .all(|(n, _)| *n <= 512)
+        );
+        if live_decoder {
+            assert!(
+                model.scheduler_statistics.decode_burst_iterations > before.decode_burst_iterations
+            );
+        }
+        for r in [&mut long, &mut short] {
+            model.finish_request(r, false).unwrap();
+        }
+        let mut baseline = model
+            .start_request(input(&fixture.cases[0], 4), &|| false)
+            .unwrap();
+        while baseline.prefilling {
+            model
+                .advance_requests(&mut [&mut baseline], &options)
+                .unwrap();
+        }
+        let native_distribution = distribution(&mut model, &mut baseline);
+        let cross_partition_kl: f64 = native_distribution
+            .iter()
+            .zip(&scores[0])
+            .map(|(b, a)| b.exp() * (b - a))
+            .sum();
+        eprintln!("heterogeneous cross-partition first-token KL {cross_partition_kl}");
+        model.finish_request(&mut baseline, false).unwrap();
+        // Match numerical chunk boundaries to isolate request interleaving.
+        // Largest-tile versus interrupted-prefill drift is reported separately;
+        // it is not a state-isolation comparison or a BF16 quality reference.
+        let mut baseline = model
+            .start_request(input(&fixture.cases[0], 4), &|| false)
+            .unwrap();
+        for &(chunk, _) in &chunks {
+            model
+                .with_request(&mut baseline, |m, r| m.advance_prefill(r, chunk, false))
+                .unwrap();
+        }
+        let (mut max_kl, mut delta, mut top3) = (0.0f64, 0., 0);
+        for (step, &token) in output.iter().enumerate() {
+            let b = distribution(&mut model, &mut baseline);
+            let a = &scores[step];
+            let kl: f64 = b.iter().zip(a).map(|(b, a)| b.exp() * (b - a)).sum();
+            eprintln!(
+                "heterogeneous position: live_decoder={live_decoder}, step={step}, token={token}, KL={kl}, NLL_delta={}",
+                b[token as usize] - a[token as usize]
+            );
+            assert!(
+                kl.is_finite() && kl < 0.05,
+                "Heterogeneous distribution changed: live_decoder={live_decoder}, step={step}, KL={kl}, chunks={chunks:?}"
+            );
+            max_kl = max_kl.max(kl);
+            delta += b[token as usize] - a[token as usize];
+            top3 += usize::from(b.iter().filter(|&&p| p > b[token as usize]).count() < 3);
+            if step + 1 < output.len() {
+                *baseline.history.last_mut().unwrap() = token;
+                model
+                    .with_request(&mut baseline, |m, _| {
+                        m.upload_ids(&m.manifest.token, &[token])
+                    })
+                    .unwrap();
+                model
+                    .advance_requests(&mut [&mut baseline], &options)
+                    .unwrap();
+            }
+        }
+        model.finish_request(&mut baseline, false).unwrap();
+        assert!(delta / (output.len() as f64) < 0.1 && top3 as f64 / output.len() as f64 >= 0.9);
+        let row = json!({"live_decoder":live_decoder,"long_chunks":chunks,"cross_partition_first_token_kl":cross_partition_kl,"max_same_history_kl":max_kl,"mean_nll_delta":delta/output.len() as f64,"selected_in_reference_top3":top3 as f64/output.len() as f64});
+        eprintln!("heterogeneous scheduling {row}");
+        rows.push(row);
+    }
+    std::fs::write(
+        fixture.output,
+        serde_json::to_vec_pretty(&json!({"cases":rows,"scheduler":model.scheduling_statistics()}))
+            .unwrap(),
     )
     .unwrap();
 }

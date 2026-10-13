@@ -167,6 +167,7 @@ struct Active<'a> {
     ending: Option<Ending>,
     started: Instant,
     queue_s: f64,
+    first_token_s: Option<f64>,
     reasoning_tokens: usize,
     raw_bytes: usize,
     pending_scores: VecDeque<(std::ops::Range<usize>, Value)>,
@@ -192,6 +193,7 @@ impl<'a> Active<'a> {
             ending: None,
             started: Instant::now(),
             queue_s,
+            first_token_s: None,
             reasoning_tokens: 0,
             raw_bytes: 0,
             pending_scores: VecDeque::new(),
@@ -199,6 +201,9 @@ impl<'a> Active<'a> {
         }
     }
     fn consume(&mut self, tokens: &[u32], codec: &ChatCodec, model: &str) {
+        if !tokens.is_empty() && self.first_token_s.is_none() {
+            self.first_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
+        }
         let scores = self.request.take_logprobs();
         for (index, &token) in tokens.iter().enumerate() {
             if self.mailbox.job.events.is_closed() || self.mailbox.failed {
@@ -364,12 +369,14 @@ impl<'a> Active<'a> {
         }
         self.mailbox.send(ModelEvent::Complete(response));
         eprintln!(
-            "{}: {} prompt, {} completion, queue {:.3}s, generation {:.3}s, finish {reason}",
+            "{}: {} prompt, {} completion, queue {:.3}s, generation {:.3}s, first_token {:.3}s, {} reasoning, finish {reason}",
             self.mailbox.job.id,
             self.mailbox.job.prepared.input.len(),
             self.count,
             self.queue_s,
-            self.started.elapsed().as_secs_f64()
+            self.started.elapsed().as_secs_f64(),
+            self.first_token_s.unwrap_or(0.),
+            self.reasoning_tokens
         );
         eprintln!(
             "{}: prefix {}; MTP {}",

@@ -225,6 +225,8 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--drain-timeout-ms` | `30000` | SIGINT/SIGTERM 后 HTTP 排空期限 |
 | `--gpu-lock` | `artifacts/gpu-experiment.lock` | GPU worker 使用的共享锁 |
 
+调度按完整迭代成本选择联合或独立 prefill。多个冷请求不会自动把长请求降为小块；尚未测量的联合路径不会覆盖可用的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
+
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
 
 启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。默认模式无法发现仅修改数值、但不改变结构的损坏。

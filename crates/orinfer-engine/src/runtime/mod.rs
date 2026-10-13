@@ -42,6 +42,7 @@ pub(crate) struct ModelRuntime {
     pub(crate) scheduler_statistics: crate::scheduler::Statistics,
     scheduler_cursor: usize,
     unmerged_prefill_s: f64,
+    decode_until: Option<Instant>,
     iteration_costs:
         std::collections::BTreeMap<(usize, usize, usize, usize), crate::scheduler::Estimate>,
     mtp_seconds_per_token: f64,
@@ -124,6 +125,7 @@ impl ModelRuntime {
             scheduler_statistics: Default::default(),
             scheduler_cursor: 0,
             unmerged_prefill_s: 0.,
+            decode_until: None,
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
             batch_speculation_costs: Default::default(),

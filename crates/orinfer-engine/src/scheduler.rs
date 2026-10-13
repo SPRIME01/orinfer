@@ -199,6 +199,24 @@ pub(crate) fn prefill_window(slack_s: f64, decode_s: f64, ceiling_ms: f64) -> f6
     (slack_s - decode_s).max(0.).min(ceiling_ms / 1000.)
 }
 
+/// A cold joint-path prior must not fragment a native large tile. Once
+/// measured, compare prompt progress against the native opportunity cost.
+pub(crate) fn joint_prefill_worthwhile(
+    loses_large_tile: bool,
+    measured: bool,
+    joint_s: f64,
+    native_s: f64,
+) -> bool {
+    (!loses_large_tile || measured) && joint_s < native_s * 0.95
+}
+
+/// Wall time, rather than a fixed round count, also bounds MTP bursts.
+pub(crate) fn decode_quantum_s(prefill_s: f64, options: &Options) -> f64 {
+    prefill_s
+        .min(options.prefill_budget_ms / 1000.)
+        .min(options.target_tpot_ms / 1000.)
+}
+
 /// Cached text admissions can form a cohort before the first decode. During
 /// ongoing generation, bound restoration work to protect inter-token latency.
 pub fn admission_should_yield(
@@ -262,6 +280,9 @@ pub struct Statistics {
     pub admissions: usize,
     pub deadline_decode_iterations: usize,
     pub prefill_progress_overrides: usize,
+    pub independent_prefill_choices: usize,
+    pub joint_prefill_choices: usize,
+    pub decode_burst_iterations: usize,
     pub max_decode_gap_s: f64,
     pub decode_budget_overruns: usize,
     pub request_start_s: f64,
@@ -276,6 +297,22 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joint_prefill_must_pay_for_fragmenting_a_large_native_tile() {
+        assert!(!joint_prefill_worthwhile(true, false, 0.2, 0.8));
+        assert!(joint_prefill_worthwhile(true, true, 0.2, 0.8));
+        assert!(!joint_prefill_worthwhile(true, true, 1.0, 0.8));
+        assert!(joint_prefill_worthwhile(false, false, 0.08, 0.2));
+        assert!(!joint_prefill_worthwhile(false, true, 0.2, 0.2));
+    }
+    #[test]
+    fn decode_bursts_are_bounded_by_both_latency_and_prompt_budgets() {
+        let mut options = Options::default();
+        assert_eq!(decode_quantum_s(0.05, &options), 0.05);
+        assert_eq!(decode_quantum_s(3.0, &options), 0.2);
+        options.target_tpot_ms = 50.;
+        assert_eq!(decode_quantum_s(3.0, &options), 0.05);
+    }
     #[test]
     fn unified_memory_admission_preserves_host_headroom() {
         let total_kib = 64 * 1024 * 1024;
