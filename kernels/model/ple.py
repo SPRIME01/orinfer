@@ -121,7 +121,6 @@ def ple_history(
     C: int,
     history: int = 9,
     dtype: str = "float16",
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     """(Normed[M,C], State[history,C], NextState), permitting State aliasing.
@@ -133,10 +132,8 @@ def ple_history(
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, C, history)):
         raise ValueError("Invalid PLE history dimensions")
-    from kernels.model.logical_rows import bind
-    from kernels.model.rows import row_extent
 
-    M, count, control = row_extent(M, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    M = count = row_count(M, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -154,4 +151,4 @@ def ple_history(
                             position >= 0, Normed[position, col], State[count + row, col]
                         )
 
-    return bind(main, control, logical_rows)
+    return main

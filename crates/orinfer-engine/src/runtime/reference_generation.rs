@@ -12,7 +12,7 @@ impl ModelRuntime {
         cancelled: impl Fn() -> bool,
         emit: impl FnMut(u32) -> bool,
     ) -> Result<usize> {
-        self.execution.prepare_legacy_sequence()?;
+        self.execution.prepare_reference_sequence()?;
         let mut prefix = super::prefix::Context::default();
         let outcome = self.generate_reference_inner(
             input,
@@ -139,7 +139,11 @@ impl ModelRuntime {
             let compute_at = Instant::now();
             let (chunk, head) = if let Some((chunk, program, head)) = selected {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
-                self.prepare_inputs(&input[offset..offset + chunk], &input[..offset])?;
+                self.prepare_prefill_inputs(
+                    &program,
+                    &input[offset..offset + chunk],
+                    &input[..offset],
+                )?;
                 self.upload_segment_controls(chunk)?;
                 self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
                 (chunk, Some(head))

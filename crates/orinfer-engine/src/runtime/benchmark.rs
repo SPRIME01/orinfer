@@ -129,10 +129,10 @@ impl ModelRuntime {
                     }
                     check(
                         sys::cuMemcpyHtoD_v2(
-                            pointers[if chunk.len() == 1 {
-                                &manifest.token
-                            } else {
+                            pointers[if manifest.prefill_plan(chunk.len()).is_some() {
                                 &manifest.input
+                            } else {
+                                &manifest.token
                             }],
                             chunk.as_ptr().cast(),
                             chunk.len() * 4,
@@ -142,7 +142,11 @@ impl ModelRuntime {
                     check(sys::cuCtxSynchronize(), "prefill upload dependency")?;
                 }
                 self.model_package.prepare_inputs(
-                    "target",
+                    if manifest.row_execution.is_some() {
+                        program
+                    } else {
+                        "target"
+                    },
                     chunk,
                     &q.input_tokens[..chunk_index * chunk_tokens],
                     |name, data| self.execution.upload_bytes(name, data),

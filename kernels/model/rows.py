@@ -13,22 +13,6 @@ def row_count(capacity, dynamic=False):
     return T.dynamic("m")
 
 
-def row_extent(capacity, *, dynamic_rows=False, logical_rows=False):
-    """Separate tensor rows from a padded arena's device-resident extent.
-
-    Dynamic rows describe a compact view whose strides follow the host scalar
-    m. Logical rows retain capacity strides and read Length on the device.
-    Mixing those contracts would silently address transposed tensors wrongly.
-    """
-    from kernels.model.logical_rows import extent
-
-    if dynamic_rows and logical_rows:
-        raise ValueError("Dynamic strides and padded logical rows are exclusive")
-    count, control = extent(capacity, logical_rows)
-    rows = row_count(capacity, dynamic_rows)
-    return rows, rows if dynamic_rows else count, control
-
-
 def explicit_rows(function):
     """Keep m in the exported host ABI, including affine-only tensor shapes."""
     from tvm import tirx as tir

@@ -731,7 +731,7 @@ impl Executor {
         Ok(())
     }
     #[cfg(test)]
-    pub(crate) fn prepare_legacy_sequence(&mut self) -> Result<()> {
+    pub(crate) fn prepare_reference_sequence(&mut self) -> Result<()> {
         if self.sequences.iter().any(|s| s.leased) {
             return Err("Complete active requests before using whole-request generation".into());
         }

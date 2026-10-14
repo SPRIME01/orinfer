@@ -16,7 +16,18 @@ impl ModelRuntime {
         let plan = spec
             .capture_plans
             .iter()
-            .find(|p| p.tokens == tokens)
+            .find(|p| {
+                phase == ExecutionPhase::Prefill
+                    && self.manifest.prefill_plan(tokens).is_some_and(|template| {
+                        p.tokens == template.chunk_tokens
+                            && self
+                                .manifest
+                                .row_execution
+                                .as_ref()
+                                .is_some_and(|rows| rows.programs.contains(&p.program))
+                    })
+            })
+            .or_else(|| spec.capture_plans.iter().find(|p| p.tokens == tokens))
             .or_else(|| {
                 let template = self.manifest.prefill_plan(tokens)?;
                 spec.capture_plans

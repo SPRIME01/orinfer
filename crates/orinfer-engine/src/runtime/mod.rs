@@ -144,6 +144,19 @@ impl ModelRuntime {
     fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
         self.prepare_program_inputs("target", tokens, history)
     }
+    fn prepare_prefill_inputs(&self, program: &str, tokens: &[u32], history: &[u32]) -> Result<()> {
+        let program = if self
+            .manifest
+            .row_execution
+            .as_ref()
+            .is_some_and(|rows| rows.programs.contains(program))
+        {
+            program
+        } else {
+            "target"
+        };
+        self.prepare_program_inputs(program, tokens, history)
+    }
     fn prepare_verification_inputs(
         &self,
         program: &str,

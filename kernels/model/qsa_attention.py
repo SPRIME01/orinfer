@@ -6,6 +6,7 @@ local to each selected tile; no expanded KV cache persists between launches.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 from kernels.model.qsa import geometry
 
 
@@ -33,14 +34,12 @@ def sparse_attention(
     threads: int = 128,
     single_buffer: bool = False,
     split_size: int | None = 256,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
     skip_empty: bool = False,
 ):
     geometry(m, capacity)
-    from kernels.model.rows import row_extent
 
-    m, _, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
     if splits not in (1, 2, 4, 8):
         raise ValueError("Invalid QSA splits")
     # Selected contains at most 512 four-token blocks plus three pending
@@ -320,8 +319,4 @@ def sparse_attention(
             main.buffer_map,
             main.attrs,
         )
-    if logical_rows:
-        from kernels.model.logical_rows import bind, guard
-
-        return bind(guard(main, control, "x"), control, True)
     return main

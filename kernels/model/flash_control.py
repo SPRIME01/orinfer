@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind
+from kernels.model.rows import row_count
 
 
 @orin_jit
@@ -45,15 +45,13 @@ def capture(
     rows: int,
     width: int,
     ring: int = 512,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     """Preserve raw Flash HC branches after advancing the target cursor."""
     if rows < 1 or ring < 1 or width <= 0 or (rows > ring and not dynamic_rows):
         raise ValueError("Target capture must fit the hidden ring")
-    from kernels.model.rows import row_extent
 
-    rows, count, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    rows = count = row_count(rows, dynamic_rows)
     stored = T.min(count, ring) if dynamic_rows else rows
     start = count - stored if dynamic_rows else 0
 
@@ -70,14 +68,13 @@ def capture(
                 if col < width and row < count:
                     Ring[(Position[0] - count + row) % ring, col] = Hidden[row, col]
 
-    return bind(kernel, control, logical_rows)
+    return kernel
 
 
 @orin_jit
-def last_hidden(rows: int, width: int, logical_rows: bool = False, dynamic_rows: bool = False):
-    from kernels.model.rows import row_extent
+def last_hidden(rows: int, width: int, dynamic_rows: bool = False):
 
-    rows, count, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    rows = count = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def kernel(
@@ -88,16 +85,5 @@ def last_hidden(rows: int, width: int, logical_rows: bool = False, dynamic_rows:
                 col = block * 256 + j
                 if col < width:
                     Condition[0, col] = Hidden[count - 1, col]
-
-    return bind(kernel, control, logical_rows)
-
-
-@orin_jit
-def length(rows: int):
-    @T.prim_func
-    def kernel(Length: T.Tensor((1,), T.int32)):
-        with T.Kernel(1, threads=32):
-            if T.get_thread_binding() == 0:
-                Length[0] = rows
 
     return kernel

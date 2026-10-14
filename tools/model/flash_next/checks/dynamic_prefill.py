@@ -81,7 +81,7 @@ def check_equal(actual, expected, label):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--lengths", nargs="+", type=int, default=[2, 15, 17, 129, 421, 512])
+    parser.add_argument("--lengths", nargs="+", type=int, default=[1, 2, 15, 17, 129, 421, 512])
     parser.add_argument("--operators", nargs="+", help="Run only named operator checks")
     args = parser.parse_args()
     if any(not 1 <= n <= 4096 for n in args.lengths):

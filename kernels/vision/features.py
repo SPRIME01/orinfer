@@ -2,6 +2,7 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
@@ -10,14 +11,12 @@ def overlay(
     hidden: int,
     capacity: int,
     features: int,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     if not 1 <= rows <= capacity or hidden <= 0 or features <= 0:
         raise ValueError("Invalid visual embedding dimensions")
-    from kernels.model.rows import row_extent
 
-    rows, _, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -34,8 +33,4 @@ def overlay(
                     for column in T.Parallel(hidden):
                         Embedding[row, column] = Features[feature, column]
 
-    if logical_rows:
-        from kernels.model.logical_rows import bind, guard
-
-        return bind(guard(main, control, "x"), control, True)
     return main

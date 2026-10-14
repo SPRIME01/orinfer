@@ -13,9 +13,7 @@ pub(super) fn arena_width(tokens: usize) -> usize {
 }
 
 pub(super) fn score_role(tokens: usize, prefix: &str) -> String {
-    let width = if prefix == "Target" && (2..16).contains(&tokens) {
-        16
-    } else if prefix == "Draft" && tokens >= 256 {
+    let width = if prefix == "Draft" && tokens >= 256 {
         512
     } else {
         arena_width(tokens)
@@ -45,7 +43,7 @@ fn recipe(tokens: usize) -> Result<Recipe> {
             last: 54,
             head: 9,
         },
-        2..=16 | 128 => Recipe {
+        16 | 128 => Recipe {
             recurrent: 44,
             attention: 58,
             first: 45,
@@ -233,19 +231,15 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
     let widths: BTreeSet<_> = profiles.iter().map(|p| p.tokens).collect();
     let dynamic = profiles.len() == 1
         && profiles[0].tokens == 4096
-        && profiles[0].min_tokens == 2
+        && profiles[0].min_tokens == 1
         && profiles[0].kind == "flash_dynamic_recurrent";
     let base = BTreeSet::from([16, 128, 512, 2048, 4096]);
     if !dynamic
-        && (!base.is_subset(&widths)
-            || widths
-                .iter()
-                .any(|n| !base.contains(n) && !(2..16).contains(n))
+        && (widths != base
             || widths.len() != profiles.len()
-            || profiles.iter().any(|p| {
-                p.kind != "flash_recurrent"
-                    || (p.min_tokens != 0 && (p.tokens != 512 || p.min_tokens != 129))
-            }))
+            || profiles
+                .iter()
+                .any(|p| p.kind != "flash_recurrent" || p.min_tokens != 0))
     {
         return Err(
             "Flash package needs registered 16/128/512/2048/4096 recurrent profiles".into(),

@@ -60,7 +60,7 @@ impl RowExecution {
             if !slots.contains(name) || variants.is_empty() {
                 return Err("Row variants require a used canonical kernel slot".into());
             }
-            let mut previous = 1;
+            let mut previous = 0;
             for variant in variants {
                 if variant.min_rows <= previous
                     || variant.min_rows > variant.max_rows
@@ -100,7 +100,7 @@ impl RowExecution {
         dynamic: &BTreeMap<String, DynamicBatchKernel>,
         rows: usize,
     ) -> Result<Vec<Invocation>> {
-        if !self.programs.contains(program) || !(2..=self.capacity).contains(&rows) {
+        if !self.programs.contains(program) || !(1..=self.capacity).contains(&rows) {
             return Err("Invalid dynamic program/row extent".into());
         }
         let mut invocations = Vec::with_capacity(operations.len());
@@ -157,7 +157,7 @@ mod tests {
                 (
                     "projection".into(),
                     vec![KernelVariant {
-                        min_rows: 2,
+                        min_rows: 1,
                         max_rows: 128,
                         multiple_of: 1,
                         kernels: vec!["fused".into()],
@@ -166,7 +166,7 @@ mod tests {
                 (
                     "mix".into(),
                     vec![KernelVariant {
-                        min_rows: 2,
+                        min_rows: 1,
                         max_rows: 128,
                         multiple_of: 1,
                         kernels: vec![],
@@ -210,7 +210,7 @@ mod tests {
             .map(String::from)
             .collect();
         execution.validate(&programs, &kernels, &dynamic).unwrap();
-        for rows in 2..=4096 {
+        for rows in 1..=4096 {
             let ops = execution
                 .specialize("prefill", &programs["prefill"], &dynamic, rows)
                 .unwrap();
@@ -220,7 +220,7 @@ mod tests {
             assert_eq!(ops.len(), if rows <= 128 { 2 } else { 3 });
         }
         assert_eq!(programs.len(), 1);
-        for rows in [0, 1, 4097] {
+        for rows in [0, 4097] {
             assert!(
                 execution
                     .specialize("prefill", &programs["prefill"], &dynamic, rows)

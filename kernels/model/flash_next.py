@@ -148,17 +148,12 @@ def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
 
 
 @orin_jit
-def hc_initialize(
-    M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False, logical_rows: bool = False
-):
+def hc_initialize(M: int, H: int = 2560, streams: int = 4, dynamic_rows: bool = False):
     """Broadcast token embeddings into every independent residual stream."""
     if any(type(v) is not int or v <= 0 for v in (M, H, streams)):
         raise ValueError("Invalid residual dimensions")
-    from kernels.model.logical_rows import bind, extent
 
-    if logical_rows and dynamic_rows:
-        raise ValueError("Logical prefill requires a fixed storage capacity")
-    count, control = extent(M, logical_rows)
+    count = M
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -172,7 +167,7 @@ def hc_initialize(
                         row < count, Embedding[row, block * 256 + j], 0
                     )
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
@@ -275,7 +270,6 @@ def qsa_prepare(
     is_neox_style: bool = False,
     staged: bool = False,
     mrope: bool = False,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     """Normalize Q/K, text RoPE, append private KV and copy gate.
@@ -296,9 +290,8 @@ def qsa_prepare(
     if theta <= 1 or not 0 < eps < 1 or type(is_neox_style) is not bool:
         raise ValueError("Invalid QSA rotation/normalization")
     size = 1 << (width - 1).bit_length()
-    from kernels.model.rows import row_extent
 
-    M, _, control = row_extent(M, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    M = row_count(M, dynamic_rows)
     cache_rows = M if staged else capacity
 
     @T.macro
@@ -410,10 +403,6 @@ def qsa_prepare(
                 QGate, Key, Value, QWeight, KWeight, Position, Query, KCache, VCache, Gate, Position
             )
 
-    if logical_rows:
-        from kernels.model.logical_rows import bind, guard
-
-        return bind(guard(main, control, "x"), control, True)
     return main
 
 

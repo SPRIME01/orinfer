@@ -32,13 +32,14 @@ pub(super) fn layout<'a>(
     if program == "batch_target" {
         return Ok(("target", tokens));
     }
-    if program == "target" {
-        let capacity = prefill
-            .iter()
-            .filter(|p| p.accepts(tokens))
-            .min_by_key(|p| p.chunk_tokens)
-            .map_or(tokens, |p| p.chunk_tokens);
-        return Ok((program, capacity));
+    if let Some(plan) = prefill
+        .iter()
+        .find(|p| p.prefill_program == program || p.stages.iter().any(|stage| stage == program))
+    {
+        if !plan.accepts(tokens) {
+            return Err("Prefill input extent does not match its program".into());
+        }
+        return Ok(("target", plan.chunk_tokens));
     }
     Ok((program, tokens))
 }
@@ -539,10 +540,10 @@ mod tests {
     fn execution_purpose_separates_overlapping_input_shapes() {
         let prefill = [crate::model::PrefillPlan {
             chunk_tokens: 4096,
-            min_tokens: 2,
+            min_tokens: 1,
             prefill_program: "prefill".into(),
             head_program: "head".into(),
-            stages: vec![],
+            stages: vec!["prefill/stage0".into()],
             live_buffers: vec![],
         }];
         let verification: Vec<_> = (2..=8)
@@ -555,7 +556,7 @@ mod tests {
             .collect();
         for plan in &verification {
             assert_eq!(
-                layout(&prefill, &verification, "target", plan.tokens).unwrap(),
+                layout(&prefill, &verification, "prefill", plan.tokens).unwrap(),
                 ("target", 4096)
             );
             assert_eq!(
@@ -569,13 +570,21 @@ mod tests {
             ("target", 128)
         );
         assert_eq!(
-            layout(&prefill, &verification, "target", 421).unwrap(),
+            layout(&prefill, &verification, "prefill", 421).unwrap(),
             ("target", 4096)
         );
         assert_eq!(
             layout(&prefill, &verification, "target", 1).unwrap(),
             ("target", 1)
         );
+        for program in ["prefill", "prefill/stage0"] {
+            assert_eq!(
+                layout(&prefill, &verification, program, 1).unwrap(),
+                ("target", 4096)
+            );
+            assert!(layout(&prefill, &verification, program, 0).is_err());
+            assert!(layout(&prefill, &verification, program, 4097).is_err());
+        }
         assert_eq!(
             layout(&prefill, &verification, "mtp_warm_m4", 4).unwrap(),
             ("mtp_warm_m4", 4)

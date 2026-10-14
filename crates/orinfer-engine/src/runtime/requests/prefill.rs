@@ -81,7 +81,8 @@ impl ModelRuntime {
                 &self.manifest.input,
                 &req.input[req.offset..req.offset + chunk],
             )?;
-            self.prepare_inputs(
+            self.prepare_prefill_inputs(
+                &plan.prefill_program,
                 &req.input[req.offset..req.offset + chunk],
                 &req.input[..req.offset],
             )?;

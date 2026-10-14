@@ -10,8 +10,7 @@ All arithmetic is TileLang; allocations and request positions belong to callers.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind, guard
-from kernels.model.rows import row_extent
+from kernels.model.rows import row_count
 
 
 def geometry(m, capacity):
@@ -21,10 +20,10 @@ def geometry(m, capacity):
 
 
 @orin_jit
-def index_query(m: int, capacity: int = 0, logical_rows: bool = False, dynamic_rows: bool = False):
+def index_query(m: int, capacity: int = 0, dynamic_rows: bool = False):
     mrope = capacity > 0
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.macro
     def prepare(QK, Weight, Position, Query, Coordinates):
@@ -84,7 +83,7 @@ def index_query(m: int, capacity: int = 0, logical_rows: bool = False, dynamic_r
         ):
             prepare(QK, Weight, Position, Query, Position)
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
@@ -92,12 +91,11 @@ def index_compress(
     m: int,
     capacity: int,
     mrope: bool = False,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     blocks = geometry(m, capacity)
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = count = row_count(m, dynamic_rows)
 
     @T.macro
     def prepare(QK, Pending, Weight, Position, Cache, Coordinates):
@@ -169,14 +167,14 @@ def index_compress(
         ):
             prepare(QK, Pending, Weight, Position, Cache, Position)
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
-def index_pending(m: int, logical_rows: bool = False, dynamic_rows: bool = False):
+def index_pending(m: int, dynamic_rows: bool = False):
     """Run after compression. One owner per ring slot, including arbitrary chunks."""
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = count = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -191,15 +189,15 @@ def index_pending(m: int, logical_rows: bool = False, dynamic_rows: bool = False
                 for d in T.Parallel(128):
                     Pending[slot, d] = QK[token - Position[0], 4, d]
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
-def index_scores(m: int, capacity: int, logical_rows: bool = False, dynamic_rows: bool = False):
+def index_scores(m: int, capacity: int, dynamic_rows: bool = False):
     blocks = geometry(m, capacity)
     stripes = min((blocks + 63) // 64, 8 if m >= 16 else 64)
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = count = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -239,7 +237,7 @@ def index_scores(m: int, capacity: int, logical_rows: bool = False, dynamic_rows
                     if qr * 4 + i < m and kb * 64 + j < (Position[0] + qr * 4 + i + 1) // 4:
                         Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
 
-    return bind(guard(main, control, "x", 4), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
@@ -248,7 +246,6 @@ def radix_histogram(
     capacity: int,
     shift: int,
     tile: int = 1024,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     blocks = geometry(m, capacity)
@@ -257,7 +254,7 @@ def radix_histogram(
     if shift not in (24, 16, 8, 0):
         raise ValueError("Invalid radix byte")
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -281,7 +278,7 @@ def radix_histogram(
                             T.atomic_add(hist[(key >> shift) & 255], 1)
                 T.copy(hist, Hist[row, segment, :])
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
@@ -290,13 +287,12 @@ def radix_choose(
     capacity: int,
     shift: int,
     tile: int = 1024,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
 ):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -333,18 +329,16 @@ def radix_choose(
                 Prefix[row] = prefix
                 Remaining[row] = remain
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
-def selection_counts(
-    m: int, capacity: int, tile: int = 1024, logical_rows: bool = False, dynamic_rows: bool = False
-):
+def selection_counts(m: int, capacity: int, tile: int = 1024, dynamic_rows: bool = False):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -376,18 +370,16 @@ def selection_counts(
                     Counts[row, 0, segment] = g[0]
                     Counts[row, 1, segment] = e[0]
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
-def selection_offsets(
-    m: int, capacity: int, tile: int = 1024, logical_rows: bool = False, dynamic_rows: bool = False
-):
+def selection_offsets(m: int, capacity: int, tile: int = 1024, dynamic_rows: bool = False):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     padded = 1 << (segments - 1).bit_length()
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -422,18 +414,16 @@ def selection_offsets(
                 if i >= T.min(full, 512) * 4 and i < T.min(full, 512) * 4 + tail:
                     Selected[row, i] = full * 4 + i - T.min(full, 512) * 4
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
-def selection_scatter(
-    m: int, capacity: int, tile: int = 1024, logical_rows: bool = False, dynamic_rows: bool = False
-):
+def selection_scatter(m: int, capacity: int, tile: int = 1024, dynamic_rows: bool = False):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -476,7 +466,7 @@ def selection_scatter(
                         for offset in T.unroll(4):
                             Selected[row, rank * 4 + offset] = (segment * tile + i) * 4 + offset
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
@@ -619,12 +609,11 @@ def sparse_attention(m: int, capacity: int, splits: int = 8):
 def sparse_merge(
     m: int,
     splits: int = 8,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
     split_size: int | None = None,
 ):
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = count = row_count(m, dynamic_rows)
     from tvm import tirx as tir
 
     position = tir.decl_buffer((1,), "int32", name="Position")
@@ -678,15 +667,15 @@ def sparse_merge(
             {**main.buffer_map, parameter: position},
             main.attrs,
         )
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
-def kv_store(m: int, capacity: int, logical_rows: bool = False, dynamic_rows: bool = False):
+def kv_store(m: int, capacity: int, dynamic_rows: bool = False):
     """Group-64 symmetric INT8 K/V; quantize the exact prepared FP16 values."""
     geometry(m, capacity)
 
-    m, count, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    m = row_count(m, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -737,4 +726,4 @@ def kv_store(m: int, capacity: int, logical_rows: bool = False, dynamic_rows: bo
                         T.max(-127.0, T.min(127.0, T.round(vr))), T.int8
                     )
 
-    return bind(guard(main, control, "x"), control, True) if logical_rows else main
+    return main

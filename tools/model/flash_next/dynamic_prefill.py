@@ -590,7 +590,7 @@ def upgrade(model, destination, output):
         set(package.get("plan_kernel_contracts", [])) - removed | {k["name"] for k in additions}
     )
     package["prefill_profiles"] = [
-        dict(tokens=CAPACITY, min_tokens=2, kind="flash_dynamic_recurrent")
+        dict(tokens=CAPACITY, min_tokens=1, kind="flash_dynamic_recurrent")
     ]
     if data["metadata"].get("mtp"):
         data["metadata"]["mtp"]["capture_plans"] = [

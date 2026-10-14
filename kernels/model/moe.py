@@ -9,7 +9,6 @@ import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
-from kernels.model.logical_rows import bind, extent, guard
 
 
 @orin_jit
@@ -122,11 +121,7 @@ def expert_dispatch(
     top_k: int = 10,
     scale_group: int = 64,
     dynamic_rows: bool = False,
-    logical_rows: bool = False,
 ):
-    _, control = extent(M, logical_rows)
-    if logical_rows and dynamic_rows:
-        raise ValueError("Logical rows require fixed tensor strides")
     """Build (A, Scale, IDs, RelativeSlot, RowOffsets, D, DS, SlotMap).
 
     A[M,H]/D[M*top_k,H] are INT8; Scale/DS are FP16. Others INT32.
@@ -162,7 +157,7 @@ def expert_dispatch(
             for group in T.Parallel(groups):
                 DS[slot, group] = Scale[row, group]
 
-    return bind(guard(main, control, "x", divisor=top_k), control, True) if logical_rows else main
+    return main
 
 
 @orin_jit
@@ -257,11 +252,7 @@ def moe_combine(
     slots: int,
     top_k: int = 10,
     dynamic_rows: bool = False,
-    logical_rows: bool = False,
 ):
-    logical_count, control = extent(M, logical_rows)
-    if logical_rows and dynamic_rows:
-        raise ValueError("Logical rows require fixed tensor strides")
     """Build (Expert, SlotMap, Prob, Shared, SharedGate, Output).
 
     Expert[slots,H], Shared[M,H], SharedGate[M] and Output[M,H] are FP16.
@@ -274,7 +265,7 @@ def moe_combine(
     width = 256
 
     M = row_count(M, dynamic_rows)
-    count = logical_count if logical_rows else M
+    count = M
 
     @T.prim_func
     def main(
@@ -307,16 +298,11 @@ def moe_combine(
                     if col < H:
                         Output[row, col] = 0
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
-def expert_histogram_local(
-    M, E=512, K=10, block=1024, dynamic_rows=False, logical_rows: bool = False
-):
-    logical_count, control = extent(M, logical_rows)
-    if logical_rows and dynamic_rows:
-        raise ValueError("Logical rows require fixed tensor strides")
+def expert_histogram_local(M, E=512, K=10, block=1024, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (M, E, K, block))
         or K > E
@@ -325,7 +311,7 @@ def expert_histogram_local(
         raise ValueError("Invalid segmented MoE histogram geometry")
     M = row_count(M, dynamic_rows)
     segments = (M * K + block - 1) // block
-    count = logical_count if logical_rows else M
+    count = M
 
     @T.prim_func
     def main(
@@ -350,7 +336,7 @@ def expert_histogram_local(
                 if assignment < count * K and matches[j] != 0:
                     Slots[assignment // K, assignment % K] = prefix[j] - 1
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit
@@ -389,12 +375,7 @@ def expert_histogram_offsets(M, E=512, K=10, block=1024, dynamic_rows=False):
 
 
 @orin_jit
-def expert_histogram_finish(
-    M, E=512, K=10, block=1024, dynamic_rows=False, logical_rows: bool = False
-):
-    logical_count, control = extent(M, logical_rows)
-    if logical_rows and dynamic_rows:
-        raise ValueError("Logical rows require fixed tensor strides")
+def expert_histogram_finish(M, E=512, K=10, block=1024, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (M, E, K, block))
         or K > E
@@ -403,7 +384,7 @@ def expert_histogram_finish(
         raise ValueError("Invalid segmented MoE histogram geometry")
     M = row_count(M, dynamic_rows)
     segments = (M * K + block - 1) // block
-    count = logical_count if logical_rows else M
+    count = M
     assignments = M * K
 
     @T.prim_func
@@ -419,7 +400,7 @@ def expert_histogram_finish(
                     row, rank = assignment // K, assignment % K
                     Slots[row, rank] += Offsets[IDs[row, rank], assignment // block]
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 @orin_jit

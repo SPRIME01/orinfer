@@ -84,7 +84,7 @@ impl DynamicBatchKernel {
     pub fn launch(&self, rows: usize) -> Result<RowLaunch> {
         // Rows count concatenated tokens, not requests. Mixed prefill bodies
         // need larger arenas while their number of independent requests stays bounded.
-        if !(2..=8192).contains(&self.capacity) || !(2..=self.capacity).contains(&rows) {
+        if !(2..=8192).contains(&self.capacity) || !(1..=self.capacity).contains(&rows) {
             return Err("Dynamic batch rows exceed the kernel capacity".into());
         }
         let mut grid = [0; 3];
@@ -159,7 +159,8 @@ mod tests {
         let launch = template.launch(33).unwrap();
         assert_eq!(launch.grid, [33, 1, 1]);
         assert_eq!(launch.arguments, [(1, 33)]);
-        assert!(template.launch(1).is_err());
+        assert_eq!(template.launch(1).unwrap().arguments, [(1, 1)]);
+        assert!(template.launch(0).is_err());
         assert!(template.launch(129).is_err());
         template.arguments[0].index = 0;
         assert!(template.validate(&kernel).is_err());

@@ -620,9 +620,6 @@ impl Manifest {
             return Err("Empty prefill".into());
         }
         if let Some(rows) = &self.row_execution {
-            if tokens == 1 {
-                return Ok((1, "decode", "head_m1"));
-            }
             let chunk = tokens.min(rows.capacity);
             let plan = self
                 .prefill_plan(chunk)
@@ -671,7 +668,7 @@ pub struct Request {
 mod branch_tests {
     use super::*;
     #[test]
-    fn logical_prefill_keeps_capacity_and_rejects_uncovered_rows() {
+    fn ranged_prefill_keeps_capacity_and_rejects_uncovered_rows() {
         let plan: PrefillPlan = serde_json::from_value(serde_json::json!({
             "chunk_tokens":512, "min_tokens":129,
             "prefill_program":"body", "head_program":"head"
@@ -717,6 +714,34 @@ mod branch_tests {
             "graph_branches":{"decode":[["fork","side","side","join"]]}
         })).unwrap();
         (m, kernels)
+    }
+    #[test]
+    fn dynamic_prefill_uses_one_plan_for_single_rows_and_tails() {
+        let (mut manifest, _) = fixture();
+        manifest.prefill_plans = vec![PrefillPlan {
+            chunk_tokens: 512,
+            min_tokens: 1,
+            prefill_program: "prefill".into(),
+            head_program: "head".into(),
+            stages: vec![],
+            live_buffers: vec![],
+        }];
+        manifest.row_execution = Some(crate::operators::rows::RowExecution {
+            capacity: 512,
+            programs: BTreeSet::from(["prefill".into(), "head".into()]),
+            variants: BTreeMap::new(),
+        });
+        for tokens in [1, 2, 17, 511, 512] {
+            assert_eq!(
+                manifest.select_prefill_plan(tokens).unwrap(),
+                (tokens, "prefill", "head")
+            );
+        }
+        assert_eq!(
+            manifest.select_prefill_plan(513).unwrap(),
+            (512, "prefill", "head")
+        );
+        assert!(manifest.select_prefill_plan(0).is_err());
     }
     #[test]
     fn permits_shared_reads_and_rejects_cross_branch_dependencies() {

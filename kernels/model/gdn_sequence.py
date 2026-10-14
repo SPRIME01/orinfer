@@ -10,8 +10,7 @@ Convolution history, position, and attention KV require separate handling.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind
-from kernels.model.rows import row_extent
+from kernels.model.rows import row_count
 
 HK, HV, DK, DV = 16, 48, 128, 128
 
@@ -24,7 +23,6 @@ def _gdn_sequence(
     in_place: bool = False,
     compact: bool = False,
     prefetch_qk: bool = False,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
     token_unroll: int = 1,
 ):
@@ -35,11 +33,7 @@ def _gdn_sequence(
         raise ValueError("Invalid GDN token unrolling")
     if token_unroll != 1 and not prefetch_qk:
         raise ValueError("GDN token unrolling requires the prefetch recurrence")
-    if logical_rows and not in_place:
-        raise ValueError("Logical rows require in-place prefill")
-    tokens, count, control = row_extent(
-        tokens, dynamic_rows=dynamic_rows, logical_rows=logical_rows
-    )
+    tokens = count = row_count(tokens, dynamic_rows)
     if (
         type(prefetch_qk) is not bool
         or prefetch_qk
@@ -115,10 +109,6 @@ def _gdn_sequence(
             predicted = T.alloc_fragment((value_tile,), T.float32)
             result = T.alloc_fragment((value_tile,), T.float32)
             update = T.alloc_fragment((value_tile,), T.float32)
-            if logical_rows:
-                for t, j in T.Parallel(tokens, value_tile):
-                    if t >= count:
-                        Out[t, h * DV + bv * value_tile + j] = 0
             for i, j in T.Parallel(DK, value_tile):
                 state[i, j] = State[h, i, bv * value_tile + j]
             if prefetch_qk:
@@ -223,7 +213,7 @@ def _gdn_sequence(
                         for j in T.Parallel(value_tile):
                             Out[t, h * DV + bv * value_tile + j] = result[j]
 
-    return bind(main, control, logical_rows)
+    return main
 
 
 _compile_sequence = orin_jit(_gdn_sequence)
@@ -244,7 +234,6 @@ def gdn_sequence(
     in_place: bool = False,
     compact: bool = False,
     prefetch_qk: bool = False,
-    logical_rows: bool = False,
     dynamic_rows: bool = False,
     token_unroll: int = 1,
 ):
@@ -262,7 +251,6 @@ def gdn_sequence(
         in_place,
         compact,
         prefetch_qk,
-        logical_rows,
         dynamic_rows,
         token_unroll,
     )

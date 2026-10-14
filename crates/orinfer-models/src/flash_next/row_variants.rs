@@ -140,7 +140,7 @@ pub(super) fn build<Data>(
                 .entry(slot.to_owned())
                 .or_default()
                 .push(KernelVariant {
-                    min_rows: 2,
+                    min_rows: 1,
                     max_rows: 4096,
                     multiple_of: 1,
                     kernels: vec![kernel.name.clone(), finish.name.clone()],

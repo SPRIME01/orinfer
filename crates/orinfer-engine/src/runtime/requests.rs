@@ -773,14 +773,15 @@ impl ModelRuntime {
         let at = Instant::now();
         let load_before = self.execution.batch_statistics.get().kernel_load_s;
         self.upload_ids(
-            if chunk == 1 {
+            if head.is_none() {
                 &self.manifest.token
             } else {
                 &self.manifest.input
             },
             &req.input[req.offset..req.offset + chunk],
         )?;
-        self.prepare_inputs(
+        self.prepare_prefill_inputs(
+            &program,
             &req.input[req.offset..req.offset + chunk],
             &req.input[..req.offset],
         )?;
@@ -1572,6 +1573,11 @@ impl ModelRuntime {
             let load_before = self.execution.batch_statistics.get().kernel_load_s;
             let i = selected[0].0;
             let tokens = self.with_request(requests[i], |model, req| {
+                if req.prefilling && model.manifest.prefill_plan(1).is_some() {
+                    return model
+                        .advance_prefill(req, 1, false)
+                        .map(|(_, tokens)| tokens);
+                }
                 #[cfg(test)]
                 profile::mark("single_activated");
                 if req.prefilling {

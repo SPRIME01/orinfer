@@ -1,4 +1,5 @@
 mod flash_batch;
+mod single_row;
 use super::*;
 use serde::Deserialize;
 use serde_json::json;

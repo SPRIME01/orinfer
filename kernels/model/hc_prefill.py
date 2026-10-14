@@ -276,7 +276,7 @@ def hc_up_mix_prefill(
         raise ValueError("Aligned HC views require a symbolic row contract")
     if type(padded_inputs) is not bool or padded_inputs and (not dynamic_rows or aligned_rows):
         raise ValueError("Padded HC inputs require a distinct symbolic row contract")
-    logical_rows = M
+    actual_rows = M
     if aligned_rows or padded_inputs:
         M = T.ceildiv(M, BM) * BM
 
@@ -287,7 +287,7 @@ def hc_up_mix_prefill(
         Residual: T.Tensor((M, 4, H), T.float16),
         Weight: T.Tensor((4, H), T.float32),
         InvRms: T.Tensor((M, 4), T.float32),
-        Out: T.Tensor((logical_rows if padded_inputs else M, H), T.float16),
+        Out: T.Tensor((actual_rows if padded_inputs else M, H), T.float16),
     ):
         with T.Kernel(T.ceildiv(M, BM), H // BN, threads=128) as (by, bx):
             T.import_source(HALF_MATH)
@@ -332,7 +332,7 @@ def hc_up_mix_prefill(
                         )
                         total[i, j] += T.cast(product, T.float32)
             for i, j in T.Parallel(BM, BN):
-                if aligned_rows or by * BM + i < logical_rows:
+                if aligned_rows or by * BM + i < actual_rows:
                     Out[by * BM + i, bx * BN + j] = total[i, j] / 4
 
     return hc_prefill_up_mix

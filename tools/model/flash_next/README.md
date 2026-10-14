@@ -2,7 +2,7 @@
 
 提供自有 Q2A8 权重、Rust 在线适配器，以及离线完整推理与原始 BF16 参考。权重转换产物先通过下述部署构建生成 `cache/model.json` 和匹配执行包，再交给 CLI。
 
-执行器固定使用已采用的 SM87 路径：专家 E8P＋block128 旋转、普通投影 W8、关键系数 BF16/FP32、group-64 INT8 KV、FP32 GDN 状态。prefill 按长度选择专家 tile；MTP 支持 1..7 个草稿和完整接受前缀提交。架构与编码约束位于 [`architecture-contract.json`](../../../configs/architecture-contract.json)，加载前拒绝不匹配的配置。
+最终执行包采用质量优先的 SM87 混合精度：专家 E8P Q2A8，GDN/QSA 输入投影和 target/MTP 共享输出头使用旋转 Q4A8，输出投影与共享 FFN 保留 W8，关键系数保留 BF16/FP32。KV 为 group-64 INT8，GDN 状态为 FP32。prefill 长度由动态参数决定；MTP 支持 1..7 个草稿和完整接受前缀提交。架构与编码约束位于 [`architecture-contract.json`](../../../configs/architecture-contract.json)，加载前拒绝不匹配的配置。
 
 小批次验证使用精确的 E8P 短码表和字节置换；router 按小批次选择输出 tile。已有原生模型可用 `tools/model/flash_next/optimize_decode.py` 重建这些算子，权重逐字节保留，新执行包仍合并为 safetensors 资产容器：
 
@@ -31,7 +31,7 @@ bash tools/operators/run.sh tools/model/flash_next/dynamic_prefill.py artifacts/
   --model /path/to/native-model --model-output artifacts/models/flash-dynamic
 ```
 
-模板支持 2–4096 个真实输入行；更长输入分块执行，单行使用 decode。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。
+模板支持 1–4096 个真实输入行；更长输入分块执行，单行 prefill 复用相同模板和 cubin。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。输入准备按执行程序区分 prefill、decode 和 MTP 验证，单行 prefill 的隐藏捕获读取模板输出。
 
 `checks/dynamic_prefill.py` 检查动态行、尾部和 graph replay；`checks/hc_alignment.py`、`checks/qsa_partitions.py`、`checks/q4_prefill.py` 检查局部实现。`checks/expert_prefill.py` 对照独立的行主序 E8P 实现，覆盖专家尾部、最大行容量和更换输入后的 graph replay。真实模型的恢复、暂停和混合请求另用 Rust GPU 测试验收。`validate_mtp_partial_prefix` 夹具可指定 `verification_tokens: 2..8`，固定验证协议以隔离缓存恢复与自适应 decode 选择，仍比较完整因果状态。
 
@@ -60,14 +60,19 @@ MTP 另用 `--component mtp --stage all` 转换，再发布到独立目录。tar
 
 ## Rust 部署
 
-在线包含 W8 embedding、CPU E8P PLE 查表、48 层 HC/GDN/QSA/MoE、256K INT8 KV，以及完整请求状态和 prefix cache。prefill 提供 4096／2048／512／128／16 token 档位，尾部用真实 M=1 执行；不填充虚假 token。基础包支持单个活跃请求、其余排队；下述 batch 构建可启用多请求 decode。可选原生 MTP 支持贪心和带惩罚项的随机采样。
+在线包含 W8 embedding、CPU E8P PLE 查表、48 层 HC/GDN/QSA/MoE、256K INT8 KV，以及完整请求状态和 prefix cache。最终部署包的 prefill 支持 1–4096 个真实 tokens；基础参考包提供固定形状作为离线构建输入，下述 batch 构建可启用多请求 decode。可选原生 MTP 支持贪心和带惩罚项的随机采样。
 
 ```bash
 make build
 bash tools/operators/run.sh tools/model/flash_next/prepare.py artifacts/flash-build \
   --checkpoint /path/to/flash-target --model-output artifacts/models/flash-serving
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving
-./target/release/orinfer serve artifacts/models/flash-serving \
+```
+
+这一步生成基础参考包；按需要附加下文的 MTP、图片及 batch 能力，最后完成规范归约、HC 操作数和动态 prefill 构建，再部署最终目录：
+
+```bash
+./target/release/orinfer serve artifacts/models/flash-dynamic \
   --model qwen-flash-next --max-active-requests 1 \
   --cuda-graph decode_only --prefix-cache-mib 512
 ```
@@ -80,7 +85,7 @@ bash tools/operators/run.sh tools/model/flash_next/prepare_mtp.py artifacts/flas
   --base-model artifacts/models/flash-serving \
   --model-output artifacts/models/flash-serving-mtp
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mtp
-# serve 使用上面的相同参数，改为 flash-serving-mtp 目录；包含 MTP 的包自动启用。
+# 继续完成最终动态 prefill 构建；serve 指向最终目录，包含 MTP 的包自动启用。
 ```
 
 代码修改或重复模板可额外指定 `--prompt-lookup`，从本请求历史中提取待验证续写；默认关闭，普通生成可能因较差候选而变慢。它仅适用于无惩罚 greedy 且未请求 logprobs 的请求，上限仍由 `--mtp-drafts` 控制。
@@ -103,9 +108,7 @@ bash tools/operators/run.sh tools/model/flash_next/prepare_vision.py artifacts/f
   --checkpoint artifacts/checkpoints/flash-vision \
   --model-output artifacts/models/flash-serving-mm
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mm
-./target/release/orinfer serve artifacts/models/flash-serving-mm \
-  --model qwen-flash-next --max-active-requests 1 \
-  --cuda-graph decode_only --prefix-cache-mib 512 --mtp-drafts 7
+# 继续完成 batch、混合执行和最终动态 prefill 构建，再部署最终目录。
 ```
 
 视觉编码器与 27B 共享 TileLang 算子和执行组件，merger 输出为 2560 维；QSA 查询、KV 和压缩索引使用交错三轴 MRoPE，MTP 读取移位后的图像特征。PLE 保留原始 image token ID。多图按消息次序独立编码，特征和位置索引属于请求私有状态；图片身份参与 prefix 匹配。
@@ -208,7 +211,7 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_hc.py artifacts/flash-m
   --model artifacts/models/flash-mixed --model-output artifacts/models/flash-mixed-hc
 ```
 
-混合片段支持 16、128、512 token，拼接容量最高 1024 行；独立长 prefill 继续使用原有 2048/4096 档。BF16 HC 操作数在矩阵乘法前准备，保留原来的 FP16 舍入边界。kernel 首次装载、graph capture 和 prefill 完成时的 head/cache/MTP 预热分别计时，避免影响后续普通批次的耗时预测；请求总时延仍包含这些开销。
+混合片段支持 16、128、512 token，拼接容量最高 1024 行；独立 prefill 使用动态模板，按调度预算选择实际长度。BF16 HC 操作数在矩阵乘法前准备，保留原来的 FP16 舍入边界。kernel 首次装载、graph capture 和 prefill 完成时的 head/cache/MTP 预热分别计时，避免影响后续普通批次的耗时预测；请求总时延仍包含这些开销。
 
 Orin 上可用 `--prefill-budget-ms 350 --target-tpot-ms 400` 起步调优。350 ms 是混合批次的预测预算，400 ms 是 decode 间隔的软目标；首次加载算子仍可能超过目标。
 
@@ -232,43 +235,12 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_draft.py artifacts/flas
 
 各验证宽度的临时 prefix/提交因子在同一请求内复用最大容量，不共享请求之间的状态；验证和接受提交完成后才复用。当前布局由每请求 115.07 MiB 降为 26.30 MiB，不改变原 kernel 的形状、索引或复制长度。
 
-### 分块数值与真实尾块
+### 动态 prefill 与可暂停前向
 
-生产构建在混合执行包之后追加以下步骤，复用现有权重并重建原生模型库：
+完成 MTP、视觉、batch 和混合执行构建后，以动态 prefill 作为最终构建步骤：先用 `canonical_reductions.py` 固定 QSA/GDN/HC 的数值归约，再用 `optimize_hc_prefill.py` 准备 HC 操作数，最后执行本文开头的 `dynamic_prefill.py`。后续重建已有动态包应使用其声明的实际行数契约；基础参考包的固定形状仅用于离线构建。
 
-```bash
-bash tools/operators/run.sh tools/model/flash_next/canonical_reductions.py artifacts/flash-canonical-build \
-  --model /path/to/flash-mixed-draft --model-output artifacts/models/flash-canonical
-bash tools/operators/run.sh tools/model/flash_next/prefill_tails.py artifacts/flash-tails-build \
-  --model artifacts/models/flash-canonical --model-output artifacts/models/flash-exact
-```
+QSA 固定按 256-token 区间归约，再按固定顺序合并八份 FP32 部分结果；最后一份覆盖 pending 尾部。GDN 保持 FP32 递推，HC down 按四路 stream 顺序求和。这些数值边界不随 batch 或 prefill 长度改变。
 
-QSA 的选中 KV 固定按 256-token 区间归约，再按固定顺序合并八份 FP32 部分结果；最后一份同时覆盖不足四 token 的 pending 尾部。GDN 固定 FP32 归约布局，HC down 按四路 stream 分别累加后依次求和。这些数值边界不随 batch 或 prefill 大小改变；权重、INT8 KV 和 Tensor Core 精度保持原配置。
+1–4096 行前向和单 token 尾块共用动态模板。原生模型库在融合和 Q4 前置转换完成后注册层边界。切换序列或执行 batch 前保存仍存活的 HC/PLE 工作区，恢复后继续执行；同一请求连续执行时不复制工作区。不发布尚未完成全部层的 prefix 状态，MTP warm 按已有 warm profile 分步执行。
 
-2–15-token prefill 尾块复用 16 行的投影与专家 cubin，只为真实长度编译因果算子。填充行不推进 KV、GDN、卷积、PLE、MTP 历史或位置，输出头选最后一条真实残差。尾块捕获和 MTP 验证使用独立的程序名。此改动需要新的执行包；更新 CLI 本身不会改变已发布 cubin 的行为。
-
-### 可暂停的大块前向
-
-512 行的前向可接受 129–512 个真实 tokens，复用投影和专家 cubin；GDN、PLE 历史、QSA、位置推进和 MTP capture 按设备上的真实长度执行。填充行不进入专家计数和 dispatch，输出头选取最后一个真实 token。输入层只生成真实 token 的 embedding/PLE，不添加虚构 token。当前其他容量仍按精确长度执行。
-
-从包含精确小尾块、规范归约和可暂停阶段的包构建：
-
-```bash
-bash tools/operators/run.sh tools/model/flash_next/prefill_tails.py /path/to/build-output \
-  --model /path/to/flash-layered --model-output /path/to/flash-logical \
-  --logical-512
-```
-
-构建复用权重和未变化的算子，并生成匹配的原生模型库。执行包 profile 的可选 `min_tokens` 声明真实长度范围；缺省时只接受精确长度，外部包仍为 schema 1。新增输出头工作区仅 5 KiB。
-
-当前模型库为 512/2048/4096-token 前向注册按层切分的阶段，边界在全部融合和 Q4 前置转换完成后生成。阶段引用现有操作和 cubin；运行时在切换序列或执行 batch 前保存仍存活的 HC/PLE 工作区，插入 decode/MTP 后恢复。同一请求连续执行时不复制工作区，备份分配在块内复用。不发布尚未完成所有层的 prefix 状态。MTP warm 也按已有 warm profile 分步执行。
-
-对已完成上述数值与尾块构建的模型，重建原生执行包即可启用：
-
-```bash
-make build
-PYTHONPATH=. .venv/bin/python -m tools.model.catalog \
-  --model /path/to/flash-exact --output /path/to/flash-layered
-```
-
-该命令重新生成匹配 catalog 的模型库，复用权重和 cubin。只替换 CLI 不会为旧执行包增加阶段。`/health` 的 `layered_prefill_iterations`、`prefill_suspend_s`、`prefill_resume_s` 和 `peak_prefill_frame_bytes` 可用于确认实际执行及开销。
+`/health` 的 `layered_prefill_iterations`、`prefill_suspend_s`、`prefill_resume_s` 和 `peak_prefill_frame_bytes` 可用于确认暂停执行及开销。`validate_flash_dynamic_prefill_chunks` 验证真实尾块分块，`validate_flash_layered_prefill` 验证暂停、覆盖、取消和槽位复用。

@@ -99,7 +99,11 @@ fn capture_kernel_arguments() {
             model.execution.ensure_sequence_program(req.slot, &program)?;
             model.upload_ids(if phase == "decode" { &model.manifest.token } else { &model.manifest.input }, tokens)?;
             model.upload_segment_controls(tokens.len())?;
-            model.prepare_inputs(tokens, history)?;
+            if phase == "prefill" {
+                model.prepare_prefill_inputs(&program, tokens, history)?;
+            } else {
+                model.prepare_inputs(tokens, history)?;
+            }
             let mut remaining = targets.iter().filter(|name| name.starts_with(&format!("{program}/"))).cloned().collect::<BTreeSet<_>>();
             for operation in model.manifest.programs[&program].clone() {
                 let selected = match &operation {
@@ -721,7 +725,11 @@ fn profile_prefill_stages() {
             .upload_ids(&model.manifest.input, &source.input_tokens[base..])
             .unwrap();
         model
-            .prepare_inputs(&source.input_tokens[base..], &source.input_tokens[..base])
+            .prepare_prefill_inputs(
+                &program,
+                &source.input_tokens[base..],
+                &source.input_tokens[..base],
+            )
             .unwrap();
         model
             .upload_ids(&model.manifest.position, &[base as u32])
@@ -1083,21 +1091,22 @@ fn capture_prefill_partitions() {
             let phase = if index == 0 { "first" } else { "last" };
             model
                 .with_request(&mut req, |m, r| {
-                    let (program, head) = if chunk == 1 {
-                        ("decode".to_owned(), None)
-                    } else {
-                        let (_, program, head) = m.manifest.select_prefill_plan(chunk)?;
-                        (program.to_owned(), Some(head.to_owned()))
-                    };
+                    let (_, program, head) = m.manifest.select_prefill_plan(chunk)?;
+                    let program = program.to_owned();
+                    let head = m.manifest.prefill_plan(chunk).map(|_| head.to_owned());
                     m.upload_ids(
-                        if chunk == 1 {
+                        if head.is_none() {
                             &m.manifest.token
                         } else {
                             &m.manifest.input
                         },
                         &r.input[r.offset..r.offset + chunk],
                     )?;
-                    m.prepare_inputs(&r.input[r.offset..r.offset + chunk], &r.input[..r.offset])?;
+                    m.prepare_prefill_inputs(
+                        &program,
+                        &r.input[r.offset..r.offset + chunk],
+                        &r.input[..r.offset],
+                    )?;
                     m.upload_segment_controls(chunk)?;
                     m.execution.ensure_sequence_program(r.slot, &program)?;
                     for invocation in prefill_invocations(m, &program, chunk)? {
