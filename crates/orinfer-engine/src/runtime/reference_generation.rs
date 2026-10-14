@@ -109,15 +109,22 @@ impl ModelRuntime {
                 .unwrap_or(input.len());
             let remaining = boundary - offset;
             let m = &self.manifest;
-            let plan = m
-                .prefill_plans
-                .iter()
-                .filter(|p| p.chunk_tokens <= remaining)
-                .max_by_key(|p| p.chunk_tokens);
+            let plan = if let Some(rows) = &m.row_execution {
+                m.prefill_plan(remaining.min(rows.capacity))
+            } else {
+                m.prefill_plans
+                    .iter()
+                    .filter(|p| p.chunk_tokens <= remaining)
+                    .max_by_key(|p| p.chunk_tokens)
+            };
             let selected = plan
                 .map(|p| {
                     (
-                        p.chunk_tokens,
+                        if m.row_execution.is_some() {
+                            remaining.min(p.chunk_tokens)
+                        } else {
+                            p.chunk_tokens
+                        },
                         p.prefill_program.clone(),
                         p.head_program.clone(),
                     )
@@ -134,7 +141,7 @@ impl ModelRuntime {
                 self.upload_ids(&m.input, &input[offset..offset + chunk])?;
                 self.prepare_inputs(&input[offset..offset + chunk], &input[..offset])?;
                 self.upload_segment_controls(chunk)?;
-                self.launch_program(&program, ExecutionPhase::Prefill)?;
+                self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
                 (chunk, Some(head))
             } else {
                 self.upload_ids(&m.token, &input[offset..offset + 1])?;
@@ -168,7 +175,7 @@ impl ModelRuntime {
             }
             if checkpoint {
                 if let Some(head) = &head {
-                    self.launch_program(head, ExecutionPhase::Prefill)?;
+                    self.launch_rows(head, chunk, ExecutionPhase::Prefill)?;
                 }
                 self.store_prefix(&input[..endpoint], &media, warm.tokens, true, prefix)?;
             }
@@ -191,10 +198,10 @@ impl ModelRuntime {
             }
             self.prefill_costs.observe(chunk, compute_s);
             offset = endpoint;
-            last_head = head;
+            last_head = head.map(|head| (head, chunk));
         }
-        if let Some(head) = last_head {
-            self.launch_program(&head, ExecutionPhase::Prefill)?;
+        if let Some((head, rows)) = last_head {
+            self.launch_rows(&head, rows, ExecutionPhase::Prefill)?;
         }
         if self.read_control(&self.manifest.position)? as usize != input.len() {
             return Err("Prefill position mismatch".into());

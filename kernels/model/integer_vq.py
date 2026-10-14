@@ -75,6 +75,7 @@ def _compile(
     selectorbook,
     group_n,
     packed_k,
+    dynamic_rows=False,
 ):
     if (
         kind not in ("vq4", "e8p")
@@ -102,6 +103,9 @@ def _compile(
     TE = 1 if shared_table else E
     entries, words = (256, 1) if selectorbook else (512, 4) if shortbook else (256, D // 4)
     G = 128
+    from kernels.model.rows import row_count
+
+    rows = row_count(rows, dynamic_rows)
 
     @T.macro
     def project(A, P, Book, Patch, WS, AS, C, expert, offset, count, bx):
@@ -321,12 +325,15 @@ def integer_vq_grouped(
     parity_xor=False,
     group_n=False,
     packed_k=128,
+    dynamic_rows=False,
 ):
     if type(group_n) is not bool:
         raise ValueError("Invalid routed tile order")
     if type(parity_xor) is not bool or parity_xor and not warp_decode:
         raise ValueError("XOR parity requires warp decode")
     if warp_decode:
+        if dynamic_rows:
+            raise ValueError("Warp decode uses its own fixed-row activation layout")
         if (
             kind != "e8p"
             or not shared_table
@@ -371,6 +378,7 @@ def integer_vq_grouped(
         selectorbook,
         group_n,
         packed_k,
+        dynamic_rows,
     )
 
 

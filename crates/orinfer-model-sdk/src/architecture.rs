@@ -25,6 +25,9 @@ pub struct BatchLayout {
     /// Architecture-owned address-table column order for private decode arenas.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state_columns: Vec<String>,
+    /// Native preparation programs that map packet-specific causal workspace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub preparation_programs: BTreeMap<usize, String>,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

@@ -63,7 +63,14 @@ def ple_gate(M: int, H: int, streams: int = 4, dtype: str = "float16", dynamic_r
 
 
 @orin_jit
-def ple_conv(M: int, C: int, taps: int = 4, dilation: int = 3, dtype: str = "float16"):
+def ple_conv(
+    M: int,
+    C: int,
+    taps: int = 4,
+    dilation: int = 3,
+    dtype: str = "float16",
+    dynamic_rows: bool = False,
+):
     """(Normed[M,C], Gated[M,C], State[history,C], Weight[C,taps], Output).
 
     Weight is supplied as FP16 coefficients by the execution plan, converted
@@ -75,6 +82,7 @@ def ple_conv(M: int, C: int, taps: int = 4, dilation: int = 3, dtype: str = "flo
     if any(type(x) is not int or x <= 0 for x in (M, C, taps, dilation)) or taps < 2:
         raise ValueError("Invalid PLE convolution dimensions")
     history = (taps - 1) * dilation
+    M = row_count(M, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -109,7 +117,12 @@ def ple_conv(M: int, C: int, taps: int = 4, dilation: int = 3, dtype: str = "flo
 
 @orin_jit
 def ple_history(
-    M: int, C: int, history: int = 9, dtype: str = "float16", logical_rows: bool = False
+    M: int,
+    C: int,
+    history: int = 9,
+    dtype: str = "float16",
+    logical_rows: bool = False,
+    dynamic_rows: bool = False,
 ):
     """(Normed[M,C], State[history,C], NextState), permitting State aliasing.
 
@@ -120,9 +133,10 @@ def ple_history(
     _dtype(dtype)
     if any(type(x) is not int or x <= 0 for x in (M, C, history)):
         raise ValueError("Invalid PLE history dimensions")
-    from kernels.model.logical_rows import bind, extent
+    from kernels.model.logical_rows import bind
+    from kernels.model.rows import row_extent
 
-    count, control = extent(M, logical_rows)
+    M, count, control = row_extent(M, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
 
     @T.prim_func
     def main(

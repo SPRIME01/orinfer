@@ -29,6 +29,9 @@ pub struct Manifest {
     pub kernels: Vec<Kernel>,
     #[serde(default)]
     pub programs: BTreeMap<String, Vec<Operation>>,
+    /// Model-owned dynamic templates, independent of scheduler chunk choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_execution: Option<crate::operators::rows::RowExecution>,
     /// Derived by the model adapter: fork, side start/end, join operation names.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub graph_branches: BTreeMap<String, Vec<[String; 4]>>,
@@ -451,6 +454,16 @@ impl Manifest {
                 return Err(format!("Missing program {required}"));
             }
         }
+        if let Some(rows) = &self.row_execution {
+            if rows.capacity > self.chunk_tokens {
+                return Err("Row execution exceeds the input allocation contract".into());
+            }
+            rows.validate(
+                &self.programs,
+                &self.kernels.iter().map(|k| k.name.clone()).collect(),
+                &self.dynamic_batch_kernels,
+            )?;
+        }
         let mut plan_sizes = BTreeSet::new();
         for plan in &self.prefill_plans {
             if plan.chunk_tokens == 0
@@ -535,6 +548,19 @@ impl Manifest {
                 }
             }
         }
+        if let Some(layout) = &self.batch_layout {
+            for (&rows, program) in &layout.preparation_programs {
+                let growth = self.kv_cache.as_ref().and_then(|kv| kv.growth.get(program));
+                if (rows != 1 && !layout.profiles.contains_key(&rows))
+                    || !self.programs.contains_key(program)
+                    || growth.is_none_or(|g| {
+                        g.tokens != rows && !(g.length.is_some() && g.tokens >= rows)
+                    })
+                {
+                    return Err("Invalid batch packet preparation contract".into());
+                }
+            }
+        }
         if !self.reset_buffers.contains(&self.position) {
             return Err("Position must reset between requests".into());
         }
@@ -592,6 +618,16 @@ impl Manifest {
     pub fn select_prefill_plan(&self, tokens: usize) -> Result<(usize, &str, &str)> {
         if tokens == 0 {
             return Err("Empty prefill".into());
+        }
+        if let Some(rows) = &self.row_execution {
+            if tokens == 1 {
+                return Ok((1, "decode", "head_m1"));
+            }
+            let chunk = tokens.min(rows.capacity);
+            let plan = self
+                .prefill_plan(chunk)
+                .ok_or("Missing dynamic prefill template")?;
+            return Ok((chunk, &plan.prefill_program, &plan.head_program));
         }
         if self.prefill_plans.is_empty() {
             if self.chunk_tokens == 0 || !tokens.is_multiple_of(self.chunk_tokens) {

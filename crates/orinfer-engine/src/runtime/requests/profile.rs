@@ -20,6 +20,38 @@ fn median(values: &[f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn prefill_invocations(
+    model: &ModelRuntime,
+    program: &str,
+    rows: usize,
+) -> Result<Vec<Invocation>> {
+    let operations = &model.manifest.programs[program];
+    if let Some(template) = model
+        .manifest
+        .row_execution
+        .as_ref()
+        .filter(|s| s.programs.contains(program))
+    {
+        template.specialize(
+            program,
+            operations,
+            &model.manifest.dynamic_batch_kernels,
+            rows,
+        )
+    } else {
+        Ok(operations
+            .iter()
+            .cloned()
+            .map(|operation| Invocation {
+                operation,
+                sequence: None,
+                launch: None,
+                views: BTreeMap::new(),
+            })
+            .collect())
+    }
+}
+
 #[test]
 #[ignore = "Captures real kernel arguments; requires model and exclusive GPU experiment lock"]
 fn capture_kernel_arguments() {
@@ -339,7 +371,11 @@ fn profile_speculative_verification() {
                 .upload_ids(&model.manifest.input, &tokens[..width])
                 .unwrap();
             model
-                .prepare_inputs(&tokens[..width], &source.input_tokens)
+                .prepare_verification_inputs(
+                    &verify.program,
+                    &tokens[..width],
+                    &source.input_tokens,
+                )
                 .unwrap();
             model.upload_segment_controls(width).unwrap();
             // Materialize demand-mapped KV/workspace before capturing the
@@ -694,16 +730,7 @@ fn profile_prefill_stages() {
             .execution
             .ensure_sequence_program(0, &program)
             .unwrap();
-        let plan: Vec<_> = model.manifest.programs[&program]
-            .iter()
-            .cloned()
-            .map(|operation| Invocation {
-                operation,
-                sequence: None,
-                launch: None,
-                views: BTreeMap::new(),
-            })
-            .collect();
+        let plan = prefill_invocations(&model, &program, chunk).unwrap();
         let trials = model
             .execution
             .profile_graph_operations_at_position(
@@ -1073,22 +1100,13 @@ fn capture_prefill_partitions() {
                     m.prepare_inputs(&r.input[r.offset..r.offset + chunk], &r.input[..r.offset])?;
                     m.upload_segment_controls(chunk)?;
                     m.execution.ensure_sequence_program(r.slot, &program)?;
-                    for operation in m.manifest.programs[&program].clone() {
-                        let name = match &operation {
+                    for invocation in prefill_invocations(m, &program, chunk)? {
+                        let name = match &invocation.operation {
                             crate::model::Operation::Kernel { name } => Some(name.clone()),
                             _ => None,
                         };
-                        m.execution.execute_batch(
-                            vec![],
-                            &[Invocation {
-                                operation,
-                                sequence: None,
-                                launch: None,
-                                views: BTreeMap::new(),
-                            }],
-                            false,
-                            false,
-                        )?;
+                        m.execution
+                            .execute_batch(vec![], &[invocation], false, false)?;
                         if let Some(watches) = name
                             .as_ref()
                             .and_then(|n| spec["watches"].get(n))
@@ -1112,7 +1130,7 @@ fn capture_prefill_partitions() {
                     if r.offset + chunk == r.input.len()
                         && let Some(head) = head
                     {
-                        m.launch_program(&head, ExecutionPhase::Prefill)?;
+                        m.launch_rows(&head, chunk, ExecutionPhase::Prefill)?;
                     }
                     m.after_prefill(r, chunk)?;
                     Ok(())

@@ -10,7 +10,8 @@ Convolution history, position, and attention KV require separate handling.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind, extent
+from kernels.model.logical_rows import bind
+from kernels.model.rows import row_extent
 
 HK, HV, DK, DV = 16, 48, 128, 128
 
@@ -24,13 +25,21 @@ def _gdn_sequence(
     compact: bool = False,
     prefetch_qk: bool = False,
     logical_rows: bool = False,
+    dynamic_rows: bool = False,
+    token_unroll: int = 1,
 ):
     assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
+    if type(token_unroll) is not int or token_unroll not in (1, 2, 4, 8):
+        raise ValueError("Invalid GDN token unrolling")
+    if token_unroll != 1 and not prefetch_qk:
+        raise ValueError("GDN token unrolling requires the prefetch recurrence")
     if logical_rows and not in_place:
         raise ValueError("Logical rows require in-place prefill")
-    count, control = extent(tokens, logical_rows)
+    tokens, count, control = row_extent(
+        tokens, dynamic_rows=dynamic_rows, logical_rows=logical_rows
+    )
     if (
         type(prefetch_qk) is not bool
         or prefetch_qk
@@ -133,77 +142,86 @@ def _gdn_sequence(
                     T.ptx_cp_async(T.access_ptr(gs[0], "w", 1), T.access_ptr(G[0, h], "r", 1), 1)
                     T.ptx_cp_async(T.access_ptr(bs[0], "w", 1), T.access_ptr(Beta[0, h], "r", 1), 1)
                 T.ptx_commit_group()
-            for t in T.serial(count):
-                if prefetch_qk:
-                    T.ptx_wait_group(0)
-                    T.sync_warp()
-                    if t + 1 < count:
-                        T.ptx_cp_async(
-                            T.access_ptr(qs[(t + 1) % 2, tid * 4], "w", 4),
-                            T.access_ptr(Q[kh, t + 1, tid * 4], "r", 4),
-                            4,
-                        )
-                        T.ptx_cp_async(
-                            T.access_ptr(ks[(t + 1) % 2, tid * 4], "w", 4),
-                            T.access_ptr(K[kh, t + 1, tid * 4], "r", 4),
-                            4,
-                        )
-                        if tid < value_tile // 4:
-                            T.ptx_cp_async(
-                                T.access_ptr(vs[(t + 1) % 2, tid * 4], "w", 4),
-                                T.access_ptr(V[h, t + 1, bv * value_tile + tid * 4], "r", 4),
-                                4,
+            # Static token positions remove repeated double-buffer indexing
+            # while retaining the original sequential FP32 recurrence.
+            for group in T.serial(T.ceildiv(count, token_unroll)):
+                for sub in T.unroll(token_unroll):
+                    t = group * token_unroll + sub
+                    if t < count:
+                        if prefetch_qk:
+                            T.ptx_wait_group(0)
+                            T.sync_warp()
+                            if t + 1 < count:
+                                T.ptx_cp_async(
+                                    T.access_ptr(qs[(t + 1) % 2, tid * 4], "w", 4),
+                                    T.access_ptr(Q[kh, t + 1, tid * 4], "r", 4),
+                                    4,
+                                )
+                                T.ptx_cp_async(
+                                    T.access_ptr(ks[(t + 1) % 2, tid * 4], "w", 4),
+                                    T.access_ptr(K[kh, t + 1, tid * 4], "r", 4),
+                                    4,
+                                )
+                                if tid < value_tile // 4:
+                                    T.ptx_cp_async(
+                                        T.access_ptr(vs[(t + 1) % 2, tid * 4], "w", 4),
+                                        T.access_ptr(
+                                            V[h, t + 1, bv * value_tile + tid * 4], "r", 4
+                                        ),
+                                        4,
+                                    )
+                                if tid == 0:
+                                    T.ptx_cp_async(
+                                        T.access_ptr(gs[(t + 1) % 2], "w", 1),
+                                        T.access_ptr(G[t + 1, h], "r", 1),
+                                        1,
+                                    )
+                                    T.ptx_cp_async(
+                                        T.access_ptr(bs[(t + 1) % 2], "w", 1),
+                                        T.access_ptr(Beta[t + 1, h], "r", 1),
+                                        1,
+                                    )
+                                T.ptx_commit_group()
+                        for i, j in T.Parallel(DK, value_tile):
+                            state[i, j] = state[i, j] * T.exp(gs[t % 2] if prefetch_qk else G[t, h])
+                            product[i, j] = state[i, j] * T.cast(
+                                (ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32
                             )
-                        if tid == 0:
-                            T.ptx_cp_async(
-                                T.access_ptr(gs[(t + 1) % 2], "w", 1),
-                                T.access_ptr(G[t + 1, h], "r", 1),
-                                1,
+                        T.reduce_sum(product, predicted, dim=0)
+                        if compact:
+                            for j in T.Parallel(value_tile):
+                                update[j] = Beta[t, h] * (
+                                    T.cast(V[h, t, bv * value_tile + j], T.float32) - predicted[j]
+                                )
+                                Prefix[t, h, bv * value_tile + j] = update[j]
+                        for i, j in T.Parallel(DK, value_tile):
+                            delta = (bs[t % 2] if prefetch_qk else Beta[t, h]) * (
+                                T.cast(
+                                    vs[t % 2, j] if prefetch_qk else V[h, t, bv * value_tile + j],
+                                    T.float32,
+                                )
+                                - predicted[j]
                             )
-                            T.ptx_cp_async(
-                                T.access_ptr(bs[(t + 1) % 2], "w", 1),
-                                T.access_ptr(Beta[t + 1, h], "r", 1),
-                                1,
+                            if compact:
+                                delta = update[j]
+                            state[i, j] = (
+                                state[i, j]
+                                + T.cast((ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32)
+                                * delta
                             )
-                        T.ptx_commit_group()
-                for i, j in T.Parallel(DK, value_tile):
-                    state[i, j] = state[i, j] * T.exp(gs[t % 2] if prefetch_qk else G[t, h])
-                    product[i, j] = state[i, j] * T.cast(
-                        (ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32
-                    )
-                T.reduce_sum(product, predicted, dim=0)
-                if compact:
-                    for j in T.Parallel(value_tile):
-                        update[j] = Beta[t, h] * (
-                            T.cast(V[h, t, bv * value_tile + j], T.float32) - predicted[j]
-                        )
-                        Prefix[t, h, bv * value_tile + j] = update[j]
-                for i, j in T.Parallel(DK, value_tile):
-                    delta = (bs[t % 2] if prefetch_qk else Beta[t, h]) * (
-                        T.cast(
-                            vs[t % 2, j] if prefetch_qk else V[h, t, bv * value_tile + j],
-                            T.float32,
-                        )
-                        - predicted[j]
-                    )
-                    if compact:
-                        delta = update[j]
-                    state[i, j] = (
-                        state[i, j]
-                        + T.cast((ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32) * delta
-                    )
-                    product[i, j] = state[i, j] * (
-                        T.cast((qs[t % 2, i] if prefetch_qk else Q[kh, t, i]), T.float32) * q_scale
-                    )
-                T.reduce_sum(product, result, dim=0)
-                for i, j in T.Parallel(DK, value_tile):
-                    if in_place:
-                        if t == count - 1:
-                            State[h, i, bv * value_tile + j] = state[i, j]
-                    elif not compact:
-                        Prefix[t, h, i, bv * value_tile + j] = state[i, j]
-                for j in T.Parallel(value_tile):
-                    Out[t, h * DV + bv * value_tile + j] = result[j]
+                            product[i, j] = state[i, j] * (
+                                T.cast((qs[t % 2, i] if prefetch_qk else Q[kh, t, i]), T.float32)
+                                * q_scale
+                            )
+                        T.reduce_sum(product, result, dim=0)
+                        for i, j in T.Parallel(DK, value_tile):
+                            if in_place:
+                                if t == count - 1:
+                                    State[h, i, bv * value_tile + j] = state[i, j]
+                            elif not compact:
+                                Prefix[t, h, i, bv * value_tile + j] = state[i, j]
+                        for j in T.Parallel(value_tile):
+                            Out[t, h * DV + bv * value_tile + j] = result[j]
 
     return bind(main, control, logical_rows)
 
@@ -227,6 +245,8 @@ def gdn_sequence(
     compact: bool = False,
     prefetch_qk: bool = False,
     logical_rows: bool = False,
+    dynamic_rows: bool = False,
+    token_unroll: int = 1,
 ):
     """Preserve the recurrence and reductions while overlapping input reads.
 
@@ -235,7 +255,16 @@ def gdn_sequence(
     """
     compiler = _compile_prefetch if prefetch_qk else _compile_sequence
     return compiler(
-        tokens, q_scale, value_tile, threads, in_place, compact, prefetch_qk, logical_rows
+        tokens,
+        q_scale,
+        value_tile,
+        threads,
+        in_place,
+        compact,
+        prefetch_qk,
+        logical_rows,
+        dynamic_rows,
+        token_unroll,
     )
 
 

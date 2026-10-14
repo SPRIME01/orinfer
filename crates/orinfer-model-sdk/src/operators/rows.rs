@@ -1,0 +1,291 @@
+//! Runtime row specialization of one model-owned execution template.
+//! Lengths change launch arguments, never compile identities or tensor roles.
+use crate::{
+    artifact::Result, execution::Invocation, model::Operation,
+    operators::dynamic::DynamicBatchKernel,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Optional local algorithm/tile substitution at a canonical kernel slot.
+/// An empty replacement omits a slot consumed by a fused implementation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelVariant {
+    pub min_rows: usize,
+    pub max_rows: usize,
+    #[serde(default = "unit_multiple")]
+    pub multiple_of: usize,
+    pub kernels: Vec<String>,
+}
+
+fn unit_multiple() -> usize {
+    1
+}
+
+/// Names are supplied by the native model adapter. Capacity bounds allocation;
+/// it neither rounds the scheduler's rows nor selects an entire forward plan.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowExecution {
+    pub capacity: usize,
+    pub programs: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub variants: BTreeMap<String, Vec<KernelVariant>>,
+}
+
+impl RowExecution {
+    pub fn validate(
+        &self,
+        programs: &BTreeMap<String, Vec<Operation>>,
+        kernels: &BTreeSet<String>,
+        dynamic: &BTreeMap<String, DynamicBatchKernel>,
+    ) -> Result<()> {
+        if !(2..=8192).contains(&self.capacity) || self.programs.is_empty() {
+            return Err("Invalid row execution capacity/programs".into());
+        }
+        let mut slots = BTreeSet::new();
+        for name in &self.programs {
+            let operations = programs
+                .get(name)
+                .filter(|ops| !ops.is_empty())
+                .ok_or("Missing row execution template")?;
+            for operation in operations {
+                if let Operation::Kernel { name } = operation {
+                    slots.insert(name);
+                }
+            }
+        }
+        for (name, variants) in &self.variants {
+            if !slots.contains(name) || variants.is_empty() {
+                return Err("Row variants require a used canonical kernel slot".into());
+            }
+            let mut previous = 1;
+            for variant in variants {
+                if variant.min_rows <= previous
+                    || variant.min_rows > variant.max_rows
+                    || variant.max_rows > self.capacity
+                    || variant.multiple_of == 0
+                    || variant.multiple_of > variant.max_rows
+                    || variant.min_rows.div_ceil(variant.multiple_of) * variant.multiple_of
+                        > variant.max_rows
+                    || variant.kernels.iter().any(|name| !kernels.contains(name))
+                {
+                    return Err("Invalid/overlapping local row kernel variants".into());
+                }
+                previous = variant.max_rows;
+                for replacement in &variant.kernels {
+                    slots.insert(replacement);
+                }
+            }
+        }
+        for name in slots {
+            if !kernels.contains(name) {
+                return Err("Unknown row execution kernel".into());
+            }
+            if let Some(contract) = dynamic.get(name) {
+                if contract.capacity < self.capacity {
+                    return Err("Row template exceeds a symbolic kernel's allocation".into());
+                }
+                contract.launch(self.capacity)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn specialize(
+        &self,
+        program: &str,
+        operations: &[Operation],
+        dynamic: &BTreeMap<String, DynamicBatchKernel>,
+        rows: usize,
+    ) -> Result<Vec<Invocation>> {
+        if !self.programs.contains(program) || !(2..=self.capacity).contains(&rows) {
+            return Err("Invalid dynamic program/row extent".into());
+        }
+        let mut invocations = Vec::with_capacity(operations.len());
+        let mut append = |operation: Operation| -> Result<()> {
+            let launch = if let Operation::Kernel { name } = &operation {
+                dynamic.get(name).map(|k| k.launch(rows)).transpose()?
+            } else {
+                None
+            };
+            invocations.push(Invocation {
+                operation,
+                sequence: None,
+                launch,
+                views: BTreeMap::new(),
+            });
+            Ok(())
+        };
+        for operation in operations {
+            if let Operation::Kernel { name } = operation
+                && let Some(variant) = self.variants.get(name).and_then(|variants| {
+                    variants.iter().find(|v| {
+                        (v.min_rows..=v.max_rows).contains(&rows)
+                            && rows.is_multiple_of(v.multiple_of)
+                    })
+                })
+            {
+                for name in &variant.kernels {
+                    append(Operation::Kernel { name: name.clone() })?;
+                }
+            } else {
+                append(operation.clone())?;
+            }
+        }
+        Ok(invocations)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operators::dynamic::{RowArgument, RowExpression};
+
+    fn fixture() -> (
+        RowExecution,
+        BTreeMap<String, Vec<Operation>>,
+        BTreeMap<String, DynamicBatchKernel>,
+    ) {
+        let kernel = |name: &str| Operation::Kernel { name: name.into() };
+        let program = vec![kernel("projection"), kernel("mix"), kernel("state")];
+        let execution = RowExecution {
+            capacity: 4096,
+            programs: BTreeSet::from(["prefill".into()]),
+            variants: BTreeMap::from([
+                (
+                    "projection".into(),
+                    vec![KernelVariant {
+                        min_rows: 2,
+                        max_rows: 128,
+                        multiple_of: 1,
+                        kernels: vec!["fused".into()],
+                    }],
+                ),
+                (
+                    "mix".into(),
+                    vec![KernelVariant {
+                        min_rows: 2,
+                        max_rows: 128,
+                        multiple_of: 1,
+                        kernels: vec![],
+                    }],
+                ),
+            ]),
+        };
+        let dynamic = ["projection", "fused", "state"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.into(),
+                    DynamicBatchKernel {
+                        name: name.into(),
+                        capacity: 4096,
+                        grid: [
+                            RowExpression::Rows,
+                            RowExpression::Constant { value: 1 },
+                            RowExpression::Constant { value: 1 },
+                        ],
+                        arguments: vec![RowArgument {
+                            index: 0,
+                            value: RowExpression::Rows,
+                        }],
+                    },
+                )
+            })
+            .collect();
+        (
+            execution,
+            BTreeMap::from([("prefill".into(), program)]),
+            dynamic,
+        )
+    }
+
+    #[test]
+    fn every_length_specializes_launches_without_new_programs() {
+        let (execution, programs, dynamic) = fixture();
+        let kernels = ["projection", "mix", "state", "fused"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        execution.validate(&programs, &kernels, &dynamic).unwrap();
+        for rows in 2..=4096 {
+            let ops = execution
+                .specialize("prefill", &programs["prefill"], &dynamic, rows)
+                .unwrap();
+            let first = if rows <= 128 { "fused" } else { "projection" };
+            assert_eq!(ops[0].operation, Operation::Kernel { name: first.into() });
+            assert_eq!(ops[0].launch.as_ref().unwrap().grid, [rows as u32, 1, 1]);
+            assert_eq!(ops.len(), if rows <= 128 { 2 } else { 3 });
+        }
+        assert_eq!(programs.len(), 1);
+        for rows in [0, 1, 4097] {
+            assert!(
+                execution
+                    .specialize("prefill", &programs["prefill"], &dynamic, rows)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_overlapping_variants_and_underallocated_kernels() {
+        let (mut execution, programs, mut dynamic) = fixture();
+        let kernels = ["projection", "mix", "state", "fused"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        dynamic.get_mut("state").unwrap().capacity = 512;
+        assert!(execution.validate(&programs, &kernels, &dynamic).is_err());
+        dynamic.get_mut("state").unwrap().capacity = 4096;
+        execution
+            .variants
+            .get_mut("projection")
+            .unwrap()
+            .push(KernelVariant {
+                min_rows: 128,
+                max_rows: 512,
+                multiple_of: 1,
+                kernels: vec!["projection".into()],
+            });
+        assert!(execution.validate(&programs, &kernels, &dynamic).is_err());
+    }
+
+    #[test]
+    fn alignment_selects_one_local_implementation_without_length_enumeration() {
+        let (mut execution, programs, dynamic) = fixture();
+        execution.variants.insert(
+            "projection".into(),
+            vec![KernelVariant {
+                min_rows: 128,
+                max_rows: 4096,
+                multiple_of: 128,
+                kernels: vec!["fused".into()],
+            }],
+        );
+        for rows in [17, 129, 421, 513, 1025] {
+            let ops = execution
+                .specialize("prefill", &programs["prefill"], &dynamic, rows)
+                .unwrap();
+            assert_eq!(
+                ops[0].operation,
+                Operation::Kernel {
+                    name: "projection".into()
+                }
+            );
+        }
+        for rows in [128, 256, 512, 2048, 4096] {
+            let ops = execution
+                .specialize("prefill", &programs["prefill"], &dynamic, rows)
+                .unwrap();
+            assert_eq!(
+                ops[0].operation,
+                Operation::Kernel {
+                    name: "fused".into()
+                }
+            );
+            assert_eq!(ops[0].launch.as_ref().unwrap().grid, [rows as u32, 1, 1]);
+        }
+    }
+}

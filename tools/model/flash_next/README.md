@@ -24,6 +24,19 @@ bash tools/operators/run.sh tools/model/flash_next/lowering.py artifacts/flash-p
   --model /path/to/native-model --model-output artifacts/models/flash-policy
 ```
 
+已有经过 HC prefill 优化的原生执行包可改为单一动态 prefill 模板：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/dynamic_prefill.py artifacts/flash-prefill-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-dynamic
+```
+
+模板支持 2–4096 个真实输入行；更长输入分块执行，单行使用 decode。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。
+
+`checks/dynamic_prefill.py` 检查动态行、尾部和 graph replay；`checks/hc_alignment.py`、`checks/qsa_partitions.py`、`checks/q4_prefill.py` 检查局部实现。`checks/expert_prefill.py` 对照独立的行主序 E8P 实现，覆盖专家尾部、最大行容量和更换输入后的 graph replay。真实模型的恢复、暂停和混合请求另用 Rust GPU 测试验收。`validate_mtp_partial_prefix` 夹具可指定 `verification_tokens: 2..8`，固定验证协议以隔离缓存恢复与自适应 decode 选择，仍比较完整因果状态。
+
+`checks/hc_streams.py` 比较四流并行投影和原始顺序累加；`checks/expert_dispatch.py` 比较合并 dispatch／打包与独立两步执行，覆盖实际路由、scale、行和、SlotMap 和更换输入后的 graph replay。HC 临时 FP32 结果共用约 20 MiB workspace，权重表示不变。
+
 ## 权重准备
 
 CPU 工具使用 `make python-env` 创建的 uv 环境，GPU 转换与验证使用固定编译镜像及 GPU 锁。固定原始 checkpoint revision，流式读取 BF16，不需要保存完整原始模型：

@@ -20,9 +20,13 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
             if !matches!(
                 target.symbol.as_str(),
                 "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-            ) || target.args.len() != 13
+            ) || !(target.args.len() == 13
+                || target.args.len() == 14
+                    && matches!(target.args.last(), Some(Argument::I32 { .. })))
                 || kernel.symbol != "pack_exact_a8_kernel"
-                || kernel.args.len() != 4
+                || !(kernel.args.len() == 4
+                    || kernel.args.len() == 5
+                        && matches!(kernel.args.last(), Some(Argument::I32 { .. })))
             {
                 return Err("Unexpected exact expert ABI".into());
             }
@@ -47,19 +51,23 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
     }) {
         return Err("Missing exact expert A8 split".into());
     }
+    let mut registered = std::collections::BTreeSet::new();
     for operations in manifest.programs.values_mut() {
         let mut expanded = Vec::with_capacity(operations.len());
         for operation in std::mem::take(operations) {
             if let Operation::Kernel { name } = &operation
-                && let Some(split) = splits.remove(name)
+                && let Some(split) = splits.get(name)
             {
-                expanded.push(Operation::Kernel { name: split });
+                expanded.push(Operation::Kernel {
+                    name: split.clone(),
+                });
+                registered.insert(name.clone());
             }
             expanded.push(operation);
         }
         *operations = expanded;
     }
-    if !splits.is_empty() {
+    if registered.len() != splits.len() {
         return Err("Unregistered exact expert execution step".into());
     }
     Ok(())
@@ -102,10 +110,15 @@ pub(super) fn banks(manifest: &Manifest, kernels: &[Kernel]) -> Result<Vec<Exper
                 let histogram = if matches!(
                     k.symbol.as_str(),
                     "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-                ) && k.args.len() == 13
+                ) && (k.args.len() == 13
+                    || k.args.len() == 14 && matches!(k.args.last(), Some(Argument::I32 { .. })))
                 {
                     2
-                } else if k.args.len() == 11 {
+                } else if k.args.len() == 11
+                    || (k.args.len() == 12
+                        && matches!(k.args.last(), Some(Argument::I32 { .. }))
+                        && manifest.dynamic_batch_kernels.contains_key(&k.name))
+                {
                     4
                 } else {
                     return Err(format!("{}: unsupported expert consumer ABI", k.name));

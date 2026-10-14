@@ -106,12 +106,15 @@ def q4_projection(
     *,
     block_m=8,
     dynamic_rows=False,
+    stages=2,
 ):
     validate_shape(M, N, K)
     if BN not in (32, 64, 128) or BK % 128 or K % BK:
         raise ValueError("Invalid Q4 Tensor Core tile")
-    if block_m not in (8, 16, 32, 64):
+    if block_m not in (8, 16, 32, 64, 128):
         raise ValueError("Invalid Q4 row tile")
+    if type(stages) is not int or stages not in (1, 2):
+        raise ValueError("Invalid Q4 pipeline depth")
     BM = block_m
     M = row_count(M, dynamic_rows)
     threads = 64 if BN == 32 else 128
@@ -132,7 +135,7 @@ def q4_projection(
             decoded = T.alloc_fragment((BN, BK // 4), T.uint32)
             acc = T.alloc_fragment((BN, BM), T.int32)
             T.clear(acc)
-            for group in T.Pipelined(K // BK, num_stages=2):
+            for group in T.Pipelined(K // BK, num_stages=stages):
                 T.copy(A[by * BM, group * BK], activation)
                 for n, j in T.Parallel(BN, BK // 4):
                     decoded[n, j] = 0
@@ -150,5 +153,35 @@ def q4_projection(
                     Out[by * BM + i, bx * BN + n] = (
                         T.cast(acc[n, i], T.float32) * T.cast(S[bx * BN + n], T.float32)
                     ) * T.cast(AS[by * BM + i], T.float32)
+
+    return main
+
+
+@orin_jit
+def unpack_q4(N: int, K: int, magnitudes=MAGNITUDES):
+    """Expand one projection into caller-owned, temporary INT8 storage.
+
+    Packed INT32 stores preserve the exact signed integer codebook. Scales and
+    rotations stay with the consuming projection; no new quantization occurs.
+    """
+    validate_shape(1, N, K)
+    source = decode_source(magnitudes)
+    words = N * (K // 4)
+
+    @T.prim_func
+    def main(
+        W: T.Tensor((N, K // 4), T.uint16),
+        Output: T.Tensor((N, K // 4), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(words, 256), threads=128) as block:
+            T.import_source(source)
+            for offset in T.Parallel(256):
+                word = block * 256 + offset
+                if word < words:
+                    n, k = word // (K // 4), word % (K // 4)
+                    Output[n, k] = T.cast(
+                        T.call_pure_extern("uint32", "q4_decode", T.cast(W[n, k], T.uint32)),
+                        T.int32,
+                    )
 
     return main

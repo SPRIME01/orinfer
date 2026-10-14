@@ -80,7 +80,7 @@ impl ModelRuntime {
             Ok(value)
         };
         for q in &requests.requests {
-            let (chunk_tokens, prefill_program, head_program) =
+            let (chunk_tokens, prefill_program, _) =
                 manifest.select_prefill_plan(q.input_tokens.len())?;
             eprintln!(
                 "request {}: {} input, {} output tokens",
@@ -101,6 +101,13 @@ impl ModelRuntime {
             let mut tokens = vec![];
             let mut logits_files = vec![];
             for (chunk_index, chunk) in q.input_tokens.chunks(chunk_tokens).enumerate() {
+                let (_, program, _) = manifest.select_prefill_plan(chunk.len())?;
+                if let Some(controls) = &manifest.segment_controls {
+                    self.execution
+                        .upload_ids(&controls.length, &[chunk.len() as u32])?;
+                    self.execution
+                        .upload_ids(&controls.last_index, &[(chunk.len() - 1) as u32])?;
+                }
                 // SAFETY: Input IDs fit this allocation and were range checked.
                 // Previous graph is complete before overwriting its input buffer.
                 unsafe {
@@ -122,7 +129,11 @@ impl ModelRuntime {
                     }
                     check(
                         sys::cuMemcpyHtoD_v2(
-                            pointers[&manifest.input],
+                            pointers[if chunk.len() == 1 {
+                                &manifest.token
+                            } else {
+                                &manifest.input
+                            }],
                             chunk.as_ptr().cast(),
                             chunk.len() * 4,
                         ),
@@ -136,8 +147,11 @@ impl ModelRuntime {
                     &q.input_tokens[..chunk_index * chunk_tokens],
                     |name, data| self.execution.upload_bytes(name, data),
                 )?;
-                self.execution
-                    .submit_program(prefill_program, ExecutionPhase::Prefill)?;
+                self.execution.submit_program_rows(
+                    program,
+                    chunk.len(),
+                    ExecutionPhase::Prefill,
+                )?;
             }
             // SAFETY: Synchronize before head timing and output download.
             unsafe {
@@ -145,8 +159,10 @@ impl ModelRuntime {
             }
             let prefill_s = request_start.elapsed().as_secs_f64();
             let head_start = Instant::now();
+            let last_rows = (q.input_tokens.len() - 1) % chunk_tokens + 1;
+            let (_, _, head_program) = manifest.select_prefill_plan(last_rows)?;
             self.execution
-                .submit_program(head_program, ExecutionPhase::Prefill)?;
+                .submit_program_rows(head_program, last_rows, ExecutionPhase::Prefill)?;
             // SAFETY: Head consumes last prefill graph's buffers on the same stream.
             unsafe {
                 check(sys::cuStreamSynchronize(s.stream), "head complete")?;

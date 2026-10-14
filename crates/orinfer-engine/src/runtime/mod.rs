@@ -144,6 +144,30 @@ impl ModelRuntime {
     fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
         self.prepare_program_inputs("target", tokens, history)
     }
+    fn prepare_verification_inputs(
+        &self,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> Result<()> {
+        // Dynamic prefill and exact verification can have the same logical
+        // row count with different physical input arenas. Let the registered
+        // model choose the verification arena from its execution program.
+        let program = if self.manifest.row_execution.is_some() {
+            program
+        } else {
+            "target"
+        };
+        self.prepare_program_inputs(program, tokens, history)
+    }
+    fn prepare_batch_target_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
+        let program = if self.manifest.row_execution.is_some() {
+            "batch_target"
+        } else {
+            "target"
+        };
+        self.prepare_program_inputs(program, tokens, history)
+    }
     fn prepare_program_inputs(&self, program: &str, tokens: &[u32], history: &[u32]) -> Result<()> {
         self.model_package
             .prepare_inputs(program, tokens, history, |name, bytes| {
@@ -164,6 +188,10 @@ impl ModelRuntime {
     }
     fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.execution.launch_program(name, phase)
+    }
+    fn launch_rows(&self, name: &str, rows: usize, phase: ExecutionPhase) -> Result<()> {
+        self.execution.submit_program_rows(name, rows, phase)?;
+        self.execution.sync()
     }
     fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
         self.execution.upload_ids(name, ids)

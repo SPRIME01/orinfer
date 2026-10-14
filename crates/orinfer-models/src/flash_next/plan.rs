@@ -152,6 +152,16 @@ pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel
                 .find(|k| &k.name == name)
                 .map(|k| Ok(k.args.clone()))
                 .unwrap_or_else(|| crate::bindings::kernel_arguments(name))?;
+            let args: Vec<_> = args
+                .into_iter()
+                .filter(|a| {
+                    matches!(
+                        a,
+                        crate::artifact::Argument::Buffer { .. }
+                            | crate::artifact::Argument::BufferSlice { .. }
+                    )
+                })
+                .collect();
             let indices: &[usize] = if name.contains("/layer1/") {
                 // PLE's input A8 projection is prepared in the preceding
                 // section. Its row scales remain live with the activation.
@@ -221,16 +231,21 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         return Err("Unsupported Flash scheduling/features contract".into());
     }
     let widths: BTreeSet<_> = profiles.iter().map(|p| p.tokens).collect();
+    let dynamic = profiles.len() == 1
+        && profiles[0].tokens == 4096
+        && profiles[0].min_tokens == 2
+        && profiles[0].kind == "flash_dynamic_recurrent";
     let base = BTreeSet::from([16, 128, 512, 2048, 4096]);
-    if !base.is_subset(&widths)
-        || widths
-            .iter()
-            .any(|n| !base.contains(n) && !(2..16).contains(n))
-        || widths.len() != profiles.len()
-        || profiles.iter().any(|p| {
-            p.kind != "flash_recurrent"
-                || (p.min_tokens != 0 && (p.tokens != 512 || p.min_tokens != 129))
-        })
+    if !dynamic
+        && (!base.is_subset(&widths)
+            || widths
+                .iter()
+                .any(|n| !base.contains(n) && !(2..16).contains(n))
+            || widths.len() != profiles.len()
+            || profiles.iter().any(|p| {
+                p.kind != "flash_recurrent"
+                    || (p.min_tokens != 0 && (p.tokens != 512 || p.min_tokens != 129))
+            }))
     {
         return Err(
             "Flash package needs registered 16/128/512/2048/4096 recurrent profiles".into(),

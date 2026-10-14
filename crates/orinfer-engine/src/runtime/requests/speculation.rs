@@ -437,7 +437,11 @@ impl ModelRuntime {
             self.execution
                 .ensure_sequence_program(req.slot, &round.plan.program)?;
             self.upload_ids(&self.manifest.input, &round.verification)?;
-            self.prepare_inputs(&round.verification, &req.history[..req.history.len() - 1])?;
+            self.prepare_verification_inputs(
+                &round.plan.program,
+                &round.verification,
+                &req.history[..req.history.len() - 1],
+            )?;
             self.upload_segment_controls(round.plan.tokens)?;
             segments.push(BatchSegment {
                 slot: req.slot,
@@ -955,7 +959,11 @@ impl ModelRuntime {
         let verification = &round.verification;
         let at = Instant::now();
         self.upload_ids(&self.manifest.input, verification)?;
-        self.prepare_inputs(verification, &req.history[..req.history.len() - 1])?;
+        self.prepare_verification_inputs(
+            &plan.program,
+            verification,
+            &req.history[..req.history.len() - 1],
+        )?;
         self.upload_segment_controls(plan.tokens)?;
         self.launch_program(&plan.program, ExecutionPhase::Decode)?;
         self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;

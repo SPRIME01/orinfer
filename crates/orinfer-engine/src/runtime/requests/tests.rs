@@ -16,6 +16,10 @@ struct Fixture {
     batches: Vec<usize>,
     #[serde(default)]
     mtp_drafts: Option<usize>,
+    /// A fixed verification protocol isolates cache restoration from adaptive
+    /// choices between ordinary decode and different verification widths.
+    #[serde(default)]
+    verification_tokens: Option<usize>,
     #[serde(default = "numerical_tokens")]
     numerical_tokens: usize,
 }
@@ -205,6 +209,18 @@ fn validate_mtp_partial_prefix() {
         memory_reserve_bytes: 0,
         ..scheduler::Options::default()
     };
+    let advance = |model: &mut ModelRuntime, request: &mut RequestState| {
+        if !request.prefilling
+            && let Some(width) = fixture.verification_tokens
+        {
+            assert!((2..=8).contains(&width));
+            let tokens =
+                model.with_request(request, |m, r| m.speculative_request_step(r, width))?;
+            Ok(vec![StepOutput { request: 0, tokens }])
+        } else {
+            model.advance_requests(&mut [request], &options)
+        }
+    };
     let mut rows = vec![];
     for &checkpoint in &fixture.checkpoint_tokens {
         eprintln!("Validate partial prefix at {checkpoint}");
@@ -232,7 +248,7 @@ fn validate_mtp_partial_prefix() {
         cold.checkpoints.insert(checkpoint);
         let mut reference = vec![];
         while !cold.is_finished() {
-            for step in model.advance_requests(&mut [&mut cold], &options).unwrap() {
+            for step in advance(&mut model, &mut cold).unwrap() {
                 reference.extend(step.tokens);
             }
         }
@@ -243,9 +259,7 @@ fn validate_mtp_partial_prefix() {
         let mut populate = model.start_request(input(&source, 16), &|| false).unwrap();
         populate.checkpoints.insert(checkpoint);
         while !populate.is_finished() {
-            model
-                .advance_requests(&mut [&mut populate], &options)
-                .unwrap();
+            advance(&mut model, &mut populate).unwrap();
         }
         model.finish_request(&mut populate, true).unwrap();
         let entry = model
@@ -276,10 +290,7 @@ fn validate_mtp_partial_prefix() {
         assert_eq!(restored.warm.tokens, checkpoint);
         let mut actual = vec![];
         while !restored.is_finished() {
-            for step in model
-                .advance_requests(&mut [&mut restored], &options)
-                .unwrap()
-            {
+            for step in advance(&mut model, &mut restored).unwrap() {
                 actual.extend(step.tokens);
             }
         }
@@ -1044,7 +1055,11 @@ fn validate_flash_mtp() {
                     }
                     model.upload_ids(&model.manifest.input, &changed).unwrap();
                     model
-                        .prepare_inputs(&changed, &req.history[..req.history.len() - 1])
+                        .prepare_verification_inputs(
+                            &verify.program,
+                            &changed,
+                            &req.history[..req.history.len() - 1],
+                        )
                         .unwrap();
                     model.upload_segment_controls(verify.tokens).unwrap();
                     model

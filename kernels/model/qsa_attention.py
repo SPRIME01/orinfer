@@ -34,8 +34,13 @@ def sparse_attention(
     single_buffer: bool = False,
     split_size: int | None = 256,
     logical_rows: bool = False,
+    dynamic_rows: bool = False,
+    skip_empty: bool = False,
 ):
     geometry(m, capacity)
+    from kernels.model.rows import row_extent
+
+    m, _, control = row_extent(m, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
     if splits not in (1, 2, 4, 8):
         raise ValueError("Invalid QSA splits")
     # Selected contains at most 512 four-token blocks plus three pending
@@ -275,9 +280,48 @@ def sparse_attention(
                     Max[row, kh * 12 + i, split] = maximum[i]
                     Den[row, kh * 12 + i, split] = denom[i]
 
-    if logical_rows:
-        from kernels.model.logical_rows import bind, extent, guard
+    if type(skip_empty) is not bool:
+        raise ValueError("Invalid QSA empty partition policy")
+    if skip_empty:
+        if split_size is None or split_size <= 0:
+            raise ValueError("Empty partition elision requires fixed QSA boundaries")
+        from tvm import tirx as tir
 
-        _, control = extent(m, True)
+        axes = {}
+
+        def axis(node):
+            if isinstance(node, tir.For) and node.thread_binding is not None:
+                axes[node.thread_binding.thread_tag] = node.loop_var
+
+        tir.stmt_functor.post_order_visit(main.body, axis)
+        position = next(b for b in main.buffer_map.values() if b.name == "Position")
+        cursor = tir.BufferLoad(position, [0]) + axes["blockIdx.x"] + 1
+        length = tir.min(tir.floordiv(cursor, 4), 512) * 4 + tir.floormod(cursor, 4)
+
+        def wrap(node):
+            if isinstance(node, tir.SBlock) and node.name_hint == "tilelang_root":
+                return tir.SBlock(
+                    node.iter_vars,
+                    node.reads,
+                    node.writes,
+                    node.name_hint,
+                    tir.IfThenElse(axes["blockIdx.z"] * split_size < length, node.body, None),
+                    node.init,
+                    node.alloc_buffers,
+                    node.match_buffers,
+                    node.annotations,
+                )
+            return None
+
+        main = tir.PrimFunc(
+            main.params,
+            tir.stmt_functor.ir_transform(main.body, None, wrap),
+            main.ret_type,
+            main.buffer_map,
+            main.attrs,
+        )
+    if logical_rows:
+        from kernels.model.logical_rows import bind, guard
+
         return bind(guard(main, control, "x"), control, True)
     return main

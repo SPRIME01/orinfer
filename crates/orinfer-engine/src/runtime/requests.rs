@@ -785,13 +785,9 @@ impl ModelRuntime {
             &req.input[..req.offset],
         )?;
         self.upload_segment_controls(chunk)?;
-        self.launch_program(&program, ExecutionPhase::Prefill)?;
+        self.launch_rows(&program, chunk, ExecutionPhase::Prefill)?;
         if let Some(spec) = &self.manifest.mtp {
-            self.mtp_capture(
-                spec,
-                plan.map_or(chunk, |p| p.chunk_tokens),
-                ExecutionPhase::Prefill,
-            )?;
+            self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
         }
         let regular_s = at.elapsed().as_secs_f64()
             - (self.execution.batch_statistics.get().kernel_load_s - load_before);
@@ -799,7 +795,7 @@ impl ModelRuntime {
             || req.checkpoints.contains(&(req.offset + chunk)))
             && let Some(head) = head
         {
-            self.launch_program(&head, ExecutionPhase::Prefill)?;
+            self.launch_rows(&head, chunk, ExecutionPhase::Prefill)?;
         }
         let tokens = self.after_prefill(req, chunk)?;
         let seconds = at.elapsed().as_secs_f64();
@@ -1742,13 +1738,18 @@ impl ModelRuntime {
                 )?;
             }
             self.upload_segment_controls(chunk)?;
-            let program = if chunk == 1 {
+            let program = if let Some(program) = self
+                .manifest
+                .batch_layout
+                .as_ref()
+                .and_then(|layout| layout.preparation_programs.get(&chunk))
+            {
+                program.clone()
+            } else if chunk == 1 {
                 "decode".into()
             } else {
                 self.manifest
-                    .prefill_plans
-                    .iter()
-                    .find(|p| p.chunk_tokens == chunk)
+                    .prefill_plan(chunk)
                     .ok_or("Missing prefill program shape")?
                     .prefill_program
                     .clone()
@@ -1763,7 +1764,7 @@ impl ModelRuntime {
                 let last = req.history.len() - 1;
                 (&req.history[last..], &req.history[..last])
             };
-            self.prepare_inputs(tokens, history)?;
+            self.prepare_batch_target_inputs(tokens, history)?;
         }
         if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
             segments.len() <= table.max_rows && segments.iter().any(|s| s.tokens == 1)

@@ -369,17 +369,42 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             format!("verify_m{}", s.tokens)
         } else if s.tokens == 1 {
             "decode".into()
+        } else if m.row_execution.is_some() {
+            format!(
+                "prefill_m{}",
+                m.prefill_plan(s.tokens)
+                    .ok_or("Missing mixed prefill template")?
+                    .chunk_tokens
+            )
         } else {
             format!("prefill_m{}", s.tokens)
         };
         if m.vision.is_some() {
-            out.push(invoke(
-                Operation::Kernel {
-                    name: format!("{program}/begin/k0"),
-                },
+            let mut input_views = empty.clone();
+            if !verified(s) && s.tokens > 1 && m.row_execution.is_some() {
+                input_views.insert(
+                    "M4096_Embedding".into(),
+                    BufferView {
+                        buffer: format!("M{width}_Embedding"),
+                        offset: 0,
+                    },
+                );
+            }
+            let name = format!("{program}/begin/k0");
+            let mut invocation = invoke(
+                Operation::Kernel { name: name.clone() },
                 Some(s.slot),
-                &empty,
-            ));
+                &input_views,
+            );
+            if m.row_execution.is_some() && !verified(s) && s.tokens > 1 {
+                invocation.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(&name)
+                        .ok_or("Missing mixed overlay template contract")?
+                        .launch(s.tokens)?,
+                );
+            }
+            out.push(invocation);
         }
         let mut views: BTreeMap<_, _> = layout
             .row_strides
@@ -575,13 +600,21 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     }
     let mut head_lane = 0;
     for (s, (first, program, views)) in segments.iter().zip(&starts) {
-        out.push(invoke(
-            Operation::Kernel {
-                name: format!("{program}/end/k0"),
-            },
+        let name = format!("{program}/end/k0");
+        let mut invocation = invoke(
+            Operation::Kernel { name: name.clone() },
             Some(s.slot),
             &empty,
-        ));
+        );
+        if m.row_execution.is_some() && !verified(s) && s.tokens > 1 {
+            invocation.launch = Some(
+                m.dynamic_batch_kernels
+                    .get(&name)
+                    .ok_or("Missing mixed position template contract")?
+                    .launch(s.tokens)?,
+            );
+        }
+        out.push(invocation);
         if m.mtp.is_some() {
             append(
                 &mut out,

@@ -17,8 +17,27 @@ impl ModelRuntime {
             .capture_plans
             .iter()
             .find(|p| p.tokens == tokens)
+            .or_else(|| {
+                let template = self.manifest.prefill_plan(tokens)?;
+                spec.capture_plans
+                    .iter()
+                    .find(|p| p.tokens == template.chunk_tokens)
+            })
+            .or_else(|| {
+                spec.capture_plans
+                    .iter()
+                    .filter(|p| {
+                        p.tokens >= tokens
+                            && self
+                                .manifest
+                                .row_execution
+                                .as_ref()
+                                .is_some_and(|rows| rows.programs.contains(&p.program))
+                    })
+                    .min_by_key(|p| p.tokens)
+            })
             .ok_or("Missing MTP hidden capture shape")?;
-        self.launch_program(&plan.program, phase)
+        self.launch_rows(&plan.program, tokens, phase)
     }
     pub(super) fn mtp_warm(
         &self,
@@ -191,7 +210,11 @@ impl ModelRuntime {
             verification_input.extend_from_slice(&drafts);
             let at = Instant::now();
             self.upload_ids(&self.manifest.input, &verification_input)?;
-            self.prepare_inputs(&verification_input, &history[..history.len() - 1])?;
+            self.prepare_verification_inputs(
+                &plan.program,
+                &verification_input,
+                &history[..history.len() - 1],
+            )?;
             self.upload_segment_controls(plan.tokens)?;
             self.launch_program(&plan.program, ExecutionPhase::Decode)?;
             self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;

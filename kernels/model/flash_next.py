@@ -22,14 +22,17 @@ def dense_projection(
     output_dtype: str = "float16",
     dynamic_rows: bool = False,
     block_n: int = 64,
+    block_m: int = 16,
 ):
     """FP16 input, FP16/BF16 weights, FP32 accumulation; optional F32 output."""
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 64:
         raise ValueError("Invalid dense projection dimensions")
     if weight_dtype not in ("float16", "bfloat16") or output_dtype not in ("float16", "float32"):
         raise ValueError("Invalid dense projection dtype")
-    if type(block_n) is not int or block_n not in (32, 64):
+    if type(block_n) is not int or block_n not in (32, 64, 128):
         raise ValueError("Invalid dense projection output tile")
+    if type(block_m) is not int or block_m not in (16, 32, 64, 128):
+        raise ValueError("Invalid dense projection row tile")
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -38,17 +41,19 @@ def dense_projection(
         Weight: T.Tensor((N, K), weight_dtype),
         Output: T.Tensor((M, N), output_dtype),
     ):
-        with T.Kernel(T.ceildiv(M, 16), T.ceildiv(N, block_n), threads=128) as (by, bx):
-            a = T.alloc_shared((16, 64), weight_dtype)
+        with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=128) as (by, bx):
+            a = T.alloc_shared((block_m, 64), weight_dtype)
             w = T.alloc_shared((block_n, 64), weight_dtype)
-            acc = T.alloc_fragment((16, block_n), T.float32)
+            acc = T.alloc_fragment((block_m, block_n), T.float32)
             T.clear(acc)
             for kg in T.Pipelined(K // 64, num_stages=2):
-                for i, j in T.Parallel(16, 64, coalesced_width=T.int32(1)):
-                    a[i, j] = T.if_then_else(by * 16 + i < M, A[by * 16 + i, kg * 64 + j], 0.0)
+                for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
+                    a[i, j] = T.if_then_else(
+                        by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0
+                    )
                 T.copy(Weight[bx * block_n, kg * 64], w)
                 T.gemm(a, w, acc, transpose_B=True)
-            T.copy(acc, Output[by * 16, bx * block_n])
+            T.copy(acc, Output[by * block_m, bx * block_n])
 
     return main
 
@@ -271,6 +276,7 @@ def qsa_prepare(
     staged: bool = False,
     mrope: bool = False,
     logical_rows: bool = False,
+    dynamic_rows: bool = False,
 ):
     """Normalize Q/K, text RoPE, append private KV and copy gate.
 
@@ -290,6 +296,9 @@ def qsa_prepare(
     if theta <= 1 or not 0 < eps < 1 or type(is_neox_style) is not bool:
         raise ValueError("Invalid QSA rotation/normalization")
     size = 1 << (width - 1).bit_length()
+    from kernels.model.rows import row_extent
+
+    M, _, control = row_extent(M, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
     cache_rows = M if staged else capacity
 
     @T.macro
@@ -402,9 +411,8 @@ def qsa_prepare(
             )
 
     if logical_rows:
-        from kernels.model.logical_rows import bind, extent, guard
+        from kernels.model.logical_rows import bind, guard
 
-        _, control = extent(M, True)
         return bind(guard(main, control, "x"), control, True)
     return main
 

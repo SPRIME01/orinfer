@@ -25,6 +25,7 @@ def gdn_conv_prep(
     weight_dtype: str = "float16",
     compact_decode: bool = False,
     inplace_history: bool = False,
+    dynamic_tokens: bool = False,
 ):
     """Build (X,W,HI,lengths,positions,Q,K,V,HO,positions_out).
 
@@ -59,7 +60,9 @@ def gdn_conv_prep(
     if compact_decode:
         tile_tokens = 1
     batch = T.dynamic("batch") if B is None else B
-    time = T.dynamic("tokens") if tokens is None else tokens
+    if type(dynamic_tokens) is not bool or dynamic_tokens and (B != 1 or compact_decode):
+        raise ValueError("Dynamic token strides require single-request prefill")
+    time = T.dynamic("m") if dynamic_tokens else T.dynamic("tokens") if tokens is None else tokens
 
     @T.macro
     def body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out):

@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind, extent
+from kernels.model.logical_rows import bind
 
 
 @orin_jit
@@ -41,11 +41,21 @@ def selections(rows: int):
 
 
 @orin_jit
-def capture(rows: int, width: int, ring: int = 512, logical_rows: bool = False):
+def capture(
+    rows: int,
+    width: int,
+    ring: int = 512,
+    logical_rows: bool = False,
+    dynamic_rows: bool = False,
+):
     """Preserve raw Flash HC branches after advancing the target cursor."""
-    if not 1 <= rows <= ring or width <= 0:
+    if rows < 1 or ring < 1 or width <= 0 or (rows > ring and not dynamic_rows):
         raise ValueError("Target capture must fit the hidden ring")
-    count, control = extent(rows, logical_rows)
+    from kernels.model.rows import row_extent
+
+    rows, count, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
+    stored = T.min(count, ring) if dynamic_rows else rows
+    start = count - stored if dynamic_rows else 0
 
     @T.prim_func
     def kernel(
@@ -53,7 +63,8 @@ def capture(rows: int, width: int, ring: int = 512, logical_rows: bool = False):
         Position: T.Tensor((1,), T.int32),
         Ring: T.Tensor((ring, width), T.float16),
     ):
-        with T.Kernel(rows, T.ceildiv(width, 256), threads=128) as (row, block):
+        with T.Kernel(stored, T.ceildiv(width, 256), threads=128) as (local_row, block):
+            row = start + local_row
             for j in T.Parallel(256):
                 col = block * 256 + j
                 if col < width and row < count:
@@ -63,8 +74,10 @@ def capture(rows: int, width: int, ring: int = 512, logical_rows: bool = False):
 
 
 @orin_jit
-def last_hidden(rows: int, width: int, logical_rows: bool = False):
-    count, control = extent(rows, logical_rows)
+def last_hidden(rows: int, width: int, logical_rows: bool = False, dynamic_rows: bool = False):
+    from kernels.model.rows import row_extent
+
+    rows, count, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
 
     @T.prim_func
     def kernel(

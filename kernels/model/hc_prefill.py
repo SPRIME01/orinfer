@@ -78,7 +78,12 @@ def hc_norm_prefill(
 
 @orin_jit
 def hc_combine_norm_prefill(
-    M: int, H: int, streams: int = 4, eps: float = 1e-6, dtype: str = "float16"
+    M: int,
+    H: int,
+    streams: int = 4,
+    eps: float = 1e-6,
+    dtype: str = "float16",
+    dynamic_rows: bool = False,
 ):
     """Combine residuals and normalize, retaining the rounded residual output.
 
@@ -92,6 +97,7 @@ def hc_combine_norm_prefill(
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)) or not 0 < eps < 1:
         raise ValueError("Invalid HC combination/normalization dimensions")
     width = 1 << (H - 1).bit_length()
+    M = row_count(M, dynamic_rows)
 
     @T.prim_func
     def hc_prefill_combine_norm(
@@ -244,7 +250,17 @@ def hc_projection_prefill(
 
 
 @orin_jit
-def hc_up_mix_prefill(M, H, rank, block_m=128, block_n=32, stages=2):
+def hc_up_mix_prefill(
+    M,
+    H,
+    rank,
+    block_m=128,
+    block_n=32,
+    stages=2,
+    dynamic_rows=False,
+    aligned_rows=False,
+    padded_inputs=False,
+):
     if (
         any(type(x) is not int or x <= 0 for x in (M, H, rank, block_m, block_n, stages))
         or block_m not in (16, 32, 64, 128)
@@ -255,6 +271,14 @@ def hc_up_mix_prefill(M, H, rank, block_m=128, block_n=32, stages=2):
     ):
         raise ValueError("Invalid HC prefill up/mix dimensions or pipeline")
     BM, BN = block_m, block_n
+    M = row_count(M, dynamic_rows)
+    if type(aligned_rows) is not bool or aligned_rows and not dynamic_rows:
+        raise ValueError("Aligned HC views require a symbolic row contract")
+    if type(padded_inputs) is not bool or padded_inputs and (not dynamic_rows or aligned_rows):
+        raise ValueError("Padded HC inputs require a distinct symbolic row contract")
+    logical_rows = M
+    if aligned_rows or padded_inputs:
+        M = T.ceildiv(M, BM) * BM
 
     @T.prim_func
     def hc_prefill_up_mix(
@@ -263,7 +287,7 @@ def hc_up_mix_prefill(M, H, rank, block_m=128, block_n=32, stages=2):
         Residual: T.Tensor((M, 4, H), T.float16),
         Weight: T.Tensor((4, H), T.float32),
         InvRms: T.Tensor((M, 4), T.float32),
-        Out: T.Tensor((M, H), T.float16),
+        Out: T.Tensor((logical_rows if padded_inputs else M, H), T.float16),
     ):
         with T.Kernel(T.ceildiv(M, BM), H // BN, threads=128) as (by, bx):
             T.import_source(HALF_MATH)
@@ -293,7 +317,7 @@ def hc_up_mix_prefill(M, H, rank, block_m=128, block_n=32, stages=2):
             T.clear(total)
             for branch in T.serial(4):
                 for i, j in T.Parallel(BM, BN, coalesced_width=T.int32(1)):
-                    if by * BM + i < M:
+                    if aligned_rows or padded_inputs or by * BM + i < M:
                         normed = T.cast(
                             T.cast(Residual[by * BM + i, branch, bx * BN + j], T.float32)
                             * inv[i, branch]
@@ -308,7 +332,68 @@ def hc_up_mix_prefill(M, H, rank, block_m=128, block_n=32, stages=2):
                         )
                         total[i, j] += T.cast(product, T.float32)
             for i, j in T.Parallel(BM, BN):
-                if by * BM + i < M:
+                if aligned_rows or by * BM + i < logical_rows:
                     Out[by * BM + i, bx * BN + j] = total[i, j] / 4
 
     return hc_prefill_up_mix
+
+
+@orin_jit
+def hc_projection_partial(M: int, N: int, K: int, dynamic_rows: bool = False):
+    """Project four streams independently, preserving each K accumulation."""
+    if any(type(n) is not int or n <= 0 for n in (M, N, K)) or K % 256:
+        raise ValueError("Invalid HC stream projection geometry")
+    M = row_count(M, dynamic_rows)
+    BM, BN = 128, 128
+
+    @T.prim_func
+    def hc_prefill_partial(
+        A: T.Tensor((M, K), T.bfloat16),
+        W: T.Tensor((N, K), T.bfloat16),
+        P: T.Tensor((4, M, N), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN), 4, threads=128) as (by, bx, branch):
+            a = T.alloc_shared((BM, 64), T.bfloat16)
+            w = T.alloc_shared((BN, 64), T.bfloat16)
+            acc = T.alloc_fragment((BM, BN), T.float32)
+            T.clear(acc)
+            for kg in T.Pipelined(K // 256, num_stages=2):
+                offset = branch * (K // 4) + kg * 64
+                T.copy(A[by * BM, offset], a)
+                T.copy(W[bx * BN, offset], w)
+                T.gemm(a, w, acc, transpose_B=True)
+            for i, j in T.Parallel(BM, BN):
+                if by * BM + i < M and bx * BN + j < N:
+                    P[branch, by * BM + i, bx * BN + j] = acc[i, j]
+
+    return hc_prefill_partial
+
+
+@orin_jit
+def hc_projection_finish(M: int, N: int, dynamic_rows: bool = False):
+    """Sum in stream order, then retain the FP16 SiLU/BF16 boundary."""
+    if any(type(n) is not int or n <= 0 for n in (M, N)):
+        raise ValueError("Invalid HC stream finish geometry")
+    M = row_count(M, dynamic_rows)
+
+    @T.prim_func
+    def hc_prefill_finish(
+        P: T.Tensor((4, M, N), T.float32),
+        C: T.Tensor((M, N), T.bfloat16),
+    ):
+        with T.Kernel(T.ceildiv(M * N, 128), threads=128) as bx:
+            total = T.alloc_fragment((128,), T.float32)
+            T.clear(total)
+            for stream in T.serial(4):
+                for i in T.Parallel(128):
+                    index = bx * 128 + i
+                    if index < M * N:
+                        total[i] += P[stream, index // N, index % N]
+            for i in T.Parallel(128):
+                index = bx * 128 + i
+                if index < M * N:
+                    rounded = T.cast(total[i], T.float16)
+                    v = T.cast(T.cast(T.cast(rounded, T.float32) / 4, T.float16), T.float32)
+                    C[index // N, index % N] = T.cast(v / (1 + T.exp(-v)), T.float16)
+
+    return hc_prefill_finish

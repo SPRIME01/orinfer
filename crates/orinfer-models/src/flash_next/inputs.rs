@@ -14,6 +14,34 @@ use std::{
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
+
+/// Execution purpose selects the arena, independently of the logical row count.
+/// Shared batch packets and exact MTP verification retain their own input views.
+pub(super) fn layout<'a>(
+    prefill: &[crate::model::PrefillPlan],
+    verification: &[orinfer_model_sdk::mtp::VerificationPlan],
+    program: &'a str,
+    tokens: usize,
+) -> Result<(&'a str, usize)> {
+    if let Some(plan) = verification.iter().find(|p| p.program == program) {
+        if plan.tokens != tokens {
+            return Err("Verification input extent does not match its program".into());
+        }
+        return Ok(("target", tokens));
+    }
+    if program == "batch_target" {
+        return Ok(("target", tokens));
+    }
+    if program == "target" {
+        let capacity = prefill
+            .iter()
+            .filter(|p| p.accepts(tokens))
+            .min_by_key(|p| p.chunk_tokens)
+            .map_or(tokens, |p| p.chunk_tokens);
+        return Ok((program, capacity));
+    }
+    Ok((program, tokens))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Book {
@@ -507,6 +535,53 @@ fn decode(packet: &[u8], table: &Table) -> Result<Vec<u16>> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_purpose_separates_overlapping_input_shapes() {
+        let prefill = [crate::model::PrefillPlan {
+            chunk_tokens: 4096,
+            min_tokens: 2,
+            prefill_program: "prefill".into(),
+            head_program: "head".into(),
+            stages: vec![],
+            live_buffers: vec![],
+        }];
+        let verification: Vec<_> = (2..=8)
+            .map(|tokens| orinfer_model_sdk::mtp::VerificationPlan {
+                tokens,
+                program: format!("verify_m{tokens}"),
+                restore_program: format!("restore_m{tokens}"),
+                capture_program: format!("capture_m{tokens}"),
+            })
+            .collect();
+        for plan in &verification {
+            assert_eq!(
+                layout(&prefill, &verification, "target", plan.tokens).unwrap(),
+                ("target", 4096)
+            );
+            assert_eq!(
+                layout(&prefill, &verification, &plan.program, plan.tokens).unwrap(),
+                ("target", plan.tokens)
+            );
+            assert!(layout(&prefill, &verification, &plan.program, plan.tokens + 1).is_err());
+        }
+        assert_eq!(
+            layout(&prefill, &verification, "batch_target", 128).unwrap(),
+            ("target", 128)
+        );
+        assert_eq!(
+            layout(&prefill, &verification, "target", 421).unwrap(),
+            ("target", 4096)
+        );
+        assert_eq!(
+            layout(&prefill, &verification, "target", 1).unwrap(),
+            ("target", 1)
+        );
+        assert_eq!(
+            layout(&prefill, &verification, "mtp_warm_m4", 4).unwrap(),
+            ("mtp_warm_m4", 4)
+        );
+    }
+
     use super::*;
     use safetensors::tensor::TensorView;
     use std::sync::atomic::{AtomicU64, Ordering};

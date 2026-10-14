@@ -11,6 +11,7 @@ mod parallel;
 mod plan;
 mod q4;
 mod routing;
+mod row_variants;
 mod vision;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
 use orinfer_model_sdk::{
@@ -102,13 +103,17 @@ impl Adapter for Flash {
         tokens: &[u32],
         history: &[u32],
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let capacity = if program == "target" {
-            self.manifest
-                .prefill_plan(tokens.len())
-                .map_or(tokens.len(), |p| p.chunk_tokens)
-        } else {
-            tokens.len()
-        };
+        let verification = self
+            .manifest
+            .mtp
+            .as_ref()
+            .map_or(&[][..], |s| s.verification_plans.as_slice());
+        let (program, capacity) = inputs::layout(
+            &self.manifest.prefill_plans,
+            verification,
+            program,
+            tokens.len(),
+        )?;
         self.inputs.prepare_for(program, tokens, history, capacity)
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
@@ -194,6 +199,80 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
     plan::stages(&mut request.metadata, &request.kernel_contracts)?;
+    if request
+        .prefill_profiles
+        .iter()
+        .any(|p| p.kind == "flash_dynamic_recurrent")
+    {
+        let manifest = &mut request.metadata;
+        // Source binding slots describe compiled implementations. Only the
+        // canonical template and its resumable stages remain public programs.
+        manifest.programs.remove("prefill_m4096");
+        manifest.programs.remove("head_m4096");
+        if let Some(kv) = &mut manifest.kv_cache {
+            kv.growth.remove("prefill_m4096");
+        }
+        let plan = manifest
+            .prefill_plans
+            .first_mut()
+            .ok_or("Missing dynamic prefill template")?;
+        plan.prefill_program = "prefill".into();
+        plan.head_program = "head".into();
+        for stage in &mut plan.stages {
+            let name = stage.replace("prefill_m4096/", "prefill/");
+            let operations = manifest
+                .programs
+                .remove(stage)
+                .ok_or("Missing dynamic prefill stage")?;
+            manifest.programs.insert(name.clone(), operations);
+            if let Some(kv) = &mut manifest.kv_cache
+                && let Some(growth) = kv.growth.remove(stage)
+            {
+                kv.growth.insert(name.clone(), growth);
+            }
+            *stage = name;
+        }
+        let mut programs = std::collections::BTreeSet::from(["prefill".into(), "head".into()]);
+        programs.extend(plan.stages.iter().cloned());
+        if manifest.mtp.is_some() {
+            programs.insert("mtp_capture_m4096".into());
+        }
+        let variants = row_variants::build(&request.kernel_contracts, &manifest.buffers)?;
+        manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
+            capacity: 4096,
+            programs,
+            variants,
+        });
+        if let Some(layout) = &mut manifest.batch_layout
+            && !layout.profiles.is_empty()
+        {
+            let kv = manifest
+                .kv_cache
+                .as_mut()
+                .ok_or("Missing batch KV metadata")?;
+            let base = kv
+                .growth
+                .get("decode")
+                .ok_or("Missing decode KV growth")?
+                .clone();
+            layout.preparation_programs.insert(1, "decode".into());
+            for &tokens in layout.profiles.keys() {
+                let program = format!("flash_segment_m{tokens}/layer3/private");
+                if !manifest.programs.contains_key(&program) {
+                    return Err("Missing batch causal preparation program".into());
+                }
+                let mut growth = base.clone();
+                growth.tokens = tokens;
+                growth.length = None;
+                growth
+                    .buffers
+                    .retain(|name| !kv.prefill_workspace.contains_key(name));
+                growth.buffers.push(plan::score_role(tokens, "Target"));
+                kv.growth.insert(program.clone(), growth);
+                layout.preparation_programs.insert(tokens, program);
+            }
+        }
+    }
     if let Some(spec) = &mut request.metadata.mtp {
         spec.mixed_verification_tokens = if !spec.batch_verification_tokens.is_empty()
             && !request.metadata.prefill_batch_profiles.is_empty()

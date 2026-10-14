@@ -548,6 +548,7 @@ mod tests {
             profiles: Default::default(),
             small_mixed_shapes: vec![],
             state_columns: vec![],
+            preparation_programs: BTreeMap::new(),
         });
         for rows in PROFILES {
             for (name, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
@@ -590,6 +591,61 @@ mod tests {
         }
         register(&mut m).unwrap();
         m
+    }
+    #[test]
+    fn mixed_endpoints_use_dynamic_prefill_template_at_segment_extent() {
+        use orinfer_model_sdk::operators::dynamic::{
+            DynamicBatchKernel, RowArgument, RowExpression,
+        };
+        let mut m = mixed_manifest();
+        m.prefill_plans = vec![crate::model::PrefillPlan {
+            chunk_tokens: 4096,
+            min_tokens: 2,
+            prefill_program: "prefill".into(),
+            head_program: "head".into(),
+            stages: vec![],
+            live_buffers: vec![],
+        }];
+        m.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
+            capacity: 4096,
+            programs: BTreeSet::new(),
+            variants: BTreeMap::new(),
+        });
+        let name = "prefill_m4096/end/k0";
+        m.dynamic_batch_kernels.insert(
+            name.into(),
+            DynamicBatchKernel {
+                name: name.into(),
+                capacity: 4096,
+                grid: std::array::from_fn(|_| RowExpression::Constant { value: 1 }),
+                arguments: vec![RowArgument {
+                    index: 1,
+                    value: RowExpression::Rows,
+                }],
+            },
+        );
+        let segments = [
+            BatchSegment {
+                slot: 7,
+                tokens: 128,
+            },
+            BatchSegment {
+                slot: 3,
+                tokens: 16,
+            },
+        ];
+        let plan = plan(&m, &segments).unwrap();
+        for segment in segments {
+            let endpoint = plan.iter().find(|invocation| {
+                invocation.sequence == Some(segment.slot)
+                    && matches!(&invocation.operation, Operation::Kernel { name: n } if n == name)
+            }).unwrap();
+            assert_eq!(
+                endpoint.launch.as_ref().unwrap().arguments,
+                [(1, segment.tokens as i32)]
+            );
+        }
+        assert!(!plan.iter().any(|invocation| matches!(&invocation.operation, Operation::Kernel { name } if name.starts_with("prefill_m16/") || name.starts_with("prefill_m128/"))));
     }
     #[test]
     fn mixed_prefill_and_decode_share_layer_weights_and_gather_only_endpoints() {

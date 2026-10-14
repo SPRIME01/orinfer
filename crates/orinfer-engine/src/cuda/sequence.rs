@@ -36,6 +36,74 @@ pub(super) struct Sequence {
 }
 
 impl Executor {
+    /// Bind actual rows to an AOT template. Unseen lengths only specialize
+    /// CPU launch parameters; they do not introduce modules or online compilation.
+    pub(crate) fn submit_program_rows(
+        &self,
+        name: &str,
+        rows: usize,
+        phase: crate::execution::ExecutionPhase,
+    ) -> Result<()> {
+        let direct = self.direct.as_ref().ok_or("Missing row program bindings")?;
+        let Some(template) = direct
+            .row_execution
+            .as_ref()
+            .filter(|s| s.programs.contains(name))
+        else {
+            return self.submit_program(name, phase);
+        };
+        self.ensure_kv(name)?;
+        let operations = {
+            let mut cache = direct.row_cache.borrow_mut();
+            if let Some(index) = cache.iter().position(|(n, m, _)| n == name && *m == rows) {
+                let entry = cache.remove(index).expect("cached row program");
+                let operations = entry.2.clone();
+                cache.push_back(entry);
+                operations
+            } else {
+                let program = direct.programs.get(name).ok_or("Missing row template")?;
+                let operations = std::rc::Rc::new(template.specialize(
+                    name,
+                    program,
+                    &direct.row_kernels,
+                    rows,
+                )?);
+                while cache.len() >= 128
+                    || cache.iter().map(|(_, _, ops)| ops.len()).sum::<usize>() + operations.len()
+                        > 65536
+                {
+                    if cache.pop_front().is_none() {
+                        break;
+                    }
+                }
+                if operations.len() <= 65536 {
+                    cache.push_back((name.into(), rows, operations.clone()));
+                }
+                operations
+            }
+        };
+        self.ensure_invocation_kernels(&operations)?;
+        for invocation in operations.iter() {
+            match &invocation.operation {
+                Operation::Copy {
+                    destination, bytes, ..
+                }
+                | Operation::Zero { destination, bytes } => {
+                    self.ensure_writable_range(destination, 0, *bytes)?;
+                }
+                _ => {}
+            }
+        }
+        if self.cuda_graph.uses_graph(phase) {
+            self.invoke_shared_pieces(&operations, true)
+        } else {
+            for invocation in operations.iter() {
+                self.invoke(invocation)?;
+            }
+            Ok(())
+        }
+    }
+
     /// Upload an architecture-supplied pointer table. Addresses are derived only
     /// from retained, leased arenas; null entries are inactive lanes. The upload
     /// finishes before capture/replay and cannot change arena ownership.

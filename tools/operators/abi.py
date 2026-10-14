@@ -88,6 +88,14 @@ def evaluate(expression, variables):
             return node.value
         if isinstance(node, ast.Name):
             return variables[node.id]
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "min"
+            and len(node.args) == 2
+            and not node.keywords
+        ):
+            return min(walk(node.args[0]), walk(node.args[1]))
         if isinstance(node, ast.UnaryOp):
             if isinstance(node.op, ast.USub):
                 return -walk(node.operand)

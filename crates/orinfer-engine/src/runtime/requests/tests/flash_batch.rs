@@ -1022,7 +1022,8 @@ fn validate_flash_batched_verification() {
                 .upload_ids(&model.manifest.input, &round.verification)
                 .unwrap();
             model
-                .prepare_inputs(
+                .prepare_verification_inputs(
+                    &round.plan.program,
                     &round.verification,
                     &request.history[..request.history.len() - 1],
                 )

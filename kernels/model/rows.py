@@ -13,6 +13,22 @@ def row_count(capacity, dynamic=False):
     return T.dynamic("m")
 
 
+def row_extent(capacity, *, dynamic_rows=False, logical_rows=False):
+    """Separate tensor rows from a padded arena's device-resident extent.
+
+    Dynamic rows describe a compact view whose strides follow the host scalar
+    m. Logical rows retain capacity strides and read Length on the device.
+    Mixing those contracts would silently address transposed tensors wrongly.
+    """
+    from kernels.model.logical_rows import extent
+
+    if dynamic_rows and logical_rows:
+        raise ValueError("Dynamic strides and padded logical rows are exclusive")
+    count, control = extent(capacity, logical_rows)
+    rows = row_count(capacity, dynamic_rows)
+    return rows, rows if dynamic_rows else count, control
+
+
 def explicit_rows(function):
     """Keep m in the exported host ABI, including affine-only tensor shapes."""
     from tvm import tirx as tir
@@ -23,7 +39,17 @@ def explicit_rows(function):
         if isinstance(node, tir.Var) and node.name == "m":
             variables.add(node)
 
-    tir.stmt_functor.post_order_visit(function.body, visit)
+    for parameter in function.params:
+        if parameter.name == "m" and parameter.dtype != "handle":
+            return function
+    for buffer in function.buffer_map.values():
+        for expression in [*buffer.shape, *buffer.strides]:
+            tir.stmt_functor.post_order_visit(expression, visit)
+    if not variables:
+        # Local lane/index variables may also be named m. Only free scalars
+        # can become a host argument; tensor geometry is authoritative first.
+        for variable in tir.analysis.undefined_vars(function.body, list(function.params)):
+            visit(variable)
     if len(variables) != 1:
         raise ValueError("Expected one symbolic row scalar")
     (rows,) = variables

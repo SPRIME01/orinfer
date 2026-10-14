@@ -192,6 +192,7 @@ pub(super) fn register(
             .map(|p| p.tokens)
             .collect(),
         state_columns: vec![],
+        preparation_programs: BTreeMap::new(),
     });
     Ok(())
 }
@@ -675,6 +676,7 @@ mod tests {
             hidden: 8,
             small_mixed_shapes: vec![2, 32],
             state_columns: vec![],
+            preparation_programs: BTreeMap::new(),
         });
         let mut section = |program: &str, name: &str, count: usize| {
             m.programs

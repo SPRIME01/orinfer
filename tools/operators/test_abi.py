@@ -46,6 +46,13 @@ class ActualAbiTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             evaluate("undefined + 1", {})
 
+    def test_bounded_ring_grid_is_arithmetic_without_general_calls(self):
+        self.assertEqual(evaluate("min(rows, 512)", {"rows": 17}), 17)
+        self.assertEqual(evaluate("min(rows, 512)", {"rows": 1025}), 512)
+        for expression in ("max(rows, 512)", "min(rows)", "min(rows, limit=512)"):
+            with self.assertRaises(ValueError):
+                evaluate(expression, {"rows": 17})
+
     def test_missing_symbolic_scalar_is_rejected_before_cuda_launch(self):
         host = parse_host(HOST)[0]
         source = 'extern "C" __global__ void main_kernel(half* C, const half* A, int rows);'

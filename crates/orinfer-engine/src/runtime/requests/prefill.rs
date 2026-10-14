@@ -105,18 +105,18 @@ impl ModelRuntime {
             self.scheduler_statistics.layered_prefill_iterations += 1;
             if stage < frame.plan.stages.len() {
                 self.upload_segment_controls(chunk)?;
-                self.launch_program(&frame.plan.stages[stage], ExecutionPhase::Prefill)?;
+                self.launch_rows(&frame.plan.stages[stage], chunk, ExecutionPhase::Prefill)?;
                 frame.next += 1;
                 frame.regular_s += began.elapsed().as_secs_f64()
                     - (self.execution.batch_statistics.get().kernel_load_s - load_before);
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
-                        self.mtp_capture(spec, frame.plan.chunk_tokens, ExecutionPhase::Prefill)?;
+                        self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
                     }
                     if req.offset + chunk == req.input.len()
                         || req.checkpoints.contains(&(req.offset + chunk))
                     {
-                        self.launch_program(&frame.plan.head_program, ExecutionPhase::Prefill)?;
+                        self.launch_rows(&frame.plan.head_program, chunk, ExecutionPhase::Prefill)?;
                     }
                 }
             } else if let Some(spec) = self.manifest.mtp.clone() {

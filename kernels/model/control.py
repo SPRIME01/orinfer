@@ -2,7 +2,7 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.logical_rows import bind, extent
+from kernels.model.logical_rows import bind
 
 
 @orin_jit
@@ -24,8 +24,10 @@ def prepare(rows: int):
 
 
 @orin_jit
-def advance(rows: int, logical_rows: bool = False):
-    count, control = extent(rows, logical_rows)
+def advance(rows: int, logical_rows: bool = False, dynamic_rows: bool = False):
+    from kernels.model.rows import row_extent
+
+    rows, count, control = row_extent(rows, dynamic_rows=dynamic_rows, logical_rows=logical_rows)
 
     @T.prim_func
     def kernel(Step: T.Tensor((1,), T.int32)):
@@ -33,4 +35,8 @@ def advance(rows: int, logical_rows: bool = False):
             if T.get_thread_binding() == 0:
                 Step[0] = Step[0] + count
 
+    if dynamic_rows:
+        from kernels.model.rows import explicit_rows
+
+        kernel = explicit_rows(kernel)
     return bind(kernel, control, logical_rows)

@@ -84,7 +84,7 @@ def expert_offsets(E: int = 512, block_m: int = 16):
 
 
 @orin_jit
-def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16):
+def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16, dynamic_rows=False):
     """Build (Counts, TileOffsets, TileExpert, TileRow), all INT32.
 
     Output capacity ceil(M*top_k/block_m)+min(E,M*top_k) bounds all distributions.
@@ -94,9 +94,8 @@ def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16):
         raise ValueError("Invalid MoE tile dimensions")
     assignments = M * top_k
     capacity = (assignments + block_m - 1) // block_m + min(E, assignments)
-    expert_capacity = (
-        M + block_m - 1
-    ) // block_m  # Each expert is selected at most once per token.
+    M = row_count(M, dynamic_rows)
+    expert_capacity = (M + block_m - 1) // block_m
 
     @T.prim_func
     def main(
@@ -324,8 +323,8 @@ def expert_histogram_local(
         or block not in (512, 1024, 2048)
     ):
         raise ValueError("Invalid segmented MoE histogram geometry")
-    segments = (M * K + block - 1) // block
     M = row_count(M, dynamic_rows)
+    segments = (M * K + block - 1) // block
     count = logical_count if logical_rows else M
 
     @T.prim_func
@@ -355,7 +354,7 @@ def expert_histogram_local(
 
 
 @orin_jit
-def expert_histogram_offsets(M, E=512, K=10, block=1024):
+def expert_histogram_offsets(M, E=512, K=10, block=1024, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (M, E, K, block))
         or K > E
@@ -364,6 +363,8 @@ def expert_histogram_offsets(M, E=512, K=10, block=1024):
         raise ValueError("Invalid segmented MoE histogram geometry")
     segments = (M * K + block - 1) // block
     width = 1 << (segments - 1).bit_length()
+    M = row_count(M, dynamic_rows)
+    segments = (M * K + block - 1) // block
 
     @T.prim_func
     def main(
@@ -400,8 +401,8 @@ def expert_histogram_finish(
         or block not in (512, 1024, 2048)
     ):
         raise ValueError("Invalid segmented MoE histogram geometry")
-    segments = (M * K + block - 1) // block
     M = row_count(M, dynamic_rows)
+    segments = (M * K + block - 1) // block
     count = logical_count if logical_rows else M
     assignments = M * K
 

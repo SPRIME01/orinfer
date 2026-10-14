@@ -35,10 +35,19 @@ pub(super) struct DirectKernel {
     pub(super) function: Option<sys::CUfunction>,
     pub(super) values: Vec<Value>,
 }
+pub(super) type RowProgramCache = std::collections::VecDeque<(
+    String,
+    usize,
+    std::rc::Rc<Vec<crate::execution::Invocation>>,
+)>;
 
 pub(super) struct DirectPrograms {
     pub(super) kernels: RefCell<BTreeMap<String, DirectKernel>>,
     pub(super) programs: BTreeMap<String, Vec<crate::model::Operation>>,
+    pub(super) row_execution: Option<orinfer_model_sdk::operators::rows::RowExecution>,
+    pub(super) row_kernels:
+        BTreeMap<String, orinfer_model_sdk::operators::dynamic::DynamicBatchKernel>,
+    pub(super) row_cache: RefCell<RowProgramCache>,
 }
 
 /// Execute an architecture adapter's explicit programs with stable allocations.
@@ -433,6 +442,9 @@ impl Executor {
         let direct = Some(DirectPrograms {
             kernels: RefCell::new(launches),
             programs: manifest.programs.clone(),
+            row_execution: manifest.row_execution.clone(),
+            row_kernels: manifest.dynamic_batch_kernels.clone(),
+            row_cache: RefCell::default(),
         });
         let load_to_ready_s = started.elapsed().as_secs_f64();
         let captured_programs: Vec<String> = graphs.keys().cloned().collect();
