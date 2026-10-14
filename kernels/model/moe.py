@@ -468,7 +468,7 @@ def route_metadata(M: int, E: int = 512, top_k: int = 10, block_m: int = 8, dyna
     Only live assignments are scanned. Unique top-k IDs bound each expert's
     count by M, and each tile is written by its expert without atomics.
     """
-    if not 1 <= M <= 128 or E != 512 or top_k != 10 or block_m not in (8, 16):
+    if not 1 <= M <= 1024 or E != 512 or top_k != 10 or block_m not in (8, 16):
         raise ValueError("Invalid decode route metadata geometry")
     capacity = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
     M = row_count(M, dynamic_rows)

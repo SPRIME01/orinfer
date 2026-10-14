@@ -217,6 +217,34 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             dead.remove(name);
         }
     }
+    if let Some(rows) = &mut manifest.row_execution {
+        rows.programs
+            .retain(|name| manifest.programs.contains_key(name));
+        rows.program_capacities
+            .retain(|name, _| rows.programs.contains(name));
+        let slots: BTreeSet<_> = rows
+            .programs
+            .iter()
+            .flat_map(|name| &manifest.programs[name])
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        rows.variants.retain(|slot, variants| {
+            if slots.contains(slot) {
+                true
+            } else {
+                dead.extend(variants.iter().flat_map(|v| v.kernels.iter().cloned()));
+                false
+            }
+        });
+        for variants in rows.variants.values() {
+            for name in variants.iter().flat_map(|v| &v.kernels) {
+                dead.remove(name);
+            }
+        }
+    }
     manifest
         .kernels
         .retain(|kernel| !dead.contains(&kernel.name));

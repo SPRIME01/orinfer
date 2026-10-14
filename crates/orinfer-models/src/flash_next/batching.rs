@@ -109,6 +109,16 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     if super::unified_decode::present(m) {
         return super::unified_decode::register(m);
     }
+    register_build_inputs(m)
+}
+
+/// Expand current compiler staging bindings. These intermediate shapes feed
+/// mixed/MTP construction and unify_decode.py, and have no serving planner.
+fn register_build_inputs(m: &mut Manifest) -> Result<()> {
+    let layout = m
+        .batch_layout
+        .as_ref()
+        .ok_or("Missing Flash batch layout")?;
     for rows in PROFILES {
         for (name, stride) in &layout.row_strides {
             let role = format!("BatchM{rows}_{name}");
@@ -130,7 +140,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
                 super::plan::section(&format!("flash_batch_m{rows}"), &section, count, None),
             );
         }
-        if !columns.is_empty() {
+        if !layout.state_columns.is_empty() {
             for layer in 0..48 {
                 let prefix = format!("flash_private_m{rows}");
                 m.programs.insert(
@@ -150,7 +160,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         if m.dynamic_batch_kernels
             .contains_key(&format!("{prefix}/begin/k0"))
         {
-            if columns.is_empty() {
+            if layout.state_columns.is_empty() {
                 return Err("Dynamic Flash batches require parallel private mixers".into());
             }
             for (section, count) in stages(rows) {
@@ -214,8 +224,8 @@ pub(super) fn state_bindings(
     {
         return Err("Flash private table requires distinct single-token requests".into());
     }
-    if segments.len() <= 1 && !super::unified_decode::present(m) {
-        return Ok(vec![]);
+    if !super::unified_decode::present(m) {
+        return Err("Flash decode requires the unified state table".into());
     }
     let names: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
     let roles: Vec<_> = (0..48)
@@ -227,12 +237,8 @@ pub(super) fn state_bindings(
             })
         })
         .collect();
-    let rows = if super::unified_decode::present(m) {
-        128
-    } else {
-        segments.len().next_power_of_two()
-    };
-    let mut result = Vec::with_capacity(rows * roles.len());
+    let rows = super::unified_decode::CAPACITY;
+    let mut result = Vec::with_capacity(rows * (roles.len() + 10));
     for lane in 0..rows {
         if let Some(segment) = segments.get(lane) {
             result.extend(
@@ -244,26 +250,24 @@ pub(super) fn state_bindings(
             result.extend(std::iter::repeat_n(None, roles.len()));
         }
     }
-    if super::unified_decode::present(m) {
-        let io = [
-            Some("M1_Embedding".to_owned()),
-            Some("M1_Ple".to_owned()),
-            Some(m.position.clone()),
-            Some(m.token.clone()),
-            Some(m.status.clone()),
-            Some(m.logits.clone()),
-            m.vision.as_ref().map(|_| "Features".into()),
-            m.vision.as_ref().map(|_| "FeatureIndex".into()),
-            m.mtp.as_ref().map(|_| "MtpHiddenRing".into()),
-            Some("State_ple".into()),
-        ];
-        for lane in 0..128 {
-            result.extend(io.iter().map(|name| {
-                segments
-                    .get(lane)
-                    .and_then(|s| name.as_ref().map(|name| (s.slot, name.clone())))
-            }));
-        }
+    let io = [
+        Some("M1_Embedding".to_owned()),
+        Some("M1_Ple".to_owned()),
+        Some(m.position.clone()),
+        Some(m.token.clone()),
+        Some(m.status.clone()),
+        Some(m.logits.clone()),
+        m.vision.as_ref().map(|_| "Features".into()),
+        m.vision.as_ref().map(|_| "FeatureIndex".into()),
+        m.mtp.as_ref().map(|_| "MtpHiddenRing".into()),
+        Some("State_ple".into()),
+    ];
+    for lane in 0..128 {
+        result.extend(io.iter().map(|name| {
+            segments
+                .get(lane)
+                .and_then(|s| name.as_ref().map(|name| (s.slot, name.clone())))
+        }));
     }
     Ok(result)
 }
@@ -280,25 +284,6 @@ fn invocation(
         launch: None,
     }
 }
-fn append(
-    out: &mut Vec<Invocation>,
-    m: &Manifest,
-    name: &str,
-    sequence: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Result<()> {
-    let ops = m
-        .programs
-        .get(name)
-        .ok_or_else(|| format!("Missing Flash batch stage {name}"))?;
-    out.extend(
-        ops.iter()
-            .cloned()
-            .map(|op| invocation(op, sequence, views)),
-    );
-    Ok(())
-}
-
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
     if segments.iter().any(|s| s.tokens != 1) {
         return super::mixed::plan(m, segments);
@@ -315,240 +300,12 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
     {
         return Err("Flash batch needs 1..128 distinct single-token sequences".into());
     }
-    if super::unified_decode::present(m) {
-        return unified_plan(m, segments);
+    if !super::unified_decode::present(m) {
+        return Err(
+            "Flash decode requires the unified row template; finalize the execution package".into(),
+        );
     }
-    if segments.len() == 1 {
-        return Ok(m.programs["decode"]
-            .iter()
-            .cloned()
-            .map(|op| invocation(op, Some(segments[0].slot), &BTreeMap::new()))
-            .chain(m.mtp.as_ref().into_iter().flat_map(|_| {
-                m.programs["mtp_capture_m1"]
-                    .iter()
-                    .cloned()
-                    .map(|op| invocation(op, Some(segments[0].slot), &BTreeMap::new()))
-            }))
-            .collect());
-    }
-    let dynamic_capacity = segments.len().next_power_of_two();
-    let dynamic = !PROFILES.contains(&segments.len())
-        && m.dynamic_batch_kernels
-            .contains_key(&format!("flash_dynamic_m{dynamic_capacity}/begin/k0"));
-    let rows = if dynamic {
-        dynamic_capacity
-    } else {
-        *m.batch_profiles
-            .iter()
-            .find(|&&r| r >= segments.len())
-            .ok_or("Missing Flash batch profile")?
-    };
-    let layout = m.batch_layout.as_ref().ok_or("Missing Flash row layout")?;
-    let prefix = format!(
-        "flash_{}_m{rows}",
-        if dynamic { "dynamic" } else { "batch" }
-    );
-    let fixed_prefix = format!("flash_batch_m{rows}");
-    let empty = BTreeMap::new();
-    let views: Vec<_> = (0..segments.len())
-        .map(|lane| {
-            layout
-                .row_strides
-                .iter()
-                .map(|(name, stride)| {
-                    (
-                        format!("BatchM{rows}_{name}"),
-                        BufferView {
-                            buffer: format!("BatchM{rows}_{name}"),
-                            offset: lane * stride,
-                        },
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .collect();
-    let mut out = vec![];
-    for (lane, segment) in segments.iter().enumerate() {
-        if m.vision.is_some() {
-            out.push(invocation(
-                Operation::Kernel {
-                    name: "decode/begin/k0".into(),
-                },
-                Some(segment.slot),
-                &empty,
-            ));
-        }
-        for name in ["M1_Embedding", "M1_Ple"] {
-            out.push(invocation(
-                Operation::Copy {
-                    source: name.into(),
-                    destination: format!("BatchM{rows}_{name}"),
-                    bytes: 5120,
-                },
-                Some(segment.slot),
-                &views[lane],
-            ));
-        }
-    }
-    if !dynamic && rows > segments.len() {
-        // Private mixers do not write inactive lanes. Clear their row roles as
-        // well, so shrinking a batch cannot reuse stale/nonfinite activations.
-        for (name, stride) in &layout.row_strides {
-            if matches!(name.as_str(), "Logits" | "Selected") {
-                continue;
-            }
-            let name = format!("BatchM{rows}_{name}");
-            let pad = BTreeMap::from([(
-                name.clone(),
-                BufferView {
-                    buffer: name.clone(),
-                    offset: segments.len() * stride,
-                },
-            )]);
-            out.push(invocation(
-                Operation::Zero {
-                    destination: name,
-                    bytes: (rows - segments.len()) * stride,
-                },
-                None,
-                &pad,
-            ));
-        }
-    }
-    append(&mut out, m, &format!("{prefix}/begin"), None, &empty)?;
-    for layer in 0..48 {
-        let private = &m.programs[&format!("{fixed_prefix}/layer{layer}/private")];
-        let mut first = 0;
-        if layer == 1 {
-            append(&mut out, m, &format!("{prefix}/layer1/ple"), None, &empty)?;
-            for (lane, s) in segments.iter().enumerate() {
-                out.extend(
-                    private[..2]
-                        .iter()
-                        .cloned()
-                        .map(|op| invocation(op, Some(s.slot), &views[lane])),
-                );
-            }
-            first = 2;
-        }
-        append(
-            &mut out,
-            m,
-            &format!("{prefix}/layer{layer}/pre"),
-            None,
-            &empty,
-        )?;
-        if !layout.state_columns.is_empty() {
-            append(
-                &mut out,
-                m,
-                &format!("flash_private_m{rows}/layer{layer}"),
-                None,
-                &empty,
-            )?;
-        } else {
-            for (lane, s) in segments.iter().enumerate() {
-                for (i, op) in private[first..].iter().enumerate() {
-                    out.push(invocation(op.clone(), Some(s.slot), &views[lane]));
-                    if layer % 4 != 3 && i == 0 {
-                        out.push(invocation(
-                            Operation::Copy {
-                                source: "M1_HistoryOut".into(),
-                                destination: format!("State_{layer}_conv"),
-                                bytes: 61440,
-                            },
-                            Some(s.slot),
-                            &empty,
-                        ));
-                    }
-                }
-            }
-        }
-        append(
-            &mut out,
-            m,
-            &format!("{prefix}/layer{layer}/post"),
-            None,
-            &empty,
-        )?;
-    }
-    for (lane, s) in segments.iter().enumerate() {
-        out.push(invocation(
-            Operation::Kernel {
-                name: "decode/end/k0".into(),
-            },
-            Some(s.slot),
-            &empty,
-        ));
-        if let Some(spec) = &m.mtp {
-            let capture = spec
-                .capture_plans
-                .iter()
-                .find(|p| p.tokens == 1)
-                .ok_or("Missing Flash MTP capture")?;
-            let capture_views = layout
-                .row_strides
-                .iter()
-                .map(|(name, stride)| {
-                    (
-                        name.clone(),
-                        BufferView {
-                            buffer: format!("BatchM{rows}_{name}"),
-                            offset: lane * stride,
-                        },
-                    )
-                })
-                .collect();
-            append(&mut out, m, &capture.program, Some(s.slot), &capture_views)?;
-        }
-    }
-    append(&mut out, m, &format!("{prefix}/head"), None, &empty)?;
-    for (lane, s) in segments.iter().enumerate() {
-        let mut copy = views[lane].clone();
-        let pair = format!("BatchM{rows}_Selected");
-        out.push(invocation(
-            Operation::Copy {
-                source: format!("BatchM{rows}_Logits"),
-                destination: m.logits.clone(),
-                bytes: m.vocab * 4,
-            },
-            Some(s.slot),
-            &copy,
-        ));
-        for (offset, destination) in [(0, &m.token), (4, &m.status)] {
-            copy.insert(
-                pair.clone(),
-                BufferView {
-                    buffer: pair.clone(),
-                    offset: lane * 8 + offset,
-                },
-            );
-            out.push(invocation(
-                Operation::Copy {
-                    source: pair.clone(),
-                    destination: destination.clone(),
-                    bytes: 4,
-                },
-                Some(s.slot),
-                &copy,
-            ));
-        }
-    }
-    if dynamic {
-        for op in &mut out {
-            if let Operation::Kernel { name } = &op.operation
-                && (name.starts_with("flash_dynamic_") || name.starts_with("flash_private_"))
-            {
-                op.launch = Some(
-                    m.dynamic_batch_kernels
-                        .get(name)
-                        .ok_or("Missing dynamic Flash invocation contract")?
-                        .launch(segments.len())?,
-                );
-            }
-        }
-    }
-    Ok(out)
+    unified_plan(m, segments)
 }
 
 fn unified_plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
@@ -633,22 +390,102 @@ mod tests {
             state_columns: vec![],
             preparation_programs: BTreeMap::new(),
         });
-        for rows in PROFILES {
-            for (name, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
-                m.buffers.push(serde_json::from_value(serde_json::json!({
-                    "name":format!("BatchM{rows}_{name}"),"dtype":"u8","shape":[rows*stride],"layout":"native_contiguous",
+        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
+        for (name, dtype, shape) in [
+            ("Position".to_owned(), "i32", vec![1]),
+            (POINTERS.to_owned(), "u64", vec![128 * (48 + 10)]),
+        ] {
+            m.buffers.push(
+                serde_json::from_value(serde_json::json!({
+                    "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
                     "alignment":256,"access":"read_write","data":null
-                })).unwrap());
+                }))
+                .unwrap(),
+            );
+        }
+        for (role, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
+            m.buffers.push(
+                serde_json::from_value(serde_json::json!({
+                    "name":format!("FlashDecode_{role}"),"dtype":"u8","shape":[128*stride],
+                    "layout":"native_contiguous","alignment":256,"access":"read_write","data":null
+                }))
+                .unwrap(),
+            );
+        }
+        for packet in ["inputs", "end", "outputs"] {
+            let name = format!("flash_decode/packet/{packet}");
+            m.dynamic_batch_kernels
+                .insert(name.clone(), dynamic(&name, 128));
+        }
+        let entry = "flash_decode/begin/k0";
+        m.dynamic_batch_kernels
+            .insert(entry.into(), dynamic(entry, 128));
+        let variant = format!("{entry}/rows/1-128");
+        m.dynamic_batch_kernels
+            .insert(variant.clone(), dynamic(&variant, 128));
+        register(&mut m).unwrap();
+        m.programs.remove("flash_decode/local");
+        m.prefill_plans = vec![crate::model::PrefillPlan {
+            chunk_tokens: 4096,
+            min_tokens: 1,
+            prefill_program: "prefill".into(),
+            head_program: "head".into(),
+            stages: vec![],
+            live_buffers: vec![],
+        }];
+        let endpoint = "prefill_m4096/end/k0";
+        m.dynamic_batch_kernels
+            .insert(endpoint.into(), dynamic(endpoint, 4096));
+        let programs = m
+            .programs
+            .keys()
+            .filter(|name| name.starts_with("flash_decode/"))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        m.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
+            capacity: 128,
+            program_capacities: BTreeMap::new(),
+            programs,
+            variants: BTreeMap::from([(
+                entry.into(),
+                vec![orinfer_model_sdk::operators::rows::KernelVariant {
+                    min_rows: 1,
+                    max_rows: 128,
+                    multiple_of: 1,
+                    kernels: vec![variant],
+                }],
+            )]),
+        });
+        for ops in m.programs.values() {
+            for op in ops {
+                if let Operation::Kernel { name } = op {
+                    m.dynamic_batch_kernels
+                        .insert(name.clone(), dynamic(name, 128));
+                }
             }
         }
-        m.programs.insert(
-            "decode".into(),
-            vec![Operation::Kernel {
-                name: "decode/end/k0".into(),
-            }],
-        );
-        register(&mut m).unwrap();
         m
+    }
+    fn dynamic(
+        name: &str,
+        capacity: usize,
+    ) -> orinfer_model_sdk::operators::dynamic::DynamicBatchKernel {
+        use orinfer_model_sdk::operators::dynamic::{
+            DynamicBatchKernel, RowArgument, RowExpression,
+        };
+        DynamicBatchKernel {
+            name: name.into(),
+            capacity,
+            grid: [
+                RowExpression::Constant { value: 1 },
+                RowExpression::Constant { value: 1 },
+                RowExpression::Rows,
+            ],
+            arguments: vec![RowArgument {
+                index: 0,
+                value: RowExpression::Rows,
+            }],
+        }
     }
     fn mixed_manifest() -> Manifest {
         let mut m = manifest();
@@ -674,6 +511,82 @@ mod tests {
         }
         register(&mut m).unwrap();
         m
+    }
+    #[test]
+    fn shared_mixed_body_uses_live_rows_and_gathers_the_common_residual() {
+        let mut m = mixed_manifest();
+        for (name, kernel) in &mut m.dynamic_batch_kernels {
+            if name.starts_with("flash_decode/")
+                && !name.contains("/packet/")
+                && !name.starts_with("flash_decode/head/")
+            {
+                kernel.capacity = 1024;
+            }
+        }
+        for buffer in &mut m.buffers {
+            if buffer.name.starts_with("FlashDecode_")
+                && !matches!(
+                    buffer.name.as_str(),
+                    "FlashDecode_Logits" | "FlashDecode_Selected"
+                )
+            {
+                buffer.shape[0] *= 8;
+            }
+        }
+        let rows = m.row_execution.as_mut().unwrap();
+        rows.capacity = 4096;
+        for program in &rows.programs {
+            rows.program_capacities.insert(
+                program.clone(),
+                if program.contains("/packet/") || program.ends_with("/head") {
+                    128
+                } else {
+                    1024
+                },
+            );
+        }
+        for choice in rows.variants.values_mut().flatten() {
+            choice.max_rows = 1024;
+        }
+        let segments = [
+            BatchSegment {
+                slot: 7,
+                tokens: 512,
+            },
+            BatchSegment { slot: 3, tokens: 1 },
+            BatchSegment {
+                slot: 11,
+                tokens: 1,
+            },
+        ];
+        let plan = plan(&m, &segments).unwrap();
+        assert!(!plan.iter().any(|i|matches!(&i.operation,Operation::Kernel{name} if name.starts_with("flash_mixed_m") || name.starts_with("flash_mixed_head_m"))));
+        let begin=plan.iter().find(|i|matches!(&i.operation,Operation::Kernel{name} if name.starts_with("flash_decode/begin/"))).unwrap();
+        assert_eq!(begin.launch.as_ref().unwrap().arguments, [(0, 514)]);
+        let head = plan
+            .iter()
+            .find(
+                |i| matches!(&i.operation,Operation::Kernel{name} if name=="flash_decode/head/k0"),
+            )
+            .unwrap();
+        assert_eq!(head.launch.as_ref().unwrap().arguments, [(0, 3)]);
+        assert_eq!(
+            head.views["FlashDecode_Residual"].buffer,
+            "FlashMixedHeadResidual"
+        );
+        let endpoints:Vec<_>=plan.iter().filter(|i|matches!(&i.operation,Operation::Copy{source,destination,..} if source=="FlashMixedResidual" && destination=="FlashMixedHeadResidual")).collect();
+        assert_eq!(endpoints.len(), 3);
+        for endpoint in endpoints {
+            assert_eq!(
+                endpoint.views["FlashMixedResidual"].buffer,
+                "FlashDecode_Residual"
+            );
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|i| matches!(i.operation, Operation::Zero { .. }))
+        );
     }
     #[test]
     fn mixed_endpoints_use_dynamic_prefill_template_at_segment_extent() {
@@ -742,7 +655,9 @@ mod tests {
             BatchSegment { slot: 3, tokens: 1 },
         ];
         let plan = plan(&m, &segments).unwrap();
-        assert!(state_bindings(&m, &segments).unwrap().is_empty());
+        let bindings = state_bindings(&m, &segments).unwrap();
+        assert_eq!(bindings[0], Some((3, "Position".into())));
+        assert!(bindings[48..128 * 48].iter().all(Option::is_none));
         for layer in 0..48 {
             let prefix = format!("flash_mixed_m256/layer{layer}/pre/");
             assert_eq!(plan.iter().filter(|i| matches!(&i.operation, Operation::Kernel { name } if name.starts_with(&prefix))).count(), if layer%4==3 {10} else if layer==1 {12} else {11});
@@ -766,7 +681,6 @@ mod tests {
     }
     #[test]
     fn mixed_decoder_subgroups_share_private_kernels_and_preserve_table_ownership() {
-        use crate::operators::dynamic::{DynamicBatchKernel, RowExpression};
         let mut m = mixed_manifest();
         for (role, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
             let name = format!("FlashMixed_{role}");
@@ -780,39 +694,6 @@ mod tests {
                 );
             }
         }
-        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
-        for (name, dtype, shape) in [
-            ("Position", "i32", vec![1]),
-            (POINTERS, "u64", vec![128, 48, 1]),
-        ] {
-            m.buffers.push(
-                serde_json::from_value(serde_json::json!({
-                    "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
-                    "alignment":256,"access":"read_write","data":null
-                }))
-                .unwrap(),
-            );
-        }
-        register(&mut m).unwrap();
-        for layer in 0..48 {
-            for op in &m.programs[&format!("flash_private_m4/layer{layer}")] {
-                if let Operation::Kernel { name } = op {
-                    m.dynamic_batch_kernels.insert(
-                        name.clone(),
-                        DynamicBatchKernel {
-                            name: name.clone(),
-                            capacity: 4,
-                            grid: [
-                                RowExpression::Constant { value: 1 },
-                                RowExpression::Constant { value: 1 },
-                                RowExpression::Rows,
-                            ],
-                            arguments: vec![],
-                        },
-                    );
-                }
-            }
-        }
         for count in [2usize, 3, 4, 8] {
             let segments: Vec<_> = std::iter::once(BatchSegment {
                 slot: 99,
@@ -824,23 +705,25 @@ mod tests {
             }))
             .collect();
             let bindings = state_bindings(&m, &segments).unwrap();
-            assert_eq!(bindings.len(), count.next_power_of_two() * 48);
+            assert_eq!(bindings.len(), 128 * (48 + 10));
             for lane in 0..count {
                 assert_eq!(bindings[lane * 48], Some((20 + lane, "Position".into())));
             }
-            assert!(bindings[count * 48..].iter().all(Option::is_none));
+            assert!(bindings[count * 48..128 * 48].iter().all(Option::is_none));
             let plan = plan(&m, &segments).unwrap();
-            let private: Vec<_> = plan.iter().filter(|i| matches!(&i.operation, Operation::Kernel {name} if name.starts_with("flash_private_"))).collect();
+            let private: Vec<_> = plan.iter().filter(|i| matches!(&i.operation, Operation::Kernel {name} if name.starts_with("flash_decode_state/"))).collect();
             assert_eq!(private.len(), 36 * 3 + 12 * 19);
             assert!(private.iter().all(|i| i.sequence.is_none()));
-            assert!(private.iter().all(|i| {
-                i.views[&format!("BatchM{}_M1_Embedding", count.next_power_of_two())].offset == 0
-            }));
-            assert!(private.iter().all(|i| if count == 3 {
-                i.launch.as_ref().unwrap().grid[2] == 3
-            } else {
-                i.launch.is_none()
-            }));
+            assert!(
+                private
+                    .iter()
+                    .all(|i| { i.views["FlashDecode_M1_Embedding"].offset == 0 })
+            );
+            assert!(
+                private
+                    .iter()
+                    .all(|i| i.launch.as_ref().unwrap().grid[2] == count as u32)
+            );
             assert!(!plan.iter().any(|i| matches!(&i.operation, Operation::Kernel {name} if name.starts_with("flash_segment_m1/layer") && name.contains("/private/"))));
             let prefill = plan.iter().find(|i| matches!(&i.operation, Operation::Kernel {name} if name=="flash_segment_m128/layer0/private/k0")).unwrap();
             assert_eq!(prefill.sequence, Some(99));
@@ -1033,9 +916,9 @@ mod tests {
     }
 
     #[test]
-    fn batching_preserves_common_profiles_and_pads_only_shared_rows() {
+    fn decode_uses_actual_rows_without_padding_or_per_request_copies() {
         let m = manifest();
-        for count in [2, 3, 4, 5, 7, 8, 9, 16, 31, 32, 64, 127, 128] {
+        for count in [1, 2, 3, 4, 5, 7, 8, 9, 16, 31, 32, 33, 64, 127, 128] {
             let segments: Vec<_> = (0..count)
                 .map(|i| BatchSegment {
                     slot: i * 3 + 7,
@@ -1043,41 +926,41 @@ mod tests {
                 })
                 .collect();
             let p = plan(&m, &segments).unwrap();
-            let rows = count.next_power_of_two();
-            let recurrences:Vec<_>=p.iter().filter(|i| matches!(&i.operation,Operation::Kernel{name} if name==&format!("flash_batch_m{rows}/layer0/private/k1"))).collect();
-            assert_eq!(recurrences.len(), count);
-            for (lane, i) in recurrences.iter().enumerate() {
-                assert_eq!(i.sequence, Some(lane * 3 + 7));
+            assert!(p.iter().all(|i| i.sequence.is_none() && i.views.is_empty()));
+            assert!(
+                p.iter()
+                    .all(|i| matches!(i.operation, Operation::Kernel { .. }))
+            );
+            assert!(
+                p.iter()
+                    .all(|i| i.launch.as_ref().unwrap().grid[2] == count as u32)
+            );
+            assert!(
+                matches!(&p[0].operation, Operation::Kernel {name} if name=="flash_decode/packet/inputs")
+            );
+            assert!(
+                matches!(&p.last().unwrap().operation, Operation::Kernel {name} if name=="flash_decode/packet/outputs")
+            );
+            assert_eq!(p.iter().filter(|i| matches!(&i.operation, Operation::Kernel {name} if name=="flash_decode/begin/k0/rows/1-128")).count(),1);
+            let bindings = state_bindings(&m, &segments).unwrap();
+            for (lane, segment) in segments.iter().enumerate() {
+                assert_eq!(bindings[lane * 48], Some((segment.slot, "Position".into())));
                 assert_eq!(
-                    i.views[&format!("BatchM{rows}_Residual")].offset,
-                    lane * 20480
+                    bindings[128 * 48 + lane * 10],
+                    Some((segment.slot, "M1_Embedding".into()))
                 );
             }
-            let zeroes = p
-                .iter()
-                .filter(|i| matches!(i.operation, Operation::Zero { .. }))
-                .count();
-            assert_eq!(zeroes, if rows == count { 0 } else { 3 });
-            assert_eq!(p.iter().filter(|i| matches!(&i.operation,Operation::Kernel{name} if name==&format!("flash_batch_m{rows}/layer0/pre/k6")) && i.sequence.is_none()).count(),1);
-            assert_eq!(p.iter().filter(|i| matches!(&i.operation,Operation::Copy{destination,..} if destination=="Logits")).count(),count);
+            assert!(bindings[count * 48..128 * 48].iter().all(Option::is_none));
+            assert!(
+                bindings[128 * 48 + count * 10..]
+                    .iter()
+                    .all(Option::is_none)
+            );
         }
     }
     #[test]
-    fn slot_order_does_not_change_ownership_and_invalid_work_is_rejected() {
+    fn invalid_decode_work_and_incomplete_packages_are_rejected() {
         let m = manifest();
-        let p = plan(
-            &m,
-            &[
-                BatchSegment {
-                    slot: 19,
-                    tokens: 1,
-                },
-                BatchSegment { slot: 2, tokens: 1 },
-            ],
-        )
-        .unwrap();
-        let owners:Vec<_>=p.iter().filter(|i| matches!(&i.operation,Operation::Copy{destination,..} if destination=="State_0_conv")).map(|i|i.sequence).collect();
-        assert_eq!(owners, vec![Some(19), Some(2)]);
         for segments in [
             vec![],
             vec![BatchSegment { slot: 0, tokens: 2 }],
@@ -1096,22 +979,59 @@ mod tests {
             .row_strides
             .insert("M1_Ple".into(), 20480);
         assert!(register(&mut broken).is_err());
+        let mut incomplete = manifest();
+        incomplete
+            .dynamic_batch_kernels
+            .remove("flash_decode/begin/k0");
+        for count in [1, 2, 3, 8, 128] {
+            let segments: Vec<_> = (0..count)
+                .map(|slot| BatchSegment { slot, tokens: 1 })
+                .collect();
+            assert!(plan(&incomplete, &segments).is_err());
+            assert!(state_bindings(&incomplete, &segments).is_err());
+        }
     }
     #[test]
-    fn parallel_private_stages_keep_state_rows_and_padding_separate() {
+    fn compiler_inputs_expand_without_an_online_decode_fallback() {
         let mut m = manifest();
-        let columns = ["M1_HistoryOut", "Position", "State_conv", "State_gdn"];
-        m.batch_layout.as_mut().unwrap().state_columns =
-            columns.iter().map(|n| (*n).into()).collect();
-        for name in ["M1_HistoryOut", "Position"] {
-            m.buffers.push(
-                serde_json::from_value(serde_json::json!({
-                    "name":name,"dtype":"u8","shape":[4],"layout":"native_contiguous",
-                    "alignment":256,"access":"read_write","data":null
-                }))
-                .unwrap(),
-            );
+        m.row_execution = None;
+        m.dynamic_batch_kernels.clear();
+        m.programs.clear();
+        m.buffers
+            .iter_mut()
+            .find(|b| b.name == POINTERS)
+            .unwrap()
+            .shape = vec![128, 48, 1];
+        for rows in PROFILES {
+            for (name, stride) in &m.batch_layout.as_ref().unwrap().row_strides {
+                m.buffers.push(serde_json::from_value(serde_json::json!({
+                    "name":format!("BatchM{rows}_{name}"),"dtype":"u8","shape":[rows*stride],
+                    "layout":"native_contiguous","alignment":256,"access":"read_write","data":null
+                })).unwrap());
+            }
         }
+        register(&mut m).unwrap();
+        assert!(m.programs.contains_key("flash_batch_m128/layer0/pre"));
+        assert!(m.programs.contains_key("flash_private_m128/layer0"));
+        assert!(plan(&m, &[BatchSegment { slot: 7, tokens: 1 }]).is_err());
+        assert!(
+            plan(
+                &m,
+                &[
+                    BatchSegment { slot: 7, tokens: 1 },
+                    BatchSegment { slot: 2, tokens: 1 }
+                ]
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn request_table_keeps_recurrence_ownership_and_inactive_rows_separate() {
+        let mut m = manifest();
+        m.batch_layout.as_mut().unwrap().state_columns = ["Position", "State_conv", "State_gdn"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         for layer in (0..48).filter(|l| l % 4 != 3) {
             for suffix in ["conv", "gdn"] {
                 m.buffers.push(serde_json::from_value(serde_json::json!({
@@ -1120,16 +1040,14 @@ mod tests {
                 })).unwrap());
             }
         }
-        m.buffers.push(
-            serde_json::from_value(serde_json::json!({
-            "name":POINTERS,"dtype":"u64","shape":[128,48,4],"layout":"native_contiguous",
-                "alignment":256,"access":"read_write","data":null
-            }))
-            .unwrap(),
-        );
+        m.buffers
+            .iter_mut()
+            .find(|b| b.name == POINTERS)
+            .unwrap()
+            .shape = vec![128 * (48 * 3 + 10)];
         register(&mut m).unwrap();
         assert_eq!(m.state_pointer_table.as_ref().unwrap().max_rows, 128);
-        for count in [2, 3, 8, 15, 128] {
+        for count in [1, 2, 3, 8, 15, 128] {
             let segments: Vec<_> = (0..count)
                 .map(|lane| BatchSegment {
                     slot: 129 - lane,
@@ -1137,109 +1055,28 @@ mod tests {
                 })
                 .collect();
             let bindings = state_bindings(&m, &segments).unwrap();
-            assert_eq!(bindings.len(), 48 * count.next_power_of_two() * 4);
+            assert_eq!(bindings.len(), 128 * (48 * 3 + 10));
             for layer in 0..48 {
                 for (lane, s) in segments.iter().enumerate() {
-                    let start = (lane * 48 + layer) * 4;
-                    assert_eq!(bindings[start], Some((s.slot, "M1_HistoryOut".into())));
-                    assert_eq!(bindings[start + 1], Some((s.slot, "Position".into())));
+                    let start = (lane * 48 + layer) * 3;
+                    assert_eq!(bindings[start], Some((s.slot, "Position".into())));
                     assert_eq!(
-                        bindings[start + 2],
+                        bindings[start + 1],
                         (layer % 4 != 3).then(|| (s.slot, format!("State_{layer}_conv")))
                     );
-                }
-            }
-            assert!(bindings[count * 48 * 4..].iter().all(Option::is_none));
-            let p = plan(&m, &segments).unwrap();
-            let private: Vec<_> = p
-                .iter()
-                .filter(|i| {
-                    matches!(&i.operation,
-                Operation::Kernel{name} if name.starts_with("flash_private_"))
-                })
-                .collect();
-            assert_eq!(private.len(), 36 * 3 + 12 * 19);
-            assert!(
-                private
-                    .iter()
-                    .all(|i| i.sequence.is_none() && i.views.is_empty())
-            );
-            assert!(!p.iter().any(|i| matches!(&i.operation,
-                Operation::Copy{destination,..} if destination=="State_0_conv")));
-        }
-        m.batch_layout.as_mut().unwrap().state_columns.swap(0, 1);
-        assert!(register(&mut m).is_err());
-    }
-    #[test]
-    fn dynamic_rows_keep_fixed_profiles_and_never_create_padding_requests() {
-        use crate::operators::dynamic::{DynamicBatchKernel, RowExpression};
-        let mut m = manifest();
-        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
-        for (name, dtype, shape) in [
-            ("Position", "i32", vec![1]),
-            (POINTERS, "u64", vec![128, 48, 1]),
-        ] {
-            m.buffers.push(
-                serde_json::from_value(serde_json::json!({
-                    "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
-                    "alignment":256,"access":"read_write","data":null
-                }))
-                .unwrap(),
-            );
-        }
-        register(&mut m).unwrap();
-        for capacity in [4, 8, 16, 32, 64, 128] {
-            let prefix = format!("flash_dynamic_m{capacity}");
-            let shared = stages(capacity)
-                .into_iter()
-                .filter(|(s, _)| !s.ends_with("/private"))
-                .flat_map(|(section, count)| {
-                    super::super::plan::section(&prefix, &section, count, None)
-                });
-            let private = (0..48).flat_map(|layer| {
-                m.programs[&format!("flash_private_m{capacity}/layer{layer}")].clone()
-            });
-            for op in shared.chain(private) {
-                if let Operation::Kernel { name } = op {
-                    m.dynamic_batch_kernels.insert(
-                        name.clone(),
-                        DynamicBatchKernel {
-                            name,
-                            capacity,
-                            grid: [
-                                RowExpression::Rows,
-                                RowExpression::Constant { value: 1 },
-                                RowExpression::Constant { value: 1 },
-                            ],
-                            arguments: vec![],
-                        },
+                    assert_eq!(
+                        bindings[start + 2],
+                        (layer % 4 != 3).then(|| (s.slot, format!("State_{layer}_gdn")))
                     );
                 }
             }
-        }
-        register(&mut m).unwrap();
-        for count in [
-            2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 63, 64, 65, 127, 128,
-        ] {
-            let segments: Vec<_> = (0..count)
-                .map(|slot| BatchSegment { slot, tokens: 1 })
-                .collect();
-            let p = plan(&m, &segments).unwrap();
-            let fixed = PROFILES.contains(&count);
             assert!(
-                !p.iter()
-                    .any(|i| matches!(i.operation, Operation::Zero { .. }))
+                bindings[count * 48 * 3..128 * 48 * 3]
+                    .iter()
+                    .all(Option::is_none)
             );
-            let overridden: Vec<_> = p.iter().filter_map(|i| i.launch.as_ref()).collect();
-            if fixed {
-                assert!(overridden.is_empty());
-            } else {
-                assert!(!overridden.is_empty());
-                assert!(overridden.iter().all(|l| l.grid[0] == count as u32));
-            }
-            assert_eq!(p.iter().filter(|i| matches!(&i.operation, Operation::Copy { destination, .. } if destination == "Logits")).count(), count);
         }
-        m.dynamic_batch_kernels.remove("flash_dynamic_m128/head/k0");
+        m.batch_layout.as_mut().unwrap().state_columns.swap(0, 1);
         assert!(register(&mut m).is_err());
     }
 }

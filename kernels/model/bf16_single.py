@@ -37,7 +37,7 @@ def bf16_single(
         raise ValueError("Unsupported single-token BF16 projection geometry")
     bn, bk = block_n, block_k
     threads = bn * 2
-    if type(rows) is not int or not 1 <= rows <= 128:
+    if type(rows) is not int or not 1 <= rows <= 1024:
         raise ValueError("Unsupported BF16 decode rows")
     if type(row_major_grid) is not bool:
         raise ValueError("Invalid request tile ordering")
@@ -153,3 +153,52 @@ def bf16_single(
                     Output[group, row, bx * bn + warp * 16 + lane // 4 + rr * 8] = acc[rr * 2]
 
     return main.with_attr("global_symbol", "bf16_single")
+
+
+@orin_jit
+def bf16_rows(
+    N, K, groups=4, *, rows=1024, block_m=16, block_n=64, dynamic_rows=True, weight_left=True
+):
+    """Share weights across token rows, retaining each group's K16 FP32 sum.
+
+    Operand orientation is selectable; neither group reduction nor output
+    rounding moves across this primitive's boundary.
+    """
+    if groups not in (1, 4) or N % block_n or K % 128 or block_m not in (16, 32, 64):
+        raise ValueError("Invalid grouped BF16 row tile")
+    rows = row_count(rows, dynamic_rows)
+
+    @T.prim_func
+    def bf16_rows_kernel(
+        A: T.Tensor((rows, groups, K), T.float16),
+        Weight: T.Tensor((N, groups * K), T.bfloat16),
+        Output: T.Tensor((groups, rows, N), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(rows, block_m), N // block_n, groups, threads=128) as (
+            by,
+            bx,
+            group,
+        ):
+            a = T.alloc_shared((block_n, 128), T.bfloat16)
+            b = T.alloc_shared((block_m, 128), T.bfloat16)
+            acc = T.alloc_fragment(
+                (block_n, block_m) if weight_left else (block_m, block_n), T.float32
+            )
+            T.clear(acc)
+            for kg in T.Pipelined(K // 128, num_stages=2):
+                T.copy(Weight[bx * block_n, group * K + kg * 128], a)
+                for i, j in T.Parallel(block_m, 128):
+                    b[i, j] = 0
+                    if by * block_m + i < rows:
+                        b[i, j] = A[by * block_m + i, group, kg * 128 + j]
+                if weight_left:
+                    T.gemm(a, b, acc, transpose_B=True)
+                else:
+                    T.gemm(b, a, acc, transpose_B=True)
+            for i, j in T.Parallel(block_n, block_m):
+                if by * block_m + j < rows:
+                    Output[group, by * block_m + j, bx * block_n + i] = (
+                        acc[i, j] if weight_left else acc[j, i]
+                    )
+
+    return bf16_rows_kernel

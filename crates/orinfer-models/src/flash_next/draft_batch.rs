@@ -9,6 +9,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn register(m: &mut Manifest) -> Result<()> {
     let Some(spec) = &m.mtp else { return Ok(()) };
+    if super::draft_rows::present(m) {
+        for tokens in 1..=8 {
+            let section = format!("draft_rows/warm_m{tokens}/private");
+            m.programs.insert(
+                section.clone(),
+                super::plan::section("draft_rows", &format!("warm_m{tokens}/private"), 19, None),
+            );
+        }
+        m.programs.insert(
+            "draft_rows/private".into(),
+            super::plan::section("draft_rows", "private", 19, None),
+        );
+        return Ok(());
+    }
     for &rows in &spec.batch_draft_profiles {
         if ![2, 4, 8].contains(&rows) {
             return Err("Unsupported Flash draft capacity".into());
@@ -75,17 +89,32 @@ pub(super) fn plan(
             start
         })
         .collect();
-    let prefix = format!("flash_draft_m{capacity}");
-    let arena = format!("DraftBatchM{capacity}_");
+    let shared = super::draft_rows::present(m);
+    let frame_capacity = if shared { 512 } else { capacity };
+    let prefix = if shared {
+        "draft_rows".into()
+    } else {
+        format!("flash_draft_m{capacity}")
+    };
+    let arena = if shared {
+        "DraftRows_".into()
+    } else {
+        format!("DraftBatchM{capacity}_")
+    };
     let mut out = vec![];
-    let mut push = |operation, sequence, views: BTreeMap<String, BufferView>| {
+    fn push(
+        out: &mut Vec<Invocation>,
+        operation: Operation,
+        sequence: Option<usize>,
+        views: BTreeMap<String, BufferView>,
+    ) {
         out.push(Invocation {
             operation,
             sequence,
             views,
             launch: None,
         });
-    };
+    }
     let copy = |source: &str, destination: &str, bytes: usize| Operation::Copy {
         source: source.into(),
         destination: destination.into(),
@@ -98,17 +127,29 @@ pub(super) fn plan(
             .find(|b| b.name == name)
             .ok_or("Missing draft row arena")?;
         let bytes = buffer.bytes()?;
-        if !bytes.is_multiple_of(capacity) {
+        if !bytes.is_multiple_of(frame_capacity) {
             return Err("Unaligned draft row arena".into());
         }
         Ok(BufferView {
             buffer: name.into(),
-            offset: index * (bytes / capacity),
+            offset: index * (bytes / frame_capacity),
         })
     };
-    let embedding = format!("{arena}DraftM{capacity}_Embedding");
-    let condition = format!("{arena}DraftM{capacity}_Condition");
-    let hidden = format!("{arena}DraftM{capacity}_HC");
+    let embedding = if shared {
+        "DraftRows_Embedding".into()
+    } else {
+        format!("{arena}DraftM{capacity}_Embedding")
+    };
+    let condition = if shared {
+        "DraftRows_Condition".into()
+    } else {
+        format!("{arena}DraftM{capacity}_Condition")
+    };
+    let hidden = if shared {
+        "DraftRows_Hidden".into()
+    } else {
+        format!("{arena}DraftM{capacity}_HC")
+    };
     // Inactive lanes are initialized without touching any request state.
     for (name, stride) in if body {
         vec![(&embedding, 5120), (&condition, 20480)]
@@ -116,9 +157,10 @@ pub(super) fn plan(
         vec![(&hidden, 20480)]
     } {
         push(
+            &mut out,
             Operation::Zero {
                 destination: name.clone(),
-                bytes: capacity * stride,
+                bytes: (if shared { used } else { capacity }) * stride,
             },
             None,
             BTreeMap::new(),
@@ -128,6 +170,7 @@ pub(super) fn plan(
         if body {
             if operation == BatchOperation::Warm {
                 push(
+                    &mut out,
                     Operation::Kernel {
                         name: format!("mtp_warm_m{}/begin/k0", segment.tokens),
                     },
@@ -137,6 +180,7 @@ pub(super) fn plan(
             }
             for i in 1..=usize::from(m.vision.is_some()) + 1 {
                 push(
+                    &mut out,
                     Operation::Kernel {
                         name: format!("mtp_warm_m{}/begin/k{i}", segment.tokens),
                     },
@@ -157,6 +201,7 @@ pub(super) fn plan(
                 ),
             ] {
                 push(
+                    &mut out,
                     copy(&source, destination, bytes),
                     Some(segment.slot),
                     BTreeMap::from([(destination.clone(), row(destination, offsets[lane])?)]),
@@ -164,6 +209,7 @@ pub(super) fn plan(
             }
         } else {
             push(
+                &mut out,
                 copy("DraftM1_Condition", &hidden, 20480),
                 Some(segment.slot),
                 BTreeMap::from([(hidden.clone(), row(&hidden, lane)?)]),
@@ -172,8 +218,26 @@ pub(super) fn plan(
     }
     if body {
         for stage in ["begin", "pre"] {
-            for op in &m.programs[&format!("{prefix}/{stage}")] {
-                push(op.clone(), None, BTreeMap::new());
+            if shared {
+                let mut calls = Vec::new();
+                super::rows::append(
+                    m,
+                    &mut calls,
+                    &format!("{prefix}/{stage}"),
+                    used,
+                    None,
+                    &BTreeMap::new(),
+                )?;
+                out.extend(calls);
+            } else {
+                for op in &m.programs[&format!("{prefix}/{stage}")] {
+                    out.push(Invocation {
+                        operation: op.clone(),
+                        sequence: None,
+                        views: BTreeMap::new(),
+                        launch: None,
+                    });
+                }
             }
         }
         // Dedicated draft arenas are row-major. Only interface buffers get a lane
@@ -184,7 +248,7 @@ pub(super) fn plan(
                 .iter()
                 .filter(|b| {
                     b.name.starts_with(&arena)
-                        && b.bytes().is_ok_and(|n| n.is_multiple_of(capacity))
+                        && b.bytes().is_ok_and(|n| n.is_multiple_of(frame_capacity))
                 })
                 .map(|b| Ok((b.name.clone(), row(&b.name, offsets[lane])?)))
                 .collect::<Result<_>>()?;
@@ -194,29 +258,70 @@ pub(super) fn plan(
                 "private".into()
             };
             for op in &m.programs[&format!("{prefix}/{section}")] {
-                push(op.clone(), Some(segment.slot), views.clone());
+                push(&mut out, op.clone(), Some(segment.slot), views.clone());
             }
-            push(
-                Operation::Kernel {
+            out.push(Invocation {
+                operation: Operation::Kernel {
                     name: format!("mtp_warm_m{}/end/k0", segment.tokens),
                 },
-                Some(segment.slot),
-                BTreeMap::new(),
-            );
+                sequence: Some(segment.slot),
+                views: BTreeMap::new(),
+                launch: None,
+            });
         }
-        for op in &m.programs[&format!("{prefix}/post")] {
-            push(op.clone(), None, BTreeMap::new());
+        if shared {
+            super::rows::append(
+                m,
+                &mut out,
+                &format!("{prefix}/post"),
+                used,
+                None,
+                &BTreeMap::new(),
+            )?;
+        } else {
+            for op in &m.programs[&format!("{prefix}/post")] {
+                out.push(Invocation {
+                    operation: op.clone(),
+                    sequence: None,
+                    views: BTreeMap::new(),
+                    launch: None,
+                });
+            }
         }
     }
     if head {
         for stage in ["head"] {
-            for op in &m.programs[&format!("{prefix}/{stage}")] {
-                push(op.clone(), None, BTreeMap::new());
+            if shared {
+                super::rows::append(
+                    m,
+                    &mut out,
+                    &format!("{prefix}/{stage}"),
+                    segments.len(),
+                    None,
+                    &BTreeMap::new(),
+                )?;
+            } else {
+                for op in &m.programs[&format!("{prefix}/{stage}")] {
+                    out.push(Invocation {
+                        operation: op.clone(),
+                        sequence: None,
+                        views: BTreeMap::new(),
+                        launch: None,
+                    });
+                }
             }
         }
     }
-    let logits = format!("{arena}logits");
-    let pairs = format!("{arena}pairs");
+    let logits = if shared {
+        "FlashDecode_Logits".into()
+    } else {
+        format!("{arena}logits")
+    };
+    let pairs = if shared {
+        "FlashDecode_Selected".into()
+    } else {
+        format!("{arena}pairs")
+    };
     for (lane, segment) in segments.iter().enumerate() {
         for (source, destination, bytes, extra) in [
             (&logits, spec.draft_logits.as_str(), m.vocab * 4, 0),
@@ -235,13 +340,21 @@ pub(super) fn plan(
             } else {
                 lane
             };
-            let mut view = row(source, endpoint)?;
+            let mut view = if shared && source != &hidden {
+                BufferView {
+                    buffer: source.clone(),
+                    offset: endpoint * (if source == &logits { m.vocab * 4 } else { 8 }),
+                }
+            } else {
+                row(source, endpoint)?
+            };
             view.offset += extra;
-            push(
-                copy(source, destination, bytes),
-                Some(segment.slot),
-                BTreeMap::from([(source.clone(), view)]),
-            );
+            out.push(Invocation {
+                operation: copy(source, destination, bytes),
+                sequence: Some(segment.slot),
+                views: BTreeMap::from([(source.clone(), view)]),
+                launch: None,
+            });
         }
     }
     Ok(out)

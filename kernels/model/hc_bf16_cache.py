@@ -41,18 +41,22 @@ def hc_up13_mix(
     stage_count: int = 1,
     base_exp: int = 99,
     patch_count: int = 0,
+    block_m: int = 8,
+    weight_left: bool = True,
 ):
     """BF16 up projection and branch mix, preserving every FP16 boundary."""
     if (
-        not 1 <= M <= 128
+        not 1 <= M <= 1024
         or H != 2560
         or rank not in (256, 320)
         or streams != 4
         or stage_count != 1
         or not 0 <= patch_count <= 3
+        or block_m not in (8, 16, 32, 64)
+        or type(weight_left) is not bool
     ):
         raise ValueError("Unsupported exact BF16 HC read cache geometry")
-    bm, bn = 8, 32
+    bm, bn = block_m, 32
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -70,7 +74,7 @@ def hc_up13_mix(
             w = T.alloc_shared((streams * bn, 64), T.bfloat16)
             lo = T.alloc_shared((streams * bn, 16), T.uint32)
             hi = T.alloc_shared((streams * bn, 10), T.uint32)
-            shape = (streams * bn, bm)
+            shape = (streams * bn, bm) if weight_left else (bm, streams * bn)
             acc = T.alloc_fragment(shape, T.float32)
             rounded_up = T.alloc_shared(shape, T.float16)
             total = T.alloc_fragment((bm, bn), T.float32)
@@ -121,13 +125,20 @@ def hc_up13_mix(
                 T.sync_threads()
                 # N x 8 MMA avoids the sixteen-row activation tile for small
                 # decode/verification batches. Preserve the same K traversal.
-                T.gemm(w, a, acc, transpose_B=True)
+                if weight_left:
+                    T.gemm(w, a, acc, transpose_B=True)
+                else:
+                    T.gemm(a, w, acc, transpose_B=True)
             T.copy(acc, rounded_up)
             T.clear(total)
             for branch in T.serial(streams):
                 for i, j in T.Parallel(bm, bn):
                     if by * bm + i < M:
-                        up = rounded_up[branch * bn + j, i]
+                        up = (
+                            rounded_up[branch * bn + j, i]
+                            if weight_left
+                            else rounded_up[i, branch * bn + j]
+                        )
                         gate = stream_sigmoid(T.cast(up, T.float32), "float16")
                         product = T.cast(
                             T.cast(gate, T.float32)

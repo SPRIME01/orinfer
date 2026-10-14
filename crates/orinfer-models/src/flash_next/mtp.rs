@@ -95,12 +95,19 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     {
         return Err("Unsupported Flash MTP profile coverage".into());
     }
+    let shared_target = super::unified_decode::shared(manifest);
+    let shared_draft = super::draft_rows::present(manifest);
     let programs = &mut manifest.programs;
     for p in &spec.warm_plans {
         let program = format!("mtp_warm_m{}", p.tokens);
         let head = format!("mtp_head_m{}", p.tokens);
-        if p.program != program || p.head_program != head {
+        if p.program != program
+            || !(p.head_program == head || shared_draft && p.head_program == "mtp_head")
+        {
             return Err("Unknown Flash draft program".into());
+        }
+        if shared_draft {
+            continue;
         }
         let (body_count, head_count) = match p.tokens {
             1..=8 => (54, 10),
@@ -132,20 +139,26 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         if p.program != program || p.restore_program != restore || p.capture_program != capture {
             return Err("Unknown Flash verification program".into());
         }
-        let mut ops = section(
-            &program,
-            "begin",
-            1 + usize::from(manifest.vision.is_some()),
-            None,
-        );
+        let mut ops = if shared_target {
+            vec![]
+        } else {
+            section(
+                &program,
+                "begin",
+                1 + usize::from(manifest.vision.is_some()),
+                None,
+            )
+        };
         let mut commit = vec![];
         for layer in 0..48 {
-            ops.extend(verification_layer(
-                &program,
-                layer,
-                p.tokens,
-                spec.shared_verification_state,
-            ));
+            if !shared_target {
+                ops.extend(verification_layer(
+                    &program,
+                    layer,
+                    p.tokens,
+                    spec.shared_verification_state,
+                ));
+            }
             commit.extend(section(
                 &restore,
                 &format!("layer{layer}"),
@@ -159,11 +172,13 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 None,
             ));
         }
-        ops.extend(section(&program, "end", 1, None));
-        ops.extend(section(&program, "head", 9, None));
-        programs.insert(program, ops);
+        if !shared_target {
+            ops.extend(section(&program, "end", 1, None));
+            ops.extend(section(&program, "head", 9, None));
+            programs.insert(program, ops);
+            programs.insert(capture.clone(), section(&capture, "body", 1, None));
+        }
         programs.insert(restore, commit);
-        programs.insert(capture.clone(), section(&capture, "body", 1, None));
     }
     for p in &spec.capture_plans {
         let name = if (2..16).contains(&p.tokens) {

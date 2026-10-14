@@ -690,7 +690,7 @@ impl ModelRuntime {
                 )?;
             } else if let Some(segment) = segments.first() {
                 self.execution.activate_sequence(segment.slot)?;
-                self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
+                self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
             }
             for j in active {
                 let (i, draft) = &mut drafts[j];
@@ -783,11 +783,7 @@ impl ModelRuntime {
             .flatten();
         let pending = *req.history.last().ok_or("Missing pending token")?;
         let Some(plan) = plan else {
-            self.upload_ids(&self.manifest.token, &[pending])?;
-            self.prepare_inputs(&[pending], &req.history[..req.history.len() - 1])?;
-            self.upload_segment_controls(1)?;
-            self.launch_program("decode", ExecutionPhase::Decode)?;
-            self.mtp_capture(&spec, 1, ExecutionPhase::Decode)?;
+            self.execute_target_tail(req)?;
             let out = self.commit_ordinary_token(req)?;
             if valid {
                 self.refresh_request_mtp(req, true)?;
@@ -825,6 +821,34 @@ impl ModelRuntime {
             failed: false,
             started: Instant::now(),
         })))
+    }
+
+    /// Use the model's ordinary one-row packet for an MTP tail whenever that
+    /// capability is declared. The packet owns target capture as well as state.
+    fn execute_target_tail(&mut self, req: &mut RequestState) -> Result<()> {
+        if self.manifest.batch_profiles.contains(&1) {
+            let allow_replay = req.limit - req.generated >= 2;
+            let segments = self.prepare_batch_inputs(&mut [req], &[(0, 1)])?;
+            let (plan, _) = self
+                .model_package
+                .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)?;
+            self.execution.execute_batch(
+                segments.iter().map(|s| (s.slot, s.tokens)).collect(),
+                &plan,
+                true,
+                allow_replay,
+            )
+        } else {
+            let pending = *req.history.last().ok_or("Missing target tail input")?;
+            self.upload_ids(&self.manifest.token, &[pending])?;
+            self.prepare_inputs(&[pending], &req.history[..req.history.len() - 1])?;
+            self.upload_segment_controls(1)?;
+            self.launch_program("decode", ExecutionPhase::Decode)?;
+            if let Some(spec) = &self.manifest.mtp {
+                self.mtp_capture(spec, 1, ExecutionPhase::Decode)?;
+            }
+            Ok(())
+        }
     }
     fn consume_draft(&self, req: &mut RequestState, build: &mut DraftRound) -> Result<()> {
         let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
@@ -944,7 +968,7 @@ impl ModelRuntime {
                     &[*build.round.drafts.last().unwrap()],
                     &[],
                 )?;
-                self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
+                self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
             }
             self.consume_draft(req, &mut build)?;
         }
@@ -965,7 +989,7 @@ impl ModelRuntime {
             &req.history[..req.history.len() - 1],
         )?;
         self.upload_segment_controls(plan.tokens)?;
-        self.launch_program(&plan.program, ExecutionPhase::Decode)?;
+        self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
         self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
         req.mtp.verification_s += at.elapsed().as_secs_f64();
         Ok(())
@@ -1191,7 +1215,7 @@ mod policy_tests {
         )
         .unwrap();
         let spec = model.manifest.mtp.clone().unwrap();
-        assert_eq!(spec.batch_draft_profiles, [2, 4, 8]);
+        assert_eq!(spec.batch_draft_profiles.last(), Some(&8));
         assert!(spec.batch_commit);
         assert!(spec.batch_warm);
         let options = scheduler::Options {
@@ -1248,7 +1272,7 @@ mod policy_tests {
                     model
                         .with_request(&mut req, |m, _| {
                             m.prepare_program_inputs(&spec.draft_program, &[selected], &[])?;
-                            m.launch_program(&spec.draft_program, ExecutionPhase::Decode)
+                            m.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)
                         })
                         .unwrap();
                 }

@@ -108,6 +108,7 @@ def profile_stream(kernel):
 class DecodeTuner:
     def __init__(self, output: Path, cache: Path | None = None):
         self.output = output
+        self.output.mkdir(parents=True, exist_ok=True)
         self.cache = cache or output / "tuning-cache"
         self.cache.mkdir(parents=True, exist_ok=True)
         self.results = {}

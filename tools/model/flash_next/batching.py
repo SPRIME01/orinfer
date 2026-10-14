@@ -59,13 +59,17 @@ def kind(label):
     return next((prefix[:-1] for prefix in PRIVATE if label.startswith(prefix)), None)
 
 
-def shape_planner(metadata, buffers, original, output, shared_kernel=None):
+def shape_planner(
+    metadata, buffers, original, output, shared_kernel=None, *, draft=False, templates_only=False
+):
     from tools.model.flash_next.native import Model
     import torch
     from tools.model.flash_next.prepare import DTYPES
 
     class ShapeModel(Model):
         def kernel(self, key, build):
+            if templates_only:
+                return None
             if kind(key):
                 return None
             if getattr(self, "exact_mixed_experts", False) and key.startswith(
@@ -87,8 +91,8 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
         metadata["max_context"] - 128,
         output,
     )
-    planner.is_mtp, planner.draft_vocab, planner.decode_w8_optimized = False, None, True
-    planner.layer_ids = tuple(range(48))
+    planner.is_mtp, planner.draft_vocab, planner.decode_w8_optimized = draft, None, True
+    planner.layer_ids = (48,) if draft else tuple(range(48))
     planner.weights, planner.states, planner.plans, planner.workspaces, planner.kernels = (
         {},
         {},
@@ -100,10 +104,13 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
     logical = {}
     weight_tensors = {}
     types = {v[0]: getattr(torch, k) for k, v in DTYPES.items()}
+    prefix = "DW_" if draft else "W_"
     for name, b in buffers.items():
-        if not name.startswith("W_"):
+        if not name.startswith(prefix) and not name.startswith("W_e8p_"):
             continue
-        match = re.fullmatch(r"W_(.+)_(short_table|packed|table|signs|value|weight|scale)", name)
+        match = re.fullmatch(
+            re.escape(prefix) + r"(.+)_(short_table|packed|table|signs|value|weight|scale)", name
+        )
         if not match and not name.startswith("W_e8p_"):
             raise ValueError(f"Unknown Flash weight role: {name}")
         tensor = torch.empty(b["shape"], dtype=types[b["dtype"]], device="meta")
@@ -120,9 +127,9 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
     # Recover those aliases from the pinned argument bindings, without copying.
     for kernel in original.values():
         packed = [a["name"] for a in kernel["args"] if a.get("name", "").endswith("_packed")]
-        if len(packed) != 1 or not packed[0].startswith("W_"):
+        if len(packed) != 1 or not packed[0].startswith(prefix):
             continue
-        role = packed[0][2 : -len("_packed")]
+        role = packed[0][len(prefix) : -len("_packed")]
         for arg in kernel["args"]:
             name = arg.get("name", "")
             suffix = (
@@ -144,7 +151,7 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
     packed_words = {
         b["shape"][-1]
         for b in buffers.values()
-        if b["name"].startswith("W_blk.") and b["name"].endswith("_packed")
+        if b["name"].startswith(prefix + "blk.") and b["name"].endswith("_packed")
     }
     if packed_words not in ({8}, {16}):
         raise ValueError("Inconsistent compressed expert bank layout")
@@ -156,8 +163,15 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
     # operands: otherwise a later workspace can reuse a freed meta storage ID
     # and be mistaken for an immutable weight during ABI publication.
     planner.weight_tensors = weight_tensors
-    for layer in range(48):
-        if layer % 4 != 3:
+    if draft:
+        # This pass consumes the body only. The published target Q4 head is
+        # rebound separately, so no legacy output matrix is needed for shapes.
+        planner.weights["output.weight"] = (
+            torch.empty((metadata["vocab"], 2560), dtype=torch.int8, device="meta"),
+            torch.empty((metadata["vocab"],), dtype=torch.float16, device="meta"),
+        )
+    for layer in planner.layer_ids:
+        if not draft and layer % 4 != 3:
             shapes = {"conv": (1, 3, 10240), "gdn": (48, 128, 128)}
         else:
             shapes = {
@@ -174,9 +188,9 @@ def shape_planner(metadata, buffers, original, output, shared_kernel=None):
             planner.states[f"{layer}:{suffix}"] = tensor
             logical[tensor.untyped_storage()._cdata] = name
     for attr, name in [
-        ("position_gpu", "Position"),
-        ("lengths", "Length"),
-        ("position_out", "PositionOut"),
+        ("position_gpu", "MtpPosition" if draft else "Position"),
+        ("lengths", "MtpLength" if draft else "Length"),
+        ("position_out", "MtpPositionOut" if draft else "PositionOut"),
     ]:
         tensor = torch.empty(1, device="meta", dtype=torch.int32)
         setattr(planner, attr, tensor)

@@ -10,6 +10,16 @@ pub(super) const CAPACITY: usize = 128;
 pub(super) const PREFIX: &str = "flash_decode";
 pub(super) const ARENA: &str = "FlashDecode_";
 
+pub(super) fn computation_capacity(m: &Manifest) -> usize {
+    m.dynamic_batch_kernels
+        .get("flash_decode/begin/k0")
+        .map_or(CAPACITY, |k| k.capacity)
+}
+
+pub(super) fn shared(m: &Manifest) -> bool {
+    computation_capacity(m) == 1024
+}
+
 pub(super) fn present(m: &Manifest) -> bool {
     m.dynamic_batch_kernels
         .contains_key("flash_decode/begin/k0")
@@ -24,7 +34,14 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         // Only the roles consumed by the decode template need a row arena.
         let name = format!("{ARENA}{role}");
         if let Some(b) = m.buffers.iter().find(|b| b.name == name)
-            && (b.data.is_some() || b.bytes()? != stride * CAPACITY)
+            && (b.data.is_some()
+                || b.bytes()?
+                    != stride
+                        * if matches!(role.as_str(), "Logits" | "Selected") {
+                            CAPACITY
+                        } else {
+                            computation_capacity(m)
+                        })
         {
             return Err("Invalid canonical decode row arena".into());
         }
@@ -38,6 +55,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             super::plan::section(PREFIX, &section, count, None),
         );
     }
+    super::draft_rows::register(m)?;
     for name in ["inputs", "end", "outputs"] {
         let kernel = format!("flash_decode/packet/{name}");
         if !m.dynamic_batch_kernels.contains_key(&kernel) {
@@ -88,6 +106,7 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
         return Ok(());
     }
     m.programs.remove("flash_decode/local");
+    super::draft_rows::configure(m)?;
     for kernel in kernels
         .iter()
         .filter(|k| k.symbol == "rows_gdn_conv_kernel")
@@ -106,7 +125,16 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
     let programs = m
         .programs
         .keys()
-        .filter(|name| name.starts_with("flash_decode/") && !name.ends_with("/private"))
+        .filter(|name| {
+            (name.starts_with("flash_decode/") && !name.ends_with("/private"))
+                || [
+                    "draft_rows/begin",
+                    "draft_rows/pre",
+                    "draft_rows/post",
+                    "draft_rows/head",
+                ]
+                .contains(&name.as_str())
+        })
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut variants: BTreeMap<String, Vec<KernelVariant>> = BTreeMap::new();
@@ -136,6 +164,7 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
             return Err("Overlapping compiled decode row selections".into());
         }
     }
+    let computation_capacity = computation_capacity(m);
     let rows = m.row_execution.get_or_insert_with(|| RowExecution {
         capacity: CAPACITY,
         programs: BTreeSet::new(),
@@ -143,20 +172,28 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
         variants: BTreeMap::new(),
     });
     for program in programs {
-        rows.program_capacities.insert(program.clone(), CAPACITY);
+        let capacity = if program.contains("/packet/") || program.ends_with("/head") {
+            CAPACITY
+        } else if program.starts_with("draft_rows/") {
+            512
+        } else {
+            computation_capacity
+        };
+        rows.program_capacities.insert(program.clone(), capacity);
         rows.programs.insert(program);
     }
     rows.variants.extend(variants);
     // A single decoder is a supported packet; advertise it after mixed plans
     // are registered, since their independent head profiles start at two.
     m.batch_profiles.insert(0, 1);
+    super::rows::verification(m)?;
     Ok(())
 }
 
 /// Build tools encode local choices in schema-1 binding identities. There is
 /// no batch-specific algorithm, fusion or weight-name dispatch in serving.
 fn selection(name: &str) -> Result<Option<(&str, KernelVariant)>> {
-    if !name.starts_with("flash_decode/") {
+    if !name.starts_with("flash_decode/") && !name.starts_with("draft_rows/") {
         return Ok(None);
     }
     let (slot, range, skip) = if let Some((slot, range)) = name.split_once("/rows/") {
@@ -171,7 +208,7 @@ fn selection(name: &str) -> Result<Option<(&str, KernelVariant)>> {
         .ok_or("Invalid decode row selection")?;
     let min_rows: usize = first.parse().map_err(|_| "Invalid decode row bound")?;
     let max_rows: usize = last.parse().map_err(|_| "Invalid decode row bound")?;
-    if min_rows == 0 || min_rows > max_rows || max_rows > CAPACITY {
+    if min_rows == 0 || min_rows > max_rows || max_rows > 1024 {
         return Err("Decode row selection outside its allocation".into());
     }
     Ok(Some((
@@ -207,7 +244,7 @@ mod tests {
         );
         assert!(selection("flash_decode/layer0/post/k2").unwrap().is_none());
         assert!(selection("prefill/layer0/rows/invalid").unwrap().is_none());
-        for range in ["0-3", "3-2", "1-129", "x-8", "8", "8-8/a8_split"] {
+        for range in ["0-3", "3-2", "1-1025", "x-8", "8", "8-8/a8_split"] {
             assert!(selection(&format!("flash_decode/head/k1/rows/{range}")).is_err());
         }
     }

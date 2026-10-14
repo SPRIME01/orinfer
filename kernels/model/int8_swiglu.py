@@ -18,7 +18,7 @@ def int8_swiglu(
     algorithm: str | None = None,
     block_m: int = 16,
 ):
-    if any(type(v) is not int or v <= 0 for v in (M, N, K)) or M > 128 or K % 128:
+    if any(type(v) is not int or v <= 0 for v in (M, N, K)) or M > 1024 or K % 128:
         raise ValueError("Invalid decode INT8 SwiGLU geometry")
     if K * 128 * 128 > 2**31 - 1 or block_n not in (4, 8, 16, 32, 64, 128):
         raise ValueError("Invalid INT8 SwiGLU accumulator/tile")

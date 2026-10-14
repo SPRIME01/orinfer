@@ -84,7 +84,9 @@ def split_prefill_a8(rows, K, dynamic_rows=False):
         "tl.if_stmt_binding_inline_replayable_binds": False,
     }
 )
-def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=False):
+def e8p_prefill_grouped(
+    rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=False, row_major=False
+):
     """Keep sixteen-row routing tiles, optionally skip their unused upper half.
 
     The eight-row path has the same K traversal and integer/FP16 boundaries.
@@ -94,6 +96,7 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or type(sparse_rows) is not bool
+        or type(row_major) is not bool
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
@@ -102,6 +105,8 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
     # Matching swizzle for sixteen-byte activation halves and ldmatrix reads.
     input_stride, input_mask = 32, 16
     rows = row_count(rows, dynamic_rows)
+    # Group-major strides depend on live rows, rather than allocation capacity.
+    group_stride, row_stride = (32, K // 2) if row_major else (rows * 32, 32)
     launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
 
     def product(tile_rows):
@@ -139,7 +144,11 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
                             16,
                         ),
                         T.access_ptr(
-                            Low[initial, T.min(offset + tid // 2, rows - 1), (tid % 2) * 16],
+                            Low[
+                                (initial) * group_stride
+                                + T.min(offset + tid // 2, rows - 1) * row_stride
+                                + (tid % 2) * 16
+                            ],
                             "r",
                             16,
                         ),
@@ -158,7 +167,11 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
                             16,
                         ),
                         T.access_ptr(
-                            High[initial, T.min(offset + tid // 2, rows - 1), (tid % 2) * 16],
+                            High[
+                                (initial) * group_stride
+                                + T.min(offset + tid // 2, rows - 1) * row_stride
+                                + (tid % 2) * 16
+                            ],
                             "r",
                             16,
                         ),
@@ -205,9 +218,9 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
                                     ),
                                     T.access_ptr(
                                         Low[
-                                            step + 3,
-                                            T.min(offset + tid // 2, rows - 1),
-                                            (tid % 2) * 16,
+                                            (step + 3) * group_stride
+                                            + T.min(offset + tid // 2, rows - 1) * row_stride
+                                            + (tid % 2) * 16
                                         ],
                                         "r",
                                         16,
@@ -228,9 +241,9 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
                                     ),
                                     T.access_ptr(
                                         High[
-                                            step + 3,
-                                            T.min(offset + tid // 2, rows - 1),
-                                            (tid % 2) * 16,
+                                            (step + 3) * group_stride
+                                            + T.min(offset + tid // 2, rows - 1) * row_stride
+                                            + (tid % 2) * 16
                                         ],
                                         "r",
                                         16,
@@ -335,8 +348,8 @@ def e8p_prefill_grouped(rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=Fa
 
     @T.prim_func
     def exact_e8p_int4(
-        Low: T.Tensor((K // 64, rows, 32), T.int8),
-        High: T.Tensor((K // 64, rows, 32), T.int8),
+        Low: T.Tensor((rows * K // 2,), T.int8),
+        High: T.Tensor((rows * K // 2,), T.int8),
         Sum: T.Tensor((rows,), T.int32),
         P: T.Tensor((E, K // 64, N, 8), T.uint16),
         Book: T.Tensor((1, 256, 1), T.uint32),

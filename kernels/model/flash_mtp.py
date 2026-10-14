@@ -2,14 +2,16 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def norm(rows: int, width: int):
+def norm(rows: int, width: int, dynamic_rows: bool = False):
     """Gemma RMS across the whole input; Gamma includes the zero-centered offset."""
     if rows < 1 or width < 1:
         raise ValueError("Invalid MTP norm shape")
     size = 1 << (width - 1).bit_length()
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -34,7 +36,9 @@ def norm(rows: int, width: int):
 
 
 @orin_jit
-def fuse(rows: int, hidden: int, branches: int = 4):
+def fuse(rows: int, hidden: int, branches: int = 4, dynamic_rows: bool = False):
+    rows = row_count(rows, dynamic_rows)
+
     @T.prim_func
     def main(
         Embedding: T.Tensor((rows, hidden), T.float16),

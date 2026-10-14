@@ -37,13 +37,17 @@ bash tools/operators/run.sh tools/model/flash_next/dynamic_prefill.py artifacts/
 bash tools/operators/run.sh tools/model/flash_next/unify_decode.py artifacts/flash-batch-template \
   --model artifacts/models/flash-dynamic --model-output artifacts/models/flash-unified \
   --tuning-cache artifacts/flash-decode-tuning
+
+bash tools/operators/run.sh tools/model/flash_next/unify_rows.py artifacts/flash-row-template \
+  --model artifacts/models/flash-unified --model-output artifacts/models/flash-shared-rows \
+  --tuning-cache artifacts/flash-decode-tuning
 ```
 
-统一模板支持 1–128 个真实 decode 行，使用一套最大容量为 128 的工作区。Q4、W8 投影和 E8P 专家从参数化源码生成 1/2/3/4/8/16/32 行特化，其余 batch 使用接受实际行数的动态 cubin。TileLang autotune 在 Orin 上离线测量合法 tile；相同矩阵几何复用结果，缓存按源码、编译器、设备及数值检查配置失效。E8P 上下投影与路由 tile 生成共用同一行 tile，A8 拆分只执行一次。所有行数复用相同辅助算子流程，取消 8/16 的人工分界。W8 投影和融合的共享 FFN gate/up/SwiGLU 同时搜索 DP4A 和 Tensor Core。HC 保留独立归约／激活，up／mix 与专家旋转／分派／位平面打包使用统一融合实现。这些融合保留原 FP16 舍入、scale 和 FP32 累加边界，数值边界不参与搜索。
+最终 target 计算模板支持 1–1024 个真实 token 行，普通 decode 最多 128 个请求、混合 prefill/decode 和 MTP 验证复用同一 begin/pre/post/head。草稿 warm 和单／多流生成共享最大 512 行的 draft 模板，输出头使用相同计算实现和 Q4 权重，仅 HC 参数不同。Q4、W8 投影和 E8P 专家从参数化源码生成 1/2/3/4/8/16/32 行特化，其余 batch 使用接受实际行数的动态 cubin。TileLang autotune 在 Orin 上离线测量合法 tile；相同矩阵几何复用结果，缓存按源码、编译器、设备及数值检查配置失效。E8P 上下投影与路由 tile 生成共用同一行 tile，A8 拆分只执行一次。所有行数复用相同辅助算子流程，取消 8/16 的人工分界。W8 投影和融合的共享 FFN gate/up/SwiGLU 同时搜索 DP4A 和 Tensor Core。HC 保留独立归约／激活，up／mix 与专家旋转／分派／位平面打包使用统一融合实现。这些融合保留原 FP16 舍入、scale 和 FP32 累加边界，数值边界不参与搜索。较宽的 BF16 投影复用行间权重，并保留原矩阵累加方向；长度只选择局部实现，不选择另一套模型计算程序。超过 128 行的整数投影复用较宽矩阵 tile；专家与路由同步使用十六行 tile和四级压缩权重预取，HC up 读取已有 BF16 权重，避免大量行重复解包压缩缓存，不增加权重副本。
 
 Rust 使用构建生成的行数选择表，无需手写 batch 档位或在线编译。GDN/QSA 继续共享单请求算子生成的动态地址表实现；GDN 卷积复用紧凑单 token 与原地历史更新，避免执行 padding 和独立历史复制。输入、图片覆盖、PLE 历史、位置、MTP 隐藏捕获及输出回写由地址表驱动，因此相同形状的 CUDA Graph 可跨请求组合复用。编译实现、工作区容量与 graph 捕获尺寸分别管理；未知 batch 数不补成虚假请求。动态回退 tile 在构建时固定，行数和专家路由在运行时确定。
 
-`checks/decode_tuning.py` 验证自动调优的固定形状和动态回退，检查整数／scale 输出、尾部保护和实际 graph replay；`checks/decode_rows.py` 检查地址表 primitive。Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流普通生成也使用统一模板。Graph 的分支按 canonical slot 声明，离线特化继承同一依赖关系；发布时逐一验证所有变体的读写集合，只有独立分支允许并行。`checks/expert_decode.py` 检查专家输入融合的全部路由输出、动态尾部与更换输入后的 Graph replay；`checks/route_decode.py` 对照原三步路由，包括热点专家、动态尾部和 replay。
+`checks/bf16_rows.py`、`checks/hc_rows.py`、`checks/bulk_rows.py` 和 `checks/row_arithmetic.py` 检查行 tile、原始累加顺序、动态尾部及 Graph replay。`checks/decode_tuning.py` 验证自动调优的固定形状和动态回退，检查整数／scale 输出、尾部保护和实际 graph replay；`checks/decode_rows.py` 检查地址表 primitive。Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流普通生成也使用统一模板；关闭 MTP 或 MTP 策略暂时关闭投机时均走此路径。在线 batch planner 不再支持逐容量执行、补齐空行或旧单流回退，未完成统一模板构建的中间包不能用于 batch 推理。MTP 末尾不足验证宽度时也走普通一行 packet；单请求 target 程序只作为状态准备与数值参考。MTP 验证与混合 batch 只保留请求私有的因果段、前缀因子、捕获和提交，草稿不再按 2/4/8 容量复制计算程序。Graph 的分支按 canonical slot 声明，离线特化继承同一依赖关系；发布时逐一验证所有变体的读写集合，只有独立分支允许并行。`checks/expert_decode.py` 检查专家输入融合的全部路由输出、动态尾部与更换输入后的 Graph replay；`checks/route_decode.py` 对照原三步路由，包括热点专家、动态尾部和 replay。
 
 模板支持 1–4096 个真实输入行；更长输入分块执行，单行 prefill 复用相同模板和 cubin。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。输入准备按执行程序区分 prefill、decode 和 MTP 验证，单行 prefill 的隐藏捕获读取模板输出。
 
@@ -83,11 +87,11 @@ bash tools/operators/run.sh tools/model/flash_next/prepare.py artifacts/flash-bu
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving
 ```
 
-这一步生成基础参考包；按需要附加下文的 MTP、图片及 batch 能力，最后完成规范归约、HC 操作数和动态 prefill 构建，再部署最终目录：
+这一步生成基础参考包；按需要附加下文的 MTP、图片及 batch 能力，最后完成规范归约、HC 操作数、动态 prefill 和统一行模板构建，再部署最终目录：
 
 ```bash
-./target/release/orinfer serve artifacts/models/flash-dynamic \
-  --model qwen-flash-next --max-active-requests 1 \
+./target/release/orinfer serve artifacts/models/flash-shared-rows \
+  --model qwen-flash-next \
   --cuda-graph decode_only --prefix-cache-mib 512
 ```
 
@@ -99,7 +103,7 @@ bash tools/operators/run.sh tools/model/flash_next/prepare_mtp.py artifacts/flas
   --base-model artifacts/models/flash-serving \
   --model-output artifacts/models/flash-serving-mtp
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mtp
-# 继续完成最终动态 prefill 构建；serve 指向最终目录，包含 MTP 的包自动启用。
+# 继续完成动态 prefill 和统一行模板构建；serve 指向最终目录，包含 MTP 的包自动启用。
 ```
 
 代码修改或重复模板可额外指定 `--prompt-lookup`，从本请求历史中提取待验证续写；默认关闭，普通生成可能因较差候选而变慢。它仅适用于无惩罚 greedy 且未请求 logprobs 的请求，上限仍由 `--mtp-drafts` 控制。
@@ -122,7 +126,7 @@ bash tools/operators/run.sh tools/model/flash_next/prepare_vision.py artifacts/f
   --checkpoint artifacts/checkpoints/flash-vision \
   --model-output artifacts/models/flash-serving-mm
 PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models/flash-serving-mm
-# 继续完成 batch、混合执行和最终动态 prefill 构建，再部署最终目录。
+# 继续完成 batch、混合执行、动态 prefill 和统一行模板构建，再部署最终目录。
 ```
 
 视觉编码器与 27B 共享 TileLang 算子和执行组件，merger 输出为 2560 维；QSA 查询、KV 和压缩索引使用交错三轴 MRoPE，MTP 读取移位后的图像特征。PLE 保留原始 image token ID。多图按消息次序独立编码，特征和位置索引属于请求私有状态；图片身份参与 prefix 匹配。
@@ -131,7 +135,7 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models
 
 ## 多请求 decode
 
-以下步骤准备基础 batch 构建输入；最终发布需继续完成规范归约、动态 prefill 和上方的 `unify_decode.py`，服务指向最终目录。旧的逐容量 decode 绑定和工作区会在统一模板发布时删除。
+以下步骤准备基础 batch 构建输入；最终发布需继续完成规范归约、动态 prefill 和上方的 `unify_decode.py` 与 `unify_rows.py`，服务指向最终目录。逐容量中间绑定只供离线构建读取，会在统一模板发布时删除；它们没有在线 batch 执行路径。
 
 在已发布的文本或多模态包上离线增加 batch 算子。先执行 `make build`，使用新的目标目录；权重逐字节复用，shape-only 编译不需要加载第二份模型：
 
@@ -245,7 +249,7 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_draft.py artifacts/flas
   --model artifacts/models/flash-verify --model-output artifacts/models/flash-draft
 ```
 
-共享验证支持每请求 2–8 行，保留每个候选位置的 logits 和精确提交因子。草稿共享 2/4/8 行的投影、HC、专家与 Q4 输出头；QSA、KV、索引和 pending 保持请求私有。接受后按真实的整段移位 token 拼接预热，单个包最多 8 行，只为每个请求的端点计算草稿头。CLI 对 2–8 个 decoder 按完整轮次成本自适应选择，其他配置仍可使用普通 target batch。
+共享验证支持每请求 2–8 行，保留每个候选位置的 logits 和精确提交因子。这两步产生离线构建输入；随后执行 `unify_decode.py` 和 `unify_rows.py`，草稿生成与接受后的预热共享动态行计算。QSA、KV、索引和 pending 保持请求私有。多流草稿最多 8 个请求，预热计算容量为 512 个真实 token 行，只为每个请求的端点计算草稿头。CLI 对 2–8 个 decoder 按完整轮次成本自适应选择，其他配置仍可使用普通 target batch。
 
 新增的 CUDA 编译只包含因子保存和完整行 Q4 草稿头等必要 kernel，其余复用现有 cubin。权重不重新量化；新增执行逻辑需要重建原生库、校验完整计划并重新进行 GPU/CLI 验收。程序声明属于模型包，关闭 MTP 时一并移除其专用 batch 程序。在线格式和 C ABI 表保持版本 1。
 
@@ -253,7 +257,7 @@ bash tools/operators/run.sh tools/model/flash_next/mixed_draft.py artifacts/flas
 
 ### 动态 prefill 与可暂停前向
 
-完成 MTP、视觉、batch 和混合执行构建后，以动态 prefill 作为最终构建步骤：先用 `canonical_reductions.py` 固定 QSA/GDN/HC 的数值归约，再用 `optimize_hc_prefill.py` 准备 HC 操作数，最后执行本文开头的 `dynamic_prefill.py`。后续重建已有动态包应使用其声明的实际行数契约；基础参考包的固定形状仅用于离线构建。
+完成 MTP、视觉、batch 和混合执行构建后，先完成动态 prefill，再构建统一 decode 行模板：先用 `canonical_reductions.py` 固定 QSA/GDN/HC 的数值归约，再用 `optimize_hc_prefill.py` 准备 HC 操作数，最后执行本文开头的 `dynamic_prefill.py`。后续重建已有动态包应使用其声明的实际行数契约；基础参考包的固定形状仅用于离线构建。
 
 QSA 固定按 256-token 区间归约，再按固定顺序合并八份 FP32 部分结果；最后一份覆盖 pending 尾部。GDN 保持 FP32 递推，HC down 按四路 stream 顺序求和。这些数值边界不随 batch 或 prefill 长度改变。
 

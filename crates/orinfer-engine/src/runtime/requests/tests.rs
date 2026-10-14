@@ -1088,7 +1088,7 @@ fn validate_flash_mtp() {
                         .unwrap();
                     model.upload_segment_controls(verify.tokens).unwrap();
                     model
-                        .launch_program(&verify.program, ExecutionPhase::Decode)
+                        .launch_rows(&verify.program, verify.tokens, ExecutionPhase::Decode)
                         .unwrap();
                     let predicted = model
                         .read_controls(&spec.verification_tokens, accepted)

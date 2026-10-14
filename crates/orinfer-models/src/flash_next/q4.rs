@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 /// Creation receives storage contracts before kernels are attached. Derive
 /// precision variants from roles, never from package kernel enumeration.
 pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
+    let shared_target = super::unified_decode::shared(manifest);
+    let shared_draft = super::draft_rows::present(manifest);
     let buffers: BTreeMap<_, _> = manifest
         .buffers
         .iter()
@@ -62,7 +64,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 }
             }
         }
-        for rows in 1..=8 {
+        for rows in (1..=8).filter(|&n| n == 1 || !shared_target) {
             let program = if rows == 1 {
                 "decode".into()
             } else {
@@ -114,7 +116,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
             }
         }
         workspaces.insert(("Out_", 6144));
-        for rows in 1..=8 {
+        for rows in (1..=8).filter(|&n| n == 1 || !shared_target) {
             let program = if rows == 1 {
                 "decode".into()
             } else {
@@ -157,8 +159,12 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         }
         let mut heads = vec!["head_m1/body/k5".to_owned()];
         if manifest.mtp.is_some() {
-            heads.extend((1..=8).map(|rows| format!("mtp_head_m{rows}/body/k5")));
-            heads.extend((2..=8).map(|rows| format!("verify_m{rows}/head/k5")));
+            if !shared_draft {
+                heads.extend((1..=8).map(|rows| format!("mtp_head_m{rows}/body/k5")));
+            }
+            if !shared_target {
+                heads.extend((2..=8).map(|rows| format!("verify_m{rows}/head/k5")));
+            }
         }
         for projection in heads {
             if !manifest

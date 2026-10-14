@@ -2,6 +2,7 @@
 mod batching;
 mod decode_fusions;
 mod draft_batch;
+mod draft_rows;
 mod experts;
 mod hc;
 mod inputs;
@@ -12,6 +13,7 @@ mod plan;
 mod q4;
 mod routing;
 mod row_variants;
+mod rows;
 mod unified_decode;
 mod vision;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};

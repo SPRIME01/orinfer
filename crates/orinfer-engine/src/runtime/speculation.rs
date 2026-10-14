@@ -82,10 +82,10 @@ impl ModelRuntime {
             let ids = &shifted_ids[offset..offset + plan.tokens];
             self.upload_ids(&spec.input, ids)?;
             self.prepare_program_inputs(&plan.program, ids, &[])?;
-            self.launch_program(&plan.program, phase)?;
+            self.launch_rows(&plan.program, plan.tokens, phase)?;
             offset += plan.tokens;
             if produce_head && offset == shifted_ids.len() {
-                self.launch_program(&plan.head_program, phase)?;
+                self.launch_rows(&plan.head_program, 1, phase)?;
             }
         }
         Ok(())
@@ -183,7 +183,7 @@ impl ModelRuntime {
                         &[*drafts.last().ok_or("Missing draft input")?],
                         &[],
                     )?;
-                    self.launch_program(&spec.draft_program, ExecutionPhase::Decode)?;
+                    self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
                 }
                 let token = self.read_control(&spec.token)?;
                 if self.read_control(&spec.status)? != 0 || token < 0 || token as usize >= vocab {
@@ -227,7 +227,7 @@ impl ModelRuntime {
                 &history[..history.len() - 1],
             )?;
             self.upload_segment_controls(plan.tokens)?;
-            self.launch_program(&plan.program, ExecutionPhase::Decode)?;
+            self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
             self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
             let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
             let status = self.read_controls(&spec.verification_status, plan.tokens)?;

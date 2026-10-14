@@ -8,10 +8,31 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-from tools.model.publication import atomic_model, clone_model, commit_package, load_model
+from tools.model.publication import (
+    atomic_model,
+    clone_model,
+    commit_package,
+    load_model,
+    link_or_copy,
+)
 
 
 class PublicationTests(unittest.TestCase):
+    def test_replacing_a_cloned_asset_does_not_overwrite_the_source_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "original"
+            clone = root / "clone"
+            replacement = root / "replacement"
+            source.write_bytes(b"old kernel")
+            os.link(source, clone)
+            replacement.write_bytes(b"new kernel")
+            link_or_copy(replacement, clone)
+            self.assertEqual(source.read_bytes(), b"old kernel")
+            self.assertEqual(clone.read_bytes(), b"new kernel")
+            link_or_copy(clone, clone)
+            self.assertEqual(clone.read_bytes(), b"new kernel")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

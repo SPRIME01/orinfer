@@ -77,6 +77,13 @@ def write_json(path, data):
 
 
 def link_or_copy(source, destination):
+    destination = Path(destination)
+    if destination.exists():
+        if os.path.samefile(source, destination):
+            return
+        # A staged package may share this inode with its immutable source.
+        # Replace the link, never overwrite bytes through the shared inode.
+        destination.unlink()
     try:
         os.link(source, destination)
     except OSError:

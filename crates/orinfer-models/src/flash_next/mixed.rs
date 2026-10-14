@@ -105,7 +105,8 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     {
         return Err("Invalid Flash mixed causal/row layout".into());
     }
-    for rows in CAPACITIES {
+    let shared = super::unified_decode::shared(m);
+    for rows in CAPACITIES.into_iter().filter(|_| !shared) {
         let prefix = format!("flash_mixed_m{rows}");
         m.programs.insert(
             format!("{prefix}/begin"),
@@ -131,7 +132,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             super::plan::section(&prefix, "layer1/ple", 7, None),
         );
     }
-    for &rows in &m.batch_profiles {
+    for &rows in m.batch_profiles.iter().filter(|_| !shared) {
         let prefix = format!("flash_mixed_head_m{rows}");
         m.programs.insert(
             format!("{prefix}/head"),
@@ -206,10 +207,17 @@ pub(super) fn validate_segments(m: &Manifest, segments: &[BatchSegment]) -> Resu
         }
         n.checked_add(s.tokens).ok_or("Mixed row overflow".into())
     })?;
-    CAPACITIES
-        .into_iter()
-        .find(|&n| n >= total)
-        .ok_or("Flash mixed row capacity exceeded".into())
+    if super::unified_decode::shared(m) {
+        if total == 0 || total > 1024 {
+            return Err("Flash mixed row capacity exceeded".into());
+        }
+        Ok(total)
+    } else {
+        CAPACITIES
+            .into_iter()
+            .find(|&n| n >= total)
+            .ok_or("Flash mixed row capacity exceeded".into())
+    }
 }
 
 fn invoke(
@@ -275,6 +283,7 @@ enum Kind {
 }
 
 fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<Invocation>> {
+    let shared = super::unified_decode::shared(m);
     let verified = |s: &BatchSegment| {
         kind != Kind::Ordinary
             && m.mtp.as_ref().is_some_and(|spec| {
@@ -313,17 +322,24 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 .checked_add(s.tokens)
                 .ok_or("Verification row overflow".to_string())
         })?;
-        if !(2..=128).contains(&segments.len())
+        if !((if shared { 1 } else { 2 })..=128).contains(&segments.len())
             || head_used > 128
             || !has_verify
             || (kind == Kind::MixedVerification && !has_prefill)
         {
             return Err("Invalid mixed verification endpoints".into());
         }
-        CAPACITIES
-            .into_iter()
-            .find(|&n| n >= total)
-            .ok_or("Missing verification row body")?
+        if shared {
+            if total > 1024 {
+                return Err("Verification row capacity exceeded".into());
+            }
+            total
+        } else {
+            CAPACITIES
+                .into_iter()
+                .find(|&n| n >= total)
+                .ok_or("Missing verification row body")?
+        }
     };
     let layout = m
         .batch_layout
@@ -341,30 +357,30 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let segments = ordered.as_slice();
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
     let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
-    let unified_decode = super::unified_decode::present(m);
-    let private_capacity = if unified_decode {
-        128
-    } else {
-        decoders.next_power_of_two().max(2)
-    };
-    let private_views: BTreeMap<_, _> = layout
+    if parallel && !super::unified_decode::present(m) {
+        return Err("Mixed decode requires the unified row template".into());
+    }
+    let mut private_views: BTreeMap<_, _> = layout
         .row_strides
         .keys()
         .filter_map(|role| {
             let buffer = format!("FlashMixed_{role}");
             m.buffers.iter().any(|b| b.name == buffer).then(|| {
                 (
-                    if unified_decode {
-                        format!("FlashDecode_{role}")
-                    } else {
-                        format!("BatchM{private_capacity}_{role}")
-                    },
+                    format!("FlashDecode_{role}"),
                     BufferView { buffer, offset: 0 },
                 )
             })
         })
         .collect();
-    let prefix = format!("flash_mixed_m{rows}");
+    if shared {
+        private_views.clear();
+    }
+    let prefix = if shared {
+        "flash_decode".into()
+    } else {
+        format!("flash_mixed_m{rows}")
+    };
     let dynamic = m
         .dynamic_batch_kernels
         .contains_key(&format!("{prefix}/begin/k0"));
@@ -415,25 +431,32 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
             out.push(invocation);
         }
-        let mut views: BTreeMap<_, _> = layout
-            .row_strides
-            .iter()
-            .filter(|(n, _)| !matches!(n.as_str(), "Logits" | "Selected"))
-            .map(|(name, stride)| {
-                let name = format!("FlashMixed_{name}");
-                (
-                    name.clone(),
-                    BufferView {
-                        buffer: name,
-                        offset: start * stride,
-                    },
-                )
-            })
-            .collect();
+        let mut views = BTreeMap::new();
+        for (role, stride) in &layout.row_strides {
+            if matches!(role.as_str(), "Logits" | "Selected") {
+                continue;
+            }
+            let old = format!("FlashMixed_{role}");
+            let name = if shared {
+                format!("FlashDecode_{role}")
+            } else {
+                old.clone()
+            };
+            let view = BufferView {
+                buffer: name.clone(),
+                offset: start * stride,
+            };
+            views.insert(old, view.clone());
+            views.insert(name, view);
+        }
         views.insert(
             RESIDUAL.into(),
             BufferView {
-                buffer: RESIDUAL.into(),
+                buffer: if shared {
+                    "FlashDecode_Residual".into()
+                } else {
+                    RESIDUAL.into()
+                },
                 offset: start * 20480,
             },
         );
@@ -441,10 +464,15 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             (format!("M{width}_Embedding"), "FlashMixed_M1_Embedding"),
             (format!("M{width}_Ple"), "FlashMixed_M1_Ple"),
         ] {
+            let destination = if shared {
+                destination.replace("FlashMixed_", "FlashDecode_")
+            } else {
+                destination.into()
+            };
             out.push(invoke(
                 Operation::Copy {
                     source,
-                    destination: destination.into(),
+                    destination,
                     bytes: s.tokens * 5120,
                 },
                 Some(s.slot),
@@ -473,10 +501,17 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             ));
         }
     }
-    append(&mut out, m, &format!("{prefix}/begin"), None, &empty)?;
+    let append_body = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
+        if shared {
+            super::rows::append(m, out, program, start, None, &empty)
+        } else {
+            append(out, m, program, None, &empty)
+        }
+    };
+    append_body(&mut out, &format!("{prefix}/begin"))?;
     for layer in 0..48 {
         if layer == 1 {
-            append(&mut out, m, &format!("{prefix}/layer1/ple"), None, &empty)?;
+            append_body(&mut out, &format!("{prefix}/layer1/ple"))?;
             for (s, (_, _, views)) in segments.iter().zip(&starts) {
                 append(
                     &mut out,
@@ -495,13 +530,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 )?;
             }
         }
-        append(
-            &mut out,
-            m,
-            &format!("{prefix}/layer{layer}/pre"),
-            None,
-            &empty,
-        )?;
+        append_body(&mut out, &format!("{prefix}/layer{layer}/pre"))?;
         // Padded private rows must never retain a previous batch's mixer output.
         if rows > start && !dynamic {
             for (name, stride) in &layout.row_strides {
@@ -533,16 +562,10 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
         }
         if parallel {
-            let program = if unified_decode {
-                format!("flash_decode_state/layer{layer}")
-            } else {
-                format!("flash_private_m{private_capacity}/layer{layer}")
-            };
+            let program = format!("flash_decode_state/layer{layer}");
             append(&mut out, m, &program, None, &private_views)?;
             for invocation in out.iter_mut().rev().take(m.programs[&program].len()) {
-                if (unified_decode || private_capacity != decoders)
-                    && let Operation::Kernel { name } = &invocation.operation
-                {
+                if let Operation::Kernel { name } = &invocation.operation {
                     invocation.launch = Some(
                         m.dynamic_batch_kernels
                             .get(name)
@@ -581,23 +604,20 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 }
             }
         }
-        append(
-            &mut out,
-            m,
-            &format!("{prefix}/layer{layer}/post"),
-            None,
-            &empty,
-        )?;
+        append_body(&mut out, &format!("{prefix}/layer{layer}/post"))?;
     }
-    let head_rows = *m
-        .batch_profiles
-        .iter()
-        .find(|&&n| {
-            n >= head_used
-                && m.programs
-                    .contains_key(&format!("flash_mixed_head_m{n}/head"))
-        })
-        .ok_or("Missing Flash endpoint head")?;
+    let head_rows = if shared {
+        head_used
+    } else {
+        *m.batch_profiles
+            .iter()
+            .find(|&&n| {
+                n >= head_used
+                    && m.programs
+                        .contains_key(&format!("flash_mixed_head_m{n}/head"))
+            })
+            .ok_or("Missing Flash endpoint head")?
+    };
     if head_rows > head_used {
         let pad = BTreeMap::from([(
             HEAD_RESIDUAL.into(),
@@ -649,7 +669,11 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             (
                 RESIDUAL.into(),
                 BufferView {
-                    buffer: RESIDUAL.into(),
+                    buffer: if shared {
+                        "FlashDecode_Residual".into()
+                    } else {
+                        RESIDUAL.into()
+                    },
                     offset: (first + if verified(s) { 0 } else { s.tokens - 1 }) * 20480,
                 },
             ),
@@ -672,44 +696,61 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         ));
         head_lane += if verified(s) { s.tokens } else { 1 };
     }
-    append(
-        &mut out,
-        m,
-        &format!("flash_mixed_head_m{head_rows}/head"),
-        None,
-        &empty,
-    )?;
+    if shared {
+        let views = BTreeMap::from([(
+            "FlashDecode_Residual".into(),
+            BufferView {
+                buffer: HEAD_RESIDUAL.into(),
+                offset: 0,
+            },
+        )]);
+        super::rows::append(m, &mut out, "flash_decode/head", head_used, None, &views)?;
+    } else {
+        append(
+            &mut out,
+            m,
+            &format!("flash_mixed_head_m{head_rows}/head"),
+            None,
+            &empty,
+        )?;
+    }
+    let logits = if shared {
+        "FlashDecode_Logits".into()
+    } else {
+        format!("BatchM{head_rows}_Logits")
+    };
+    let selected = if shared {
+        "FlashDecode_Selected".into()
+    } else {
+        format!("BatchM{head_rows}_Selected")
+    };
     let mut head_lane = 0;
     for s in segments {
         if verified(s) {
             let spec = m.mtp.as_ref().unwrap();
             let views = BTreeMap::from([
                 (
-                    format!("BatchM{head_rows}_Logits"),
+                    logits.clone(),
                     BufferView {
-                        buffer: format!("BatchM{head_rows}_Logits"),
+                        buffer: logits.clone(),
                         offset: head_lane * m.vocab * 4,
                     },
                 ),
                 (
-                    format!("BatchM{head_rows}_Selected"),
+                    selected.clone(),
                     BufferView {
-                        buffer: format!("BatchM{head_rows}_Selected"),
+                        buffer: selected.clone(),
                         offset: head_lane * 8,
                     },
                 ),
             ]);
             for (source, destination, bytes) in [
                 (
-                    format!("BatchM{head_rows}_Logits"),
+                    logits.clone(),
                     spec.verification_logits.clone(),
                     s.tokens * m.vocab * 4,
                 ),
-                (
-                    format!("BatchM{head_rows}_Selected"),
-                    "VerificationPairs".into(),
-                    s.tokens * 8,
-                ),
+                (selected.clone(), "VerificationPairs".into(), s.tokens * 8),
             ] {
                 out.push(invoke(
                     Operation::Copy {
@@ -732,15 +773,15 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             continue;
         }
         let mut views = BTreeMap::from([(
-            format!("BatchM{head_rows}_Logits"),
+            logits.clone(),
             BufferView {
-                buffer: format!("BatchM{head_rows}_Logits"),
+                buffer: logits.clone(),
                 offset: head_lane * m.vocab * 4,
             },
         )]);
         out.push(invoke(
             Operation::Copy {
-                source: format!("BatchM{head_rows}_Logits"),
+                source: logits.clone(),
                 destination: m.logits.clone(),
                 bytes: m.vocab * 4,
             },
@@ -748,7 +789,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             &views,
         ));
         for (offset, destination) in [(0, &m.token), (4, &m.status)] {
-            let name = format!("BatchM{head_rows}_Selected");
+            let name = selected.clone();
             views.insert(
                 name.clone(),
                 BufferView {
@@ -768,7 +809,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         }
         head_lane += 1;
     }
-    if dynamic {
+    if dynamic && !shared {
         for invocation in &mut out {
             if let Operation::Kernel { name } = &invocation.operation
                 && name.starts_with(&format!("{prefix}/"))

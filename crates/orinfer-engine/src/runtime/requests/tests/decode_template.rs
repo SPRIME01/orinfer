@@ -2,6 +2,50 @@
 use super::*;
 
 #[test]
+#[ignore = "Requires Flash mixed rows and exclusive GPU experiment lock"]
+fn profile_flash_mixed_layer() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            prefix_cache_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut source = input(fixture.cases.last().unwrap(), 64);
+    source.input_tokens.truncate(128);
+    let mut decoder = model.start_request(source, &|| false).unwrap();
+    model
+        .with_request(&mut decoder, |m, r| m.advance_prefill(r, 128, false))
+        .unwrap();
+    let mut source = input(fixture.cases.last().unwrap(), 64);
+    source.input_tokens.truncate(512);
+    let mut prefill = model.start_request(source, &|| false).unwrap();
+    let segments = model
+        .prepare_batch_inputs(&mut [&mut prefill, &mut decoder], &[(0, 512), (1, 1)])
+        .unwrap();
+    let (calls, _) = model
+        .model_package
+        .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Ordinary)
+        .unwrap();
+    let end=calls.iter().position(|call|matches!(&call.operation,crate::model::Operation::Kernel {name} if name.contains("/layer1/"))).unwrap();
+    let calls = &calls[..end];
+    let trials = model.execution.profile_graph_operations(calls).unwrap();
+    let mut records = Vec::new();
+    for (i, call) in calls.iter().enumerate() {
+        let ms = trials.iter().map(|t| t[i] as f64).sum::<f64>() / trials.len() as f64;
+        records.push(json!({"operation":call.operation,"ms":ms}));
+    }
+    std::fs::write(fixture.output, serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+    model.finish_request(&mut prefill, false).unwrap();
+    model.finish_request(&mut decoder, false).unwrap();
+}
+
+#[test]
 #[ignore = "Requires the unified Flash package and exclusive GPU experiment lock"]
 fn validate_flash_decode_template_reuse() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
@@ -120,6 +164,65 @@ fn validate_flash_decode_template_reuse() {
             .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "Requires MTP packages and exclusive GPU experiment lock"]
+fn benchmark_flash_shared_speculation() {
+    let fixture: Fixture = crate::model::read(&PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: fixture.cuda_graph.parse().unwrap(),
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(3),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let options = scheduler::Options {
+        target_tpot_ms: 2000.,
+        memory_reserve_bytes: 0,
+        ..Default::default()
+    };
+    let mut results = Vec::new();
+    for (case, source) in fixture.cases.iter().enumerate() {
+        let mut request = model.start_request(input(source, 64), &|| false).unwrap();
+        let at = Instant::now();
+        prefill_reference(&mut model, &mut request);
+        let prefill_s = at.elapsed().as_secs_f64();
+        let mut samples = Vec::new();
+        let mut tokens = Vec::new();
+        let mut committed = 0;
+        let mut round = 0;
+        while !request.is_finished() {
+            let before = request.generated;
+            let at = Instant::now();
+            let output = model
+                .advance_requests(&mut [&mut request], &options)
+                .unwrap();
+            assert!(request.failure().is_none());
+            if round >= 3 {
+                committed += request.generated - before;
+                samples.push(at.elapsed().as_secs_f64());
+            }
+            tokens.extend(output.into_iter().flat_map(|s| s.tokens));
+            round += 1;
+        }
+        let seconds = samples.iter().sum::<f64>();
+        results.push(
+            json!({"case":case,"prompt_tokens":request.input.len(),"prefill_s":prefill_s,
+            "committed_tokens":committed,"decode_tps":committed as f64/seconds,
+            "samples_s":samples,"tokens":tokens,"mtp":request.speculation_statistics()}),
+        );
+        eprintln!("MTP case {case}: {} tokens / {seconds:.6}s", committed);
+        model.finish_request(&mut request, true).unwrap();
+    }
+    std::fs::write(fixture.output, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
 }
 
 #[test]

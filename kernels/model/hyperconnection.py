@@ -318,11 +318,22 @@ def hc_projection(
 
 
 @orin_jit
-def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = False):
+def hc_up_mix(
+    M: int,
+    H: int,
+    rank: int,
+    streams: int = 4,
+    dynamic_rows: bool = False,
+    block_m: int | None = None,
+):
     """BF16 up projection and branch mix, preserving every FP16 boundary."""
     assert M >= 1 and H % 32 == 0 and rank % 64 == 0 and streams == 4
     small = M <= 8
     bm, bn = (8 if small else 16), 32
+    if block_m is not None:
+        if small or block_m not in (16, 32, 64, 128):
+            raise ValueError("Unsupported HC up row tile")
+        bm = block_m
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -366,7 +377,7 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = 
                     T.gemm(a, w, acc, transpose_B=True)
             T.copy(acc, rounded_up)
             for branch in T.serial(streams):
-                for i, j in T.Parallel(bm, bn):
+                for i, j in T.Parallel(bm, bn, coalesced_width=T.int32(1)):
                     if by * bm + i < M:
                         up = (
                             rounded_up[branch * bn + j, i]
@@ -380,7 +391,7 @@ def hc_up_mix(M: int, H: int, rank: int, streams: int = 4, dynamic_rows: bool = 
                             T.float16,
                         )
                         total[i, j] += T.cast(product, T.float32)
-            for i, j in T.Parallel(bm, bn):
+            for i, j in T.Parallel(bm, bn, coalesced_width=T.int32(1)):
                 if by * bm + i < M:
                     Out[by * bm + i, bx * bn + j] = total[i, j] / streams
 
