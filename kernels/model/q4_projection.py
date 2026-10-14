@@ -39,10 +39,12 @@ def validate_shape(M, N, K):
 
 
 @orin_jit
-def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES):
+def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES, *, dynamic_rows=False):
     validate_shape(M, N, K)
     if not 1 <= M <= 8 or BN not in (4, 8, 16):
         raise ValueError("Q4 GEMV supports one to eight rows and BN=4/8/16")
+    BM = M
+    M = row_count(M, dynamic_rows)
     source = decode_source(magnitudes)
 
     @T.prim_func
@@ -55,13 +57,13 @@ def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES):
     ):
         with T.Kernel(T.ceildiv(N, BN), threads=128) as bx:
             T.import_source(source)
-            acc = T.alloc_fragment((M, BN, 32), T.int32)
-            total = T.alloc_fragment((M, BN), T.int32)
+            acc = T.alloc_fragment((BM, BN, 32), T.int32)
+            total = T.alloc_fragment((BM, BN), T.int32)
             weight = T.alloc_fragment((BN, 32), T.uint32)
             T.annotate_layout(
                 {
                     acc: tilelang.Fragment(
-                        (M, BN, 32),
+                        (BM, BN, 32),
                         forward_thread_fn=lambda i, n, l: (n % 4) * 32 + l,
                         forward_index_fn=lambda i, n, l: i * (BN // 4) + n // 4,
                     ),
@@ -80,13 +82,14 @@ def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES):
                         weight[n, l] = T.call_pure_extern(
                             "uint32", "q4_decode", T.cast(W[bx * BN + n, group * 32 + l], T.uint32)
                         )
-                for i, n, l in T.Parallel(M, BN, 32):
-                    acc[i, n, l] = T.call_pure_extern(
-                        "int32", "q4_mad", A[i, group * 32 + l], weight[n, l], acc[i, n, l]
-                    )
+                for i, n, l in T.Parallel(BM, BN, 32):
+                    if i < M:
+                        acc[i, n, l] = T.call_pure_extern(
+                            "int32", "q4_mad", A[i, group * 32 + l], weight[n, l], acc[i, n, l]
+                        )
             T.reduce_sum(acc, total, dim=2)
-            for i, n in T.Parallel(M, BN):
-                if bx * BN + n < N:
+            for i, n in T.Parallel(BM, BN):
+                if i < M and bx * BN + n < N:
                     Out[i, bx * BN + n] = (
                         T.cast(total[i, n], T.float32) * T.cast(S[bx * BN + n], T.float32)
                     ) * T.cast(AS[i], T.float32)

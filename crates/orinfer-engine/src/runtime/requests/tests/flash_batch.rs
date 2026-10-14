@@ -660,13 +660,27 @@ fn validate_flash_decode_batches() {
         // admitted cohort does not prove that the batch kernel actually ran.
         for i in 0..count {
             while requests[i].prefilling {
-                for step in model
-                    .advance_requests(&mut [&mut requests[i]], &options)
-                    .unwrap()
-                {
-                    assert_eq!(step.request, 0);
-                    assert_eq!(step.tokens.len(), 1);
-                    outputs[i].extend(step.tokens);
+                // Freeze prompt chunking as well as token history. Adaptive
+                // scheduler feedback must not change the reference's initial state.
+                let (_, tokens) = model
+                    .with_request(&mut requests[i], |m, r| {
+                        let remaining = ModelRuntime::prefill_boundary(r) - r.offset;
+                        let chunk = m
+                            .manifest
+                            .prefill_plans
+                            .iter()
+                            .filter_map(|p| {
+                                let n = p.chunk_tokens.min(remaining);
+                                p.accepts(n).then_some(n)
+                            })
+                            .max()
+                            .unwrap_or(1);
+                        m.advance_prefill(r, chunk, false)
+                    })
+                    .unwrap();
+                if !tokens.is_empty() {
+                    assert_eq!(tokens.len(), 1);
+                    outputs[i].extend(tokens);
                     scores[i].push(distribution(&mut model, &mut requests[i]));
                 }
             }
@@ -705,7 +719,20 @@ fn validate_flash_decode_batches() {
                 .unwrap();
             while baseline.prefilling {
                 model
-                    .advance_requests(&mut [&mut baseline], &options)
+                    .with_request(&mut baseline, |m, r| {
+                        let remaining = ModelRuntime::prefill_boundary(r) - r.offset;
+                        let chunk = m
+                            .manifest
+                            .prefill_plans
+                            .iter()
+                            .filter_map(|p| {
+                                let n = p.chunk_tokens.min(remaining);
+                                p.accepts(n).then_some(n)
+                            })
+                            .max()
+                            .unwrap_or(1);
+                        m.advance_prefill(r, chunk, false)
+                    })
                     .unwrap();
             }
             let mut kl = 0.;
@@ -1095,11 +1122,7 @@ fn validate_flash_mixed_decoder_groups() {
         let mut reference = vec![];
         for lane in 0..count {
             let mut request = model.start_request(request_input(lane), &|| false).unwrap();
-            while request.prefilling {
-                model
-                    .advance_requests(&mut [&mut request], &options)
-                    .unwrap();
-            }
+            prefill_reference(&mut model, &mut request);
             model
                 .advance_requests(&mut [&mut request], &options)
                 .unwrap();
@@ -1109,11 +1132,7 @@ fn validate_flash_mixed_decoder_groups() {
         let mut requests = vec![];
         for lane in 0..count {
             let mut request = model.start_request(request_input(lane), &|| false).unwrap();
-            while request.prefilling {
-                model
-                    .advance_requests(&mut [&mut request], &options)
-                    .unwrap();
-            }
+            prefill_reference(&mut model, &mut request);
             requests.push(request);
         }
         requests.push(

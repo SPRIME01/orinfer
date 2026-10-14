@@ -12,6 +12,7 @@ mod plan;
 mod q4;
 mod routing;
 mod row_variants;
+mod unified_decode;
 mod vision;
 use crate::{adapter::Adapter, artifact::Result, model::Manifest, policy::Policy};
 use orinfer_model_sdk::{
@@ -240,6 +241,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         let variants = row_variants::build(&request.kernel_contracts, &manifest.buffers)?;
         manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
             capacity: 4096,
+            program_capacities: std::collections::BTreeMap::new(),
             programs,
             variants,
         });
@@ -292,6 +294,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             vec![]
         };
     }
+    unified_decode::configure(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
         &request.model_root,

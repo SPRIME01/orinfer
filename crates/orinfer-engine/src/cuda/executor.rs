@@ -5,12 +5,16 @@ use std::cell::RefCell;
 pub(super) struct BatchGraphKey {
     pub operation: orinfer_model_sdk::abi::BatchOperation,
     pub segments: Vec<(usize, usize)>,
+    pub rows: usize,
+    pub shared: Option<SharedGraphKey>,
 }
 impl From<Vec<(usize, usize)>> for BatchGraphKey {
     fn from(segments: Vec<(usize, usize)>) -> Self {
         Self {
             operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            rows: segments.iter().map(|(_, tokens)| tokens).sum(),
             segments,
+            shared: None,
         }
     }
 }
@@ -27,6 +31,8 @@ pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize, u
 pub(super) struct SharedGraphKey {
     pub operations: Vec<crate::execution::Invocation>,
     pub addresses: Vec<u64>,
+    /// Unique buffer bases checked by the fully indirect replay fast path.
+    pub buffers: Vec<(String, u64)>,
 }
 pub(super) type SharedGraphCache = BTreeMap<SharedGraphKey, (Handle, u64)>;
 

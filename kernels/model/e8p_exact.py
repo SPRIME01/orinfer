@@ -8,6 +8,7 @@ The K64 code layout and matching within-eight permutation are lossless.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 SOURCE = r"""
 __device__ __forceinline__ unsigned nib_fast(unsigned c,unsigned b){unsigned pp=__popc(c&255u)&1u,ss=c^pp;unsigned sel=(ss&0x33u)|((ss&0xccu)<<6);unsigned f=0xeee00e00u^(pp*0x11111111u);return b^__byte_perm(f,0u,sel);}
@@ -29,9 +30,10 @@ __device__ __forceinline__ int nib_sum(unsigned a,unsigned b){return __dp4a((int
 
 
 @orin_jit
-def split_a8(rows, K):
+def split_a8(rows, K, dynamic_rows=False):
     if any(type(x) is not int or x <= 0 for x in (rows, K)) or K % 128:
         raise ValueError("Invalid exact A8 split geometry")
+    rows = row_count(rows, dynamic_rows)
     W = 1 << ((K // 8 - 1).bit_length())
 
     @T.prim_func
@@ -76,7 +78,7 @@ def split_a8(rows, K):
         "tl.if_stmt_binding_inline_replayable_binds": False,
     }
 )
-def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16):
+def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or K % 128
@@ -90,6 +92,8 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16):
     # sixteen-byte row halves so ldmatrix and writes both use distinct banks.
     # The small decode tile benefits from weight swizzling only.
     input_stride, input_mask = (32, 16) if BM == 16 else (48, 0)
+    rows = row_count(rows, dynamic_rows)
+    launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
 
     @T.prim_func
     def exact_e8p_int4(
@@ -107,7 +111,7 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16):
         TC: T.Tensor((1,), T.int32),
         Out: T.Tensor((rows, N), T.float16),
     ):
-        with T.Kernel(T.ceildiv(N, BN), tiles, threads=128) as (bx, tile):
+        with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=128) as (bx, tile):
             T.import_source(SOURCE)
             tid = T.get_thread_binding()
             lane = tid % 32

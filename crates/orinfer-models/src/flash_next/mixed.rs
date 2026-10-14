@@ -341,7 +341,12 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let segments = ordered.as_slice();
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
     let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
-    let private_capacity = decoders.next_power_of_two().max(2);
+    let unified_decode = super::unified_decode::present(m);
+    let private_capacity = if unified_decode {
+        128
+    } else {
+        decoders.next_power_of_two().max(2)
+    };
     let private_views: BTreeMap<_, _> = layout
         .row_strides
         .keys()
@@ -349,7 +354,11 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             let buffer = format!("FlashMixed_{role}");
             m.buffers.iter().any(|b| b.name == buffer).then(|| {
                 (
-                    format!("BatchM{private_capacity}_{role}"),
+                    if unified_decode {
+                        format!("FlashDecode_{role}")
+                    } else {
+                        format!("BatchM{private_capacity}_{role}")
+                    },
                     BufferView { buffer, offset: 0 },
                 )
             })
@@ -524,10 +533,14 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
         }
         if parallel {
-            let program = format!("flash_private_m{private_capacity}/layer{layer}");
+            let program = if unified_decode {
+                format!("flash_decode_state/layer{layer}")
+            } else {
+                format!("flash_private_m{private_capacity}/layer{layer}")
+            };
             append(&mut out, m, &program, None, &private_views)?;
             for invocation in out.iter_mut().rev().take(m.programs[&program].len()) {
-                if private_capacity != decoders
+                if (unified_decode || private_capacity != decoders)
                     && let Operation::Kernel { name } = &invocation.operation
                 {
                     invocation.launch = Some(

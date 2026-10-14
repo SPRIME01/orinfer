@@ -728,6 +728,7 @@ mod branch_tests {
         }];
         manifest.row_execution = Some(crate::operators::rows::RowExecution {
             capacity: 512,
+            program_capacities: BTreeMap::new(),
             programs: BTreeSet::from(["prefill".into(), "head".into()]),
             variants: BTreeMap::new(),
         });

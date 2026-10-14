@@ -31,6 +31,17 @@ bash tools/operators/run.sh tools/model/flash_next/dynamic_prefill.py artifacts/
   --model /path/to/native-model --model-output artifacts/models/flash-dynamic
 ```
 
+动态 prefill 构建后，发布统一 decode batch 模板：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/unify_decode.py artifacts/flash-batch-template \
+  --model artifacts/models/flash-dynamic --model-output artifacts/models/flash-unified
+```
+
+统一模板支持 1–128 个真实 decode 行，使用一套最大容量为 128 的工作区。2/4/8 路的 Q4 使用局部专用实现，其他行数使用动态实现；窄 W8 投影、共享 FFN 和中等 batch 也可以选择局部 tile。HC 保留单路的 FP16 输入和 FP32 累加边界。GDN/QSA 继续复用单请求算子生成的地址表实现。输入、图片覆盖、PLE 历史、位置、MTP 隐藏捕获及输出回写由地址表驱动，因此相同形状的 CUDA Graph 可跨请求组合复用。编译实现、工作区容量与 graph 捕获尺寸分别管理；未知 batch 数不触发在线编译，也不补成虚假请求。
+
+`checks/decode_rows.py` 验证 Q4／E8P 动态尾部及更换地址后的 graph replay；Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流生成保留现有专用 decode 优化。
+
 模板支持 1–4096 个真实输入行；更长输入分块执行，单行 prefill 复用相同模板和 cubin。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。输入准备按执行程序区分 prefill、decode 和 MTP 验证，单行 prefill 的隐藏捕获读取模板输出。
 
 `checks/dynamic_prefill.py` 检查动态行、尾部和 graph replay；`checks/hc_alignment.py`、`checks/qsa_partitions.py`、`checks/q4_prefill.py` 检查局部实现。`checks/expert_prefill.py` 对照独立的行主序 E8P 实现，覆盖专家尾部、最大行容量和更换输入后的 graph replay。真实模型的恢复、暂停和混合请求另用 Rust GPU 测试验收。`validate_mtp_partial_prefix` 夹具可指定 `verification_tokens: 2..8`，固定验证协议以隔离缓存恢复与自适应 decode 选择，仍比较完整因果状态。
@@ -116,6 +127,8 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.package artifacts/models
 默认单图最多 8192 patches（2048 image tokens），多图合计最多 16384 image tokens；可用 `--max-patches`、`--max-features` 调整构建容量。`--compile-cache` 可复用已有 TileLang 编译缓存。上下文仍为 256K、KV 仍为 INT8；视觉编码不被文本 prefix cache 省略。请求格式见[服务使用](../../../docs/serving.md)，独立编码器、chat template 和 MRoPE 的验证入口见[图文工具](../../vision/README.md)。
 
 ## 多请求 decode
+
+以下步骤准备基础 batch 构建输入；最终发布需继续完成规范归约、动态 prefill 和上方的 `unify_decode.py`，服务指向最终目录。旧的逐容量 decode 绑定和工作区会在统一模板发布时删除。
 
 在已发布的文本或多模态包上离线增加 batch 算子。先执行 `make build`，使用新的目标目录；权重逐字节复用，shape-only 编译不需要加载第二份模型：
 

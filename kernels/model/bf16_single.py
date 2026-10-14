@@ -13,7 +13,18 @@ from kernels.model.rows import row_count
 @orin_jit(
     pass_configs={"tl.disable_thread_storage_sync": True, "tl.disable_shared_memory_reuse": True}
 )
-def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3, *, rows=1, dynamic_rows=False):
+def bf16_single(
+    N,
+    K,
+    groups=1,
+    block_n=32,
+    block_k=256,
+    stages=3,
+    *,
+    rows=1,
+    dynamic_rows=False,
+    row_major_grid=False,
+):
     if (
         any(type(x) is not int or x <= 0 for x in (N, K, groups, block_n, block_k, stages))
         or groups not in (1, 4)
@@ -26,8 +37,10 @@ def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3, *, rows=1, dy
         raise ValueError("Unsupported single-token BF16 projection geometry")
     bn, bk = block_n, block_k
     threads = bn * 2
-    if type(rows) is not int or not 1 <= rows <= 8:
+    if type(rows) is not int or not 1 <= rows <= 128:
         raise ValueError("Unsupported BF16 decode rows")
+    if type(row_major_grid) is not bool:
+        raise ValueError("Invalid request tile ordering")
     rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
@@ -36,7 +49,14 @@ def bf16_single(N, K, groups=1, block_n=32, block_k=256, stages=3, *, rows=1, dy
         Weight: T.Tensor((N, groups * K // 2), T.uint32),
         Output: T.Tensor((groups, rows, N), T.float32),
     ):
-        with T.Kernel(N // bn, groups, rows, threads=threads) as (bx, group, row):
+        with T.Kernel(
+            (N // bn) * rows if row_major_grid else N // bn,
+            groups,
+            1 if row_major_grid else rows,
+            threads=threads,
+        ) as (block, group, lane):
+            bx = block // rows if row_major_grid else block
+            row = block % rows if row_major_grid else lane
             T.import_source(SOURCE)
             tid = T.get_thread_binding()
             lane = tid % 32

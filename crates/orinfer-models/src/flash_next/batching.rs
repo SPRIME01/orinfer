@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const PROFILES: [usize; 7] = [2, 4, 8, 16, 32, 64, 128];
 const POINTERS: &str = "FlashBatchPointers";
 
-fn stages(rows: usize) -> Vec<(String, usize)> {
+pub(super) fn stages(rows: usize) -> Vec<(String, usize)> {
     let small = rows <= 8;
     let pre = if small { 11 } else { 12 };
     let post = if small { 26 } else { 29 };
@@ -81,7 +81,11 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
                 .find(|b| b.name == POINTERS)
                 .is_none_or(|b| {
                     b.dtype != crate::artifact::Dtype::U64
-                        || b.shape != [128, 48, columns.len()]
+                        || if super::unified_decode::present(m) {
+                            b.shape != [128 * (48 * columns.len() + 10)]
+                        } else {
+                            b.shape != [128, 48, columns.len()]
+                        }
                         || b.data.is_some()
                 })
             || columns.iter().any(|name| {
@@ -101,6 +105,9 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         });
     } else if m.buffers.iter().any(|b| b.name == POINTERS) {
         return Err("Flash private address table needs column identities".into());
+    }
+    if super::unified_decode::present(m) {
+        return super::unified_decode::register(m);
     }
     for rows in PROFILES {
         for (name, stride) in &layout.row_strides {
@@ -207,7 +214,7 @@ pub(super) fn state_bindings(
     {
         return Err("Flash private table requires distinct single-token requests".into());
     }
-    if segments.len() <= 1 {
+    if segments.len() <= 1 && !super::unified_decode::present(m) {
         return Ok(vec![]);
     }
     let names: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
@@ -220,7 +227,11 @@ pub(super) fn state_bindings(
             })
         })
         .collect();
-    let rows = segments.len().next_power_of_two();
+    let rows = if super::unified_decode::present(m) {
+        128
+    } else {
+        segments.len().next_power_of_two()
+    };
     let mut result = Vec::with_capacity(rows * roles.len());
     for lane in 0..rows {
         if let Some(segment) = segments.get(lane) {
@@ -231,6 +242,27 @@ pub(super) fn state_bindings(
             );
         } else {
             result.extend(std::iter::repeat_n(None, roles.len()));
+        }
+    }
+    if super::unified_decode::present(m) {
+        let io = [
+            Some("M1_Embedding".to_owned()),
+            Some("M1_Ple".to_owned()),
+            Some(m.position.clone()),
+            Some(m.token.clone()),
+            Some(m.status.clone()),
+            Some(m.logits.clone()),
+            m.vision.as_ref().map(|_| "Features".into()),
+            m.vision.as_ref().map(|_| "FeatureIndex".into()),
+            m.mtp.as_ref().map(|_| "MtpHiddenRing".into()),
+            Some("State_ple".into()),
+        ];
+        for lane in 0..128 {
+            result.extend(io.iter().map(|name| {
+                segments
+                    .get(lane)
+                    .and_then(|s| name.as_ref().map(|name| (s.slot, name.clone())))
+            }));
         }
     }
     Ok(result)
@@ -282,6 +314,9 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
             != segments.len()
     {
         return Err("Flash batch needs 1..128 distinct single-token sequences".into());
+    }
+    if super::unified_decode::present(m) {
+        return unified_plan(m, segments);
     }
     if segments.len() == 1 {
         return Ok(m.programs["decode"]
@@ -516,6 +551,54 @@ pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invoca
     Ok(out)
 }
 
+fn unified_plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
+    use super::unified_decode::PREFIX;
+    let rows = m
+        .row_execution
+        .as_ref()
+        .ok_or("Missing decode specialization")?;
+    let mut out = Vec::new();
+    let append_rows = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
+        out.extend(rows.specialize(
+            program,
+            &m.programs[program],
+            &m.dynamic_batch_kernels,
+            segments.len(),
+        )?);
+        Ok(())
+    };
+    let append_private = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
+        for op in &m.programs[program] {
+            let mut call = invocation(op.clone(), None, &BTreeMap::new());
+            if let Operation::Kernel { name } = &call.operation {
+                call.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(name)
+                        .ok_or("Missing decode state launch")?
+                        .launch(segments.len())?,
+                );
+            }
+            out.push(call);
+        }
+        Ok(())
+    };
+    append_rows(&mut out, "flash_decode/packet/inputs")?;
+    append_rows(&mut out, &format!("{PREFIX}/begin"))?;
+    for layer in 0..48 {
+        if layer == 1 {
+            append_rows(&mut out, &format!("{PREFIX}/layer1/ple"))?;
+            append_private(&mut out, "flash_decode_ple")?;
+        }
+        append_rows(&mut out, &format!("{PREFIX}/layer{layer}/pre"))?;
+        append_private(&mut out, &format!("flash_decode_state/layer{layer}"))?;
+        append_rows(&mut out, &format!("{PREFIX}/layer{layer}/post"))?;
+    }
+    append_rows(&mut out, "flash_decode/packet/end")?;
+    append_rows(&mut out, &format!("{PREFIX}/head"))?;
+    append_rows(&mut out, "flash_decode/packet/outputs")?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +691,7 @@ mod tests {
         }];
         m.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
             capacity: 4096,
+            program_capacities: BTreeMap::new(),
             programs: BTreeSet::new(),
             variants: BTreeMap::new(),
         });

@@ -30,6 +30,9 @@ fn unit_multiple() -> usize {
 pub struct RowExecution {
     pub capacity: usize,
     pub programs: BTreeSet<String>,
+    /// Per-program bounds let decode and prefill share the same specialization machinery.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub program_capacities: BTreeMap<String, usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub variants: BTreeMap<String, Vec<KernelVariant>>,
 }
@@ -44,27 +47,37 @@ impl RowExecution {
         if !(2..=8192).contains(&self.capacity) || self.programs.is_empty() {
             return Err("Invalid row execution capacity/programs".into());
         }
-        let mut slots = BTreeSet::new();
-        for name in &self.programs {
+        if self.program_capacities.iter().any(|(name, &capacity)| {
+            !self.programs.contains(name) || capacity == 0 || capacity > self.capacity
+        }) {
+            return Err("Invalid per-program row capacity".into());
+        }
+        let mut slots = BTreeMap::new();
+        for name_of_program in &self.programs {
             let operations = programs
-                .get(name)
+                .get(name_of_program)
                 .filter(|ops| !ops.is_empty())
                 .ok_or("Missing row execution template")?;
             for operation in operations {
                 if let Operation::Kernel { name } = operation {
-                    slots.insert(name);
+                    slots
+                        .entry(name)
+                        .and_modify(|bound: &mut usize| {
+                            *bound = (*bound).max(self.program_capacity(name_of_program))
+                        })
+                        .or_insert(self.program_capacity(name_of_program));
                 }
             }
         }
         for (name, variants) in &self.variants {
-            if !slots.contains(name) || variants.is_empty() {
+            if !slots.contains_key(name) || variants.is_empty() {
                 return Err("Row variants require a used canonical kernel slot".into());
             }
             let mut previous = 0;
             for variant in variants {
                 if variant.min_rows <= previous
                     || variant.min_rows > variant.max_rows
-                    || variant.max_rows > self.capacity
+                    || variant.max_rows > slots[name]
                     || variant.multiple_of == 0
                     || variant.multiple_of > variant.max_rows
                     || variant.min_rows.div_ceil(variant.multiple_of) * variant.multiple_of
@@ -75,22 +88,33 @@ impl RowExecution {
                 }
                 previous = variant.max_rows;
                 for replacement in &variant.kernels {
-                    slots.insert(replacement);
+                    let bound = slots[name];
+                    slots
+                        .entry(replacement)
+                        .and_modify(|v| *v = (*v).max(bound))
+                        .or_insert(bound);
                 }
             }
         }
-        for name in slots {
+        for (name, capacity) in slots {
             if !kernels.contains(name) {
                 return Err("Unknown row execution kernel".into());
             }
             if let Some(contract) = dynamic.get(name) {
-                if contract.capacity < self.capacity {
+                if contract.capacity < capacity {
                     return Err("Row template exceeds a symbolic kernel's allocation".into());
                 }
-                contract.launch(self.capacity)?;
+                contract.launch(capacity)?;
             }
         }
         Ok(())
+    }
+
+    pub fn program_capacity(&self, program: &str) -> usize {
+        self.program_capacities
+            .get(program)
+            .copied()
+            .unwrap_or(self.capacity)
     }
 
     pub fn specialize(
@@ -100,7 +124,8 @@ impl RowExecution {
         dynamic: &BTreeMap<String, DynamicBatchKernel>,
         rows: usize,
     ) -> Result<Vec<Invocation>> {
-        if !self.programs.contains(program) || !(1..=self.capacity).contains(&rows) {
+        if !self.programs.contains(program) || !(1..=self.program_capacity(program)).contains(&rows)
+        {
             return Err("Invalid dynamic program/row extent".into());
         }
         let mut invocations = Vec::with_capacity(operations.len());
@@ -152,6 +177,7 @@ mod tests {
         let program = vec![kernel("projection"), kernel("mix"), kernel("state")];
         let execution = RowExecution {
             capacity: 4096,
+            program_capacities: BTreeMap::new(),
             programs: BTreeSet::from(["prefill".into()]),
             variants: BTreeMap::from([
                 (
@@ -200,6 +226,55 @@ mod tests {
             BTreeMap::from([("prefill".into(), program)]),
             dynamic,
         )
+    }
+
+    #[test]
+    fn per_program_capacity_limits_decode_without_restricting_prefill() {
+        let (mut rows, mut programs, mut dynamic) = fixture();
+        let op = Operation::Kernel {
+            name: "decode_projection".into(),
+        };
+        programs.insert("decode_rows".into(), vec![op]);
+        rows.programs.insert("decode_rows".into());
+        rows.program_capacities.insert("decode_rows".into(), 128);
+        dynamic.insert(
+            "decode_projection".into(),
+            DynamicBatchKernel {
+                name: "decode_projection".into(),
+                capacity: 128,
+                grid: [
+                    RowExpression::Rows,
+                    RowExpression::Constant { value: 1 },
+                    RowExpression::Constant { value: 1 },
+                ],
+                arguments: vec![],
+            },
+        );
+        let kernels = dynamic
+            .keys()
+            .cloned()
+            .chain([
+                "fused".into(),
+                "state".into(),
+                "mix".into(),
+                "projection".into(),
+            ])
+            .collect();
+        rows.validate(&programs, &kernels, &dynamic).unwrap();
+        assert!(
+            rows.specialize("decode_rows", &programs["decode_rows"], &dynamic, 128)
+                .is_ok()
+        );
+        assert!(
+            rows.specialize("decode_rows", &programs["decode_rows"], &dynamic, 129)
+                .is_err()
+        );
+        assert!(
+            rows.specialize("prefill", &programs["prefill"], &dynamic, 4096)
+                .is_ok()
+        );
+        rows.program_capacities.insert("missing".into(), 128);
+        assert!(rows.validate(&programs, &kernels, &dynamic).is_err());
     }
 
     #[test]

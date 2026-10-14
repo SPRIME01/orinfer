@@ -1,3 +1,4 @@
+mod decode_template;
 mod flash_batch;
 mod single_row;
 use super::*;
@@ -40,6 +41,28 @@ fn input(source: &GenerationInput, limit: usize) -> GenerationInput {
         max_new_tokens: limit,
         sampling: source.sampling.clone(),
         prefix_hints: vec![],
+    }
+}
+
+/// Hold prompt chunking constant when comparing decode implementations.
+fn prefill_reference(model: &mut ModelRuntime, request: &mut RequestState) {
+    while request.prefilling {
+        model
+            .with_request(request, |m, r| {
+                let remaining = ModelRuntime::prefill_boundary(r) - r.offset;
+                let chunk = m
+                    .manifest
+                    .prefill_plans
+                    .iter()
+                    .filter_map(|p| {
+                        let n = p.chunk_tokens.min(remaining);
+                        p.accepts(n).then_some(n)
+                    })
+                    .max()
+                    .unwrap_or(1);
+                m.advance_prefill(r, chunk, false)
+            })
+            .unwrap();
     }
 }
 

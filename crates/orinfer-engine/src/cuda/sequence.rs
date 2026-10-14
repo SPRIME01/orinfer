@@ -470,19 +470,20 @@ impl Executor {
     /// Retire captures before destroying reusable buffers. Graphs belonging to
     /// active sequences remain valid; idle sequence state is still warm.
     pub(crate) fn reclaim_idle_graphs(&mut self) -> Result<()> {
-        let has_idle_graphs = self
-            .batch_graphs
-            .borrow()
-            .keys()
-            .any(|key| key.iter().all(|(slot, _)| !self.sequences[*slot].leased))
-            || self.sequences.iter().enumerate().any(|(slot, sequence)| {
-                !sequence.leased
-                    && if slot == self.active_sequence {
-                        !self.graphs.borrow().is_empty()
-                    } else {
-                        !sequence.graphs.is_empty()
-                    }
-            });
+        let has_idle_graphs = self.batch_graphs.borrow().keys().any(|key| {
+            if key.shared.is_some() {
+                self.sequences.iter().all(|s| !s.leased)
+            } else {
+                key.iter().all(|(slot, _)| !self.sequences[*slot].leased)
+            }
+        }) || self.sequences.iter().enumerate().any(|(slot, sequence)| {
+            !sequence.leased
+                && if slot == self.active_sequence {
+                    !self.graphs.borrow().is_empty()
+                } else {
+                    !sequence.graphs.is_empty()
+                }
+        });
         if !has_idle_graphs {
             return Ok(());
         }
@@ -491,7 +492,13 @@ impl Executor {
             .batch_graphs
             .get_mut()
             .keys()
-            .filter(|key| key.iter().all(|(slot, _)| !self.sequences[*slot].leased))
+            .filter(|key| {
+                if key.shared.is_some() {
+                    self.sequences.iter().all(|s| !s.leased)
+                } else {
+                    key.iter().all(|(slot, _)| !self.sequences[*slot].leased)
+                }
+            })
             .cloned()
             .collect();
         let mut execs = Vec::new();
@@ -1234,10 +1241,13 @@ impl Executor {
     pub(crate) fn has_batch_graph(&self, key: &[(usize, usize)], decode: bool) -> bool {
         (self.cuda_graph == crate::execution::CudaGraphMode::Full
             || (decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly))
-            && self
-                .batch_graphs
-                .borrow()
-                .contains_key(&key.to_vec().into())
+            && self.batch_graphs.borrow().keys().any(|cached| {
+                cached == &key.to_vec().into()
+                    || cached.shared.is_some()
+                        && cached.operation == orinfer_model_sdk::abi::BatchOperation::Ordinary
+                        && cached.rows == key.len()
+                        && key.iter().all(|(_, tokens)| *tokens == 1)
+            })
     }
     pub(crate) fn execute_batch(
         &mut self,
@@ -1351,6 +1361,48 @@ impl Executor {
             .collect::<Result<Vec<_>>>()
             .map(Some)
     }
+    fn shared_buffer_checks(&self, operations: &[Invocation]) -> Result<Vec<(String, u64)>> {
+        let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
+        let kernels = direct.kernels.borrow();
+        let mut names = std::collections::BTreeSet::new();
+        for call in operations {
+            let mut add = |name: &str| {
+                names.insert(
+                    call.views
+                        .get(name)
+                        .map_or(name, |v| v.buffer.as_str())
+                        .to_owned(),
+                );
+            };
+            match &call.operation {
+                Operation::Kernel { name } => {
+                    for arg in &kernels.get(name).ok_or("Missing shared kernel")?.spec.args {
+                        if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = arg
+                        {
+                            add(name);
+                        }
+                    }
+                }
+                Operation::Copy {
+                    source,
+                    destination,
+                    ..
+                } => {
+                    add(source);
+                    add(destination);
+                }
+                Operation::Zero { destination, .. } => add(destination),
+            }
+        }
+        let views = BTreeMap::new();
+        names
+            .into_iter()
+            .map(|name| {
+                let address = self.address(&name, None, &views)?;
+                Ok((name, address))
+            })
+            .collect()
+    }
     /// Share stateless pieces across changing request membership. Private stages
     /// remain direct; pointer-table contents are uploaded before any replay.
     fn invoke_shared_pieces(&self, operations: &[Invocation], allow_capture: bool) -> Result<()> {
@@ -1382,6 +1434,7 @@ impl Executor {
             let key = SharedGraphKey {
                 operations: piece.to_vec(),
                 addresses,
+                buffers: vec![],
             };
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);
@@ -1450,6 +1503,69 @@ impl Executor {
         decode: bool,
         allow_capture: bool,
     ) -> Result<()> {
+        if operations.is_empty() && decode && segments.iter().all(|(_, n)| *n == 1) {
+            let cached = {
+                let mut cache = self.batch_graphs.borrow_mut();
+                cache
+                    .iter_mut()
+                    .find(|(key, _)| {
+                        key.shared.is_some()
+                            && key.operation == operation
+                            && key.rows == segments.len()
+                    })
+                    .map(|(key, (graph, last, _, hits))| {
+                        let tick = self.batch_graph_clock.get().wrapping_add(1);
+                        self.batch_graph_clock.set(tick);
+                        *last = tick;
+                        *hits = hits.saturating_add(1);
+                        (*graph, key.shared.as_ref().unwrap())
+                    })
+                    .map(|(graph, shared)| -> Result<_> {
+                        // Views and slice offsets are immutable in the cached
+                        // program; checking each unique base covers every bound
+                        // pointer without traversing all kernel arguments again.
+                        let views = BTreeMap::new();
+                        let valid = !shared.buffers.is_empty()
+                            && shared.buffers.iter().all(|(name, expected)| {
+                                self.address(name, None, &views)
+                                    .is_ok_and(|actual| actual == *expected)
+                            });
+                        if valid {
+                            Ok((graph, None))
+                        } else {
+                            Ok((graph, Some(shared.operations.clone())))
+                        }
+                    })
+                    .transpose()?
+            };
+            if let Some((graph, rebind)) = cached {
+                if let Some(operations) = rebind {
+                    return self.execute_batch_operation(
+                        operation,
+                        segments,
+                        &operations,
+                        decode,
+                        allow_capture,
+                    );
+                }
+                self.save_live_workspace()?;
+                let at = Instant::now();
+                // SAFETY: Address identity was checked; pointer-table owners were
+                // validated and uploaded by the caller before every replay.
+                unsafe {
+                    check(
+                        sys::cuGraphLaunch(graph, self.session.stream),
+                        "hot indirect batch graph",
+                    )?;
+                }
+                self.sync()?;
+                let mut stats = self.batch_statistics.get();
+                stats.graph_hits += 1;
+                stats.replay_s += at.elapsed().as_secs_f64();
+                self.batch_statistics.set(stats);
+                return Ok(());
+            }
+        }
         // Batch kernels can address inactive sequences without activating them.
         self.save_live_workspace()?;
         // Copy/zero destinations can also write KV (e.g. state restoration).
@@ -1485,9 +1601,45 @@ impl Executor {
                 self.ensure_writable_range(name, offset, bytes)?;
             }
         }
+        // A fully indirect plan captures only session-owned table/workspace
+        // addresses. Changing request membership cannot invalidate those pointers.
+        let shared = if !operations.is_empty()
+            && decode
+            && segments.iter().all(|(_, tokens)| *tokens == 1)
+        {
+            let mut addresses = Vec::new();
+            let mut indirect = true;
+            for call in operations {
+                if let Some(mut resolved) = self.shared_addresses(call)? {
+                    addresses.append(&mut resolved);
+                } else {
+                    indirect = false;
+                    break;
+                }
+            }
+            if indirect {
+                Some(super::executor::SharedGraphKey {
+                    operations: operations.to_vec(),
+                    addresses,
+                    buffers: self.shared_buffer_checks(operations)?,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let rows = segments.iter().map(|(_, tokens)| tokens).sum();
+        let segments = if shared.is_some() {
+            Vec::new()
+        } else {
+            segments
+        };
         let key = super::executor::BatchGraphKey {
             operation,
             segments,
+            rows,
+            shared,
         };
         self.ensure_invocation_kernels(operations)?;
         let dynamic = operations.iter().any(|op| op.launch.is_some());
@@ -1604,8 +1756,16 @@ impl Executor {
         } else {
             self.batch_graphs
                 .borrow()
-                .get(&super::executor::BatchGraphKey::from(key.to_vec()))
+                .iter()
+                .find(|(cached, _)| {
+                    **cached == super::executor::BatchGraphKey::from(key.to_vec())
+                        || cached.shared.is_some()
+                            && cached.operation == orinfer_model_sdk::abi::BatchOperation::Ordinary
+                            && cached.rows == key.len()
+                            && key.iter().all(|(_, tokens)| *tokens == 1)
+                })
                 .ok_or("Missing hot batch graph")?
+                .1
                 .0
         };
         self.profile_graph_time(graph, repetitions)
@@ -1771,6 +1931,32 @@ impl Drop for Executor {
 mod graph_cache_tests {
     use super::*;
     #[test]
+    fn indirect_graph_identity_tracks_shape_and_workspace_not_request_slots() {
+        use super::super::executor::{BatchGraphKey, SharedGraphKey};
+        let graph = SharedGraphKey {
+            operations: vec![],
+            addresses: vec![42],
+            buffers: vec![("workspace".into(), 42)],
+        };
+        let first = BatchGraphKey {
+            operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,
+            segments: vec![],
+            rows: 2,
+            shared: Some(graph.clone()),
+        };
+        let mut next = first.clone();
+        assert_eq!(first, next);
+        next.shared.as_mut().unwrap().addresses[0] = 43;
+        assert_ne!(first, next);
+        next = first.clone();
+        next.rows = 3;
+        assert_ne!(first, next);
+        next = first.clone();
+        next.operation = orinfer_model_sdk::abi::BatchOperation::Verification;
+        assert_ne!(first, next);
+    }
+
+    #[test]
     fn verification_graphs_cannot_alias_ordinary_batches() {
         use super::super::executor::BatchGraphKey;
         use orinfer_model_sdk::abi::BatchOperation;
@@ -1778,6 +1964,8 @@ mod graph_cache_tests {
         let verification = BatchGraphKey {
             operation: BatchOperation::Verification,
             segments: ordinary.segments.clone(),
+            rows: ordinary.rows,
+            shared: None,
         };
         let mut cache = super::super::executor::BatchGraphCache::new();
         cache.insert(ordinary.clone(), (ptr::null_mut(), 1, 1, 1));
