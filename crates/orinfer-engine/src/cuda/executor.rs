@@ -74,6 +74,7 @@ pub(crate) struct Executor {
     pub(super) prefill_workspace: std::collections::BTreeSet<String>,
     pub(crate) allocations: Allocations,
     pub(crate) parallel_regions: RefCell<Vec<[String; 4]>>,
+    pub(super) row_kernel_slots: BTreeMap<String, String>,
     #[cfg(test)]
     pub(crate) parallel_gate_first: std::cell::Cell<bool>,
     #[cfg(test)]
@@ -468,6 +469,11 @@ impl Executor {
         };
         let executor = Self {
             snapshot_allocations: vec![],
+            row_kernel_slots: manifest
+                .row_execution
+                .as_ref()
+                .map(|rows| rows.kernel_slots())
+                .unwrap_or_default(),
             parallel_regions: RefCell::new(
                 manifest
                     .graph_branches

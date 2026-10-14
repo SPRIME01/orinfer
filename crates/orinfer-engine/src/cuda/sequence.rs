@@ -977,7 +977,7 @@ impl Executor {
             .enumerate()
             .filter_map(|(i, o)| {
                 if let Operation::Kernel { name } = &o.operation {
-                    Some((name.as_str(), i))
+                    Some((self.row_kernel_slots.get(name).unwrap_or(name).as_str(), i))
                 } else {
                     None
                 }
@@ -993,7 +993,10 @@ impl Executor {
             .kernels
             .borrow();
         let mut preferred = std::collections::BTreeSet::new();
-        for region in regions.iter() {
+        for region in regions
+            .iter()
+            .filter(|r| position.contains_key(r[0].as_str()))
+        {
             let lo = position[region[0].as_str()];
             let side = position[region[1].as_str()];
             let end = position[region[2].as_str()] + 1;
@@ -1114,7 +1117,7 @@ impl Executor {
             .enumerate()
             .filter_map(|(i, op)| {
                 if let Operation::Kernel { name } = &op.operation {
-                    Some((name.as_str(), i))
+                    Some((self.row_kernel_slots.get(name).unwrap_or(name).as_str(), i))
                 } else {
                     None
                 }
@@ -1133,7 +1136,10 @@ impl Executor {
             return operations.iter().try_for_each(|op| self.invoke(op));
         }
         let mut regions = Vec::new();
-        for r in configured.iter() {
+        for r in configured
+            .iter()
+            .filter(|r| names.contains_key(r[0].as_str()))
+        {
             let mut indices = [0; 4];
             for (i, name) in r.iter().enumerate() {
                 indices[i] = *names

@@ -192,19 +192,30 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
                         writes.insert(destination.as_str());
                     }
                     Operation::Kernel { name } => {
-                        let k = catalog
-                            .get(name.as_str())
-                            .ok_or("Missing branch kernel contract")?;
-                        if k.readonly_arguments.len() != k.args.len() {
-                            return Err("Missing branch argument access contract".into());
-                        }
-                        for (arg, readonly) in k.args.iter().zip(&k.readonly_arguments) {
-                            if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } =
-                                arg
-                            {
-                                reads.insert(name.as_str());
-                                if !readonly {
-                                    writes.insert(name.as_str());
+                        // Certify every compiled substitution, including fused
+                        // variants whose writes differ from the canonical ABI.
+                        let alternatives = manifest
+                            .row_execution
+                            .as_ref()
+                            .and_then(|rows| rows.variants.get(name))
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|v| v.kernels.iter());
+                        for identity in std::iter::once(name).chain(alternatives) {
+                            let k = catalog
+                                .get(identity.as_str())
+                                .ok_or("Missing branch kernel contract")?;
+                            if k.readonly_arguments.len() != k.args.len() {
+                                return Err("Missing branch argument access contract".into());
+                            }
+                            for (arg, readonly) in k.args.iter().zip(&k.readonly_arguments) {
+                                if let Argument::Buffer { name }
+                                | Argument::BufferSlice { name, .. } = arg
+                                {
+                                    reads.insert(name.as_str());
+                                    if !readonly {
+                                        writes.insert(name.as_str());
+                                    }
                                 }
                             }
                         }
@@ -220,6 +231,15 @@ pub fn validate_graph_branches(manifest: &Manifest, kernels: &[Kernel]) -> Resul
                 indices[i] = *positions
                     .get(name.as_str())
                     .ok_or("Missing fork/join endpoint")?;
+            }
+            if branch.iter().any(|name| {
+                manifest
+                    .row_execution
+                    .as_ref()
+                    .and_then(|rows| rows.variants.get(name))
+                    .is_some_and(|variants| variants.iter().any(|v| v.kernels.len() != 1))
+            }) {
+                return Err("Parallel endpoints require one kernel per row choice".into());
             }
             let [fork, start, end, join] = indices;
             if !(fork < start && start <= end && end + 1 == join) {
@@ -768,6 +788,53 @@ mod branch_tests {
         };
         assert!(validate_graph_branches(&m, &k).is_err());
     }
+    #[test]
+    fn row_substitutions_must_preserve_branch_independence() {
+        use crate::operators::rows::{KernelVariant, RowExecution};
+        let (mut m, mut kernels) = fixture();
+        let mut alternate = kernels[2].clone();
+        alternate.name = "side/aot".into();
+        kernels.push(alternate);
+        m.row_execution = Some(RowExecution {
+            capacity: 128,
+            programs: BTreeSet::from(["decode".into()]),
+            program_capacities: BTreeMap::new(),
+            variants: BTreeMap::from([(
+                "side".into(),
+                vec![KernelVariant {
+                    min_rows: 1,
+                    max_rows: 128,
+                    multiple_of: 1,
+                    kernels: vec!["side/aot".into()],
+                }],
+            )]),
+        });
+        validate_graph_branches(&m, &kernels).unwrap();
+        assert_eq!(
+            m.row_execution.as_ref().unwrap().kernel_slots()["side/aot"],
+            "side"
+        );
+        kernels[4].args[1] = Argument::Buffer { name: "A".into() };
+        assert!(
+            validate_graph_branches(&m, &kernels)
+                .unwrap_err()
+                .contains("Dependent")
+        );
+        m.row_execution
+            .as_mut()
+            .unwrap()
+            .variants
+            .get_mut("side")
+            .unwrap()[0]
+            .kernels
+            .clear();
+        assert!(
+            validate_graph_branches(&m, &kernels)
+                .unwrap_err()
+                .contains("endpoints")
+        );
+    }
+
     #[test]
     fn rejects_missing_endpoints_and_overlapping_regions() {
         let (mut m, k) = fixture();

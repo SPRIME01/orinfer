@@ -17,11 +17,12 @@ def rotate_activation_a8(
 ):
     if type(M) is not int or M <= 0 or type(K) is not int or K <= 0 or K % 128:
         raise ValueError("Invalid rotation dimensions")
-    if output_layout not in ("a8", "e8p", "e8p_dispatch"):
+    if output_layout not in ("a8", "e8p", "e8p_dispatch", "e8p_rows", "e8p_scatter"):
         raise ValueError("Invalid activation output layout")
     exact = output_layout != "a8"
-    dispatch = output_layout == "e8p_dispatch"
-    if exact and (
+    scatter = output_layout == "e8p_scatter"
+    dispatch = output_layout in ("e8p_dispatch", "e8p_scatter")
+    if output_layout in ("e8p", "e8p_dispatch") and (
         dynamic_rows
         or (M, K, swiglu, dispatch)
         not in (
@@ -30,12 +31,16 @@ def rotate_activation_a8(
         )
     ):
         raise ValueError("Unsupported decode activation fusion")
+    if output_layout == "e8p_rows" and (M > 1280 or K != 640 or not swiglu):
+        raise ValueError("Unsupported row-tiled expert down fusion")
+    if scatter and (M > 128 or K != 2560 or swiglu):
+        raise ValueError("Unsupported row-tiled expert input fusion")
     width = 2 * K if swiglu else K
     M = row_count(M, dynamic_rows)
-    slots = 10 if dispatch else M
+    slots = M * 10 if dispatch else M
 
     @T.macro
-    def body(X, Signs, Q, S, Low, High, Sum, row):
+    def body(X, Signs, Q, S, Low, High, Sum, IDs, RelativeSlot, RowOffsets, DS, SlotMap, row):
         current = T.alloc_shared((K,), T.float32)
         values = T.alloc_fragment((K,), T.float32)
         quant = T.alloc_fragment((K,), T.int32)
@@ -129,18 +134,31 @@ def rotate_activation_a8(
                         "uint32", "__shfl_xor_sync", T.uint32(0xFFFFFFFF), high[k], 1 << stage, 32
                     )
             T.reduce_sum(quant, total, dim=0)
-            for k in T.Parallel(K):
-                if k % 8 == 0:
-                    if dispatch:
-                        Low[0, k // 8] = low[k]
-                        High[0, k // 8] = high[k]
-                    else:
-                        Low[row, k // 8] = low[k]
-                        High[row, k // 8] = high[k]
-            if dispatch:
-                Sum[0] = total[0]
+            if scatter:
+                T.sync_threads()
+                for choice in T.serial(10):
+                    slot = RowOffsets[IDs[row, choice]] + RelativeSlot[row, choice]
+                    for k in T.Parallel(K):
+                        if k % 8 == 0:
+                            Low[slot, k // 8] = low[k]
+                            High[slot, k // 8] = high[k]
+                    if T.get_thread_binding() == 0:
+                        Sum[slot] = total[0]
+                        SlotMap[row, choice] = slot
+                        DS[slot, 0] = S[row, 0]
             else:
-                Sum[row] = total[0]
+                for k in T.Parallel(K):
+                    if k % 8 == 0:
+                        if dispatch:
+                            Low[0, k // 8] = low[k]
+                            High[0, k // 8] = high[k]
+                        else:
+                            Low[row, k // 8] = low[k]
+                            High[row, k // 8] = high[k]
+                if dispatch:
+                    Sum[0] = total[0]
+                else:
+                    Sum[row] = total[0]
 
     if not exact:
 
@@ -152,22 +170,30 @@ def rotate_activation_a8(
             S: T.Tensor((M, 1), T.float16),
         ):
             with T.Kernel(M, threads=128) as row:
-                body(X, Signs, Q, S, Q, Q, S, row)
+                body(X, Signs, Q, S, Q, Q, S, Q, Q, Q, S, Q, row)
 
         return main
 
-    @T.prim_func
-    def rotate_split_a8(
-        X: T.Tensor((M, width), T.float16),
-        Signs: T.Tensor((K,), T.int8),
-        Q: T.Tensor((M, K), T.int8),
-        S: T.Tensor((M, 1), T.float16),
-        Low: T.Tensor((slots, K // 8), T.uint32),
-        High: T.Tensor((slots, K // 8), T.uint32),
-        Sum: T.Tensor((slots,), T.int32),
-    ):
-        with T.Kernel(M, threads=128) as row:
-            body(X, Signs, Q, S, Low, High, Sum, row)
+    if not dispatch:
+
+        @T.prim_func
+        def rotate_split_a8(
+            X: T.Tensor((M, width), T.float16),
+            Signs: T.Tensor((K,), T.int8),
+            Q: T.Tensor((M, K), T.int8),
+            S: T.Tensor((M, 1), T.float16),
+            Low: T.Tensor((slots, K // 8), T.uint32),
+            High: T.Tensor((slots, K // 8), T.uint32),
+            Sum: T.Tensor((slots,), T.int32),
+        ):
+            with T.Kernel(M, threads=128) as row:
+                body(X, Signs, Q, S, Low, High, Sum, Q, Q, Q, S, Q, row)
+
+        return (
+            rotate_split_a8.with_attr("global_symbol", "rows_rotate_split")
+            if output_layout == "e8p_rows"
+            else rotate_split_a8
+        )
 
     @T.prim_func
     def rotate_dispatch_a8(
@@ -178,17 +204,20 @@ def rotate_activation_a8(
         Low: T.Tensor((slots, K // 8), T.uint32),
         High: T.Tensor((slots, K // 8), T.uint32),
         Sum: T.Tensor((slots,), T.int32),
-        IDs: T.Tensor((1, 10), T.int32),
-        RelativeSlot: T.Tensor((1, 10), T.int32),
+        IDs: T.Tensor((M, 10), T.int32),
+        RelativeSlot: T.Tensor((M, 10), T.int32),
         RowOffsets: T.Tensor((512,), T.int32),
-        DS: T.Tensor((10, 1), T.float16),
-        SlotMap: T.Tensor((1, 10), T.int32),
+        DS: T.Tensor((slots, 1), T.float16),
+        SlotMap: T.Tensor((M, 10), T.int32),
     ):
         with T.Kernel(M, threads=128) as row:
-            body(X, Signs, Q, S, Low, High, Sum, row)
-            for rank in T.Parallel(10):
-                slot = RowOffsets[IDs[0, rank]] + RelativeSlot[0, rank]
-                SlotMap[0, rank] = slot
-                DS[slot, 0] = S[0, 0]
+            body(X, Signs, Q, S, Low, High, Sum, IDs, RelativeSlot, RowOffsets, DS, SlotMap, row)
+            if not scatter:
+                for rank in T.Parallel(10):
+                    slot = RowOffsets[IDs[0, rank]] + RelativeSlot[0, rank]
+                    SlotMap[0, rank] = slot
+                    DS[slot, 0] = S[0, 0]
 
-    return rotate_dispatch_a8 if dispatch else rotate_split_a8
+    if scatter:
+        return rotate_dispatch_a8.with_attr("global_symbol", "rows_rotate_scatter")
+    return rotate_dispatch_a8

@@ -43,13 +43,39 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
             splits.insert(projection.to_owned(), kernel.name.clone());
         }
     }
-    if kernels.iter().any(|k| {
+    for kernel in kernels.iter().filter(|k| {
         matches!(
             k.symbol.as_str(),
             "exact_e8p_int4_kernel" | "exact_e8p_shared_input_kernel"
-        ) && !splits.contains_key(&k.name)
+        )
     }) {
-        return Err("Missing exact expert A8 split".into());
+        if splits.contains_key(&kernel.name) {
+            continue;
+        }
+        // A row specialization consumes the canonical split once. All pointer
+        // operands must stay identical; only the row scalar and tile may differ.
+        let canonical = kernel
+            .name
+            .split_once("/rows/")
+            .and_then(|(slot, _)| contracts.get(slot).copied())
+            .filter(|k| splits.contains_key(&k.name));
+        fn pointer(arg: &Argument) -> Option<(&str, usize)> {
+            match arg {
+                Argument::Buffer { name } => Some((name, 0)),
+                Argument::BufferSlice { name, offset } => Some((name, *offset)),
+                _ => None,
+            }
+        }
+        if canonical.is_none_or(|base| {
+            base.symbol != kernel.symbol
+                || base
+                    .args
+                    .iter()
+                    .filter_map(pointer)
+                    .ne(kernel.args.iter().filter_map(pointer))
+        }) {
+            return Err("Missing exact expert A8 split or changed row operands".into());
+        }
     }
     let mut registered = std::collections::BTreeSet::new();
     for operations in manifest.programs.values_mut() {

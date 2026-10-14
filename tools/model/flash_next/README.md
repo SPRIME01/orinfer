@@ -35,12 +35,15 @@ bash tools/operators/run.sh tools/model/flash_next/dynamic_prefill.py artifacts/
 
 ```bash
 bash tools/operators/run.sh tools/model/flash_next/unify_decode.py artifacts/flash-batch-template \
-  --model artifacts/models/flash-dynamic --model-output artifacts/models/flash-unified
+  --model artifacts/models/flash-dynamic --model-output artifacts/models/flash-unified \
+  --tuning-cache artifacts/flash-decode-tuning
 ```
 
-统一模板支持 1–128 个真实 decode 行，使用一套最大容量为 128 的工作区。2/4/8 路的 Q4 使用局部专用实现，其他行数使用动态实现；窄 W8 投影、共享 FFN 和中等 batch 也可以选择局部 tile。HC 保留单路的 FP16 输入和 FP32 累加边界。GDN/QSA 继续复用单请求算子生成的地址表实现。输入、图片覆盖、PLE 历史、位置、MTP 隐藏捕获及输出回写由地址表驱动，因此相同形状的 CUDA Graph 可跨请求组合复用。编译实现、工作区容量与 graph 捕获尺寸分别管理；未知 batch 数不触发在线编译，也不补成虚假请求。
+统一模板支持 1–128 个真实 decode 行，使用一套最大容量为 128 的工作区。Q4、W8 投影和 E8P 专家从参数化源码生成 1/2/3/4/8/16/32 行特化，其余 batch 使用接受实际行数的动态 cubin。TileLang autotune 在 Orin 上离线测量合法 tile；相同矩阵几何复用结果，缓存按源码、编译器、设备及数值检查配置失效。E8P 上下投影与路由 tile 生成共用同一行 tile，A8 拆分只执行一次。所有行数复用相同辅助算子流程，取消 8/16 的人工分界。W8 投影和融合的共享 FFN gate/up/SwiGLU 同时搜索 DP4A 和 Tensor Core。HC 保留独立归约／激活，up／mix 与专家旋转／分派／位平面打包使用统一融合实现。这些融合保留原 FP16 舍入、scale 和 FP32 累加边界，数值边界不参与搜索。
 
-`checks/decode_rows.py` 验证 Q4／E8P 动态尾部及更换地址后的 graph replay；Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流生成保留现有专用 decode 优化。
+Rust 使用构建生成的行数选择表，无需手写 batch 档位或在线编译。GDN/QSA 继续共享单请求算子生成的动态地址表实现；GDN 卷积复用紧凑单 token 与原地历史更新，避免执行 padding 和独立历史复制。输入、图片覆盖、PLE 历史、位置、MTP 隐藏捕获及输出回写由地址表驱动，因此相同形状的 CUDA Graph 可跨请求组合复用。编译实现、工作区容量与 graph 捕获尺寸分别管理；未知 batch 数不补成虚假请求。动态回退 tile 在构建时固定，行数和专家路由在运行时确定。
+
+`checks/decode_tuning.py` 验证自动调优的固定形状和动态回退，检查整数／scale 输出、尾部保护和实际 graph replay；`checks/decode_rows.py` 检查地址表 primitive。Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流普通生成也使用统一模板。Graph 的分支按 canonical slot 声明，离线特化继承同一依赖关系；发布时逐一验证所有变体的读写集合，只有独立分支允许并行。`checks/expert_decode.py` 检查专家输入融合的全部路由输出、动态尾部与更换输入后的 Graph replay；`checks/route_decode.py` 对照原三步路由，包括热点专家、动态尾部和 replay。
 
 模板支持 1–4096 个真实输入行；更长输入分块执行，单行 prefill 复用相同模板和 cubin。加载和请求执行均无需 JIT，不再按每个输入长度发布独立 prefill 程序。局部实现选择包括 HC 对齐行、四流投影，以及 router 的三档分块。专家上投影按真实尾部选择八行或十六行计算，较长输入合并 dispatch 与 A8 位平面打包；这些选择读取同一份权重。层边界暂停、MTP 隐藏捕获和混合 batch 的 overlay／位置推进共用模板。原生模型声明 batch packet 的输入布局和内存准备程序，执行器按声明映射 QSA workspace。输入准备按执行程序区分 prefill、decode 和 MTP 验证，单行 prefill 的隐藏捕获读取模板输出。
 

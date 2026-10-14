@@ -1566,7 +1566,10 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
-        if selected.len() == 1 && selected[0].1 == 1 {
+        if selected.len() == 1
+            && selected[0].1 == 1
+            && (requests[selected[0].0].prefilling || !self.manifest.batch_profiles.contains(&1))
+        {
             let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
             let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
@@ -1637,6 +1640,15 @@ impl ModelRuntime {
                 .observe((at.elapsed().as_secs_f64() - capture_s - load_s).max(0.000001));
             return Ok(());
         }
+        self.execute_batch_selected(requests, selected, output)
+    }
+
+    fn execute_batch_selected(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
         #[cfg(test)]
         profile::mark("policy");
         let inputs_at = Instant::now();

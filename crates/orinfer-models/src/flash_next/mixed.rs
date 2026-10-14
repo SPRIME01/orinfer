@@ -592,7 +592,11 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let head_rows = *m
         .batch_profiles
         .iter()
-        .find(|&&n| n >= head_used)
+        .find(|&&n| {
+            n >= head_used
+                && m.programs
+                    .contains_key(&format!("flash_mixed_head_m{n}/head"))
+        })
         .ok_or("Missing Flash endpoint head")?;
     if head_rows > head_used {
         let pad = BTreeMap::from([(

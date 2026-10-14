@@ -72,14 +72,12 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         .keys()
         .filter(|name| {
             name.starts_with("flash_decode/")
-                && ["small", "tiny", "quad", "pair", "four", "oct"]
-                    .iter()
-                    .any(|tag| name.ends_with(&format!("/{tag}")))
+                && (name.contains("/rows/") || name.contains("/skip/"))
         })
         .map(|name| Operation::Kernel { name: name.clone() })
         .collect::<Vec<_>>();
     if local.is_empty() {
-        return Err("Missing decode local implementations".into());
+        return Err("Missing compiled decode row selections".into());
     }
     m.programs.insert("flash_decode/local".into(), local);
     super::mixed::register(m)
@@ -90,117 +88,52 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
         return Ok(());
     }
     m.programs.remove("flash_decode/local");
+    for kernel in kernels
+        .iter()
+        .filter(|k| k.symbol == "rows_gdn_conv_kernel")
+    {
+        let section = kernel
+            .name
+            .strip_suffix("/k0")
+            .ok_or("Invalid compact convolution slot")?;
+        let program = m
+            .programs
+            .get_mut(section)
+            .ok_or("Missing private convolution program")?;
+        let copy = format!("{section}/k1");
+        program.retain(|op| !matches!(op, Operation::Kernel { name } if name == &copy));
+    }
     let programs = m
         .programs
         .keys()
         .filter(|name| name.starts_with("flash_decode/") && !name.ends_with("/private"))
         .cloned()
         .collect::<BTreeSet<_>>();
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
     let mut variants: BTreeMap<String, Vec<KernelVariant>> = BTreeMap::new();
-    for program in &programs {
-        for (index, op) in m.programs[program].iter().enumerate() {
-            let Operation::Kernel { name } = op else {
-                continue;
-            };
-            let small = format!("{name}/small");
-            let replacement = |kernel: String| {
-                let split = format!("{kernel}/a8_split");
-                if m.dynamic_batch_kernels.contains_key(&split) {
-                    vec![split, kernel]
-                } else {
-                    vec![kernel]
-                }
-            };
-            let skip = format!("{name}/small_skip");
-            let weight_role = |kernel: &crate::artifact::Kernel, suffix: &str| {
-                kernel.args.iter().any(|a|matches!(a,crate::artifact::Argument::Buffer {name} if name.contains("hc_") && name.contains(suffix)))
-            };
-            let hc_up = contracts
-                .get(small.as_str())
-                .is_some_and(|k| weight_role(k, "_up.weight"));
-            let hc_injection = contracts
-                .get(small.as_str())
-                .is_some_and(|k| weight_role(k, "_inject.weight"));
-            let hc_mix = index > 0
-                && if let Operation::Kernel { name: previous } = &m.programs[program][index - 1] {
-                    contracts
-                        .get(format!("{previous}/small").as_str())
-                        .is_some_and(|k| weight_role(k, "_up.weight"))
-                } else {
-                    false
-                };
-            if m.dynamic_batch_kernels.contains_key(&small) {
-                let local = variants.entry(name.clone()).or_default();
-                let bands: &[(usize, usize, &[&str])] = &[
-                    (1, 1, &["tiny", "small"]),
-                    (2, 2, &["pair", "tiny", "small"]),
-                    (3, 3, &["quad", "small"]),
-                    (4, 4, &["four", "quad", "small"]),
-                    (5, 7, &["small"]),
-                    (8, 8, &["oct", "small"]),
-                ];
-                for &(min_rows, max_rows, tags) in bands {
-                    let kernel = tags
-                        .iter()
-                        .map(|tag| format!("{name}/{tag}"))
-                        .find(|key| m.dynamic_batch_kernels.contains_key(key))
-                        .ok_or("Missing local decode fallback")?;
-                    let kernels = replacement(kernel);
-                    if let Some(last) = local.last_mut()
-                        && last.max_rows + 1 == min_rows
-                        && last.kernels == kernels
-                    {
-                        last.max_rows = max_rows;
-                    } else {
-                        local.push(KernelVariant {
-                            min_rows,
-                            max_rows,
-                            multiple_of: 1,
-                            kernels,
-                        });
-                    }
-                }
-                if hc_up || hc_injection {
-                    local.last_mut().unwrap().max_rows = CAPACITY;
-                }
-            } else if m.dynamic_batch_kernels.contains_key(&skip) {
-                variants
-                    .entry(name.clone())
-                    .or_default()
-                    .push(KernelVariant {
-                        min_rows: 1,
-                        max_rows: if hc_mix { CAPACITY } else { 8 },
-                        multiple_of: 1,
-                        kernels: vec![],
-                    });
+    let slots = programs
+        .iter()
+        .flat_map(|program| m.programs[program].iter())
+        .filter_map(|op| {
+            if let Operation::Kernel { name } = op {
+                Some(name.as_str())
+            } else {
+                None
             }
-            if let Some(parent) = name.strip_suffix("/a8_split")
-                && m.dynamic_batch_kernels
-                    .contains_key(&format!("{parent}/small"))
-            {
-                variants
-                    .entry(name.clone())
-                    .or_default()
-                    .push(KernelVariant {
-                        min_rows: 1,
-                        max_rows: 8,
-                        multiple_of: 1,
-                        kernels: vec![],
-                    });
-            }
-            let medium = format!("{name}/medium");
-            if !hc_up && !hc_injection && !hc_mix && m.dynamic_batch_kernels.contains_key(&medium) {
-                variants
-                    .entry(name.clone())
-                    .or_default()
-                    .push(KernelVariant {
-                        min_rows: 9,
-                        max_rows: 16,
-                        multiple_of: 1,
-                        kernels: vec![medium],
-                    });
-            }
+        })
+        .collect::<BTreeSet<_>>();
+    for kernel in kernels {
+        let Some((slot, variant)) = selection(&kernel.name)? else {
+            continue;
+        };
+        if !slots.contains(slot) {
+            return Err("Decode row selection has no canonical operation".into());
+        }
+        variants.entry(slot.into()).or_default().push(variant);
+    }
+    for choices in variants.values_mut() {
+        choices.sort_by_key(|v| v.min_rows);
+        if choices.windows(2).any(|v| v[0].max_rows >= v[1].min_rows) {
+            return Err("Overlapping compiled decode row selections".into());
         }
     }
     let rows = m.row_execution.get_or_insert_with(|| RowExecution {
@@ -214,5 +147,68 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
         rows.programs.insert(program);
     }
     rows.variants.extend(variants);
+    // A single decoder is a supported packet; advertise it after mixed plans
+    // are registered, since their independent head profiles start at two.
+    m.batch_profiles.insert(0, 1);
     Ok(())
+}
+
+/// Build tools encode local choices in schema-1 binding identities. There is
+/// no batch-specific algorithm, fusion or weight-name dispatch in serving.
+fn selection(name: &str) -> Result<Option<(&str, KernelVariant)>> {
+    if !name.starts_with("flash_decode/") {
+        return Ok(None);
+    }
+    let (slot, range, skip) = if let Some((slot, range)) = name.split_once("/rows/") {
+        (slot, range, false)
+    } else if let Some((slot, range)) = name.split_once("/skip/") {
+        (slot, range, true)
+    } else {
+        return Ok(None);
+    };
+    let (first, last) = range
+        .split_once('-')
+        .ok_or("Invalid decode row selection")?;
+    let min_rows: usize = first.parse().map_err(|_| "Invalid decode row bound")?;
+    let max_rows: usize = last.parse().map_err(|_| "Invalid decode row bound")?;
+    if min_rows == 0 || min_rows > max_rows || max_rows > CAPACITY {
+        return Err("Decode row selection outside its allocation".into());
+    }
+    Ok(Some((
+        slot,
+        KernelVariant {
+            min_rows,
+            max_rows,
+            multiple_of: 1,
+            kernels: if skip { vec![] } else { vec![name.into()] },
+        },
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn compiled_ranges_select_exact_rows_or_dynamic_tail() {
+        for (range, first, last) in [("3-3", 3, 3), ("5-7", 5, 7), ("33-128", 33, 128)] {
+            let name = format!("flash_decode/layer0/pre/k1/rows/{range}");
+            let (slot, v) = selection(&name).unwrap().unwrap();
+            assert_eq!(slot, "flash_decode/layer0/pre/k1");
+            assert_eq!((v.min_rows, v.max_rows), (first, last));
+            assert_eq!(v.kernels, [name]);
+        }
+        assert!(
+            selection("flash_decode/layer0/post/k2/skip/1-128")
+                .unwrap()
+                .unwrap()
+                .1
+                .kernels
+                .is_empty()
+        );
+        assert!(selection("flash_decode/layer0/post/k2").unwrap().is_none());
+        assert!(selection("prefill/layer0/rows/invalid").unwrap().is_none());
+        for range in ["0-3", "3-2", "1-129", "x-8", "8", "8-8/a8_split"] {
+            assert!(selection(&format!("flash_decode/head/k1/rows/{range}")).is_err());
+        }
+    }
 }

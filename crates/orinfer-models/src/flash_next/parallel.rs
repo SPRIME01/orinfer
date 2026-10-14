@@ -79,3 +79,79 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
     manifest.graph_branches.insert("decode".into(), branches);
     orinfer_model_sdk::model::validate_graph_branches(manifest, kernels)
 }
+
+/// Canonical slots own dependency regions; AOT row substitutions retain them.
+pub(super) fn build_rows(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
+    if !super::unified_decode::present(manifest) {
+        return Ok(());
+    }
+    let catalog: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    for (program, ops) in &manifest.programs {
+        if !program.starts_with("flash_decode/layer") {
+            continue;
+        }
+        let names = ops
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let select = |suffix: &str| -> Result<usize> {
+            let positions = names
+                .iter()
+                .enumerate()
+                .filter_map(|(i, name)| {
+                    catalog.get(name.as_str()).and_then(|k| {
+                        k.args.iter().any(|a| {
+                    matches!(a, Argument::Buffer { name } if name.ends_with(suffix))
+                }).then_some(i)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if positions.len() != 1 {
+                return Err(format!(
+                    "Ambiguous row branch projection {program}/{suffix}"
+                ));
+            }
+            Ok(positions[0])
+        };
+        let mut regions = Vec::new();
+        let part = if program.ends_with("/pre") {
+            "hc_attn"
+        } else if program.ends_with("/post") {
+            "hc_ffn"
+        } else {
+            continue;
+        };
+        let root = select(&format!("{part}_down.weight_value"))?;
+        let inject = select(&format!("{part}_inject.weight_value"))?;
+        regions.push([root, inject, inject, inject + 1]);
+        if part == "hc_ffn" {
+            let expert = select("ffn_gate_up_exps.weight_packed")?;
+            let shared = select("ffn_gate_shexp.weight_weight")?;
+            let gate = select("ffn_gate_inp_shexp.weight_value")?;
+            regions.push([
+                expert,
+                shared.checked_sub(1).ok_or("Missing shared FFN norm")?,
+                gate,
+                gate + 1,
+            ]);
+        }
+        let branches = regions
+            .into_iter()
+            .map(|indices| {
+                let mut region = [String::new(), String::new(), String::new(), String::new()];
+                for (i, index) in indices.into_iter().enumerate() {
+                    region[i] = names
+                        .get(index)
+                        .ok_or("Missing row branch endpoint")?
+                        .to_string();
+                }
+                Ok(region)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        manifest.graph_branches.insert(program.clone(), branches);
+    }
+    orinfer_model_sdk::model::validate_graph_branches(manifest, kernels)
+}

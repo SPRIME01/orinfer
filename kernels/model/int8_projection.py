@@ -82,24 +82,27 @@ def int8_projection(
 
 @orin_jit
 def int8_small_projection(
-    M: int, N: int, K: int, output_dtype: str = "float16", dynamic_rows: bool = False
+    M: int,
+    N: int,
+    K: int,
+    output_dtype: str = "float16",
+    dynamic_rows: bool = False,
+    block_m: int | None = None,
+    block_n: int = 4,
 ):
-    """Four outputs per CTA for narrow projections; packed views alias INT8.
+    """Row-tiled DP4A projections; packed views alias the original INT8.
 
     Each warp reduces one output, reusing its weight words across four token
     rows. INT32 accumulation is exact; rescaling keeps the Tensor Core path's
     FP32 multiply order and final output rounding.
     """
-    if (
-        any(type(v) is not int or v <= 0 for v in (M, N, K))
-        or N > 128
-        or K % 128
-        or K * 128 * 128 > 2**31 - 1
-    ):
+    if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 128 or K * 128 * 128 > 2**31 - 1:
         raise ValueError("Invalid small INT8 projection geometry")
     if output_dtype not in ("float16", "float32"):
         raise ValueError("Invalid small INT8 projection output dtype")
-    bm, bn = min(M, 4), 4
+    bm, bn = min(M, 4) if block_m is None else block_m, block_n
+    if not 1 <= bm <= 8 or bn not in (4, 8, 16):
+        raise ValueError("Invalid INT8 DP4A tile")
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
@@ -119,13 +122,13 @@ def int8_small_projection(
                 {
                     acc: tilelang.Fragment(
                         (bm, bn, 32),
-                        forward_thread_fn=lambda i, n, k: n * 32 + k,
-                        forward_index_fn=lambda i, n, k: i,
+                        forward_thread_fn=lambda i, n, k: (n % 4) * 32 + k,
+                        forward_index_fn=lambda i, n, k: i * (bn // 4) + n // 4,
                     ),
                     w: tilelang.Fragment(
                         (bn, 32),
-                        forward_thread_fn=lambda n, k: n * 32 + k,
-                        forward_index_fn=lambda n, k: 0,
+                        forward_thread_fn=lambda n, k: (n % 4) * 32 + k,
+                        forward_index_fn=lambda n, k: n // 4,
                     ),
                 }
             )

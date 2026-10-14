@@ -266,6 +266,10 @@ def moe_combine(
 
     M = row_count(M, dynamic_rows)
     count = M
+    # Dynamic decode has exactly top_k assignments per live request. A
+    # compile-time capacity bound would silently drop valid larger batches.
+    if dynamic_rows:
+        slots = M * top_k
 
     @T.prim_func
     def main(
@@ -454,3 +458,58 @@ def single_route_metadata(E: int = 512, top_k: int = 10, capacity: int = 11):
                 TileCount[0] = top_k
 
     return single_route_metadata_kernel
+
+
+@orin_jit
+def route_metadata(M: int, E: int = 512, top_k: int = 10, block_m: int = 8, dynamic_rows=False):
+    """One block emits stable counts, relative slots and matching expert tiles.
+
+    Each expert owns its counter; assignments are visited in token/rank order.
+    Only live assignments are scanned. Unique top-k IDs bound each expert's
+    count by M, and each tile is written by its expert without atomics.
+    """
+    if not 1 <= M <= 128 or E != 512 or top_k != 10 or block_m not in (8, 16):
+        raise ValueError("Invalid decode route metadata geometry")
+    capacity = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
+    M = row_count(M, dynamic_rows)
+
+    @T.prim_func
+    def rows_route_metadata(
+        IDs: T.Tensor((M, top_k), T.int32),
+        Counts: T.Tensor((E,), T.int32),
+        RelativeSlot: T.Tensor((M, top_k), T.int32),
+        RowOffsets: T.Tensor((E,), T.int32),
+        TileOffsets: T.Tensor((E,), T.int32),
+        TileCount: T.Tensor((1,), T.int32),
+        TileExpert: T.Tensor((capacity,), T.int32),
+        TileRow: T.Tensor((capacity,), T.int32),
+    ):
+        with T.Kernel(1, threads=512):
+            counts = T.alloc_fragment((E,), T.int32)
+            rows = T.alloc_fragment((E,), T.int32)
+            tiles = T.alloc_fragment((E,), T.int32)
+            T.clear(counts)
+            for assignment in T.serial(M * top_k):
+                for expert in T.Parallel(E):
+                    if IDs[assignment // top_k, assignment % top_k] == expert:
+                        RelativeSlot[assignment // top_k, assignment % top_k] = counts[expert]
+                        counts[expert] += 1
+            for expert in T.Parallel(E):
+                Counts[expert] = counts[expert]
+                rows[expert] = counts[expert]
+                tiles[expert] = T.ceildiv(counts[expert], block_m)
+            T.cumsum(rows, dim=0)
+            T.cumsum(tiles, dim=0)
+            for expert in T.Parallel(E):
+                RowOffsets[expert] = rows[expert] - counts[expert]
+                TileOffsets[expert] = tiles[expert] - T.ceildiv(counts[expert], block_m)
+                if expert == E - 1:
+                    TileCount[0] = tiles[expert]
+            for tile in T.serial(T.ceildiv(M, block_m)):
+                for expert in T.Parallel(E):
+                    if tile * block_m < counts[expert]:
+                        index = tiles[expert] - T.ceildiv(counts[expert], block_m) + tile
+                        TileExpert[index] = expert
+                        TileRow[index] = tile * block_m
+
+    return rows_route_metadata

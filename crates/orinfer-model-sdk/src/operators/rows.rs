@@ -110,6 +110,22 @@ impl RowExecution {
         Ok(())
     }
 
+    /// Ambiguous multi-slot replacements cannot identify a parallel endpoint.
+    pub fn kernel_slots(&self) -> BTreeMap<String, String> {
+        let (mut slots, mut ambiguous) = (BTreeMap::new(), BTreeSet::new());
+        for (slot, variants) in &self.variants {
+            for name in variants.iter().flat_map(|v| &v.kernels) {
+                if let Some(previous) = slots.insert(name.clone(), slot.clone())
+                    && previous != *slot
+                {
+                    ambiguous.insert(name.clone());
+                }
+            }
+        }
+        slots.retain(|name, _| !ambiguous.contains(name));
+        slots
+    }
+
     pub fn program_capacity(&self, program: &str) -> usize {
         self.program_capacities
             .get(program)

@@ -39,11 +39,21 @@ def validate_shape(M, N, K):
 
 
 @orin_jit
-def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES, *, dynamic_rows=False):
+def q4_gemv(
+    M,
+    N,
+    K,
+    BN=16,
+    output_dtype="float16",
+    magnitudes=MAGNITUDES,
+    *,
+    dynamic_rows=False,
+    block_m=None,
+):
     validate_shape(M, N, K)
-    if not 1 <= M <= 8 or BN not in (4, 8, 16):
-        raise ValueError("Q4 GEMV supports one to eight rows and BN=4/8/16")
-    BM = M
+    BM = min(M, 8) if block_m is None else block_m
+    if type(BM) is not int or not 1 <= BM <= 8 or BN not in (4, 8, 16):
+        raise ValueError("Q4 DP4A requires BM=1..8 and BN=4/8/16")
     M = row_count(M, dynamic_rows)
     source = decode_source(magnitudes)
 
@@ -55,7 +65,7 @@ def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES, *, dy
         AS: T.Tensor((M,), T.float16),
         Out: T.Tensor((M, N), output_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, BN), threads=128) as bx:
+        with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
             T.import_source(source)
             acc = T.alloc_fragment((BM, BN, 32), T.int32)
             total = T.alloc_fragment((BM, BN), T.int32)
@@ -83,18 +93,61 @@ def q4_gemv(M, N, K, BN=16, output_dtype="float16", magnitudes=MAGNITUDES, *, dy
                             "uint32", "q4_decode", T.cast(W[bx * BN + n, group * 32 + l], T.uint32)
                         )
                 for i, n, l in T.Parallel(BM, BN, 32):
-                    if i < M:
+                    if by * BM + i < M:
                         acc[i, n, l] = T.call_pure_extern(
-                            "int32", "q4_mad", A[i, group * 32 + l], weight[n, l], acc[i, n, l]
+                            "int32",
+                            "q4_mad",
+                            A[by * BM + i, group * 32 + l],
+                            weight[n, l],
+                            acc[i, n, l],
                         )
             T.reduce_sum(acc, total, dim=2)
             for i, n in T.Parallel(BM, BN):
-                if i < M and bx * BN + n < N:
-                    Out[i, bx * BN + n] = (
+                if by * BM + i < M and bx * BN + n < N:
+                    Out[by * BM + i, bx * BN + n] = (
                         T.cast(total[i, n], T.float32) * T.cast(S[bx * BN + n], T.float32)
-                    ) * T.cast(AS[i], T.float32)
+                    ) * T.cast(AS[by * BM + i], T.float32)
 
     return main
+
+
+def q4_decode(
+    rows,
+    outputs,
+    inputs,
+    *,
+    algorithm,
+    block_m,
+    block_n,
+    block_k=128,
+    stages=2,
+    output_dtype="float16",
+    dynamic_rows=False,
+):
+    """One AOT entry point; tiling selects DP4A or Tensor Core at build time."""
+    if algorithm == "dp4a":
+        return q4_gemv.__wrapped__(
+            rows,
+            outputs,
+            inputs,
+            block_n,
+            output_dtype,
+            dynamic_rows=dynamic_rows,
+            block_m=block_m,
+        )
+    if algorithm == "tensor_core":
+        return q4_projection.__wrapped__(
+            rows,
+            outputs,
+            inputs,
+            block_n,
+            block_k,
+            output_dtype,
+            dynamic_rows=dynamic_rows,
+            block_m=block_m,
+            stages=stages,
+        )
+    raise ValueError("Unknown Q4 decode implementation")
 
 
 @orin_jit

@@ -1,5 +1,6 @@
 mod decode_template;
 mod flash_batch;
+mod single_decode;
 mod single_row;
 use super::*;
 use serde::Deserialize;

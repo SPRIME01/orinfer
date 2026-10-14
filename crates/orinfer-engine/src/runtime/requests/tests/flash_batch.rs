@@ -518,6 +518,9 @@ fn validate_flash_decode_batches() {
     assert!(!model.manifest.batch_profiles.is_empty());
     let spec = model.manifest.mtp.take();
     let options = scheduler::Options {
+        // Exercise the fixture's actual batch range, rather than silently
+        // deferring every >32-row case at the service's default active limit.
+        max_active: fixture.batches.iter().copied().max().unwrap_or(32).min(128),
         memory_reserve_bytes: 256 << 20,
         ..Default::default()
     };

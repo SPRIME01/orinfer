@@ -25,6 +25,7 @@
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射离线编译进Rust模型库，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
+- Flash Next普通decode共享1–128行执行模板。整数投影和专家按1/2/3/4/8/16/32离线特化，其余行数使用动态参数cubin；TileLang自动调优只选择不改变scale、dtype与归约边界的合法tile，路由与专家tile必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子不保留8/16分界。Graph分支按模板槽位注册，全部特化验证读写依赖后复用；不手写batch档位，不在线调优；缓存按源码、编译器和设备身份失效。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
 - Cooperative launch需显式声明并校验occupancy，不假定普通launch可跨block同步。
 - 性能以完整链及真实模型为准。合成探针、微测外推和四输出profile不能替代完整请求TPS。
