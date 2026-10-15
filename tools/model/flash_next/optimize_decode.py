@@ -28,7 +28,6 @@ from tools.model.publication import (
 from tools.model.flash_next.kernel_policy import (
     expert_tile_config,
     expert_projection_config,
-    router_tile,
 )
 from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
@@ -499,12 +498,9 @@ def upgrade(model, destination, report, components=COMPONENTS):
             if router["dtype"] != "bf16" or router["shape"] != [experts, hidden]:
                 raise ValueError("Unexpected router weight")
             pointers = pointer_bindings(kernel, host(kernel))
-            bn = router_tile(rows, experts, hidden, experts, hidden)
             rebuilt, assets = compile_kernel(
                 f"router-m{rows}",
-                lambda rows=rows, bn=bn: dense_projection(
-                    rows, experts, hidden, "bfloat16", "float32", block_n=bn
-                ),
+                lambda rows=rows: dense_projection(rows, experts, hidden, "bfloat16", "float32"),
             )
             package["kernels"][i] = replace_binding(kernel, rebuilt, assets, pointers)
             updated["routers"] += 1

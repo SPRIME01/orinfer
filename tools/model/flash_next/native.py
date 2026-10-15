@@ -63,7 +63,6 @@ from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.kernel_policy import (
     expert_tile_config,
     expert_projection_config,
-    router_tile,
 )
 from tools.model.flash_next.chunks import chunks
 from tools.model.flash_next.speculation import DEFAULT_DRAFTS
@@ -477,7 +476,7 @@ class Model:
                         return
                     # Portable reference tile; published row choices are measured
                     # separately, preserving K traversal and output rounding.
-                    bn = router_tile(rows, n, width, e, h)
+                    bn = 64
                     call(
                         f"dense-{rows}-{n}-{width}-{wd}-{od}-{bn}",
                         lambda: fn.dense_projection(rows, n, width, wd, od, block_n=bn),

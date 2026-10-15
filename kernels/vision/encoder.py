@@ -7,6 +7,7 @@ only: Length masks every attention key; it never adds model input tokens.
 import math
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.floating_core import mma_loop, rounded_float, BF16_SOURCE
 
 
 @orin_jit
@@ -24,6 +25,16 @@ def linear(
     assert activation in ("none", "gelu", "gelu_tanh")
     output_dtype = output_dtype or dtype
     rows = T.dynamic("rows")
+    project = mma_loop(rows, k, bm, bn, bk, dtype=dtype)
+
+    @T.macro
+    def store(Y, i, j, value):
+        if output_dtype == "bfloat16":
+            T.evaluate(
+                T.call_extern("void", "orinfer_store_bf16", T.access_ptr(Y[i, j], "w", 1), value)
+            )
+        else:
+            Y[i, j] = T.cast(value, output_dtype)
 
     @T.prim_func
     def kernel(
@@ -33,39 +44,45 @@ def linear(
         Y: T.Tensor((rows, n), output_dtype),
     ):
         with T.Kernel(T.ceildiv(rows, bm), T.ceildiv(n, bn), threads=128) as (by, bx):
-            a = T.alloc_shared((bm, bk), dtype)
-            b = T.alloc_shared((bn, bk), dtype)
+            if dtype == "bfloat16" or output_dtype == "bfloat16":
+                T.import_source(BF16_SOURCE)
             accum = T.alloc_fragment((bm, bn), T.float32)
-            T.clear(accum)
-            for ko in T.Pipelined(T.ceildiv(k, bk), num_stages=2):
-                T.copy(X[by * bm, ko * bk], a)
-                T.copy(W[bx * bn, ko * bk], b)
-                T.gemm(a, b, accum, transpose_B=True)
+            project(X, W, accum, by, bx, 0)
             for i, j in T.Parallel(bm, bn):
                 if by * bm + i < rows and bx * bn + j < n:
                     # Conv3D patch embedding stores the dot product in the
                     # native dtype before adding bias; Linear fuses the bias
                     # into its FP32 accumulator. Preserve both semantics.
                     if separate_bias:
-                        product = T.cast(T.cast(accum[i, j], dtype), T.float32)
+                        product = rounded_float(accum[i, j], dtype)
                     else:
                         product = accum[i, j]
-                    value = T.cast(product + T.cast(Bias[bx * bn + j], T.float32), dtype)
+                    value = rounded_float(product + T.cast(Bias[bx * bn + j], T.float32), dtype)
                     if activation == "none":
-                        Y[by * bm + i, bx * bn + j] = value
+                        store(Y, by * bm + i, bx * bn + j, value)
                     else:
                         x = T.cast(value, T.float32)
                         if activation == "gelu_tanh":
-                            Y[by * bm + i, bx * bn + j] = (
-                                0.5
-                                * x
-                                * (1 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+                            store(
+                                Y,
+                                by * bm + i,
+                                bx * bn + j,
+                                (
+                                    0.5
+                                    * x
+                                    * (1 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+                                ),
                             )
                         else:
-                            Y[by * bm + i, bx * bn + j] = (
-                                0.5
-                                * x
-                                * (1 + T.call_extern("float32", "erff", x * 0.7071067811865476))
+                            store(
+                                Y,
+                                by * bm + i,
+                                bx * bn + j,
+                                (
+                                    0.5
+                                    * x
+                                    * (1 + T.call_extern("float32", "erff", x * 0.7071067811865476))
+                                ),
                             )
 
     return kernel

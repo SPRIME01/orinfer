@@ -5,10 +5,10 @@ Each nibble stores three magnitude bits and one sign bit. A fixed symmetric
 weights without group scale operations inside the dot-product loop.
 """
 
-import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
+from kernels.model.integer_core import dp4a, tensor_core
 
 
 MAGNITUDES = (3, 10, 19, 31, 46, 67, 93, 127)
@@ -26,9 +26,6 @@ __device__ __forceinline__ unsigned q4_decode(unsigned p) {{
     unsigned v = __byte_perm({lo}u, {hi}u, p & 0x7777u);
     unsigned signs = __byte_perm(0u, 0xffffffffu, (p >> 1) & 0x4444u);
     return (v ^ signs) + (signs & 0x01010101u);
-}}
-__device__ __forceinline__ int q4_mad(int a, unsigned w, int c) {{
-    return __dp4a(a, (int)w, c);
 }}
 """
 
@@ -57,6 +54,8 @@ def q4_gemv(
     M = row_count(M, dynamic_rows)
     source = decode_source(magnitudes)
 
+    project = dp4a(M, N, K, BM, BN, codec="q4", source=source)
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K // 4), T.int32),
@@ -66,47 +65,7 @@ def q4_gemv(
         Out: T.Tensor((M, N), output_dtype),
     ):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
-            T.import_source(source)
-            acc = T.alloc_fragment((BM, BN, 32), T.int32)
-            total = T.alloc_fragment((BM, BN), T.int32)
-            weight = T.alloc_fragment((BN, 32), T.uint32)
-            T.annotate_layout(
-                {
-                    acc: tilelang.Fragment(
-                        (BM, BN, 32),
-                        forward_thread_fn=lambda i, n, l: (n % 4) * 32 + l,
-                        forward_index_fn=lambda i, n, l: i * (BN // 4) + n // 4,
-                    ),
-                    weight: tilelang.Fragment(
-                        (BN, 32),
-                        forward_thread_fn=lambda n, l: (n % 4) * 32 + l,
-                        forward_index_fn=lambda n, l: n // 4,
-                    ),
-                }
-            )
-            T.clear(acc)
-            for group in T.serial(K // 128):
-                for n, l in T.Parallel(BN, 32):
-                    weight[n, l] = 0
-                    if bx * BN + n < N:
-                        weight[n, l] = T.call_pure_extern(
-                            "uint32", "q4_decode", T.cast(W[bx * BN + n, group * 32 + l], T.uint32)
-                        )
-                for i, n, l in T.Parallel(BM, BN, 32):
-                    if by * BM + i < M:
-                        acc[i, n, l] = T.call_pure_extern(
-                            "int32",
-                            "q4_mad",
-                            A[by * BM + i, group * 32 + l],
-                            weight[n, l],
-                            acc[i, n, l],
-                        )
-            T.reduce_sum(acc, total, dim=2)
-            for i, n in T.Parallel(BM, BN):
-                if by * BM + i < M and bx * BN + n < N:
-                    Out[by * BM + i, bx * BN + n] = (
-                        T.cast(total[i, n], T.float32) * T.cast(S[bx * BN + n], T.float32)
-                    ) * T.cast(AS[by * BM + i], T.float32)
+            project(A, W, W, S, S, AS, Out, by, bx)
 
     return main
 
@@ -176,6 +135,8 @@ def q4_projection(
     threads = 64 if BN == 32 else 128
     source = decode_source(magnitudes)
 
+    project = tensor_core(M, N, K, BM, BN, BK, stages=stages, codec="q4", source=source)
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K), T.int8),
@@ -185,30 +146,7 @@ def q4_projection(
         Out: T.Tensor((M, N), output_dtype),
     ):
         with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN), threads=threads) as (by, bx):
-            T.import_source(source)
-            activation = T.alloc_shared((BM, BK), T.int8)
-            weight = T.alloc_shared((BN, BK), T.int8)
-            decoded = T.alloc_fragment((BN, BK // 4), T.uint32)
-            acc = T.alloc_fragment((BN, BM), T.int32)
-            T.clear(acc)
-            for group in T.Pipelined(K // BK, num_stages=stages):
-                T.copy(A[by * BM, group * BK], activation)
-                for n, j in T.Parallel(BN, BK // 4):
-                    decoded[n, j] = 0
-                    if bx * BN + n < N:
-                        decoded[n, j] = T.call_pure_extern(
-                            "uint32",
-                            "q4_decode",
-                            T.cast(W[bx * BN + n, group * (BK // 4) + j], T.uint32),
-                        )
-                for n, j in T.Parallel(BN, BK):
-                    weight[n, j] = T.cast((decoded[n, j // 4] >> ((j % 4) * 8)) & 255, T.int8)
-                T.gemm(weight, activation, acc, transpose_B=True)
-            for i, n in T.Parallel(BM, BN):
-                if by * BM + i < M and bx * BN + n < N:
-                    Out[by * BM + i, bx * BN + n] = (
-                        T.cast(acc[n, i], T.float32) * T.cast(S[bx * BN + n], T.float32)
-                    ) * T.cast(AS[by * BM + i], T.float32)
+            project(A, W, W, S, S, AS, Out, by, bx)
 
     return main
 

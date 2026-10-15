@@ -10,23 +10,7 @@ import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
 
-SOURCE = r"""
-__device__ __forceinline__ unsigned nib_fast(unsigned c,unsigned b){unsigned pp=__popc(c&255u)&1u,ss=c^pp;unsigned sel=(ss&0x33u)|((ss&0xccu)<<6);unsigned f=0xeee00e00u^(pp*0x11111111u);return b^__byte_perm(f,0u,sel);}
-
-__device__ __forceinline__ unsigned nib_pair(const unsigned short* p){return *reinterpret_cast<const unsigned*>(p);}
-__device__ __forceinline__ void nib_store2(signed char* p,unsigned a,unsigned b){*reinterpret_cast<uint2*>(p)=make_uint2(a,b);}
-
-__device__ __forceinline__ void nib_mma_low(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
- asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.u4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+r"(d[0]),"+r"(d[1]),"+r"(d[2]),"+r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-}
-__device__ __forceinline__ void nib_mma_high(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
- asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};" : "+r"(d[0]),"+r"(d[1]),"+r"(d[2]),"+r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
-}
-__device__ __forceinline__ void nib_ldm4(const signed char* p,unsigned* out) {unsigned a=__cvta_generic_to_shared(p);asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(out[0]),"=r"(out[1]),"=r"(out[2]),"=r"(out[3]) : "r"(a));}
-__device__ __forceinline__ void nib_ldm2(const signed char* p,unsigned* out) {unsigned a=__cvta_generic_to_shared(p);asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(out[0]),"=r"(out[1]) : "r"(a));}
-__device__ __forceinline__ void nib_store(signed char* p,unsigned x){*reinterpret_cast<unsigned*>(p)=x;}
-__device__ __forceinline__ int nib_sum(unsigned a,unsigned b){return __dp4a((int)a,0x01010101,__dp4a((int)b,0x01010101,0));}
-"""
+from kernels.model.e8p_core import SOURCE, mma_pair, store_rows, low_plane, high_plane
 
 
 @orin_jit
@@ -52,18 +36,8 @@ def split_a8(rows, K, dynamic_rows=False):
                 if j < K // 8:
                     x = T.ldg32(A[row, j * 8])
                     y = T.ldg32(A[row, j * 8 + 4])
-                    Low[row, j] = (
-                        (x & T.uint32(0x00000F0F))
-                        | ((x >> 12) & T.uint32(0x0000F0F0))
-                        | ((y << 16) & T.uint32(0x0F0F0000))
-                        | ((y << 4) & T.uint32(0xF0F00000))
-                    )
-                    High[row, j] = (
-                        ((x >> 4) & T.uint32(0x00000F0F))
-                        | ((x >> 16) & T.uint32(0x0000F0F0))
-                        | ((y << 12) & T.uint32(0x0F0F0000))
-                        | (y & T.uint32(0xF0F00000))
-                    )
+                    Low[row, j] = low_plane(x, y)
+                    High[row, j] = high_plane(x, y)
                     sums[j] = T.call_pure_extern("int32", "nib_sum", x, y)
             T.reduce_sum(sums, total, dim=0)
             Sum[row] = total[0]
@@ -94,6 +68,8 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
     input_stride, input_mask = (32, 16) if BM == 16 else (48, 0)
     rows = row_count(rows, dynamic_rows)
     launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
+
+    multiply, store = mma_pair(BM), store_rows(BM, BN, N)
 
     @T.prim_func
     def exact_e8p_int4(
@@ -288,44 +264,8 @@ def e8p_exact_grouped(rows, E, tiles, N, K, *, block_m=16, dynamic_rows=False):
                             )
                         )
                         for stripe in T.unroll(BM // 8):
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_mma_low",
-                                    T.access_ptr(lo[nt * (BM // 2) + stripe * 4], "rw", 4),
-                                    v[0],
-                                    v[1],
-                                    v[2],
-                                    v[3],
-                                    a[stripe * 2],
-                                    a[stripe * 2 + 1],
-                                )
-                            )
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_mma_high",
-                                    T.access_ptr(hi[nt * (BM // 2) + stripe * 4], "rw", 4),
-                                    v[0],
-                                    v[1],
-                                    v[2],
-                                    v[3],
-                                    a[BM // 4 + stripe * 2],
-                                    a[BM // 4 + 1 + stripe * 2],
-                                )
-                            )
+                            multiply(lo, hi, v, a, nt, stripe)
                     T.sync_threads()
-                for nt in T.unroll(2):
-                    for stripe in T.unroll(BM // 8):
-                        for r in T.unroll(2):
-                            n = bx * BN + warp * 32 + nt * 16 + lane // 4 + r * 8
-                            for t in T.unroll(2):
-                                m = stripe * 8 + (lane % 4) * 2 + t
-                                if m < count and n < N:
-                                    j = nt * (BM // 2) + stripe * 4 + r * 2 + t
-                                    value = 2 * (lo[j] + 16 * hi[j]) + Sum[offset + m]
-                                    Out[offset + m, n] = (
-                                        T.cast(value, T.float32) * T.cast(WS[expert, n], T.float32)
-                                    ) * T.cast(AS[offset + m], T.float32)
+                store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
 
     return exact_e8p_int4

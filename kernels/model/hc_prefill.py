@@ -10,6 +10,7 @@ import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.hyperconnection import _dtype
+from kernels.model.floating_core import mma_loop
 from kernels.model.rows import row_count
 from kernels.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
 
@@ -186,26 +187,14 @@ def hc_projection_prefill(
     threads = 64 if block_n == 16 else 128
     M = row_count(M, dynamic_rows)
 
+    accumulate = mma_loop(
+        M, K, block_m, block_n, 64, stages=stages, reduction_groups=reduction_groups
+    )
+
     @T.macro
     def project(A, W, C, by, bx):
-        a = T.alloc_shared((block_m, 64), T.bfloat16)
-        w = T.alloc_shared((block_n, 64), T.bfloat16)
         acc = T.alloc_fragment((block_m, block_n), T.float32)
-        if reduction_groups == 4:
-            total = T.alloc_fragment((block_m, block_n), T.float32)
-            T.clear(total)
-        for branch in T.serial(reduction_groups):
-            T.clear(acc)
-            for kg in T.Pipelined(K // (64 * reduction_groups), num_stages=stages):
-                offset = branch * (K // reduction_groups) + kg * 64
-                T.copy(A[by * block_m, offset], a)
-                T.copy(W[bx * block_n, offset], w)
-                T.gemm(a, w, acc, transpose_B=True)
-            if reduction_groups == 4:
-                for i, j in T.Parallel(block_m, block_n):
-                    total[i, j] += acc[i, j]
-        if reduction_groups == 4:
-            T.copy(total, acc)
+        accumulate(A, W, acc, by, bx, 0)
         if silu:
             for i, j in T.Parallel(block_m, block_n, coalesced_width=T.int32(1)):
                 if by * block_m + i < M and bx * block_n + j < N:

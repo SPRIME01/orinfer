@@ -10,7 +10,13 @@ import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
 
-from kernels.model.e8p_exact import SOURCE as EXACT_SOURCE
+from kernels.model.e8p_core import (
+    SOURCE as EXACT_SOURCE,
+    mma_pair,
+    store_rows,
+    low_plane,
+    high_plane,
+)
 from kernels.model.rows import row_count
 
 SOURCE = (
@@ -56,18 +62,8 @@ def split_prefill_a8(rows, K, dynamic_rows=False):
                 if by * BM + i < rows and j < K // 8:
                     x = T.ldg32(A[by * BM + i, j * 8])
                     y = T.ldg32(A[by * BM + i, j * 8 + 4])
-                    Low[j // 8, by * BM + i, j % 8] = (
-                        (x & T.uint32(0x00000F0F))
-                        | ((x >> 12) & T.uint32(0x0000F0F0))
-                        | ((y << 16) & T.uint32(0x0F0F0000))
-                        | ((y << 4) & T.uint32(0xF0F00000))
-                    )
-                    High[j // 8, by * BM + i, j % 8] = (
-                        ((x >> 4) & T.uint32(0x00000F0F))
-                        | ((x >> 16) & T.uint32(0x0000F0F0))
-                        | ((y << 12) & T.uint32(0x0F0F0000))
-                        | (y & T.uint32(0xF0F00000))
-                    )
+                    Low[j // 8, by * BM + i, j % 8] = low_plane(x, y)
+                    High[j // 8, by * BM + i, j % 8] = high_plane(x, y)
                     sums[i, j] = T.call_pure_extern("int32", "nib_sum", x, y)
             T.reduce_sum(sums, total, dim=1)
             for i in T.Parallel(BM):
@@ -110,6 +106,8 @@ def e8p_prefill_grouped(
     launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
 
     def product(tile_rows):
+        multiply, store = mma_pair(tile_rows), store_rows(tile_rows, BN, N)
+
         @T.macro
         def project(
             Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count
@@ -298,48 +296,8 @@ def e8p_prefill_grouped(
                                     "uint32", "nib_prefill", code, book[code >> 8]
                                 )
                             for stripe in T.unroll(tile_rows // 8):
-                                T.evaluate(
-                                    T.call_extern(
-                                        "void",
-                                        "nib_mma_low",
-                                        T.access_ptr(
-                                            lo[nt * (tile_rows // 2) + stripe * 4], "rw", 4
-                                        ),
-                                        v[0],
-                                        v[1],
-                                        v[2],
-                                        v[3],
-                                        a[stripe * 2],
-                                        a[stripe * 2 + 1],
-                                    )
-                                )
-                                T.evaluate(
-                                    T.call_extern(
-                                        "void",
-                                        "nib_mma_high",
-                                        T.access_ptr(
-                                            hi[nt * (tile_rows // 2) + stripe * 4], "rw", 4
-                                        ),
-                                        v[0],
-                                        v[1],
-                                        v[2],
-                                        v[3],
-                                        a[tile_rows // 4 + stripe * 2],
-                                        a[tile_rows // 4 + 1 + stripe * 2],
-                                    )
-                                )
-            for nt in T.unroll(2):
-                for stripe in T.unroll(tile_rows // 8):
-                    for r in T.unroll(2):
-                        n = bx * BN + warp * 32 + nt * 16 + lane // 4 + r * 8
-                        for t in T.unroll(2):
-                            r_index = stripe * 8 + (lane % 4) * 2 + t
-                            if r_index < count and n < N:
-                                j = nt * (tile_rows // 2) + stripe * 4 + r * 2 + t
-                                value = 2 * (lo[j] + 16 * hi[j]) + Sum[offset + r_index]
-                                Out[offset + r_index, n] = (
-                                    T.cast(value, T.float32) * T.cast(WS[expert, n], T.float32)
-                                ) * T.cast(AS[offset + r_index], T.float32)
+                                multiply(lo, hi, v, a, nt, stripe)
+            store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
 
         return project
 
@@ -476,18 +434,8 @@ def dispatch_prefill_a8(M, K=2560, E=512, top_k=10, dynamic_rows=False):
                     slot = RowOffsets[IDs[row, rank]] + RelativeSlot[row, rank]
                     x = T.ldg32(A[row, j * 8])
                     y = T.ldg32(A[row, j * 8 + 4])
-                    Low[j // 8, slot, j % 8] = (
-                        (x & T.uint32(0x00000F0F))
-                        | ((x >> 12) & T.uint32(0x0000F0F0))
-                        | ((y << 16) & T.uint32(0x0F0F0000))
-                        | ((y << 4) & T.uint32(0xF0F00000))
-                    )
-                    High[j // 8, slot, j % 8] = (
-                        ((x >> 4) & T.uint32(0x00000F0F))
-                        | ((x >> 16) & T.uint32(0x0000F0F0))
-                        | ((y << 12) & T.uint32(0x0F0F0000))
-                        | (y & T.uint32(0xF0F00000))
-                    )
+                    Low[j // 8, slot, j % 8] = low_plane(x, y)
+                    High[j // 8, slot, j % 8] = high_plane(x, y)
                     sums[i, j] = T.call_pure_extern("int32", "nib_sum", x, y)
             T.reduce_sum(sums, total, dim=1)
             for i in T.Parallel(BM):

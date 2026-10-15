@@ -7,7 +7,7 @@ Low/High uint32 views alias the unchanged packed A8 workspace.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.e8p_exact import SOURCE
+from kernels.model.e8p_core import SOURCE, mma_pair, store_rows
 
 
 @orin_jit(
@@ -22,20 +22,20 @@ def e8p_single_decode_grouped(rows, E, tiles, N, K, *, shared_input=False):
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or K % 128
         or K * 128 * 128 > 2**31 - 1
-        or rows != 10
-        or E != 512
-        or tiles != 11
-        or (N, K) not in ((1280, 2560), (2560, 640))
+        or rows > E
+        or tiles < rows
     ):
         raise ValueError("Invalid exact E8P geometry")
-    if type(shared_input) is not bool or (shared_input and (N, K) != (1280, 2560)):
-        raise ValueError("Shared expert input is restricted to single-token GU")
+    if type(shared_input) is not bool:
+        raise ValueError("Invalid unique-route shared-input contract")
     input_rows = 1 if shared_input else rows
     BM, BN, BK = 8, 128, 64
     # NCU identifies excess shared wavefronts for strided stores. Swizzle
     # sixteen-byte row halves so ldmatrix and writes both use distinct banks.
     # The small decode tile benefits from weight swizzling only.
     input_stride, input_mask = (32, 16) if BM == 16 else (48, 0)
+
+    multiply, store = mma_pair(BM), store_rows(BM, BN, N)
 
     @T.prim_func
     def exact_e8p_int4(
@@ -119,45 +119,9 @@ def e8p_single_decode_grouped(rows, E, tiles, N, K, *, shared_input=False):
                             code = T.cast(packed[slot, n, col], T.uint32)
                             v[rr] = T.call_pure_extern("uint32", "nib_fast", code, book[code >> 8])
                         for stripe in T.unroll(BM // 8):
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_mma_low",
-                                    T.access_ptr(lo[nt * (BM // 2) + stripe * 4], "rw", 4),
-                                    v[0],
-                                    v[1],
-                                    v[2],
-                                    v[3],
-                                    a[stripe * 2],
-                                    a[stripe * 2 + 1],
-                                )
-                            )
-                            T.evaluate(
-                                T.call_extern(
-                                    "void",
-                                    "nib_mma_high",
-                                    T.access_ptr(hi[nt * (BM // 2) + stripe * 4], "rw", 4),
-                                    v[0],
-                                    v[1],
-                                    v[2],
-                                    v[3],
-                                    a[BM // 4 + stripe * 2],
-                                    a[BM // 4 + 1 + stripe * 2],
-                                )
-                            )
+                            multiply(lo, hi, v, a, nt, stripe)
                     T.sync_threads()
-                for nt in T.unroll(2):
-                    for stripe in T.unroll(BM // 8):
-                        for r in T.unroll(2):
-                            n = bx * BN + warp * 32 + nt * 16 + lane // 4 + r * 8
-                            for t in T.unroll(2):
-                                m = stripe * 8 + (lane % 4) * 2 + t
-                                if m < count and n < N:
-                                    j = nt * (BM // 2) + stripe * 4 + r * 2 + t
-                                    value = 2 * (lo[j] + 16 * hi[j]) + Sum[input_offset + m]
-                                    Out[offset + m, n] = (
-                                        T.cast(value, T.float32) * T.cast(WS[expert, n], T.float32)
-                                    ) * T.cast(AS[input_offset + m], T.float32)
+                store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, input_offset)
 
     return (
         exact_e8p_int4.with_attr("global_symbol", "exact_e8p_shared_input")

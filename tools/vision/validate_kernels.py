@@ -67,6 +67,29 @@ def main():
         x.reshape(-1, 3, 2, 16, 16), w.reshape(1152, 3, 2, 16, 16), b, stride=(2, 16, 16)
     ).reshape(65, 1152)
     check("patch_conv_bias", linear(1152, 1536, separate_bias=True), [x, w, b], [y], [expected])
+    # Exercise BF16 stream rounding without the NVRTC vector alias round-trip.
+    # Both matrix axes have tails; Conv3D and Linear retain distinct rounding.
+    for act, separate in [("none", True), ("gelu_tanh", False), ("gelu", False)]:
+        x = torch.randn((17, 1176), device="cuda", dtype=torch.bfloat16) * 0.1
+        w = torch.randn((130, 1176), device="cuda", dtype=torch.bfloat16) * 0.02
+        b = torch.randn(130, device="cuda", dtype=torch.bfloat16) * 0.01
+        y = torch.empty((17, 130), device="cuda", dtype=torch.bfloat16)
+        dot = x.float() @ w.float().T
+        if separate:
+            dot = dot.bfloat16().float()
+        reference = (dot + b.float()).bfloat16()
+        if act != "none":
+            reference = F.gelu(
+                reference.float(), approximate="tanh" if act == "gelu_tanh" else "none"
+            ).bfloat16()
+        check(
+            f"bf16_linear_tail_{act}",
+            linear(130, 1176, act, dtype="bfloat16", separate_bias=separate),
+            [x, w, b],
+            [y],
+            [reference],
+            tolerance=0.006,
+        )
     rows = 68
     h = 1152
     x = torch.randn((rows, h), device="cuda", dtype=torch.float16)

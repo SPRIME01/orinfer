@@ -68,10 +68,6 @@ def expert_tile_config(rows):
     )
 
 
-def router_tile(rows, outputs, inputs, experts, hidden):
-    return 64
-
-
 def expert_projection_config(rows, inputs, *, parity_xor=False):
     if type(inputs) is not int or inputs <= 0 or inputs % 128:
         raise ValueError("Unsupported expert input width")

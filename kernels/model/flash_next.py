@@ -10,6 +10,7 @@ qsa.py and qsa_attention.py; prepared FP16 KV tiles are only temporary.
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
+from kernels.model.floating_core import mma_loop
 from kernels.model.rows import row_count
 
 
@@ -35,6 +36,8 @@ def dense_projection(
         raise ValueError("Invalid dense projection row tile")
     M = row_count(M, dynamic_rows)
 
+    project = mma_loop(M, K, block_m, block_n, 64, dtype=weight_dtype)
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K), T.float16),
@@ -42,17 +45,8 @@ def dense_projection(
         Output: T.Tensor((M, N), output_dtype),
     ):
         with T.Kernel(T.ceildiv(M, block_m), T.ceildiv(N, block_n), threads=128) as (by, bx):
-            a = T.alloc_shared((block_m, 64), weight_dtype)
-            w = T.alloc_shared((block_n, 64), weight_dtype)
             acc = T.alloc_fragment((block_m, block_n), T.float32)
-            T.clear(acc)
-            for kg in T.Pipelined(K // 64, num_stages=2):
-                for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
-                    a[i, j] = T.if_then_else(
-                        by * block_m + i < M, A[by * block_m + i, kg * 64 + j], 0.0
-                    )
-                T.copy(Weight[bx * block_n, kg * 64], w)
-                T.gemm(a, w, acc, transpose_B=True)
+            project(A, Weight, acc, by, bx, 0)
             T.copy(acc, Output[by * block_m, bx * block_n])
 
     return main

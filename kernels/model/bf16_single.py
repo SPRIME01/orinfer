@@ -7,6 +7,7 @@ expanded representation is created. FP32 accumulates in the original K16 order.
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.bf16_mma import SOURCE
+from kernels.model.floating_core import mma_loop
 from kernels.model.rows import row_count
 
 
@@ -168,6 +169,17 @@ def bf16_rows(
         raise ValueError("Invalid grouped BF16 row tile")
     rows = row_count(rows, dynamic_rows)
 
+    project = mma_loop(
+        rows,
+        K,
+        block_m,
+        block_n,
+        128,
+        weight_left=weight_left,
+        grouped_input=True,
+        weight_first=True,
+    )
+
     @T.prim_func
     def bf16_rows_kernel(
         A: T.Tensor((rows, groups, K), T.float16),
@@ -179,22 +191,10 @@ def bf16_rows(
             bx,
             group,
         ):
-            a = T.alloc_shared((block_n, 128), T.bfloat16)
-            b = T.alloc_shared((block_m, 128), T.bfloat16)
             acc = T.alloc_fragment(
                 (block_n, block_m) if weight_left else (block_m, block_n), T.float32
             )
-            T.clear(acc)
-            for kg in T.Pipelined(K // 128, num_stages=2):
-                T.copy(Weight[bx * block_n, group * K + kg * 128], a)
-                for i, j in T.Parallel(block_m, 128):
-                    b[i, j] = 0
-                    if by * block_m + i < rows:
-                        b[i, j] = A[by * block_m + i, group, kg * 128 + j]
-                if weight_left:
-                    T.gemm(a, b, acc, transpose_B=True)
-                else:
-                    T.gemm(b, a, acc, transpose_B=True)
+            project(A, Weight, acc, by, bx, group)
             for i, j in T.Parallel(block_n, block_m):
                 if by * block_m + j < rows:
                     Output[group, by * block_m + j, bx * block_n + i] = (

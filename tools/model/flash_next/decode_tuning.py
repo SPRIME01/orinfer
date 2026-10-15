@@ -189,14 +189,11 @@ class DecodeTuner:
         for file in ("decode_tuning.py", "decode_policy.py"):
             source.update(Path(__file__).with_name(file).read_bytes())
         root = Path(__file__).resolve().parents[3]
-        for file in (
-            "q4_projection.py",
-            "int8_projection.py",
-            "int8_swiglu.py",
-            "e8p_exact.py",
-            "rows.py",
-        ):
-            source.update((root / "kernels/model" / file).read_bytes())
+        # Include inlined components as well as public wrappers. A change to a
+        # shared loader/mainloop/epilogue must invalidate every consumer's tile.
+        for path in sorted((root / "kernels").rglob("*.py")):
+            source.update(str(path.relative_to(root)).encode())
+            source.update(path.read_bytes())
         identity = dict(
             spec=spec,
             configs=configs,

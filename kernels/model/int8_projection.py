@@ -1,21 +1,14 @@
-"""Row-scaled dense INT8 Tensor Core projections for Flash Next.
+"""Shared row-scaled dense INT8 projections for model adapters.
 
 Only the final INT32 accumulator is rescaled. Weights remain stored INT8,
 including the output head; no persistent FP16 or expanded expert copy exists.
 """
 
-import tilelang
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
-
-
-_DP4A_SOURCE = """
-__device__ __forceinline__ int orinfer_dp4a(int a, int b, int c) {
-    return __dp4a(a, b, c);
-}
-"""
+from kernels.model.integer_core import dp4a, tensor_core
 
 
 @orin_jit
@@ -43,6 +36,8 @@ def int8_projection(
     M = row_count(M, dynamic_rows)
     mt, nt = (M + block_m - 1) // block_m, (N + block_n - 1) // block_n
 
+    project = tensor_core(M, N, K, block_m, block_n, block_k)
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K), T.int8),
@@ -62,20 +57,7 @@ def int8_projection(
             else:
                 by = pid % mt
                 bx = pid // mt
-            a = T.alloc_shared((block_m, block_k), T.int8)
-            w = T.alloc_shared((block_n, block_k), T.int8)
-            acc = T.alloc_fragment((block_m, block_n), T.int32)
-            T.clear(acc)
-            for kg in T.Pipelined(K // block_k, num_stages=2):
-                T.copy(A[by * block_m, kg * block_k], a)
-                T.copy(Weight[bx * block_n, kg * block_k], w)
-                T.gemm(a, w, acc, transpose_B=True)
-            for i, j in T.Parallel(block_m, block_n):
-                if by * block_m + i < M and bx * block_n + j < N:
-                    Output[by * block_m + i, bx * block_n + j] = (
-                        T.cast(acc[i, j], T.float32)
-                        * T.cast(WeightScale[bx * block_n + j], T.float32)
-                    ) * T.cast(TokenScale[by * block_m + i], T.float32)
+            project(A, Weight, Weight, WeightScale, WeightScale, TokenScale, Output, by, bx)
 
     return main
 
@@ -105,6 +87,8 @@ def int8_small_projection(
         raise ValueError("Invalid INT8 DP4A tile")
     M = row_count(M, dynamic_rows)
 
+    project = dp4a(M, N, K, bm, bn)
+
     @T.prim_func
     def main(
         A: T.Tensor((M, K // 4), T.int32),
@@ -114,44 +98,6 @@ def int8_small_projection(
         Output: T.Tensor((M, N), output_dtype),
     ):
         with T.Kernel(T.ceildiv(M, bm), T.ceildiv(N, bn), threads=128) as (by, bx):
-            T.import_source(_DP4A_SOURCE)
-            acc = T.alloc_fragment((bm, bn, 32), T.int32)
-            total = T.alloc_fragment((bm, bn), T.int32)
-            w = T.alloc_fragment((bn, 32), T.int32)
-            T.annotate_layout(
-                {
-                    acc: tilelang.Fragment(
-                        (bm, bn, 32),
-                        forward_thread_fn=lambda i, n, k: (n % 4) * 32 + k,
-                        forward_index_fn=lambda i, n, k: i * (bn // 4) + n // 4,
-                    ),
-                    w: tilelang.Fragment(
-                        (bn, 32),
-                        forward_thread_fn=lambda n, k: (n % 4) * 32 + k,
-                        forward_index_fn=lambda n, k: n // 4,
-                    ),
-                }
-            )
-            T.clear(acc)
-            for kg in T.serial(K // 128):
-                for n, k in T.Parallel(bn, 32):
-                    w[n, k] = 0
-                    if bx * bn + n < N:
-                        w[n, k] = Weight[bx * bn + n, kg * 32 + k]
-                for i, n, k in T.Parallel(bm, bn, 32):
-                    if by * bm + i < M:
-                        acc[i, n, k] = T.call_pure_extern(
-                            "int32",
-                            "orinfer_dp4a",
-                            A[by * bm + i, kg * 32 + k],
-                            w[n, k],
-                            acc[i, n, k],
-                        )
-            T.reduce_sum(acc, total, dim=2)
-            for i, n in T.Parallel(bm, bn):
-                if by * bm + i < M and bx * bn + n < N:
-                    Output[by * bm + i, bx * bn + n] = (
-                        T.cast(total[i, n], T.float32) * T.cast(WeightScale[bx * bn + n], T.float32)
-                    ) * T.cast(TokenScale[by * bm + i], T.float32)
+            project(A, Weight, Weight, WeightScale, WeightScale, TokenScale, Output, by, bx)
 
     return main
