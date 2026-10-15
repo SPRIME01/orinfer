@@ -15,7 +15,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from tools.model.publication import AssetReader, load_model, write_json
-from tools.model.flash_next.unify_rows import Compiler
+from tools.model.flash_next.compiler import Compiler
 from tools.model.flash_next.prefill_tuning import ranges
 from tools.operators.abi import evaluate
 

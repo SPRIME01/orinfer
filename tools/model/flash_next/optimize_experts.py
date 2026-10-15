@@ -17,7 +17,7 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from tools.model.compact import compact_package, header, write_shard
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.model.publication import (
     AssetReader,
     atomic_model,

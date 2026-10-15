@@ -3,7 +3,6 @@
 import unittest
 
 from tools.model.flash_next.draft_rows import causal_bindings, primitive_row_multiplier
-from tools.model.flash_next.unify_rows import obsolete_computation
 
 
 class SharedRowsTests(unittest.TestCase):
@@ -31,22 +30,3 @@ class SharedRowsTests(unittest.TestCase):
         del original["mtp_warm_m128/layer48/k4"]
         with self.assertRaisesRegex(ValueError, "Missing chronological"):
             causal_bindings(original, Interfaces(), 128, [1, 2, 3, 4])
-
-    def test_pruning_keeps_capture_controls_and_commit_factors(self):
-        for name in [
-            "verify_m4/layer3/k12",
-            "mtp_head_m128/body/k2",
-            "mtp_warm_m128/layer48/k3",
-            "flash_draft_m8/post/k2",
-        ]:
-            self.assertTrue(obsolete_computation(name))
-        for name in [
-            "verify_m4/begin/k0",
-            "verify_m4/head/k8",
-            "verify_m4/end/k0",
-            "restore_m4/layer0/k0",
-            "draft_rows/capture_m128",
-            "draft_rows/causal_m128/k3",
-            "mtp_warm_m128/begin/k1",
-        ]:
-            self.assertFalse(obsolete_computation(name))

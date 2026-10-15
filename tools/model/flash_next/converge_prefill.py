@@ -16,8 +16,8 @@ from tools.model.publication import (
     link_or_copy,
     write_json,
 )
-from tools.model.flash_next.unify_rows import Compiler
-from tools.model.flash_next.optimize_decode import replace_binding
+from tools.model.flash_next.compiler import Compiler
+from tools.model.flash_next.compiler import replace_binding
 from tools.model.upgrade_dynamic_batch import contract
 from tools.operators.abi import parse_host, validate_parameter_count
 

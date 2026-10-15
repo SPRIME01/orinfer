@@ -43,17 +43,7 @@ fn recipe(tokens: usize) -> Result<Recipe> {
             last: 54,
             head: 9,
         },
-        16 | 128 => Recipe {
-            recurrent: 44,
-            attention: 58,
-            first: 45,
-            ple: 53,
-            history_at: 13,
-            ple_history_at: 22,
-            last: 58,
-            head: 10,
-        },
-        512 | 2048 | 4096 => Recipe {
+        4096 => Recipe {
             recurrent: 42,
             attention: 56,
             first: 44,
@@ -233,17 +223,8 @@ pub(super) fn build(manifest: &mut Manifest, profiles: &[PrefillProfile]) -> Res
         && profiles[0].tokens == 4096
         && profiles[0].min_tokens == 1
         && profiles[0].kind == "flash_dynamic_recurrent";
-    let base = BTreeSet::from([16, 128, 512, 2048, 4096]);
-    if !dynamic
-        && (widths != base
-            || widths.len() != profiles.len()
-            || profiles
-                .iter()
-                .any(|p| p.kind != "flash_recurrent" || p.min_tokens != 0))
-    {
-        return Err(
-            "Flash package needs registered 16/128/512/2048/4096 recurrent profiles".into(),
-        );
+    if !dynamic {
+        return Err("Flash requires one dynamic 1..4096 prefill template".into());
     }
     let mut states = BTreeSet::from([
         "State_ple".to_owned(),

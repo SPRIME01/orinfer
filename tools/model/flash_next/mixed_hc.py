@@ -13,7 +13,7 @@ from tools.model.publication import (
     file_hash,
     link_or_copy,
 )
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.model.upgrade_dynamic_batch import contract
 from tools.operators.abi import parse_host
 

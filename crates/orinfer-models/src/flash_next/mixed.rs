@@ -1,80 +1,14 @@
 //! Concatenated dense/MoE rows with independent causal segments and endpoint heads.
 use crate::{
-    artifact::{Argument, Dtype, Kernel, Result},
+    artifact::Result,
     execution::{BufferView, Invocation},
     model::{Manifest, Operation},
 };
 use orinfer_model_sdk::architecture::BatchSegment;
 use std::collections::{BTreeMap, BTreeSet};
 
-const CAPACITIES: [usize; 5] = [32, 64, 128, 256, 1024];
-const SEGMENTS: [usize; 4] = [1, 16, 128, 512];
 const RESIDUAL: &str = "FlashMixedResidual";
 const HEAD_RESIDUAL: &str = "FlashMixedHeadResidual";
-
-pub(super) fn operands(m: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
-    let buffers: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
-    let mut casts = BTreeMap::new();
-    for kernel in kernels {
-        let Some(parent) = kernel.name.strip_suffix("/bf16_input") else {
-            continue;
-        };
-        let projection = contracts.get(parent).ok_or("Missing HC operand consumer")?;
-        let names: Vec<_> = kernel
-            .args
-            .iter()
-            .filter_map(|a| {
-                if let Argument::Buffer { name } = a {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !parent.starts_with("flash_mixed_m")
-            || kernel.symbol != "hc_input_cast_kernel"
-            || names.len() != 2
-        {
-            return Err("Invalid joined HC operand cast".into());
-        }
-        let input = names
-            .iter()
-            .find_map(|n| buffers.get(n).filter(|b| b.dtype == Dtype::F16))
-            .ok_or("Missing FP16 HC operand")?;
-        let output = names
-            .iter()
-            .find_map(|n| buffers.get(n).filter(|b| b.dtype == Dtype::Bf16))
-            .ok_or("Missing BF16 HC operand")?;
-        if input.data.is_some()
-            || output.data.is_some()
-            || input.bytes()? < output.bytes()?
-            || !projection
-                .args
-                .iter()
-                .any(|a| matches!(a,Argument::Buffer {name} if name==&output.name))
-        {
-            return Err("HC operand cast/consumer storage mismatch".into());
-        }
-        casts.insert(parent.to_owned(), kernel.name.clone());
-    }
-    for operations in m.programs.values_mut() {
-        let mut result = Vec::new();
-        for op in std::mem::take(operations) {
-            if let Operation::Kernel { name } = &op
-                && let Some(cast) = casts.remove(name)
-            {
-                result.push(Operation::Kernel { name: cast });
-            }
-            result.push(op);
-        }
-        *operations = result;
-    }
-    if !casts.is_empty() {
-        return Err("Unregistered joined HC operand conversion".into());
-    }
-    Ok(())
-}
 
 pub(super) fn register(m: &mut Manifest) -> Result<()> {
     let layout = m.batch_layout.as_ref().ok_or("Missing Flash layout")?;
@@ -84,24 +18,14 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         }
         return Ok(());
     }
-    let dynamic_segments = super::causal_rows::present(m) && layout.segment_tokens == 512;
-    let shapes_valid = if dynamic_segments {
-        layout.profiles.keys().copied().collect::<Vec<_>>() == [512]
-            && layout.small_mixed_shapes.is_empty()
-            && m.prefill_batch_profiles
-                .iter()
-                .map(|p| p.tokens)
-                .collect::<Vec<_>>()
-                == [1024]
-    } else {
-        layout.profiles.keys().copied().collect::<Vec<_>>() == [16, 128, 512]
-            && layout.small_mixed_shapes == [16, 128, 512]
-            && m.prefill_batch_profiles
-                .iter()
-                .map(|p| p.tokens)
-                .collect::<Vec<_>>()
-                == [256, 1024]
-    };
+    let shapes_valid = layout.segment_tokens == 512
+        && layout.profiles.keys().copied().collect::<Vec<_>>() == [512]
+        && layout.small_mixed_shapes.is_empty()
+        && m.prefill_batch_profiles
+            .iter()
+            .map(|p| p.tokens)
+            .collect::<Vec<_>>()
+            == [1024];
     if !shapes_valid
         || layout.profiles.values().any(|v| v != "flash_recurrent")
         || m.prefill_batch_profiles
@@ -116,91 +40,6 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             .is_none_or(|b| b.data.is_some() || b.bytes().ok() != Some(1024 * 20480))
     {
         return Err("Invalid Flash mixed causal/row layout".into());
-    }
-    let shared = super::unified_decode::shared(m);
-    for rows in CAPACITIES.into_iter().filter(|_| !shared) {
-        let prefix = format!("flash_mixed_m{rows}");
-        m.programs.insert(
-            format!("{prefix}/begin"),
-            super::plan::section(&prefix, "begin", 1, None),
-        );
-        for layer in 0..48 {
-            let attention = usize::from(layer % 4 == 3);
-            let pre = if rows > 128 { 11 } else { 12 };
-            let post = if rows > 128 { 30 } else { 29 };
-            for (stage, count) in [
-                ("pre", pre - attention + usize::from(layer == 1)),
-                ("post", post - attention),
-            ] {
-                let section = format!("layer{layer}/{stage}");
-                m.programs.insert(
-                    format!("{prefix}/{section}"),
-                    super::plan::section(&prefix, &section, count, None),
-                );
-            }
-        }
-        m.programs.insert(
-            format!("{prefix}/layer1/ple"),
-            super::plan::section(&prefix, "layer1/ple", 7, None),
-        );
-    }
-    for &rows in m.batch_profiles.iter().filter(|_| !shared) {
-        let prefix = format!("flash_mixed_head_m{rows}");
-        m.programs.insert(
-            format!("{prefix}/head"),
-            super::plan::section(&prefix, "head", if rows <= 8 { 8 } else { 9 }, None),
-        );
-    }
-    if !super::causal_rows::present(m) {
-        for tokens in SEGMENTS {
-            let prefix = format!("flash_segment_m{tokens}");
-            for layer in 0..48 {
-                let section = format!("layer{layer}/private");
-                let count = if layer % 4 == 3 { 19 } else { 2 };
-                m.programs.insert(
-                    format!("{prefix}/{section}"),
-                    super::plan::section(&prefix, &section, count, None),
-                );
-            }
-            m.programs.insert(
-                format!("{prefix}/layer1/ple"),
-                super::plan::section(&prefix, "layer1/ple", 2, None),
-            );
-            if m.mtp.is_some() {
-                let name = format!("flash_mixed_capture_m{tokens}");
-                m.programs
-                    .insert(name.clone(), super::plan::section(&name, "body", 1, None));
-            }
-        }
-        if let Some(spec) = &m.mtp {
-            for &tokens in &spec.batch_verification_tokens {
-                if !(2..=8).contains(&tokens) {
-                    return Err("Unsupported Flash verification segment".into());
-                }
-                let prefix = format!("flash_verify_segment_m{tokens}");
-                for layer in 0..48 {
-                    let section = format!("layer{layer}/private");
-                    m.programs.insert(
-                        format!("{prefix}/{section}"),
-                        super::plan::section(
-                            &prefix,
-                            &section,
-                            if layer % 4 == 3 { 20 } else { 4 },
-                            None,
-                        ),
-                    );
-                }
-                m.programs.insert(
-                    format!("{prefix}/layer1/ple"),
-                    super::plan::section(&prefix, "layer1/ple", 3, None),
-                );
-                let capture = format!("flash_verify_capture_m{tokens}");
-                m.programs.insert(
-                    capture.clone(),
-                    super::plan::section(&capture, "body", 1, None),
-                );
-            }
-        }
     }
     super::causal_rows::register(m);
     Ok(())
@@ -222,27 +61,16 @@ pub(super) fn validate_segments(m: &Manifest, segments: &[BatchSegment]) -> Resu
         }
         n.checked_add(s.tokens).ok_or("Mixed row overflow".into())
     })?;
-    if super::unified_decode::shared(m) {
-        if total == 0 || total > 1024 {
-            return Err("Flash mixed row capacity exceeded".into());
-        }
-        Ok(total)
-    } else {
-        CAPACITIES
-            .into_iter()
-            .find(|&n| n >= total)
-            .ok_or("Flash mixed row capacity exceeded".into())
+    if total == 0 || total > 1024 {
+        return Err("Flash mixed row capacity exceeded".into());
     }
+    Ok(total)
 }
 
 fn segment_supported(m: &Manifest, tokens: usize) -> bool {
-    m.batch_layout.as_ref().is_some_and(|l| {
-        if l.segment_tokens > 0 {
-            (1..=l.segment_tokens).contains(&tokens)
-        } else {
-            SEGMENTS.contains(&tokens)
-        }
-    })
+    m.batch_layout
+        .as_ref()
+        .is_some_and(|l| (1..=l.segment_tokens).contains(&tokens))
 }
 
 pub(super) fn mixed_rows_plan(
@@ -286,21 +114,6 @@ fn append(
     Ok(())
 }
 
-fn append_causal(
-    out: &mut Vec<Invocation>,
-    m: &Manifest,
-    program: &str,
-    count: usize,
-    slot: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Result<()> {
-    if super::causal_rows::present(m) {
-        super::rows::append(m, out, program, count, slot, views)
-    } else {
-        append(out, m, program, slot, views)
-    }
-}
-
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
     plan_kind(m, segments, Kind::Ordinary)
 }
@@ -335,7 +148,6 @@ enum Kind {
 }
 
 fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<Invocation>> {
-    let shared = super::unified_decode::shared(m);
     let explicit_verify: BTreeSet<_> = match kind {
         Kind::MixedRows(n) => segments[n..].iter().map(|s| s.slot).collect(),
         _ => BTreeSet::new(),
@@ -358,7 +170,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         .iter()
         .map(|s| if verified(s) { s.tokens } else { 1 })
         .sum();
-    let rows = if kind == Kind::Ordinary {
+    if kind == Kind::Ordinary {
         validate_segments(m, segments)?
     } else {
         let mut slots = BTreeSet::new();
@@ -380,24 +192,17 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 .checked_add(s.tokens)
                 .ok_or("Verification row overflow".to_string())
         })?;
-        if !((if shared { 1 } else { 2 })..=128).contains(&segments.len())
+        if !(1..=128).contains(&segments.len())
             || head_used > 128
             || !has_verify
             || (mixed && !has_prefill)
         {
             return Err("Invalid mixed verification endpoints".into());
         }
-        if shared {
-            if total > 1024 {
-                return Err("Verification row capacity exceeded".into());
-            }
-            total
-        } else {
-            CAPACITIES
-                .into_iter()
-                .find(|&n| n >= total)
-                .ok_or("Missing verification row body")?
+        if total > 1024 {
+            return Err("Verification row capacity exceeded".into());
         }
+        total
     };
     let layout = m
         .batch_layout
@@ -415,33 +220,8 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let segments = ordered.as_slice();
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
     let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
-    if parallel && !super::unified_decode::present(m) {
-        return Err("Mixed decode requires the unified row template".into());
-    }
-    let mut private_views: BTreeMap<_, _> = layout
-        .row_strides
-        .keys()
-        .filter_map(|role| {
-            let buffer = format!("FlashMixed_{role}");
-            m.buffers.iter().any(|b| b.name == buffer).then(|| {
-                (
-                    format!("FlashDecode_{role}"),
-                    BufferView { buffer, offset: 0 },
-                )
-            })
-        })
-        .collect();
-    if shared {
-        private_views.clear();
-    }
-    let prefix = if shared {
-        "flash_decode".into()
-    } else {
-        format!("flash_mixed_m{rows}")
-    };
-    let dynamic = m
-        .dynamic_batch_kernels
-        .contains_key(&format!("{prefix}/begin/k0"));
+
+    let prefix = "flash_decode";
     let empty = BTreeMap::new();
     let mut out = vec![];
     let mut starts = vec![];
@@ -473,19 +253,17 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 .program
         } else if s.tokens == 1 {
             "decode".into()
-        } else if m.row_execution.is_some() {
+        } else {
             format!(
                 "prefill_m{}",
                 m.prefill_plan(s.tokens)
                     .ok_or("Missing mixed prefill template")?
                     .chunk_tokens
             )
-        } else {
-            format!("prefill_m{}", s.tokens)
         };
         if m.vision.is_some() {
             let mut input_views = empty.clone();
-            if !verified(s) && s.tokens > 1 && m.row_execution.is_some() {
+            if !verified(s) && s.tokens > 1 {
                 input_views.insert(
                     "M4096_Embedding".into(),
                     BufferView {
@@ -516,11 +294,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 continue;
             }
             let old = format!("FlashMixed_{role}");
-            let name = if shared {
-                format!("FlashDecode_{role}")
-            } else {
-                old.clone()
-            };
+            let name = format!("FlashDecode_{role}");
             let view = BufferView {
                 buffer: name.clone(),
                 offset: start * stride,
@@ -531,11 +305,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         views.insert(
             RESIDUAL.into(),
             BufferView {
-                buffer: if shared {
-                    "FlashDecode_Residual".into()
-                } else {
-                    RESIDUAL.into()
-                },
+                buffer: "FlashDecode_Residual".into(),
                 offset: start * 20480,
             },
         );
@@ -543,11 +313,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             (format!("M{width}_Embedding"), "FlashMixed_M1_Embedding"),
             (format!("M{width}_Ple"), "FlashMixed_M1_Ple"),
         ] {
-            let destination = if shared {
-                destination.replace("FlashMixed_", "FlashDecode_")
-            } else {
-                destination.into()
-            };
+            let destination = destination.replace("FlashMixed_", "FlashDecode_");
             out.push(invoke(
                 Operation::Copy {
                     source,
@@ -561,56 +327,22 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         starts.push((start, program, views));
         start += s.tokens;
     }
-    if rows > start {
-        for name in ["FlashMixed_M1_Embedding", "FlashMixed_M1_Ple"] {
-            let pad = BTreeMap::from([(
-                name.into(),
-                BufferView {
-                    buffer: name.into(),
-                    offset: start * 5120,
-                },
-            )]);
-            out.push(invoke(
-                Operation::Zero {
-                    destination: name.into(),
-                    bytes: (rows - start) * 5120,
-                },
-                None,
-                &pad,
-            ));
-        }
-    }
+
     let append_body = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
-        if shared {
-            super::rows::append(m, out, program, start, None, &empty)
-        } else {
-            append(out, m, program, None, &empty)
-        }
+        super::rows::append(m, out, program, start, None, &empty)
     };
     append_body(&mut out, &format!("{prefix}/begin"))?;
     for layer in 0..48 {
         if layer == 1 {
             append_body(&mut out, &format!("{prefix}/layer1/ple"))?;
             for (s, (_, _, views)) in segments.iter().zip(&starts) {
-                append_causal(
-                    &mut out,
+                super::rows::append(
                     m,
-                    &if super::causal_rows::present(m) {
-                        format!(
-                            "causal_rows/{}/layer1/ple",
-                            if verified(s) { "verify" } else { "target" }
-                        )
-                    } else {
-                        format!(
-                            "{}_m{}/layer1/ple",
-                            if verified(s) {
-                                "flash_verify_segment"
-                            } else {
-                                "flash_segment"
-                            },
-                            s.tokens
-                        )
-                    },
+                    &mut out,
+                    &format!(
+                        "causal_rows/{}/layer1/ple",
+                        if verified(s) { "verify" } else { "target" }
+                    ),
                     s.tokens,
                     Some(s.slot),
                     views,
@@ -618,39 +350,9 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
         }
         append_body(&mut out, &format!("{prefix}/layer{layer}/pre"))?;
-        // Padded private rows must never retain a previous batch's mixer output.
-        if rows > start && !dynamic {
-            for (name, stride) in &layout.row_strides {
-                if matches!(
-                    name.as_str(),
-                    "Logits" | "Selected" | "M1_Embedding" | "M1_Ple"
-                ) {
-                    continue;
-                }
-                let name = format!("FlashMixed_{name}");
-                if !m.buffers.iter().any(|b| b.name == name) {
-                    continue;
-                }
-                let pad = BTreeMap::from([(
-                    name.clone(),
-                    BufferView {
-                        buffer: name.clone(),
-                        offset: start * stride,
-                    },
-                )]);
-                out.push(invoke(
-                    Operation::Zero {
-                        destination: name,
-                        bytes: (rows - start) * stride,
-                    },
-                    None,
-                    &pad,
-                ));
-            }
-        }
         if parallel {
             let program = format!("flash_decode_state/layer{layer}");
-            append(&mut out, m, &program, None, &private_views)?;
+            append(&mut out, m, &program, None, &empty)?;
             for invocation in out.iter_mut().rev().take(m.programs[&program].len()) {
                 if let Operation::Kernel { name } = &invocation.operation {
                     invocation.launch = Some(
@@ -667,28 +369,14 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             .zip(&starts)
             .filter(|(s, _)| !parallel || s.tokens != 1)
         {
-            let section = if super::causal_rows::present(m) {
-                format!(
-                    "causal_rows/{}/layer{layer}/private",
-                    if verified(s) { "verify" } else { "target" }
-                )
-            } else {
-                format!(
-                    "{}_m{}/layer{layer}/private",
-                    if verified(s) {
-                        "flash_verify_segment"
-                    } else {
-                        "flash_segment"
-                    },
-                    s.tokens
-                )
-            };
+            let section = format!(
+                "causal_rows/{}/layer{layer}/private",
+                if verified(s) { "verify" } else { "target" }
+            );
             let private = &m.programs[&section];
             for (i, op) in private.iter().enumerate() {
                 let mut invocation = invoke(op.clone(), Some(s.slot), views);
-                if super::causal_rows::present(m)
-                    && let Operation::Kernel { name } = op
-                {
+                if let Operation::Kernel { name } = op {
                     invocation.launch = Some(
                         m.dynamic_batch_kernels
                             .get(name)
@@ -700,14 +388,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 if layer % 4 != 3 && i == usize::from(verified(s)) {
                     out.push(invoke(
                         Operation::Copy {
-                            source: format!(
-                                "M{}_HistoryOut",
-                                if super::causal_rows::present(m) {
-                                    if verified(s) { 8 } else { 4096 }
-                                } else {
-                                    super::plan::arena_width(s.tokens)
-                                }
-                            ),
+                            source: format!("M{}_HistoryOut", if verified(s) { 8 } else { 4096 }),
                             destination: format!("State_{layer}_conv"),
                             bytes: 61440,
                         },
@@ -719,38 +400,10 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         }
         append_body(&mut out, &format!("{prefix}/layer{layer}/post"))?;
     }
-    let head_rows = if shared {
-        head_used
-    } else {
-        *m.batch_profiles
-            .iter()
-            .find(|&&n| {
-                n >= head_used
-                    && m.programs
-                        .contains_key(&format!("flash_mixed_head_m{n}/head"))
-            })
-            .ok_or("Missing Flash endpoint head")?
-    };
-    if head_rows > head_used {
-        let pad = BTreeMap::from([(
-            HEAD_RESIDUAL.into(),
-            BufferView {
-                buffer: HEAD_RESIDUAL.into(),
-                offset: head_used * 20480,
-            },
-        )]);
-        out.push(invoke(
-            Operation::Zero {
-                destination: HEAD_RESIDUAL.into(),
-                bytes: (head_rows - head_used) * 20480,
-            },
-            None,
-            &pad,
-        ));
-    }
+
     let mut head_lane = 0;
     for (s, (first, program, views)) in segments.iter().zip(&starts) {
-        let name = if super::causal_rows::present(m) && verified(s) {
+        let name = if verified(s) {
             "causal_rows/verify/advance".into()
         } else {
             format!("{program}/end/k0")
@@ -760,9 +413,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             Some(s.slot),
             &empty,
         );
-        if (super::causal_rows::present(m) && verified(s))
-            || (m.row_execution.is_some() && !verified(s) && s.tokens > 1)
-        {
+        if verified(s) || s.tokens > 1 {
             invocation.launch = Some(
                 m.dynamic_batch_kernels
                     .get(&name)
@@ -772,21 +423,13 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         }
         out.push(invocation);
         if m.mtp.is_some() {
-            append_causal(
-                &mut out,
+            super::rows::append(
                 m,
-                &if super::causal_rows::present(m) {
-                    format!(
-                        "causal_rows/{}/capture",
-                        if verified(s) { "verify" } else { "target" }
-                    )
-                } else {
-                    format!(
-                        "flash_{}_capture_m{}",
-                        if verified(s) { "verify" } else { "mixed" },
-                        s.tokens
-                    )
-                },
+                &mut out,
+                &format!(
+                    "causal_rows/{}/capture",
+                    if verified(s) { "verify" } else { "target" }
+                ),
                 s.tokens,
                 Some(s.slot),
                 views,
@@ -796,11 +439,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             (
                 RESIDUAL.into(),
                 BufferView {
-                    buffer: if shared {
-                        "FlashDecode_Residual".into()
-                    } else {
-                        RESIDUAL.into()
-                    },
+                    buffer: "FlashDecode_Residual".into(),
                     offset: (first + if verified(s) { 0 } else { s.tokens - 1 }) * 20480,
                 },
             ),
@@ -823,34 +462,17 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         ));
         head_lane += if verified(s) { s.tokens } else { 1 };
     }
-    if shared {
-        let views = BTreeMap::from([(
-            "FlashDecode_Residual".into(),
-            BufferView {
-                buffer: HEAD_RESIDUAL.into(),
-                offset: 0,
-            },
-        )]);
-        super::rows::append(m, &mut out, "flash_decode/head", head_used, None, &views)?;
-    } else {
-        append(
-            &mut out,
-            m,
-            &format!("flash_mixed_head_m{head_rows}/head"),
-            None,
-            &empty,
-        )?;
-    }
-    let logits = if shared {
-        "FlashDecode_Logits".into()
-    } else {
-        format!("BatchM{head_rows}_Logits")
-    };
-    let selected = if shared {
-        "FlashDecode_Selected".into()
-    } else {
-        format!("BatchM{head_rows}_Selected")
-    };
+    let views = BTreeMap::from([(
+        "FlashDecode_Residual".into(),
+        BufferView {
+            buffer: HEAD_RESIDUAL.into(),
+            offset: 0,
+        },
+    )]);
+    super::rows::append(m, &mut out, "flash_decode/head", head_used, None, &views)?;
+
+    let logits = "FlashDecode_Logits".to_owned();
+    let selected = "FlashDecode_Selected".to_owned();
     let mut head_lane = 0;
     for s in segments {
         if verified(s) {
@@ -889,24 +511,19 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                     &views,
                 ));
             }
-            let name = if super::causal_rows::present(m) {
-                "causal_rows/verify/selections".into()
-            } else {
-                format!("verify_m{}/head/k8", s.tokens)
-            };
+            let name = "causal_rows/verify/selections".to_owned();
             let mut selection = invoke(
                 Operation::Kernel { name: name.clone() },
                 Some(s.slot),
                 &empty,
             );
-            if super::causal_rows::present(m) {
-                selection.launch = Some(
-                    m.dynamic_batch_kernels
-                        .get(&name)
-                        .ok_or("Missing causal selection launch")?
-                        .launch(s.tokens)?,
-                );
-            }
+            selection.launch = Some(
+                m.dynamic_batch_kernels
+                    .get(&name)
+                    .ok_or("Missing causal selection launch")?
+                    .launch(s.tokens)?,
+            );
+
             out.push(selection);
             head_lane += s.tokens;
             continue;
@@ -948,19 +565,6 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         }
         head_lane += 1;
     }
-    if dynamic && !shared {
-        for invocation in &mut out {
-            if let Operation::Kernel { name } = &invocation.operation
-                && name.starts_with(&format!("{prefix}/"))
-            {
-                invocation.launch = Some(
-                    m.dynamic_batch_kernels
-                        .get(name)
-                        .ok_or("Missing joined row launch contract")?
-                        .launch(start)?,
-                );
-            }
-        }
-    }
+
     Ok(out)
 }

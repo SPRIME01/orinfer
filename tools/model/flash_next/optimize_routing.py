@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from tools.model.compact import compact_package
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.model.package import model_library
 from tools.model.publication import (
     ROOT,

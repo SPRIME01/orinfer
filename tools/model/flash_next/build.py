@@ -22,7 +22,7 @@ from tools.model.flash_next.construction import (
     prefill_names,
     projection,
 )  # noqa: E402
-from tools.model.flash_next.unify_rows import Compiler  # noqa: E402
+from tools.model.flash_next.compiler import Compiler  # noqa: E402
 from tools.model.publication import (  # noqa: E402
     ROOT,
     atomic_model,

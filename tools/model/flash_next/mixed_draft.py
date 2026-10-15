@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 
 from tools.model.flash_next.mixed_verify import Interfaces, share_verification_state
-from tools.model.flash_next.optimize_decode import replace_binding
+from tools.model.flash_next.compiler import replace_binding
 from tools.model.publication import (
     atomic_model,
     clone_model,

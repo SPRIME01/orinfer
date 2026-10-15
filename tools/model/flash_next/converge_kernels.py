@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 from tools.model.publication import atomic_model, clone_model, load_model, write_json
-from tools.model.flash_next.unify_rows import Compiler
+from tools.model.flash_next.compiler import Compiler
 from tools.model.upgrade_dynamic_batch import contract
 
 
@@ -155,7 +155,7 @@ def injection_choices(package, compiler, tuning):
     """Use K16 MMA for every HC injection, including the single-row reference."""
     from tools.operators.abi import parse_host, validate_parameter_count
     from tools.model.publication import link_or_copy, file_hash
-    from tools.model.flash_next.optimize_decode import replace_binding
+    from tools.model.flash_next.compiler import replace_binding
 
     report = json.loads((tuning / "results.json").read_text())
     if not report["complete"] or report["source"] != compiler.reader.base.name:

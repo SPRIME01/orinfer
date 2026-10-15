@@ -1,7 +1,6 @@
-"""Typed local fusions must consume only their declared adjacent operations."""
+"""AOT specializations and the symbolic fallback cover rows without gaps."""
 
 import unittest
-from tools.model.flash_next.unify_decode import share_dynamic_fallbacks
 from tools.model.flash_next.decode_policy import (
     decode_shapes,
     selection_name,
@@ -11,30 +10,6 @@ from tools.model.flash_next.decode_policy import (
 
 
 class DecodeAlignmentTests(unittest.TestCase):
-    def test_complete_row_table_reuses_its_dynamic_cubin_for_the_canonical_slot(self):
-        kernels = [dict(name="slot", module="unused")]
-        for shape in decode_shapes():
-            for first, last in shape.ranges():
-                kernels.append(dict(name=selection_name("slot", first, last), module=shape.key))
-        contracts = [dict(name=k["name"], capacity=128) for k in kernels]
-        self.assertEqual(share_dynamic_fallbacks(kernels, contracts), 1)
-        self.assertEqual(kernels[0], dict(name="slot", module="dynamic"))
-        self.assertEqual(contracts[0], dict(name="slot", capacity=128))
-        kernels.pop()
-        kernels[0]["module"] = "untouched"
-        self.assertEqual(share_dynamic_fallbacks(kernels, contracts), 0)
-        self.assertEqual(kernels[0]["module"], "untouched")
-
-    def test_fused_range_rejects_an_overlapping_medium_tile(self):
-        kernels = [
-            dict(name="slot"),
-            dict(name="slot/rows/1-128"),
-            dict(name="slot/rows/9-16"),
-        ]
-        contracts = [dict(name=k["name"]) for k in kernels]
-        with self.assertRaisesRegex(ValueError, "Overlapping.*slot"):
-            share_dynamic_fallbacks(kernels, contracts)
-
     def test_specializations_and_symbolic_fallback_cover_each_live_row_once(self):
         shapes = decode_shapes()
         self.assertEqual([s.rows for s in shapes if not s.dynamic], [1, 2, 3, 4, 8, 16, 32])

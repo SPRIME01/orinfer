@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 
 from tools.model.flash_next.kernel_policy import expert_implementation, projection_policies
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.model.flash_next.optimize_experts import row_tile
 from tools.model.publication import (
     AssetReader,

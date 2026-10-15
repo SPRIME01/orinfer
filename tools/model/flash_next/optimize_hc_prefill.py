@@ -17,7 +17,7 @@ from tools.model.publication import (
     write_json,
 )
 from tools.model.compact import compact_package
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.operators.abi import parse_host, validate_parameter_count
 
 

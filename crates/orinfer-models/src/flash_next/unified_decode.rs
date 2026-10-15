@@ -10,15 +10,7 @@ pub(super) const CAPACITY: usize = 128;
 pub(super) const PREFIX: &str = "flash_decode";
 pub(super) const ARENA: &str = "FlashDecode_";
 
-pub(super) fn computation_capacity(m: &Manifest) -> usize {
-    m.dynamic_batch_kernels
-        .get("flash_decode/begin/k0")
-        .map_or(CAPACITY, |k| k.capacity)
-}
-
-pub(super) fn shared(m: &Manifest) -> bool {
-    computation_capacity(m) == 1024
-}
+pub(super) const COMPUTATION_CAPACITY: usize = 1024;
 
 pub(super) fn present(m: &Manifest) -> bool {
     m.dynamic_batch_kernels
@@ -40,13 +32,13 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
                         * if matches!(role.as_str(), "Logits" | "Selected") {
                             CAPACITY
                         } else {
-                            computation_capacity(m)
+                            COMPUTATION_CAPACITY
                         })
         {
             return Err("Invalid canonical decode row arena".into());
         }
     }
-    for (section, count) in super::batching::stages(CAPACITY) {
+    for (section, count) in super::batching::stages() {
         if section.ends_with("/private") {
             continue;
         }
@@ -102,9 +94,6 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
 }
 
 pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -> Result<()> {
-    if !present(m) {
-        return Ok(());
-    }
     m.programs.remove("flash_decode/local");
     super::draft_rows::configure(m)?;
     for kernel in kernels
@@ -164,7 +153,7 @@ pub(super) fn configure(m: &mut Manifest, kernels: &[crate::artifact::Kernel]) -
             return Err("Overlapping compiled decode row selections".into());
         }
     }
-    let computation_capacity = computation_capacity(m);
+    let computation_capacity = COMPUTATION_CAPACITY;
     let rows = m.row_execution.get_or_insert_with(|| RowExecution {
         capacity: CAPACITY,
         programs: BTreeSet::new(),

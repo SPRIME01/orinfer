@@ -82,9 +82,6 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
 
 /// Canonical slots own dependency regions; AOT row substitutions retain them.
 pub(super) fn build_rows(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
-    if !super::unified_decode::present(manifest) {
-        return Ok(());
-    }
     let catalog: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
     for (program, ops) in &manifest.programs {
         if !program.starts_with("flash_decode/layer") {

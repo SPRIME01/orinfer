@@ -70,28 +70,14 @@ impl Adapter for Flash {
                         .verification_plan(segment.tokens)
                         .ok_or("Missing MTP commit profile")?;
                     if include_plan {
-                        if causal_rows::present(&self.manifest) {
-                            rows::append(
-                                &self.manifest,
-                                &mut plan,
-                                &restore.restore_program,
-                                segment.tokens,
-                                Some(segment.slot),
-                                &Default::default(),
-                            )?;
-                            continue;
-                        }
-                        plan.extend(
-                            self.manifest.programs[&restore.restore_program]
-                                .iter()
-                                .cloned()
-                                .map(|operation| orinfer_model_sdk::execution::Invocation {
-                                    operation,
-                                    sequence: Some(segment.slot),
-                                    launch: None,
-                                    views: Default::default(),
-                                }),
-                        );
+                        rows::append(
+                            &self.manifest,
+                            &mut plan,
+                            &restore.restore_program,
+                            segment.tokens,
+                            Some(segment.slot),
+                            &Default::default(),
+                        )?;
                     }
                 }
                 Ok((plan, vec![]))
@@ -228,9 +214,21 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     {
         return Err("Flash package arithmetic/checkpoint signature mismatch".into());
     }
+    if !unified_decode::present(&request.metadata)
+        || request.metadata.dynamic_batch_kernels["flash_decode/begin/k0"].capacity
+            != unified_decode::COMPUTATION_CAPACITY
+        || !causal_rows::present(&request.metadata)
+        || request
+            .metadata
+            .batch_layout
+            .as_ref()
+            .is_none_or(|l| l.segment_tokens != 512)
+        || (request.metadata.mtp.is_some() && !draft_rows::present(&request.metadata))
+    {
+        return Err("Flash requires shared target/draft rows and dynamic causal state".into());
+    }
     plan::build(&mut request.metadata, &request.prefill_profiles)?;
-    mixed::operands(&mut request.metadata, &request.kernel_contracts)?;
-    q4::build(&mut request.metadata)?;
+    q4::validate(&request.metadata)?;
     q4::prerequisites(&mut request.metadata, &request.kernel_contracts)?;
     experts::build(&mut request.metadata, &request.kernel_contracts)?;
     hc::build(&mut request.metadata, &request.kernel_contracts)?;
@@ -238,89 +236,77 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     decode_fusions::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build(&mut request.metadata, &request.kernel_contracts)?;
     plan::stages(&mut request.metadata, &request.kernel_contracts)?;
-    if request
-        .prefill_profiles
-        .iter()
-        .any(|p| p.kind == "flash_dynamic_recurrent")
-    {
-        let manifest = &mut request.metadata;
-        // Source binding slots describe compiled implementations. Only the
-        // canonical template and its resumable stages remain public programs.
-        manifest.programs.remove("prefill_m4096");
-        manifest.programs.remove("head_m4096");
-        if let Some(kv) = &mut manifest.kv_cache {
-            kv.growth.remove("prefill_m4096");
-        }
-        let plan = manifest
-            .prefill_plans
-            .first_mut()
-            .ok_or("Missing dynamic prefill template")?;
-        plan.prefill_program = "prefill".into();
-        plan.head_program = "head".into();
-        for stage in &mut plan.stages {
-            let name = stage.replace("prefill_m4096/", "prefill/");
-            let operations = manifest
-                .programs
-                .remove(stage)
-                .ok_or("Missing dynamic prefill stage")?;
-            manifest.programs.insert(name.clone(), operations);
-            if let Some(kv) = &mut manifest.kv_cache
-                && let Some(growth) = kv.growth.remove(stage)
-            {
-                kv.growth.insert(name.clone(), growth);
-            }
-            *stage = name;
-        }
-        let mut programs = std::collections::BTreeSet::from(["prefill".into(), "head".into()]);
-        programs.extend(plan.stages.iter().cloned());
-        if manifest.mtp.is_some() {
-            programs.insert("mtp_capture_m4096".into());
-        }
-        let variants = row_variants::build(&request.kernel_contracts, &manifest.buffers)?;
-        manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
-            capacity: 4096,
-            program_capacities: std::collections::BTreeMap::new(),
-            programs,
-            variants,
-        });
-        let dynamic_causal = causal_rows::present(manifest);
-        if let Some(layout) = &mut manifest.batch_layout
-            && !layout.profiles.is_empty()
+
+    let manifest = &mut request.metadata;
+    // Source binding slots describe compiled implementations. Only the
+    // canonical template and its resumable stages remain public programs.
+    manifest.programs.remove("prefill_m4096");
+    manifest.programs.remove("head_m4096");
+    if let Some(kv) = &mut manifest.kv_cache {
+        kv.growth.remove("prefill_m4096");
+    }
+    let plan = manifest
+        .prefill_plans
+        .first_mut()
+        .ok_or("Missing dynamic prefill template")?;
+    plan.prefill_program = "prefill".into();
+    plan.head_program = "head".into();
+    for stage in &mut plan.stages {
+        let name = stage.replace("prefill_m4096/", "prefill/");
+        let operations = manifest
+            .programs
+            .remove(stage)
+            .ok_or("Missing dynamic prefill stage")?;
+        manifest.programs.insert(name.clone(), operations);
+        if let Some(kv) = &mut manifest.kv_cache
+            && let Some(growth) = kv.growth.remove(stage)
         {
-            let kv = manifest
-                .kv_cache
-                .as_mut()
-                .ok_or("Missing batch KV metadata")?;
-            let base = kv
-                .growth
-                .get("decode")
-                .ok_or("Missing decode KV growth")?
-                .clone();
-            layout.preparation_programs.insert(1, "decode".into());
-            for &tokens in layout.profiles.keys() {
-                let program = if layout.segment_tokens > 0 {
-                    "causal_rows/target/layer3/private".into()
-                } else {
-                    format!("flash_segment_m{tokens}/layer3/private")
-                };
-                if !manifest.programs.contains_key(&program) {
-                    return Err("Missing batch causal preparation program".into());
-                }
-                let mut growth = base.clone();
-                growth.tokens = tokens;
-                growth.length = (layout.segment_tokens > 0).then(|| "Length".into());
-                growth
-                    .buffers
-                    .retain(|name| !kv.prefill_workspace.contains_key(name));
-                growth.buffers.push(plan::score_role(
-                    if dynamic_causal { 512 } else { tokens },
-                    "Target",
-                ));
-                kv.growth.insert(program.clone(), growth);
-                layout.preparation_programs.insert(tokens, program);
+            kv.growth.insert(name.clone(), growth);
+        }
+        *stage = name;
+    }
+    let mut programs = std::collections::BTreeSet::from(["prefill".into(), "head".into()]);
+    programs.extend(plan.stages.iter().cloned());
+    if manifest.mtp.is_some() {
+        programs.insert("mtp_capture_m4096".into());
+    }
+    let variants = row_variants::build(&request.kernel_contracts, &manifest.buffers)?;
+    manifest.row_execution = Some(orinfer_model_sdk::operators::rows::RowExecution {
+        capacity: 4096,
+        program_capacities: std::collections::BTreeMap::new(),
+        programs,
+        variants,
+    });
+    if let Some(layout) = &mut manifest.batch_layout
+        && !layout.profiles.is_empty()
+    {
+        let kv = manifest
+            .kv_cache
+            .as_mut()
+            .ok_or("Missing batch KV metadata")?;
+        let base = kv
+            .growth
+            .get("decode")
+            .ok_or("Missing decode KV growth")?
+            .clone();
+        layout.preparation_programs.insert(1, "decode".into());
+        for &tokens in layout.profiles.keys() {
+            let program = "causal_rows/target/layer3/private".to_owned();
+            if !manifest.programs.contains_key(&program) {
+                return Err("Missing batch causal preparation program".into());
             }
+            let mut growth = base.clone();
+            growth.tokens = tokens;
+            growth.length = (layout.segment_tokens > 0).then(|| "Length".into());
+            growth
+                .buffers
+                .retain(|name| !kv.prefill_workspace.contains_key(name));
+            growth.buffers.push(plan::score_role(512, "Target"));
+            kv.growth.insert(program.clone(), growth);
+            layout.preparation_programs.insert(tokens, program);
         }
     }
+
     if let Some(spec) = &mut request.metadata.mtp {
         spec.mixed_verification_tokens = if !spec.batch_verification_tokens.is_empty()
             && !request.metadata.prefill_batch_profiles.is_empty()

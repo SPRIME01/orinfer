@@ -12,7 +12,7 @@ from safetensors.numpy import save_file
 
 from tools.model.compact import compact_package
 from tools.model.flash_next.hc_bf16 import pack
-from tools.model.flash_next.optimize_decode import pointer_bindings, replace_binding
+from tools.model.flash_next.compiler import pointer_bindings, replace_binding
 from tools.model.flash_next.optimize_hc import up_rank
 from tools.model.publication import (
     AssetReader,

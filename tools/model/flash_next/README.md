@@ -74,7 +74,7 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.weights \
   --output artifacts/models/flash-next-quantized
 ```
 
-这些是量化中间权重。`prepare.py`、`prepare_mtp.py`、`prepare_vision.py` 与早期升级工具保留作基础计划捕获、数学参考及构建开发用途；它们的单独输出不能代替完整的当前原生部署包。正式重建使用上方 `build.py`，不再要求用户手工串联历史升级目录。
+这些是量化中间权重，不能直接作为当前原生部署包。`native.py`、`mtp.py` 与 `reference/` 提供离线数学对照；正式执行包重建统一使用上方 `build.py`，共用 `compiler.py` 的 host ABI 绑定与编译产物导出。旧的固定 batch／逐长度计划升级入口已移除，不支持把历史中间包转换为部署包。
 
 数值验证固定 seed 20261002，对同一 teacher-forced 历史比较 top3 概率、KL/NLL 和任务结果；token 不完全一致不自动判失败。完整 BF16 参考位于 `reference/`，部分层结果不能视为整模型基线。`checks/` 提供 kernel、尾部和 replay 验证，Rust GPU 测试覆盖状态、prefix、MTP 和混合请求。性能以 Rust CLI 完整请求为准，不能用微测外推 TPS。
 

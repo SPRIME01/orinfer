@@ -10,7 +10,7 @@ pub(super) fn present(m: &Manifest) -> bool {
 }
 
 pub(super) fn register(m: &mut Manifest) -> Result<()> {
-    if !present(m) {
+    if m.mtp.is_none() {
         return Ok(());
     }
     for stage in ["begin", "pre", "post"] {
@@ -45,12 +45,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
 
 pub(super) fn causal_begin(m: &Manifest, tokens: usize, gather: bool) -> Vec<Operation> {
     let mut ops = Vec::new();
-    if tokens != 512
-        && !(gather
-            && m.mtp
-                .as_ref()
-                .is_some_and(|s| s.warm_plans.iter().any(|p| p.min_tokens > 0)))
-    {
+    if !gather && tokens != 512 {
         ops.push(Operation::Copy {
             source: format!("DraftM{tokens}_Embedding"),
             destination: "DraftM512_Embedding".into(),
@@ -80,9 +75,9 @@ pub(super) fn causal_begin(m: &Manifest, tokens: usize, gather: bool) -> Vec<Ope
 }
 
 pub(super) fn configure(m: &mut Manifest) -> Result<()> {
-    if !present(m) {
+    let Some(spec) = m.mtp.clone() else {
         return Ok(());
-    }
+    };
     let head: Vec<_> = m.programs["flash_decode/head"]
         .iter()
         .map(|op| {
@@ -95,7 +90,6 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
         })
         .collect::<Result<_>>()?;
     m.programs.insert("draft_rows/head".into(), head.clone());
-    let spec = m.mtp.clone().ok_or("Missing draft state contract")?;
     let mut head_program = vec![Operation::Copy {
         source: "DraftM1_Condition".into(),
         destination: "DraftRows_Hidden".into(),
@@ -114,74 +108,37 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
     ]);
     for warm in &spec.warm_plans {
         let n = warm.tokens;
-        let causal = super::causal_rows::present(m);
-        let mut body = (0..2 + usize::from(m.vision.is_some()))
-            .map(|i| Operation::Kernel {
-                name: format!("mtp_warm_m{n}/begin/k{i}"),
-            })
-            .collect::<Vec<_>>();
-        if causal {
-            body = causal_begin(m, n, true);
-        }
-        if warm.min_tokens > 0 {
-            body.extend(
-                ["embedding", "condition"]
-                    .into_iter()
-                    .map(|name| Operation::Kernel {
-                        name: format!("causal_rows/warm/{name}"),
-                    }),
-            );
-        } else {
-            body.extend([
-                Operation::Copy {
-                    source: format!("DraftM{}_Embedding", if causal { 512 } else { n }),
-                    destination: "DraftRows_Embedding".into(),
-                    bytes: n * 5120,
-                },
-                Operation::Copy {
-                    source: format!("DraftM{}_Condition", if causal { 512 } else { n }),
-                    destination: "DraftRows_Condition".into(),
-                    bytes: n * 20480,
-                },
-            ]);
-        }
+        let mut body = causal_begin(m, n, true);
+        body.extend(
+            ["embedding", "condition"]
+                .into_iter()
+                .map(|name| Operation::Kernel {
+                    name: format!("causal_rows/warm/{name}"),
+                }),
+        );
+
         for stage in ["begin", "pre"] {
             body.extend(m.programs[&format!("draft_rows/{stage}")].clone());
         }
         body.extend((0..19).map(|i| Operation::Kernel {
-            name: if causal {
-                format!("causal_rows/draft/k{i}")
-            } else {
-                format!("draft_rows/causal_m{n}/k{i}")
-            },
+            name: { format!("causal_rows/draft/k{i}") },
         }));
         body.extend(m.programs["draft_rows/post"].clone());
         body.extend([
             Operation::Kernel {
-                name: if causal {
-                    "causal_rows/warm/advance".into()
-                } else {
-                    format!("mtp_warm_m{n}/end/k0")
-                },
+                name: "causal_rows/warm/advance".into(),
             },
             Operation::Kernel {
-                name: if causal {
-                    "causal_rows/warm/capture".into()
-                } else {
-                    format!("draft_rows/capture_m{n}")
-                },
+                name: "causal_rows/warm/capture".into(),
             },
         ]);
-        if n == 1 || warm.min_tokens > 0 {
-            let mut draft = body[1..].to_vec();
-            if causal {
-                // Replace gather with the carried endpoint condition.
-                draft = causal_begin(m, 1, false);
-                draft.extend(body[causal_begin(m, n, true).len()..].to_vec());
-            }
-            draft.extend(head_program.clone());
-            m.programs.insert(spec.draft_program.clone(), draft);
-        }
+        // Replace gather with the carried endpoint condition.
+        let mut draft = causal_begin(m, 1, false);
+        draft.extend(body[causal_begin(m, n, true).len()..].to_vec());
+
+        draft.extend(head_program.clone());
+        m.programs.insert(spec.draft_program.clone(), draft);
+
         m.programs.insert(warm.program.clone(), body);
         m.programs
             .insert(warm.head_program.clone(), head_program.clone());

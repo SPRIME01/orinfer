@@ -11,7 +11,7 @@ import shutil
 from pathlib import Path
 
 from tools.model.flash_next.converge_kernels import coalesce_adjacent_selections
-from tools.model.flash_next.unify_rows import Compiler
+from tools.model.flash_next.compiler import Compiler
 from tools.model.publication import atomic_model, clone_model, load_model, write_json
 from tools.operators.abi import evaluate
 

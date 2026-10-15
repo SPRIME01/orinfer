@@ -7,54 +7,6 @@ use crate::{
 use orinfer_model_sdk::{abi::BatchOperation, architecture::BatchSegment};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn register(m: &mut Manifest) -> Result<()> {
-    let Some(spec) = &m.mtp else { return Ok(()) };
-    if super::causal_rows::present(m) {
-        return Ok(());
-    }
-    if super::draft_rows::present(m) {
-        for tokens in 1..=8 {
-            let section = format!("draft_rows/warm_m{tokens}/private");
-            m.programs.insert(
-                section.clone(),
-                super::plan::section("draft_rows", &format!("warm_m{tokens}/private"), 19, None),
-            );
-        }
-        m.programs.insert(
-            "draft_rows/private".into(),
-            super::plan::section("draft_rows", "private", 19, None),
-        );
-        return Ok(());
-    }
-    for &rows in &spec.batch_draft_profiles {
-        if ![2, 4, 8].contains(&rows) {
-            return Err("Unsupported Flash draft capacity".into());
-        }
-        for (stage, count) in [
-            ("begin", 5),
-            ("pre", 10),
-            ("private", 19),
-            ("post", 25),
-            ("head", 8),
-        ] {
-            let prefix = format!("flash_draft_m{rows}");
-            m.programs.insert(
-                format!("{prefix}/{stage}"),
-                super::plan::section(&prefix, stage, count, None),
-            );
-        }
-        for tokens in 1..=rows {
-            let prefix = format!("flash_draft_m{rows}");
-            let section = format!("warm_m{tokens}/private");
-            m.programs.insert(
-                format!("{prefix}/{section}"),
-                super::plan::section(&prefix, &section, 19, None),
-            );
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn plan(
     m: &Manifest,
     segments: &[BatchSegment],
@@ -66,12 +18,9 @@ pub(super) fn plan(
     let used = segments.iter().try_fold(0usize, |sum, s| {
         sum.checked_add(s.tokens).ok_or("Draft row overflow")
     })?;
-    let capacity = spec
-        .batch_draft_profiles
-        .iter()
-        .copied()
-        .find(|&n| n >= used)
-        .ok_or("Unsupported draft batch capacity")?;
+    if used > spec.batch_draft_profiles.last().copied().unwrap_or(0) {
+        return Err("Unsupported draft batch capacity".into());
+    }
     let mut owners = BTreeSet::new();
     if segments.is_empty()
         || (operation == BatchOperation::Draft && segments.len() < 2)
@@ -92,18 +41,9 @@ pub(super) fn plan(
             start
         })
         .collect();
-    let shared = super::draft_rows::present(m);
-    let frame_capacity = if shared { 512 } else { capacity };
-    let prefix = if shared {
-        "draft_rows".into()
-    } else {
-        format!("flash_draft_m{capacity}")
-    };
-    let arena = if shared {
-        "DraftRows_".into()
-    } else {
-        format!("DraftBatchM{capacity}_")
-    };
+    let frame_capacity = 512;
+    let prefix = "draft_rows";
+    let arena = "DraftRows_";
     let mut out = vec![];
     fn push(
         out: &mut Vec<Invocation>,
@@ -138,22 +78,10 @@ pub(super) fn plan(
             offset: index * (bytes / frame_capacity),
         })
     };
-    let embedding = if shared {
-        "DraftRows_Embedding".into()
-    } else {
-        format!("{arena}DraftM{capacity}_Embedding")
-    };
-    let condition = if shared {
-        "DraftRows_Condition".into()
-    } else {
-        format!("{arena}DraftM{capacity}_Condition")
-    };
-    let hidden = if shared {
-        "DraftRows_Hidden".into()
-    } else {
-        format!("{arena}DraftM{capacity}_HC")
-    };
-    // Inactive lanes are initialized without touching any request state.
+    let embedding = "DraftRows_Embedding".to_owned();
+    let condition = "DraftRows_Condition".to_owned();
+    let hidden = "DraftRows_Hidden".to_owned();
+    // Initialize only live scratch rows, without touching request state.
     for (name, stride) in if body {
         vec![(&embedding, 5120), (&condition, 20480)]
     } else {
@@ -163,7 +91,7 @@ pub(super) fn plan(
             &mut out,
             Operation::Zero {
                 destination: name.clone(),
-                bytes: (if shared { used } else { capacity }) * stride,
+                bytes: used * stride,
             },
             None,
             BTreeMap::new(),
@@ -171,73 +99,37 @@ pub(super) fn plan(
     }
     for (lane, segment) in segments.iter().enumerate() {
         if body {
-            if !super::causal_rows::present(m) {
-                if operation == BatchOperation::Warm {
-                    push(
-                        &mut out,
-                        Operation::Kernel {
-                            name: format!("mtp_warm_m{}/begin/k0", segment.tokens),
-                        },
-                        Some(segment.slot),
-                        BTreeMap::new(),
-                    );
-                }
-                for i in 1..=usize::from(m.vision.is_some()) + 1 {
-                    push(
-                        &mut out,
-                        Operation::Kernel {
-                            name: format!("mtp_warm_m{}/begin/k{i}", segment.tokens),
-                        },
-                        Some(segment.slot),
-                        BTreeMap::new(),
-                    );
-                }
-            } else {
-                for operation in super::draft_rows::causal_begin(
-                    m,
-                    segment.tokens,
-                    operation == BatchOperation::Warm,
-                ) {
-                    let launch = if let Operation::Kernel { name } = &operation {
-                        Some(
-                            m.dynamic_batch_kernels
-                                .get(name)
-                                .ok_or("Missing draft causal control")?
-                                .launch(segment.tokens)?,
-                        )
-                    } else {
-                        None
-                    };
-                    out.push(Invocation {
-                        operation,
-                        sequence: Some(segment.slot),
-                        views: BTreeMap::new(),
-                        launch,
-                    });
-                }
+            for operation in super::draft_rows::causal_begin(
+                m,
+                segment.tokens,
+                operation == BatchOperation::Warm,
+            ) {
+                let launch = if let Operation::Kernel { name } = &operation {
+                    Some(
+                        m.dynamic_batch_kernels
+                            .get(name)
+                            .ok_or("Missing draft causal control")?
+                            .launch(segment.tokens)?,
+                    )
+                } else {
+                    None
+                };
+                out.push(Invocation {
+                    operation,
+                    sequence: Some(segment.slot),
+                    views: BTreeMap::new(),
+                    launch,
+                });
             }
+
             for (source, destination, bytes) in [
                 (
-                    format!(
-                        "DraftM{}_Embedding",
-                        if super::causal_rows::present(m) {
-                            512
-                        } else {
-                            segment.tokens
-                        }
-                    ),
+                    "DraftM512_Embedding".to_owned(),
                     &embedding,
                     segment.tokens * 5120,
                 ),
                 (
-                    format!(
-                        "DraftM{}_Condition",
-                        if super::causal_rows::present(m) {
-                            512
-                        } else {
-                            segment.tokens
-                        }
-                    ),
+                    "DraftM512_Condition".to_owned(),
                     &condition,
                     segment.tokens * 20480,
                 ),
@@ -260,27 +152,14 @@ pub(super) fn plan(
     }
     if body {
         for stage in ["begin", "pre"] {
-            if shared {
-                let mut calls = Vec::new();
-                super::rows::append(
-                    m,
-                    &mut calls,
-                    &format!("{prefix}/{stage}"),
-                    used,
-                    None,
-                    &BTreeMap::new(),
-                )?;
-                out.extend(calls);
-            } else {
-                for op in &m.programs[&format!("{prefix}/{stage}")] {
-                    out.push(Invocation {
-                        operation: op.clone(),
-                        sequence: None,
-                        views: BTreeMap::new(),
-                        launch: None,
-                    });
-                }
-            }
+            super::rows::append(
+                m,
+                &mut out,
+                &format!("{prefix}/{stage}"),
+                used,
+                None,
+                &BTreeMap::new(),
+            )?;
         }
         // Dedicated draft arenas are row-major. Only interface buffers get a lane
         // view; causal scratch/control bindings still resolve within the owner slot.
@@ -289,103 +168,55 @@ pub(super) fn plan(
                 .buffers
                 .iter()
                 .filter(|b| {
-                    b.name.starts_with(&arena)
+                    b.name.starts_with(arena)
                         && b.bytes().is_ok_and(|n| n.is_multiple_of(frame_capacity))
                 })
                 .map(|b| Ok((b.name.clone(), row(&b.name, offsets[lane])?)))
                 .collect::<Result<_>>()?;
-            let section = if operation == BatchOperation::Warm {
-                format!("warm_m{}/private", segment.tokens)
-            } else {
-                "private".into()
-            };
-            if super::causal_rows::present(m) {
-                super::rows::append(
-                    m,
-                    &mut out,
-                    "causal_rows/draft",
-                    segment.tokens,
-                    Some(segment.slot),
-                    &views,
-                )?;
-            } else {
-                for op in &m.programs[&format!("{prefix}/{section}")] {
-                    push(&mut out, op.clone(), Some(segment.slot), views.clone());
-                }
-            }
+            super::rows::append(
+                m,
+                &mut out,
+                "causal_rows/draft",
+                segment.tokens,
+                Some(segment.slot),
+                &views,
+            )?;
+
             out.push(Invocation {
                 operation: Operation::Kernel {
-                    name: if super::causal_rows::present(m) {
-                        "causal_rows/warm/advance".into()
-                    } else {
-                        format!("mtp_warm_m{}/end/k0", segment.tokens)
-                    },
+                    name: "causal_rows/warm/advance".into(),
                 },
                 sequence: Some(segment.slot),
                 views: BTreeMap::new(),
-                launch: if super::causal_rows::present(m) {
+                launch: {
                     Some(
                         m.dynamic_batch_kernels["causal_rows/warm/advance"]
                             .launch(segment.tokens)?,
                     )
-                } else {
-                    None
                 },
             });
         }
-        if shared {
-            super::rows::append(
-                m,
-                &mut out,
-                &format!("{prefix}/post"),
-                used,
-                None,
-                &BTreeMap::new(),
-            )?;
-        } else {
-            for op in &m.programs[&format!("{prefix}/post")] {
-                out.push(Invocation {
-                    operation: op.clone(),
-                    sequence: None,
-                    views: BTreeMap::new(),
-                    launch: None,
-                });
-            }
-        }
+        super::rows::append(
+            m,
+            &mut out,
+            &format!("{prefix}/post"),
+            used,
+            None,
+            &BTreeMap::new(),
+        )?;
     }
     if head {
-        for stage in ["head"] {
-            if shared {
-                super::rows::append(
-                    m,
-                    &mut out,
-                    &format!("{prefix}/{stage}"),
-                    segments.len(),
-                    None,
-                    &BTreeMap::new(),
-                )?;
-            } else {
-                for op in &m.programs[&format!("{prefix}/{stage}")] {
-                    out.push(Invocation {
-                        operation: op.clone(),
-                        sequence: None,
-                        views: BTreeMap::new(),
-                        launch: None,
-                    });
-                }
-            }
-        }
+        super::rows::append(
+            m,
+            &mut out,
+            "draft_rows/head",
+            segments.len(),
+            None,
+            &BTreeMap::new(),
+        )?;
     }
-    let logits = if shared {
-        "FlashDecode_Logits".into()
-    } else {
-        format!("{arena}logits")
-    };
-    let pairs = if shared {
-        "FlashDecode_Selected".into()
-    } else {
-        format!("{arena}pairs")
-    };
+    let logits = "FlashDecode_Logits".to_owned();
+    let pairs = "FlashDecode_Selected".to_owned();
     for (lane, segment) in segments.iter().enumerate() {
         for (source, destination, bytes, extra) in [
             (&logits, spec.draft_logits.as_str(), m.vocab * 4, 0),
@@ -404,7 +235,7 @@ pub(super) fn plan(
             } else {
                 lane
             };
-            let mut view = if shared && source != &hidden {
+            let mut view = if source != &hidden {
                 BufferView {
                     buffer: source.clone(),
                     offset: endpoint * (if source == &logits { m.vocab * 4 } else { 8 }),

@@ -3,11 +3,9 @@
 import unittest
 from tools.model.flash_next.mixed_verify import share_verification_state
 
-from tools.model.flash_next.optimize_decode import (
+from tools.model.flash_next.compiler import (
     pointer_bindings,
     replace_binding,
-    rotation_geometry,
-    validate_gdn_prefill_state,
 )
 
 
@@ -80,17 +78,6 @@ class DecodePackageTests(unittest.TestCase):
         self.assertEqual(binding["grid"], [32, 1, 1])
         self.assertEqual(binding["args"], original["args"])
 
-    def test_gdn_matrix_and_flat_arena_have_the_same_extent(self):
-        for shape in ([48, 128, 128], [48 * 128 * 128]):
-            validate_gdn_prefill_state(dict(dtype="f32", shape=shape), dict(kind="buffer"))
-        for dtype, shape, offset in (
-            ("f16", [48, 128, 128], 0),
-            ("f32", [48, 128, 127], 0),
-            ("f32", [48, 128, 128], 4),
-        ):
-            with self.assertRaisesRegex(ValueError, "FP32"):
-                validate_gdn_prefill_state(dict(dtype=dtype, shape=shape), dict(offset=offset))
-
     def test_reordered_launch_preserves_slice_without_mutating_original(self):
         original = dict(
             name="verify_m3/layer0/k30",
@@ -134,31 +121,6 @@ class DecodePackageTests(unittest.TestCase):
         ]:
             with self.assertRaises(ValueError):
                 pointer_bindings(original, host)
-
-    def test_mtp_last_row_slice_and_full_verification_have_distinct_extents(self):
-        buffers = {
-            "hidden": dict(name="hidden", dtype="f16", shape=[3, 128]),
-            "signs": dict(name="Q4_output_signs", dtype="i8", shape=[128]),
-            "activation": dict(name="activation", dtype="i8", shape=[3, 128]),
-            "scale": dict(name="scale", dtype="f16", shape=[3]),
-        }
-        pointers = {
-            "X": dict(kind="buffer_slice", name="hidden", offset=512),
-            "Signs": dict(kind="buffer", name="signs"),
-            "Q": dict(kind="buffer", name="activation"),
-            "S": dict(kind="buffer", name="scale"),
-        }
-        kernel = dict(grid=[3, 1, 1])
-        self.assertEqual(
-            rotation_geometry("mtp_head_m3", kernel, pointers, buffers), (1, 128, False)
-        )
-        with self.assertRaisesRegex(ValueError, "workspace"):
-            rotation_geometry("verify_m3", kernel, pointers, buffers)
-        pointers["X"]["offset"] = 0
-        self.assertEqual(rotation_geometry("verify_m3", kernel, pointers, buffers), (3, 128, False))
-        pointers["X"]["offset"] = 768
-        with self.assertRaisesRegex(ValueError, "workspace"):
-            rotation_geometry("mtp_head_m3", kernel, pointers, buffers)
 
 
 if __name__ == "__main__":

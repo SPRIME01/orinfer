@@ -6,56 +6,6 @@ use crate::{
 };
 use std::collections::BTreeSet;
 
-fn verification_layer(program: &str, layer: usize, tokens: usize, shared: bool) -> Vec<Operation> {
-    let saved = if shared {
-        "VerifyShared".into()
-    } else {
-        format!("VerifyM{tokens}")
-    };
-    let count = match layer {
-        0 => 44,
-        1 => 53,
-        _ if layer % 4 == 3 => 55,
-        _ => 43,
-    };
-    let history = if layer == 1 { 23 } else { 13 };
-    let mut slot = 0;
-    (0..count)
-        .map(|index| {
-            if layer % 4 != 3 {
-                let copy = match index {
-                    n if n == history => Some((
-                        format!("M{tokens}_HistoryOut"),
-                        format!("State_{layer}_conv"),
-                        61440,
-                    )),
-                    n if n == history + 2 => Some((
-                        format!("VerifyM{tokens}_Keys"),
-                        format!("{saved}_Saved_{layer}_gdn_K"),
-                        tokens * 16 * 128 * 2,
-                    )),
-                    n if n == history + 3 => Some((
-                        format!("VerifyM{tokens}_Gates"),
-                        format!("{saved}_Saved_{layer}_gdn_G"),
-                        tokens * 48 * 4,
-                    )),
-                    _ => None,
-                };
-                if let Some((source, destination, bytes)) = copy {
-                    return Operation::Copy {
-                        source,
-                        destination,
-                        bytes,
-                    };
-                }
-            }
-            let name = format!("{program}/layer{layer}/k{slot}");
-            slot += 1;
-            Operation::Kernel { name }
-        })
-        .collect()
-}
-
 pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     let Some(spec) = manifest.mtp.clone() else {
         return Ok(());
@@ -80,7 +30,6 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     {
         return Err("Unsupported Flash MTP control/state contract".into());
     }
-    let warm_widths: BTreeSet<_> = spec.warm_plans.iter().map(|p| p.tokens).collect();
     let capture_widths: BTreeSet<_> = spec.capture_plans.iter().map(|p| p.tokens).collect();
     let verify_widths: BTreeSet<_> = spec.verification_widths().into_iter().collect();
     let dynamic_verify = spec.verification_plans.len() == 1
@@ -93,97 +42,27 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         && spec.warm_plans[0].min_tokens == 1
         && spec.warm_plans[0].tokens == 512
         && spec.warm_plans[0].program == "mtp_warm";
-    if !(dynamic_warm || warm_widths == BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512]))
-        || warm_widths.len() != spec.warm_plans.len()
+    if !dynamic_warm
+        || !dynamic_verify
+        || spec.warm_plans[0].head_program != "mtp_head"
         || capture_widths != expected_capture
         || capture_widths.len() != spec.capture_plans.len()
         || verify_widths != (2..=8).collect()
-        || (!dynamic_verify && verify_widths.len() != spec.verification_plans.len())
     {
-        return Err("Unsupported Flash MTP profile coverage".into());
+        return Err("Flash MTP requires dynamic warm and verification templates".into());
     }
-    let causal = super::causal_rows::present(manifest);
-    let shared_target = super::unified_decode::shared(manifest);
-    let shared_draft = super::draft_rows::present(manifest);
     let programs = &mut manifest.programs;
-    for p in &spec.warm_plans {
-        let program = format!("mtp_warm_m{}", p.tokens);
-        let head = format!("mtp_head_m{}", p.tokens);
-        if !dynamic_warm
-            && (p.program != program
-                || !(p.head_program == head || shared_draft && p.head_program == "mtp_head"))
-        {
-            return Err("Unknown Flash draft program".into());
-        }
-        if shared_draft {
-            continue;
-        }
-        let (body_count, head_count) = match p.tokens {
-            1..=8 => (54, 10),
-            16 | 128 => (58, 11),
-            512 => (57, 10),
-            _ => unreachable!(),
-        };
-        let mut ops = section(
-            &program,
-            "begin",
-            7 + usize::from(manifest.vision.is_some()),
-            None,
-        );
-        ops.extend(section(&program, "layer48", body_count, None));
-        ops.extend(section(&program, "end", 1, None));
-        let head_ops = section(&head, "body", head_count, None);
-        if p.tokens == 1 {
-            let mut chain = ops[1..].to_vec();
-            chain.extend(head_ops.clone());
-            programs.insert("mtp_draft".into(), chain);
-        }
-        programs.insert(program, ops);
-        programs.insert(head, head_ops);
-    }
     for p in &spec.verification_plans {
-        let (program, restore, capture) = if dynamic_verify {
-            (
-                "mtp_verify".into(),
-                "mtp_restore".into(),
-                "mtp_capture".into(),
-            )
-        } else {
-            (
-                format!("verify_m{}", p.tokens),
-                format!("restore_m{}", p.tokens),
-                format!("mtp_capture_m{}", p.tokens),
-            )
-        };
-        if p.program != program || p.restore_program != restore || p.capture_program != capture {
+        if p.program != "mtp_verify"
+            || p.restore_program != "mtp_restore"
+            || p.capture_program != "mtp_capture"
+        {
             return Err("Unknown Flash verification program".into());
         }
-        let mut ops = if shared_target {
-            vec![]
-        } else {
-            section(
-                &program,
-                "begin",
-                1 + usize::from(manifest.vision.is_some()),
-                None,
-            )
-        };
         let mut commit = vec![];
         for layer in 0..48 {
-            if !shared_target {
-                ops.extend(verification_layer(
-                    &program,
-                    layer,
-                    p.tokens,
-                    spec.shared_verification_state,
-                ));
-            }
             commit.extend(section(
-                if causal {
-                    "causal_rows/restore"
-                } else {
-                    &restore
-                },
+                "causal_rows/restore",
                 &format!("layer{layer}"),
                 if layer == 1 {
                     3
@@ -195,20 +74,11 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 None,
             ));
         }
-        if !shared_target {
-            ops.extend(section(&program, "end", 1, None));
-            ops.extend(section(&program, "head", 9, None));
-            programs.insert(program, ops);
-            programs.insert(capture.clone(), section(&capture, "body", 1, None));
-        }
-        programs.insert(restore, commit);
+
+        programs.insert(p.restore_program.clone(), commit);
     }
     for p in &spec.capture_plans {
-        let name = if (2..16).contains(&p.tokens) {
-            format!("mtp_prefill_capture_m{}", p.tokens)
-        } else {
-            format!("mtp_capture_m{}", p.tokens)
-        };
+        let name = format!("mtp_capture_m{}", p.tokens);
         if p.program != name {
             return Err("Unknown Flash capture program".into());
         }
@@ -240,10 +110,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| !n.starts_with("State_48_"))
                     .cloned()
-                    .chain([super::plan::score_role(
-                        if causal { 8 } else { p.tokens },
-                        "Verify",
-                    )])
+                    .chain([super::plan::score_role(8, "Verify")])
                     .collect(),
             },
         );
@@ -260,10 +127,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| n.starts_with("State_48_"))
                     .cloned()
-                    .chain([super::plan::score_role(
-                        if causal { 512 } else { p.tokens },
-                        "Draft",
-                    )])
+                    .chain([super::plan::score_role(512, "Draft")])
                     .collect(),
             },
         );
@@ -283,5 +147,5 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 .collect(),
         },
     );
-    super::draft_batch::register(manifest)
+    Ok(())
 }
