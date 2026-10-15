@@ -20,7 +20,11 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
         let mut ops = Vec::new();
         if m.vision.is_some() {
             ops.push(Operation::Kernel {
-                name: format!("verify_m{n}/begin/k0"),
+                name: if plan.min_tokens > 0 {
+                    "mtp_verify/begin/k0".into()
+                } else {
+                    format!("verify_m{n}/begin/k0")
+                },
             });
         }
         for (source, destination, bytes) in [

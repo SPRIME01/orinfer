@@ -68,8 +68,16 @@ __device__ __forceinline__ unsigned flash_bf16_pair(V a, V b) {
 
 
 @orin_jit
-def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
-    """Single-output gate, preserving the dense BF16 MMA accumulation order.
+def scalar_bf16_projection(
+    M: int,
+    K: int,
+    dynamic_rows: bool = False,
+    *,
+    outputs: int = 1,
+    block_m: int | None = None,
+    dtype: str = "float16",
+):
+    """Narrow output projection, preserving the dense BF16 MMA accumulation order.
 
     Load only live activation rows and the one weight row into transient shared
     memory once. One warp executes the same m16n8k16 BF16 instructions; the
@@ -77,18 +85,20 @@ def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
     """
     if any(type(v) is not int or v <= 0 for v in (M, K)) or K % 64:
         raise ValueError("Invalid scalar BF16 projection dimensions")
-    tile = min(M, 8)
-    if (tile + 1) * K * 2 > 48 * 1024:
+    if outputs not in (1, 4) or dtype not in ("float16", "bfloat16"):
+        raise ValueError("Invalid narrow BF16 projection contract")
+    tile = block_m if block_m is not None else min(M, 8)
+    if tile not in (1, 2, 3, 4, 5, 6, 7, 8) or (tile + 1) * K * 2 > 96 * 1024:
         raise ValueError("Scalar BF16 projection exceeds shared memory budget")
     M = row_count(M, dynamic_rows)
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, K), T.float16),
-        Weight: T.Tensor((1, K), T.bfloat16),
-        Output: T.Tensor((M, 1), T.float16),
+        A: T.Tensor((M, K), dtype),
+        Weight: T.Tensor((outputs, K), T.bfloat16),
+        Output: T.Tensor((M, outputs), dtype),
     ):
-        with T.Kernel(T.ceildiv(M, tile), threads=128) as block:
+        with T.Kernel(T.ceildiv(M, tile), outputs, threads=128) as (block, col):
             T.import_source(_BF16_PAIR)
             a = T.alloc_shared((tile, K), T.bfloat16)
             w = T.alloc_shared((K,), T.bfloat16)
@@ -96,7 +106,7 @@ def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
                 a[r, k] = 0
                 if block * tile + r < M:
                     a[r, k] = T.cast(A[block * tile + r, k], T.bfloat16)
-            T.copy(Weight[0, 0], w)
+            T.copy(Weight[col, 0], w)
             T.sync_threads()
             tx = T.get_thread_binding()
             if tx < 32:
@@ -142,7 +152,7 @@ def scalar_bf16_projection(M: int, K: int, dynamic_rows: bool = False):
                             False,
                         )
                 if row < tile and block * tile + row < M and tid == 0:
-                    Output[block * tile + row, 0] = acc[0]
+                    Output[block * tile + row, col] = acc[0]
 
     return main
 

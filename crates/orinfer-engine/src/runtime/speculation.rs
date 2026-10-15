@@ -73,17 +73,12 @@ impl ModelRuntime {
                 return Err("Request cancelled during MTP warm/refresh".into());
             }
             let remaining = shifted_ids.len() - offset;
-            let plan = spec
-                .warm_plans
-                .iter()
-                .filter(|p| p.tokens <= remaining)
-                .max_by_key(|p| p.tokens)
-                .ok_or("No compatible MTP warm plan")?;
-            let ids = &shifted_ids[offset..offset + plan.tokens];
+            let (plan, tokens) = spec.warm_plan(remaining)?;
+            let ids = &shifted_ids[offset..offset + tokens];
             self.upload_ids(&spec.input, ids)?;
             self.prepare_program_inputs(&plan.program, ids, &[])?;
-            self.launch_rows(&plan.program, plan.tokens, phase)?;
-            offset += plan.tokens;
+            self.launch_rows(&plan.program, tokens, phase)?;
+            offset += tokens;
             if produce_head && offset == shifted_ids.len() {
                 self.launch_rows(&plan.head_program, 1, phase)?;
             }
@@ -136,15 +131,11 @@ impl ModelRuntime {
             let position = self.read_control(&self.manifest.position)? as usize;
             let capacity = self.manifest.max_context.saturating_sub(position);
             let remaining_outputs = limit - generated;
-            let plan = spec
-                .verification_plans
-                .iter()
-                .filter(|p| {
-                    p.tokens <= capacity
-                        && p.tokens <= remaining_outputs
-                        && p.tokens <= spec.default_verification_tokens
-                })
-                .max_by_key(|p| p.tokens);
+            let plan = spec.best_verification_plan(
+                capacity
+                    .min(remaining_outputs)
+                    .min(spec.default_verification_tokens),
+            );
             let Some(plan) = plan else {
                 // Final single-token tail or a context edge. The ordinary
                 // target graph preserves existing sampling/state semantics.

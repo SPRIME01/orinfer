@@ -126,13 +126,7 @@ impl ModelRuntime {
                     end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
                 let remaining = warm_end.saturating_sub(req.warm.tokens + 1);
                 if remaining > 0 {
-                    let tokens = spec
-                        .warm_plans
-                        .iter()
-                        .filter(|p| p.tokens <= remaining)
-                        .map(|p| p.tokens)
-                        .max()
-                        .ok_or("Missing resumed MTP warm shape")?;
+                    let (_, tokens) = spec.warm_plan(remaining)?;
                     let offset = req.warm.tokens + 1;
                     self.mtp_warm_state(
                         &spec,

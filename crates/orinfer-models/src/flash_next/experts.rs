@@ -52,6 +52,21 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
         if splits.contains_key(&kernel.name) {
             continue;
         }
+        // An everywhere-selected fused dispatch produces the exact input
+        // planes itself; no unused standalone pack needs to be published.
+        if kernel.name.starts_with("prefill_m4096/")
+            && let Some((section, _)) = kernel.name.rsplit_once('/')
+            && kernels.iter().any(|producer| {
+                producer.symbol == "dispatch_planes_kernel"
+                    && producer.name.rsplit_once('/').is_some_and(|(parent, _)| parent == section)
+                    && [(3, 2), (4, 4), (8, 9)].iter().all(|&(consumer, output)| {
+                        matches!((kernel.args.get(consumer), producer.args.get(output)),
+                            (Some(Argument::Buffer {name:a}),Some(Argument::Buffer {name:b})) if a==b)
+                    })
+            })
+        {
+            continue;
+        }
         // A row specialization consumes the canonical split once. All pointer
         // operands must stay identical; only the row scalar and tile may differ.
         let canonical = kernel
@@ -214,6 +229,33 @@ mod tests {
             &["A", "High", "Low", "Sum"],
         );
         (m, vec![projection, split])
+    }
+
+    #[test]
+    fn sole_fused_dispatch_retires_pack_only_for_matching_expert_planes() {
+        let (mut m, mut kernels) = fixture();
+        kernels.truncate(1);
+        kernels[0].name = "prefill_m4096/layer0/k29".into();
+        m.programs.clear();
+        m.programs.insert(
+            "prefill".into(),
+            vec![Operation::Kernel {
+                name: kernels[0].name.clone(),
+            }],
+        );
+        kernels.push(kernel(
+            "prefill_m4096/layer0/k25",
+            "dispatch_planes_kernel",
+            &[
+                "A", "DS", "High", "IDs", "Low", "Relative", "Offsets", "Scale", "Slots", "Sum",
+            ],
+        ));
+        build(&mut m, &kernels).unwrap();
+        assert_eq!(m.programs["prefill"].len(), 1);
+        kernels[1].args[2] = Argument::Buffer {
+            name: "another_owner".into(),
+        };
+        assert!(build(&mut m, &kernels).is_err());
     }
 
     #[test]

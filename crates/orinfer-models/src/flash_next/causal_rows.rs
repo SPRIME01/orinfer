@@ -58,11 +58,15 @@ pub(super) fn register(m: &mut Manifest) {
         "causal_rows/draft".into(),
         super::plan::section("causal_rows", "draft", 19, None),
     );
+    let dynamic = m
+        .batch_layout
+        .as_ref()
+        .is_some_and(|l| l.segment_tokens > 0);
     for (old, family, widths) in [
         ("flash_segment", "target", vec![1, 16, 128, 512]),
         ("flash_verify_segment", "verify", (2..=8).collect()),
     ] {
-        for n in widths {
+        for n in widths.into_iter().filter(|_| !dynamic) {
             for layer in 0..48 {
                 let section = format!("layer{layer}/private");
                 m.programs.insert(
@@ -87,13 +91,13 @@ pub(super) fn register(m: &mut Manifest) {
             }],
         );
     }
-    for n in [1, 16, 128, 512] {
+    for n in [1, 16, 128, 512].into_iter().filter(|_| !dynamic) {
         m.programs.insert(
             format!("flash_mixed_capture_m{n}"),
             m.programs["causal_rows/target/capture"].clone(),
         );
     }
-    for n in 2..=8 {
+    for n in (2..=8).filter(|_| !dynamic) {
         m.programs.insert(
             format!("flash_verify_capture_m{n}"),
             m.programs["causal_rows/verify/capture"].clone(),
@@ -113,12 +117,14 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
             || name.starts_with("flash_mixed_capture_m")
             || name.starts_with("flash_verify_capture_m")
             || name.starts_with("restore_m")
+            || name == "mtp_restore"
         {
             entries.push((
                 name.clone(),
                 if name.contains("/verify/")
                     || name.contains("/restore/")
                     || name.starts_with("restore_m")
+                    || name == "mtp_restore"
                     || name.starts_with("flash_verify")
                 {
                     8

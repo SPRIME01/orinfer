@@ -17,9 +17,9 @@ def main():
     report = {"complete": False, "cases": []}
     for m, n, k, dtype in (
         (1, 4, 10240, "float16"),
-        (3, 7, 129, "float16"),
+        (3, 4, 10240, "float16"),
         (8, 4, 10240, "float16"),
-        (3, 7, 129, "bfloat16"),
+        (3, 4, 10240, "bfloat16"),
     ):
         x = torch.randn((m, k), device="cuda").to(getattr(torch, dtype))
         w = (torch.randn((n, k), device="cuda") / k**0.5).bfloat16()

@@ -47,7 +47,37 @@ bash tools/operators/run.sh tools/model/flash_next/unify_rows.py artifacts/flash
 
 Rust 使用构建生成的行数选择表，无需手写 batch 档位或在线编译。GDN/QSA 继续共享单请求算子生成的动态地址表实现；GDN 卷积复用紧凑单 token 与原地历史更新，避免执行 padding 和独立历史复制。输入、图片覆盖、PLE 历史、位置、MTP 隐藏捕获及输出回写由地址表驱动，因此相同形状的 CUDA Graph 可跨请求组合复用。编译实现、工作区容量与 graph 捕获尺寸分别管理；未知 batch 数不补成虚假请求。动态回退 tile 在构建时固定，行数和专家路由在运行时确定。
 
-`unify_rows.py` 同时调用 `causal_rows.py`，把请求私有的因果状态算子收敛为动态长度绑定：target 因果段和 draft 支持最多 512 行，验证和接受前缀恢复支持最多 8 行。GDN/QSA、卷积/PLE 历史、隐藏捕获、位置推进和验证选择显式接收真实段长；GDN 因子的 head-major stride 随实际行数变化，隐藏环使用发布的物理容量。验证保留独立的前缀因子与提交语义，owner 和状态视图保持请求隔离。元数据中的允许长度及 warm／混合调度档位仍用于输入复制和分块策略，轻量程序别名指向同一组动态 kernel，不再为每个长度编译状态 cubin。原有模型可单独执行 `causal_rows.py` 升级执行包，无需重新量化或增加权重副本。
+`unify_rows.py` 同时调用 `causal_rows.py`，把请求私有的因果状态算子收敛为动态长度绑定：target 因果段和 draft 支持最多 512 行，验证和接受前缀恢复支持最多 8 行。GDN/QSA、卷积/PLE 历史、隐藏捕获、位置推进和验证选择显式接收真实段长；GDN 因子的 head-major stride 随实际行数变化，隐藏环使用发布的物理容量。验证保留独立的前缀因子与提交语义，owner 和状态视图保持请求隔离。这一步的中间包仍保留输入和调度包装，指向相同动态 kernel；最终发布再执行下面的收敛步骤。无需重新量化或增加权重副本。
+
+最终发布前执行离线 prefill autotune 和收敛：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/prefill_tuning.py artifacts/prefill-tuning
+bash tools/operators/run.sh tools/model/flash_next/converge_prefill.py artifacts/prefill-final \
+  --model artifacts/models/flash-shared-rows --model-output artifacts/models/flash-final \
+  --tuning artifacts/prefill-tuning
+```
+
+调优测量完整局部调用链，验证输出、尾部与修改输入后的 Graph replay；Router、HC up/mix、专家分派只发布实际选中的实现。行区间来自测量结果，线上不调优，也没有手写的 128／1024 性能分界。128 行对齐是某个候选的合法性要求，不是手动性能选择。资产重新打包，未选中的候选和旧 cubin 不进入最终包。
+
+继续收敛共享计算、视觉与验证入口：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/row_tuning.py artifacts/shared-row-tuning \
+  --model artifacts/models/flash-final
+bash tools/operators/run.sh tools/model/flash_next/injection_tuning.py artifacts/injection-tuning \
+  --model artifacts/models/flash-final
+PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.converge_kernels \
+  --model artifacts/models/flash-final --model-output artifacts/models/flash-ready \
+  --output artifacts/shared-row-publish --tuning artifacts/shared-row-tuning/results.json \
+  --injection-tuning artifacts/injection-tuning
+```
+
+HC injection 的小行路径和大行路径统一采用 BF16 MMA 的 K16 累加顺序，单行参考也使用相同契约；不把不同归约顺序作为性能候选。离线验证全部真实 injection 矩阵、非对齐长度与更改输入后的 Graph replay，再选择窄输出直接 MMA 或矩阵 tile。未选中的 tile 不进入执行包。
+
+共享投影、HC 与专家的大行数选择同样来自实测，不沿用中间构建的 32／128 分界。专家路由与上下投影作为一个组合调优；相同 cubin 的重复候选合并，只发布获选实现。已约定的七个固定行数特化保留，其余行数使用连续动态契约。视觉编码使用一个容量模板，真实 patches 控制 launch，merger 的行数与 grid 按四分之一计算。MTP 验证、恢复和捕获各使用一个入口，支持实际 2–8 行；草稿数量、短尾和接受前缀语义保持独立。
+
+该步骤同时把混合片段和 warm 改为连续 1–512 行：调度器根据剩余 token、包容量和时延预算选择实际长度，不再凑 16／128／512。warm 只有一个动态程序及一个输出头，按真实行数复制输入并推进状态。混合 MTP 包显式标记前置 prefill 片段数，因此 2 行 prefill 和 2 行验证可以共存；请求角色参与计划及 Graph 缓存身份。数据格式和 C ABI 仍为版本 1。
 
 `checks/bf16_rows.py`、`checks/hc_rows.py`、`checks/bulk_rows.py` 和 `checks/row_arithmetic.py` 检查行 tile、原始累加顺序、动态尾部及 Graph replay。`checks/decode_tuning.py` 验证自动调优的固定形状和动态回退，检查整数／scale 输出、尾部保护和实际 graph replay；`checks/decode_rows.py` 检查地址表 primitive。Rust 的 `validate_flash_decode_template_reuse` 检查完整状态与跨请求图复用，`benchmark_flash_decode_template` 测量真实模型批次。单流普通生成也使用统一模板；关闭 MTP 或 MTP 策略暂时关闭投机时均走此路径。在线 batch planner 不再支持逐容量执行、补齐空行或旧单流回退，未完成统一模板构建的中间包不能用于 batch 推理。MTP 末尾不足验证宽度时也走普通一行 packet；单请求 target 程序只作为状态准备与数值参考。MTP 验证与混合 batch 只保留请求私有的因果段、前缀因子、捕获和提交，草稿不再按 2/4/8 容量复制计算程序。Graph 的分支按 canonical slot 声明，离线特化继承同一依赖关系；发布时逐一验证所有变体的读写集合，只有独立分支允许并行。`checks/expert_decode.py` 检查专家输入融合的全部路由输出、动态尾部与更换输入后的 Graph replay；`checks/route_decode.py` 对照原三步路由，包括热点专家、动态尾部和 replay。
 

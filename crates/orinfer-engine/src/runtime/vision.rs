@@ -62,7 +62,7 @@ impl ModelRuntime {
             let plan = v
                 .plans
                 .iter()
-                .filter(|p| p.patches >= patches)
+                .filter(|p| p.patches >= patches && p.min_patches <= patches)
                 .min_by_key(|p| p.patches)
                 .ok_or("No image graph")?;
             let raw: Vec<u8> = image
@@ -81,7 +81,11 @@ impl ModelRuntime {
                 &[image.grid_height as u32, image.grid_width as u32],
             )?;
             self.upload_ids(&v.length, &[patches as u32])?;
-            self.launch_program(&plan.program, ExecutionPhase::Vision)?;
+            if plan.min_patches > 0 {
+                self.launch_rows(&plan.program, patches, ExecutionPhase::Vision)?;
+            } else {
+                self.launch_program(&plan.program, ExecutionPhase::Vision)?;
+            }
             self.execution.copy_range(
                 &v.output,
                 &v.features,

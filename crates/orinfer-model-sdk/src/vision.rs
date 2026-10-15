@@ -25,6 +25,8 @@ impl Precision {
 #[serde(deny_unknown_fields)]
 pub struct VisionPlan {
     pub patches: usize,
+    #[serde(default, skip_serializing_if = "crate::model::is_zero")]
+    pub min_patches: usize,
     pub program: String,
 }
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +130,13 @@ impl VisionSpec {
         let mut sizes = BTreeSet::new();
         for p in &self.plans {
             if p.patches == 0
+                || p.min_patches > p.patches
+                || !p.min_patches.is_multiple_of(4)
+                || (p.min_patches > 0
+                    && m.row_execution.as_ref().is_none_or(|rows| {
+                        !rows.programs.contains(&p.program)
+                            || rows.program_capacity(&p.program) < p.patches
+                    }))
                 || !p.patches.is_multiple_of(4)
                 || p.patches > self.max_patches
                 || !sizes.insert(p.patches)

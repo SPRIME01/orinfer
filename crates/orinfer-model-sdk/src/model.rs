@@ -475,8 +475,15 @@ impl Manifest {
             }
         }
         if let Some(rows) = &self.row_execution {
-            if rows.capacity > self.chunk_tokens {
-                return Err("Row execution exceeds the input allocation contract".into());
+            for program in &rows.programs {
+                let allocation = self
+                    .vision
+                    .as_ref()
+                    .and_then(|v| v.plans.iter().find(|p| &p.program == program))
+                    .map_or(self.chunk_tokens, |p| p.patches);
+                if rows.program_capacity(program) > allocation {
+                    return Err("Row execution exceeds the input allocation contract".into());
+                }
             }
             rows.validate(
                 &self.programs,

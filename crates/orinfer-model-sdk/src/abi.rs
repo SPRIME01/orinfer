@@ -32,9 +32,22 @@ pub enum BatchOperation {
     Warm = 4,
     DraftHead = 5,
     MixedVerification = 6,
+    /// Prefill segments precede verification segments; lengths do not encode roles.
+    MixedRows {
+        prefills: u8,
+    },
 }
 impl BatchOperation {
     pub fn from_flags(flags: u32) -> Result<Self> {
+        let prefills = flags >> 8;
+        if prefills != 0 {
+            if flags & 254 != 12 || prefills > 127 {
+                return Err("Invalid typed mixed packet flags".into());
+            }
+            return Ok(Self::MixedRows {
+                prefills: prefills as u8,
+            });
+        }
         match flags >> 1 {
             0 => Ok(Self::Ordinary),
             1 => Ok(Self::Verification),
@@ -45,6 +58,19 @@ impl BatchOperation {
             6 => Ok(Self::MixedVerification),
             _ => Err("Unknown batch operation".into()),
         }
+    }
+    pub fn flags(self, include_plan: bool) -> u32 {
+        let code = match self {
+            Self::Ordinary => 0,
+            Self::Verification => 2,
+            Self::Draft => 4,
+            Self::Commit => 6,
+            Self::Warm => 8,
+            Self::DraftHead => 10,
+            Self::MixedVerification => 12,
+            Self::MixedRows { prefills } => 12 | (u32::from(prefills) << 8),
+        };
+        code | u32::from(include_plan)
     }
 }
 
@@ -554,6 +580,16 @@ mod tests {
 
     #[test]
     fn operation_flags_preserve_ordinary_calls_and_reject_unknown_modes() {
+        for prefills in [1, 2, 17, 127] {
+            let operation = BatchOperation::MixedRows { prefills };
+            for plan in [false, true] {
+                assert_eq!(
+                    BatchOperation::from_flags(operation.flags(plan)).unwrap(),
+                    operation
+                );
+            }
+        }
+        assert!(BatchOperation::from_flags(1 << 8).is_err());
         for flag in [0, 1] {
             assert_eq!(
                 BatchOperation::from_flags(flag).unwrap(),

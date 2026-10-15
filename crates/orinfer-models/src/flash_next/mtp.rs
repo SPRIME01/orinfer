@@ -82,16 +82,23 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     }
     let warm_widths: BTreeSet<_> = spec.warm_plans.iter().map(|p| p.tokens).collect();
     let capture_widths: BTreeSet<_> = spec.capture_plans.iter().map(|p| p.tokens).collect();
-    let verify_widths: BTreeSet<_> = spec.verification_plans.iter().map(|p| p.tokens).collect();
+    let verify_widths: BTreeSet<_> = spec.verification_widths().into_iter().collect();
+    let dynamic_verify = spec.verification_plans.len() == 1
+        && spec.verification_plans[0].min_tokens == 2
+        && spec.verification_plans[0].tokens == 8;
     let expected_capture: BTreeSet<_> = std::iter::once(1)
         .chain(manifest.prefill_plans.iter().map(|p| p.chunk_tokens))
         .collect();
-    if warm_widths != BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512])
+    let dynamic_warm = spec.warm_plans.len() == 1
+        && spec.warm_plans[0].min_tokens == 1
+        && spec.warm_plans[0].tokens == 512
+        && spec.warm_plans[0].program == "mtp_warm";
+    if !(dynamic_warm || warm_widths == BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 16, 128, 512]))
         || warm_widths.len() != spec.warm_plans.len()
         || capture_widths != expected_capture
         || capture_widths.len() != spec.capture_plans.len()
         || verify_widths != (2..=8).collect()
-        || verify_widths.len() != spec.verification_plans.len()
+        || (!dynamic_verify && verify_widths.len() != spec.verification_plans.len())
     {
         return Err("Unsupported Flash MTP profile coverage".into());
     }
@@ -102,8 +109,9 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     for p in &spec.warm_plans {
         let program = format!("mtp_warm_m{}", p.tokens);
         let head = format!("mtp_head_m{}", p.tokens);
-        if p.program != program
-            || !(p.head_program == head || shared_draft && p.head_program == "mtp_head")
+        if !dynamic_warm
+            && (p.program != program
+                || !(p.head_program == head || shared_draft && p.head_program == "mtp_head"))
         {
             return Err("Unknown Flash draft program".into());
         }
@@ -134,9 +142,19 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         programs.insert(head, head_ops);
     }
     for p in &spec.verification_plans {
-        let program = format!("verify_m{}", p.tokens);
-        let restore = format!("restore_m{}", p.tokens);
-        let capture = format!("mtp_capture_m{}", p.tokens);
+        let (program, restore, capture) = if dynamic_verify {
+            (
+                "mtp_verify".into(),
+                "mtp_restore".into(),
+                "mtp_capture".into(),
+            )
+        } else {
+            (
+                format!("verify_m{}", p.tokens),
+                format!("restore_m{}", p.tokens),
+                format!("mtp_capture_m{}", p.tokens),
+            )
+        };
         if p.program != program || p.restore_program != restore || p.capture_program != capture {
             return Err("Unknown Flash verification program".into());
         }
@@ -214,7 +232,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         kv.growth.insert(
             p.program.clone(),
             KvGrowth {
-                length: None,
+                length: (p.min_tokens > 0).then(|| "Length".into()),
                 position: manifest.position.clone(),
                 tokens: p.tokens,
                 buffers: kv
@@ -234,7 +252,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
         kv.growth.insert(
             p.program.clone(),
             KvGrowth {
-                length: None,
+                length: (p.min_tokens > 0).then(|| "MtpLength".into()),
                 position: spec.position.clone(),
                 tokens: p.tokens,
                 buffers: kv

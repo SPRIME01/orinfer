@@ -139,11 +139,11 @@ impl LoadOptions {
             .as_mut()
             .ok_or("Model package has no MTP support")?;
         let rows = drafts + 1;
-        if !spec.verification_plans.iter().any(|p| p.tokens == rows) {
+        if spec.verification_plan(rows).is_none() {
             let available: Vec<_> = spec
-                .verification_plans
-                .iter()
-                .map(|p| p.tokens - 1)
+                .verification_widths()
+                .into_iter()
+                .map(|n| n - 1)
                 .collect();
             return Err(format!(
                 "Model package does not support {drafts} MTP drafts; available: {available:?}"

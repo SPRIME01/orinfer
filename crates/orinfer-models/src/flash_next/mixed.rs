@@ -84,14 +84,26 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         }
         return Ok(());
     }
-    if layout.profiles.keys().copied().collect::<Vec<_>>() != [16, 128, 512]
+    let dynamic_segments = super::causal_rows::present(m) && layout.segment_tokens == 512;
+    let shapes_valid = if dynamic_segments {
+        layout.profiles.keys().copied().collect::<Vec<_>>() == [512]
+            && layout.small_mixed_shapes.is_empty()
+            && m.prefill_batch_profiles
+                .iter()
+                .map(|p| p.tokens)
+                .collect::<Vec<_>>()
+                == [1024]
+    } else {
+        layout.profiles.keys().copied().collect::<Vec<_>>() == [16, 128, 512]
+            && layout.small_mixed_shapes == [16, 128, 512]
+            && m.prefill_batch_profiles
+                .iter()
+                .map(|p| p.tokens)
+                .collect::<Vec<_>>()
+                == [256, 1024]
+    };
+    if !shapes_valid
         || layout.profiles.values().any(|v| v != "flash_recurrent")
-        || layout.small_mixed_shapes != [16, 128, 512]
-        || m.prefill_batch_profiles
-            .iter()
-            .map(|p| p.tokens)
-            .collect::<Vec<_>>()
-            != [256, 1024]
         || m.prefill_batch_profiles
             .iter()
             .any(|p| !matches!(p.kind.as_str(), "flash_mixed" | "flash_mixed_grouped"))
@@ -205,7 +217,7 @@ pub(super) fn validate_segments(m: &Manifest, segments: &[BatchSegment]) -> Resu
     }
     let mut slots = BTreeSet::new();
     let total = segments.iter().try_fold(0usize, |n, s| -> Result<usize> {
-        if !SEGMENTS.contains(&s.tokens) || !slots.insert(s.slot) {
+        if !segment_supported(m, s.tokens) || !slots.insert(s.slot) {
             return Err("Invalid or repeated Flash causal segment".into());
         }
         n.checked_add(s.tokens).ok_or("Mixed row overflow".into())
@@ -221,6 +233,27 @@ pub(super) fn validate_segments(m: &Manifest, segments: &[BatchSegment]) -> Resu
             .find(|&n| n >= total)
             .ok_or("Flash mixed row capacity exceeded".into())
     }
+}
+
+fn segment_supported(m: &Manifest, tokens: usize) -> bool {
+    m.batch_layout.as_ref().is_some_and(|l| {
+        if l.segment_tokens > 0 {
+            (1..=l.segment_tokens).contains(&tokens)
+        } else {
+            SEGMENTS.contains(&tokens)
+        }
+    })
+}
+
+pub(super) fn mixed_rows_plan(
+    m: &Manifest,
+    segments: &[BatchSegment],
+    prefills: usize,
+) -> Result<Vec<Invocation>> {
+    if prefills == 0 || prefills >= segments.len() {
+        return Err("Invalid mixed role boundary".into());
+    }
+    plan_kind(m, segments, Kind::MixedRows(prefills))
 }
 
 fn invoke(
@@ -298,14 +331,23 @@ enum Kind {
     Ordinary,
     Verification,
     MixedVerification,
+    MixedRows(usize),
 }
 
 fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<Invocation>> {
     let shared = super::unified_decode::shared(m);
+    let explicit_verify: BTreeSet<_> = match kind {
+        Kind::MixedRows(n) => segments[n..].iter().map(|s| s.slot).collect(),
+        _ => BTreeSet::new(),
+    };
+    let mixed = matches!(kind, Kind::MixedVerification | Kind::MixedRows(_));
     let verified = |s: &BatchSegment| {
         kind != Kind::Ordinary
             && m.mtp.as_ref().is_some_and(|spec| {
-                if kind == Kind::MixedVerification {
+                if matches!(kind, Kind::MixedRows(_)) {
+                    explicit_verify.contains(&s.slot)
+                        && spec.mixed_verification_tokens.contains(&s.tokens)
+                } else if kind == Kind::MixedVerification {
                     spec.mixed_verification_tokens.contains(&s.tokens)
                 } else {
                     spec.batch_verification_tokens.contains(&s.tokens)
@@ -328,9 +370,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
             if verified(s) {
                 has_verify = true;
-            } else if kind == Kind::MixedVerification
-                && SEGMENTS.contains(&s.tokens)
-                && s.tokens > 1
+            } else if mixed && !explicit_verify.contains(&s.slot) && segment_supported(m, s.tokens)
             {
                 has_prefill = true;
             } else {
@@ -343,7 +383,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         if !((if shared { 1 } else { 2 })..=128).contains(&segments.len())
             || head_used > 128
             || !has_verify
-            || (kind == Kind::MixedVerification && !has_prefill)
+            || (mixed && !has_prefill)
         {
             return Err("Invalid mixed verification endpoints".into());
         }
@@ -407,9 +447,30 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let mut starts = vec![];
     let mut start = 0;
     for s in segments {
-        let width = super::plan::arena_width(s.tokens);
+        let width = if verified(s) {
+            m.mtp
+                .as_ref()
+                .and_then(|spec| spec.verification_plans.iter().find(|p| p.accepts(s.tokens)))
+                .map_or(super::plan::arena_width(s.tokens), |p| {
+                    super::plan::arena_width(p.tokens)
+                })
+        } else if m
+            .batch_layout
+            .as_ref()
+            .is_some_and(|l| l.segment_tokens > 0)
+            && !verified(s)
+            && s.tokens > 1
+        {
+            4096
+        } else {
+            super::plan::arena_width(s.tokens)
+        };
         let program = if verified(s) {
-            format!("verify_m{}", s.tokens)
+            m.mtp
+                .as_ref()
+                .and_then(|spec| spec.verification_plan(s.tokens))
+                .ok_or("Missing verification input template")?
+                .program
         } else if s.tokens == 1 {
             "decode".into()
         } else if m.row_execution.is_some() {
@@ -439,7 +500,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 Some(s.slot),
                 &input_views,
             );
-            if m.row_execution.is_some() && !verified(s) && s.tokens > 1 {
+            if m.dynamic_batch_kernels.contains_key(&name) {
                 invocation.launch = Some(
                     m.dynamic_batch_kernels
                         .get(&name)
@@ -534,15 +595,22 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 append_causal(
                     &mut out,
                     m,
-                    &format!(
-                        "{}_m{}/layer1/ple",
-                        if verified(s) {
-                            "flash_verify_segment"
-                        } else {
-                            "flash_segment"
-                        },
-                        s.tokens
-                    ),
+                    &if super::causal_rows::present(m) {
+                        format!(
+                            "causal_rows/{}/layer1/ple",
+                            if verified(s) { "verify" } else { "target" }
+                        )
+                    } else {
+                        format!(
+                            "{}_m{}/layer1/ple",
+                            if verified(s) {
+                                "flash_verify_segment"
+                            } else {
+                                "flash_segment"
+                            },
+                            s.tokens
+                        )
+                    },
                     s.tokens,
                     Some(s.slot),
                     views,
@@ -599,15 +667,23 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             .zip(&starts)
             .filter(|(s, _)| !parallel || s.tokens != 1)
         {
-            let private = &m.programs[&format!(
-                "{}_m{}/layer{layer}/private",
-                if verified(s) {
-                    "flash_verify_segment"
-                } else {
-                    "flash_segment"
-                },
-                s.tokens
-            )];
+            let section = if super::causal_rows::present(m) {
+                format!(
+                    "causal_rows/{}/layer{layer}/private",
+                    if verified(s) { "verify" } else { "target" }
+                )
+            } else {
+                format!(
+                    "{}_m{}/layer{layer}/private",
+                    if verified(s) {
+                        "flash_verify_segment"
+                    } else {
+                        "flash_segment"
+                    },
+                    s.tokens
+                )
+            };
+            let private = &m.programs[&section];
             for (i, op) in private.iter().enumerate() {
                 let mut invocation = invoke(op.clone(), Some(s.slot), views);
                 if super::causal_rows::present(m)
@@ -699,11 +775,18 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             append_causal(
                 &mut out,
                 m,
-                &format!(
-                    "flash_{}_capture_m{}",
-                    if verified(s) { "verify" } else { "mixed" },
-                    s.tokens
-                ),
+                &if super::causal_rows::present(m) {
+                    format!(
+                        "causal_rows/{}/capture",
+                        if verified(s) { "verify" } else { "target" }
+                    )
+                } else {
+                    format!(
+                        "flash_{}_capture_m{}",
+                        if verified(s) { "verify" } else { "mixed" },
+                        s.tokens
+                    )
+                },
                 s.tokens,
                 Some(s.slot),
                 views,

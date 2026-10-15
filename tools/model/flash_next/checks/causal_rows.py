@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 import tilelang
 from kernels.model import flash_mtp, flash_control, speculation, speculative_factors
+from kernels.model.causal_rows import copy as copy_rows
 from kernels.model.rows import explicit_rows
 from tools.model.flash_next.decode_tuning import profile_stream
 from tools.operators.common import configure, write_json
@@ -58,6 +59,12 @@ def main():
     configure()
     torch.manual_seed(20261002)
     evidence = []
+    for width in [2560, 10240]:
+        kernel = compile_rows(copy_rows.__wrapped__(512, width))
+        for n in [1, 3, 17, 129, 257, 511, 512]:
+            x = torch.randn(n, width, dtype=torch.float16, device="cuda")
+            checked(kernel, [x], [output((n, width))], n, lambda: [x], lambda: x.neg_())
+            evidence.append(dict(kind="row-copy", rows=n, width=width, exact=True, replay=True))
     for history in [3, 9]:
         kernel = compile_rows(
             flash_mtp.history_prefix.__wrapped__(512, 10240, history, dynamic_rows=True)

@@ -64,7 +64,11 @@ pub(super) fn register(
         return Ok(());
     };
     for plan in &v.plans {
-        let program = format!("vision_m{}", plan.patches);
+        let program = if plan.min_patches > 0 {
+            "vision".into()
+        } else {
+            format!("vision_m{}", plan.patches)
+        };
         if plan.program != program {
             return Err("Unknown Flash vision profile".into());
         }
@@ -76,4 +80,54 @@ pub(super) fn register(
         programs.insert(program, ops);
     }
     Ok(())
+}
+
+/// Vision lengths use the same symbolic launch machinery as text rows.
+pub(super) fn configure(m: &mut Manifest) -> Result<()> {
+    let Some(v) = &m.vision else {
+        return Ok(());
+    };
+    for plan in v.plans.iter().filter(|p| p.min_patches > 0) {
+        let rows = m
+            .row_execution
+            .as_mut()
+            .ok_or("Missing dynamic vision rows")?;
+        // Raising the shared storage bound must not widen existing text programs.
+        for name in &rows.programs {
+            rows.program_capacities
+                .entry(name.clone())
+                .or_insert(rows.capacity);
+        }
+        rows.capacity = rows.capacity.max(plan.patches);
+        rows.programs.insert(plan.program.clone());
+        rows.program_capacities
+            .insert(plan.program.clone(), plan.patches);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn vision_capacity_does_not_widen_text_or_mtp_programs() {
+        let mut m: Manifest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"target":"sm_87","model":"flash","chunk_tokens":4096,
+            "max_context":262144,"vocab":32,"toolchain":{},"buffers":[],"reset_buffers":[],
+            "input":"i","token":"t","status":"s","logits":"l","position":"p",
+            "weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
+            "row_execution":{"capacity":4096,"programs":["prefill","verify"],"program_capacities":{"verify":8}},
+            "vision":{"hidden":2560,"patch_size":16,"temporal_patch_size":2,"merge_size":2,
+                "max_patches":8192,"max_features":16384,"pixels":"p","grid":"g","length":"n",
+                "output":"o","features":"f","feature_index":"x","mrope_positions":"r",
+                "plans":[{"patches":8192,"min_patches":4,"program":"vision"}],
+                "image_token_id":1,"vision_start_token_id":2,"vision_end_token_id":3}
+        })).unwrap();
+        configure(&mut m).unwrap();
+        let rows = m.row_execution.unwrap();
+        assert_eq!(rows.capacity, 8192);
+        assert_eq!(rows.program_capacity("vision"), 8192);
+        assert_eq!(rows.program_capacity("prefill"), 4096);
+        assert_eq!(rows.program_capacity("verify"), 8);
+    }
 }

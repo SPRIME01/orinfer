@@ -78,7 +78,7 @@ fn programs(manifest: &crate::model::Manifest) -> std::collections::BTreeSet<Str
         }
         // Short remaining budgets may use fewer drafts than the configured count.
         for plan in &spec.verification_plans {
-            if plan.tokens <= spec.default_verification_tokens {
+            if plan.tokens <= spec.default_verification_tokens || plan.min_tokens > 0 {
                 programs.extend([
                     plan.program.clone(),
                     plan.restore_program.clone(),

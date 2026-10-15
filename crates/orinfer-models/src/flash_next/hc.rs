@@ -16,7 +16,11 @@ pub(super) fn build(manifest: &mut Manifest, kernels: &[Kernel]) -> Result<()> {
     let contracts: BTreeMap<_, _> = kernels.iter().map(|k| (k.name.as_str(), k)).collect();
     let fused: BTreeSet<_> = kernels
         .iter()
-        .filter(|k| k.symbol == "hc_prefill_up_mix_kernel" && !k.name.ends_with("/aligned_rows"))
+        .filter(|k| {
+            k.symbol == "hc_prefill_up_mix_kernel"
+                && !k.name.ends_with("/aligned_rows")
+                && !k.name.contains("/choice/")
+        })
         .map(|k| k.name.clone())
         .collect();
     if fused.is_empty() {

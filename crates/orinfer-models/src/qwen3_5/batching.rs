@@ -186,6 +186,7 @@ pub(super) fn register(
             .map(|p| (p.tokens, p.kind.clone()))
             .collect(),
         hidden: t.hidden_size,
+        segment_tokens: 0,
         small_mixed_shapes: profiles
             .iter()
             .filter(|p| matches!(p.kind.as_str(), "sequence" | "recurrent"))
@@ -674,6 +675,7 @@ mod tests {
             ]),
             profiles: BTreeMap::from([(2, "sequence".into()), (32, "recurrent".into())]),
             hidden: 8,
+            segment_tokens: 0,
             small_mixed_shapes: vec![2, 32],
             state_columns: vec![],
             preparation_programs: BTreeMap::new(),

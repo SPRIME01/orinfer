@@ -78,14 +78,27 @@ fn validate_flash_mixed_speculation() {
         m.start_request(source, &|| false).unwrap()
     };
     let mut rows = vec![];
-    for (tokens, width, count) in [
+    let mut shapes = vec![
         (16, 2, 1),
         (128, 2, 1),
         (128, 2, 2),
         (512, 2, 1),
         (128, 2, 4),
         (128, 2, 1),
-    ] {
+    ];
+    if model
+        .manifest
+        .batch_layout
+        .as_ref()
+        .is_some_and(|l| l.segment_tokens > 0)
+    {
+        shapes.extend(
+            [1, 2, 3, 7, 17, 129, 257, 511]
+                .into_iter()
+                .map(|n| (n, 2, 1)),
+        );
+    }
+    for (tokens, width, count) in shapes {
         let mut p = start_prefill(&mut model, tokens);
         let at = Instant::now();
         model
@@ -947,6 +960,7 @@ fn validate_flash_batched_verification() {
                 panic!("Expected MTP round")
             };
             assert_eq!(&round.verification, candidate);
+            model.upload_segment_controls(round.plan.tokens).unwrap();
             model
                 .execution
                 .ensure_sequence_program(request.slot, &round.plan.program)

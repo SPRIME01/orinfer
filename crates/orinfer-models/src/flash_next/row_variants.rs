@@ -20,63 +20,6 @@ pub(super) fn build<Data>(
         let Some((slot, suffix)) = kernel.name.rsplit_once('/') else {
             continue;
         };
-        if suffix == "dispatch_planes" {
-            let canonical = contracts.get(slot).ok_or("Missing expert dispatch slot")?;
-            if !slot.starts_with("prefill_m4096/")
-                || canonical.symbol != "main_kernel"
-                || canonical.args.len() != 9
-                || kernel.args.len() != 11
-                || kernel.symbol != "dispatch_planes_kernel"
-                || !matches!(canonical.args[8], Argument::I32 { value: 4096 })
-                || !matches!(kernel.args[10], Argument::I32 { value: 4096 })
-            {
-                return Err("Invalid direct expert dispatch contract".into());
-            }
-            let source = argument(canonical, 1)?;
-            let layer = slot
-                .rsplit_once('/')
-                .ok_or("Missing expert dispatch layer")?
-                .0;
-            let pack: Vec<_> = contracts.values().copied().filter(|k| {
-                k.name.starts_with(&format!("{layer}/")) && k.symbol == "pack_exact_a8_kernel"
-                    && matches!(k.args.first(), Some(Argument::Buffer { name }) if name == source)
-            }).collect();
-            let [pack] = pack.as_slice() else {
-                return Err("Expert dispatch requires one matching plane pack slot".into());
-            };
-            if pack.args.len() != 5 || !matches!(pack.args[4], Argument::I32 { value: 40960 }) {
-                return Err("Invalid expert plane pack extent".into());
-            }
-            for (from, to) in [(0, 0), (2, 1), (3, 3), (4, 5), (5, 6), (6, 7), (7, 8)] {
-                if argument(canonical, from)? != argument(kernel, to)? {
-                    return Err("Direct expert dispatch changes its routing operands".into());
-                }
-            }
-            for (from, to) in [(1, 2), (2, 4), (3, 9)] {
-                if argument(pack, from)? != argument(kernel, to)? {
-                    return Err("Direct expert dispatch changes its activation planes".into());
-                }
-            }
-            variants
-                .entry(slot.to_owned())
-                .or_default()
-                .push(KernelVariant {
-                    min_rows: 128,
-                    max_rows: 4096,
-                    multiple_of: 1,
-                    kernels: vec![kernel.name.clone()],
-                });
-            variants
-                .entry(pack.name.clone())
-                .or_default()
-                .push(KernelVariant {
-                    min_rows: 128,
-                    max_rows: 4096,
-                    multiple_of: 1,
-                    kernels: vec![],
-                });
-            continue;
-        }
         if suffix == "hc_finish" && !contracts.contains_key(format!("{slot}/hc_partials").as_str())
         {
             return Err("Missing HC stream producer".into());
@@ -147,41 +90,63 @@ pub(super) fn build<Data>(
                 });
             continue;
         }
-        let (min_rows, max_rows, multiple_of, symbol) = match suffix {
-            "aligned_rows" => (128, 4096, 128, "hc_prefill_up_mix_kernel"),
-            "medium_rows" => (128, 1023, 1, "main_kernel"),
-            "large_rows" => (1024, 4096, 1, "main_kernel"),
-            _ => continue,
+    }
+    let mut measured: BTreeMap<(String, usize, usize, usize), BTreeMap<usize, String>> =
+        BTreeMap::new();
+    for kernel in kernels {
+        let Some((slot, choice)) = kernel.name.split_once("/choice/") else {
+            continue;
         };
-        let canonical = contracts
-            .get(slot)
-            .ok_or("Missing canonical prefill variant slot")?;
-        let same = canonical.args.len() == kernel.args.len()
-            && canonical
-                .args
-                .iter()
-                .zip(&kernel.args)
-                .all(|(a, b)| match (a, b) {
-                    (Argument::Buffer { name: a }, Argument::Buffer { name: b }) => a == b,
-                    (Argument::I32 { value: a }, Argument::I32 { value: b }) => a == b,
-                    _ => false,
-                });
-        if !slot.starts_with("prefill_m4096/")
-            || canonical.symbol != symbol
-            || kernel.symbol != symbol
-            || !same
-        {
-            return Err("Prefill variant changes the canonical operand contract".into());
+        if !slot.starts_with("prefill_m4096/") || !contracts.contains_key(slot) {
+            return Err("Measured prefill choice lacks a canonical slot".into());
         }
-        variants
-            .entry(slot.to_owned())
-            .or_default()
-            .push(KernelVariant {
-                min_rows,
-                max_rows,
-                multiple_of,
-                kernels: vec![kernel.name.clone()],
-            });
+        let parts: Vec<_> = choice.split('/').collect();
+        if parts.len() != 3 {
+            return Err("Invalid measured prefill choice".into());
+        }
+        let (low, high) = parts[0]
+            .split_once('-')
+            .ok_or("Invalid measured prefill interval")?;
+        let first = low
+            .parse::<usize>()
+            .map_err(|_| "Invalid measured row minimum")?;
+        let last = high
+            .parse::<usize>()
+            .map_err(|_| "Invalid measured row maximum")?;
+        let multiple = parts[1]
+            .parse::<usize>()
+            .map_err(|_| "Invalid measured row multiple")?;
+        if first == 0 || first > last || last > 4096 || multiple == 0 {
+            return Err("Invalid measured prefill bounds".into());
+        }
+        let steps = measured
+            .entry((slot.into(), first, last, multiple))
+            .or_default();
+        if parts[2] == "skip" {
+            if !steps.is_empty() {
+                return Err("Mixed skip/kernel prefill choice".into());
+            }
+        } else {
+            let at = parts[2]
+                .strip_prefix('k')
+                .ok_or("Invalid measured prefill step")?
+                .parse::<usize>()
+                .map_err(|_| "Invalid measured prefill step")?;
+            if steps.insert(at, kernel.name.clone()).is_some() {
+                return Err("Duplicate measured prefill step".into());
+            }
+        }
+    }
+    for ((slot, min_rows, max_rows, multiple_of), steps) in measured {
+        if steps.keys().copied().ne(0..steps.len()) {
+            return Err("Noncontiguous measured prefill steps".into());
+        }
+        variants.entry(slot).or_default().push(KernelVariant {
+            min_rows,
+            max_rows,
+            multiple_of,
+            kernels: steps.into_values().collect(),
+        });
     }
     for choices in variants.values_mut() {
         choices.sort_by_key(|v| v.min_rows);
@@ -203,32 +168,18 @@ mod tests {
         .unwrap()
     }
     #[test]
-    fn tiling_ranges_keep_the_same_operands() {
-        let slot = "prefill_m4096/layer0/k36";
-        let v = build::<()>(
-            &[
-                kernel(slot, "A"),
-                kernel(&format!("{slot}/large_rows"), "A"),
-                kernel(&format!("{slot}/medium_rows"), "A"),
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!((v[slot][0].min_rows, v[slot][0].max_rows), (128, 1023));
-        assert_eq!((v[slot][1].min_rows, v[slot][1].max_rows), (1024, 4096));
-        assert!(
-            build::<()>(
-                &[
-                    kernel(slot, "A"),
-                    kernel(&format!("{slot}/medium_rows"), "B")
-                ],
-                &[]
-            )
-            .is_err()
-        );
-        assert!(build::<()>(&[kernel(&format!("{slot}/medium_rows"), "A")], &[]).is_err());
+    fn measured_ranges_do_not_invent_runtime_boundaries() {
+        let slot = "prefill_m4096/layer0/k0";
+        let selections = [
+            kernel(slot, "A"),
+            kernel(&format!("{slot}/choice/19-93/1/k0"), "A"),
+            kernel(&format!("{slot}/choice/94-281/1/k0"), "A"),
+        ];
+        let v = build::<()>(&selections, &[]).unwrap();
+        assert_eq!((v[slot][0].min_rows, v[slot][0].max_rows), (19, 93));
+        assert_eq!((v[slot][1].min_rows, v[slot][1].max_rows), (94, 281));
+        assert!(build::<()>(&selections[1..], &[]).is_err());
     }
-
     #[test]
     fn hc_stream_pair_checks_workspace_and_endpoints() {
         let slot = "prefill_m4096/layer0/k3";
@@ -285,48 +236,5 @@ mod tests {
             name: "Other".into(),
         };
         assert!(build(&invalid, &buffers).is_err());
-    }
-
-    #[test]
-    fn direct_dispatch_consumes_only_its_matching_pack() {
-        let slot = "prefill_m4096/layer0/k44";
-        let pack_slot = "prefill_m4096/layer0/k45";
-        let args = |names: &[&str], value| -> Vec<Argument> {
-            names
-                .iter()
-                .map(|name| Argument::Buffer {
-                    name: (*name).into(),
-                })
-                .chain([Argument::I32 { value }])
-                .collect()
-        };
-        let mut canonical = kernel(slot, "A");
-        canonical.args = args(
-            &[
-                "A", "D", "DS", "IDs", "Relative", "Offsets", "Scale", "SlotMap",
-            ],
-            4096,
-        );
-        let mut pack = kernel(pack_slot, "D");
-        pack.symbol = "pack_exact_a8_kernel".into();
-        pack.args = args(&["D", "High", "Low", "Sum"], 40960);
-        let mut direct = kernel(&format!("{slot}/dispatch_planes"), "A");
-        direct.symbol = "dispatch_planes_kernel".into();
-        direct.args = args(
-            &[
-                "A", "DS", "High", "IDs", "Low", "Relative", "Offsets", "Scale", "SlotMap", "Sum",
-            ],
-            4096,
-        );
-        let kernels = vec![canonical, pack, direct];
-        let v = build::<()>(&kernels, &[]).unwrap();
-        assert_eq!(v[slot][0].min_rows, 128);
-        assert!(v[pack_slot][0].kernels.is_empty());
-        assert!(build::<()>(&[kernels[0].clone(), kernels[2].clone()], &[]).is_err());
-        let mut invalid = kernels.clone();
-        invalid[2].args[4] = Argument::Buffer {
-            name: "OtherLow".into(),
-        };
-        assert!(build::<()>(&invalid, &[]).is_err());
     }
 }

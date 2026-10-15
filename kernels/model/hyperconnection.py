@@ -400,36 +400,20 @@ def hc_up_mix(
 
 @orin_jit
 def hc_injection(
-    M: int, N: int, K: int, dtype: str = "float16", threads: int = 256, dynamic_rows: bool = False
+    M: int, N: int, K: int, dtype: str = "float16", dynamic_rows: bool = False, block_m: int = 1
 ):
-    """Small-output HC projection with one CTA per token/output channel.
+    """Narrow BF16 MMA with the same K16 accumulation as bulk projection.
 
-    Round activation operands to BF16, retain BF16 weights and reduce in FP32.
-    The reduction association differs from Tensor Core projection; all stream
-    rounding boundaries remain explicit. Output must be disjoint from inputs.
+    Cache a token tile and one weight row; each output channel owns a CTA.
+    No split-K or floating sum changes with the logical token count.
     """
-    _dtype(dtype)
-    if any(type(x) is not int or x <= 0 for x in (M, N, K)) or N > 16 or threads not in (128, 256):
-        raise ValueError("Invalid small HC projection dimensions")
-    width = (K + threads - 1) // threads * threads
-    M = row_count(M, dynamic_rows)
+    from kernels.model.flash_next import scalar_bf16_projection
 
-    @T.prim_func
-    def main(
-        A: T.Tensor((M, K), dtype), W: T.Tensor((N, K), T.bfloat16), Out: T.Tensor((M, N), dtype)
-    ):
-        with T.Kernel(M, N, threads=threads) as (row, col):
-            product = T.alloc_fragment((width,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            for d in T.Parallel(width, coalesced_width=T.int32(1)):
-                product[d] = 0
-                if d < K:
-                    activation = T.cast(T.cast(A[row, d], T.bfloat16), T.float32)
-                    product[d] = activation * T.cast(W[col, d], T.float32)
-            T.reduce_sum(product, total, dim=0)
-            Out[row, col] = total[0]
-
-    return main
+    if N != 4:
+        raise ValueError("HC injection requires four stream gates")
+    return scalar_bf16_projection.__wrapped__(
+        M, K, dynamic_rows, outputs=N, block_m=block_m, dtype=dtype
+    )
 
 
 @orin_jit

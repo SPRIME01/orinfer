@@ -573,7 +573,7 @@ impl ModelPackage {
                 self.handle,
                 segments.as_ptr(),
                 segments.len(),
-                ((operation as u32) << 1) | u32::from(include_plan),
+                operation.flags(include_plan),
                 &mut output,
                 &mut error,
             )

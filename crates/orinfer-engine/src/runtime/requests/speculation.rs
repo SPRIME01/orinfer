@@ -434,6 +434,9 @@ impl ModelRuntime {
         for (i, round) in &rounds {
             let req = &mut requests[*i];
             self.execution.activate_sequence(req.slot)?;
+            // Shared verification entries map KV using the live width, not
+            // the capacity or the preceding prefill's workspace control.
+            self.upload_segment_controls(round.plan.tokens)?;
             self.execution
                 .ensure_sequence_program(req.slot, &round.plan.program)?;
             self.upload_ids(&self.manifest.input, &round.verification)?;
@@ -451,7 +454,9 @@ impl ModelRuntime {
         let operation = if prefills.is_empty() {
             orinfer_model_sdk::abi::BatchOperation::Verification
         } else {
-            orinfer_model_sdk::abi::BatchOperation::MixedVerification
+            orinfer_model_sdk::abi::BatchOperation::MixedRows {
+                prefills: prefills.len() as u8,
+            }
         };
         let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
         if !bindings.is_empty() {
@@ -610,15 +615,14 @@ impl ModelRuntime {
                 if rows + tokens > capacity {
                     break;
                 }
-                let warm = spec
-                    .warm_plans
-                    .iter()
-                    .find(|p| p.tokens == tokens)
-                    .ok_or("Missing accepted warm profile")?;
-                self.execution
-                    .ensure_sequence_program(requests[*i].slot, &warm.program)?;
+                let (warm, live) = spec.warm_plan(tokens)?;
+                if live != tokens {
+                    return Err("Accepted warm chain exceeds native capacity".into());
+                }
                 self.upload_ids(&spec.input, &round.tokens)?;
                 self.prepare_program_inputs(&warm.program, &round.tokens, &[])?;
+                self.execution
+                    .ensure_sequence_program(requests[*i].slot, &warm.program)?;
                 segments.push(BatchSegment {
                     slot: requests[*i].slot,
                     tokens,
@@ -774,15 +778,12 @@ impl ModelRuntime {
         let remaining = req.limit - req.generated;
         let plan = valid
             .then(|| {
-                spec.verification_plans
-                    .iter()
-                    .filter(|p| {
-                        p.tokens <= remaining
-                            && p.tokens <= max_rows
-                            && p.tokens <= spec.default_verification_tokens
-                            && p.tokens <= self.manifest.max_context - position
-                    })
-                    .max_by_key(|p| p.tokens)
+                spec.best_verification_plan(
+                    remaining
+                        .min(max_rows)
+                        .min(spec.default_verification_tokens)
+                        .min(self.manifest.max_context - position),
+                )
             })
             .flatten();
         let pending = *req.history.last().ok_or("Missing pending token")?;

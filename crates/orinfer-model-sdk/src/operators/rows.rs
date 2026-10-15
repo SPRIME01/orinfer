@@ -44,7 +44,7 @@ impl RowExecution {
         kernels: &BTreeSet<String>,
         dynamic: &BTreeMap<String, DynamicBatchKernel>,
     ) -> Result<()> {
-        if !(2..=8192).contains(&self.capacity) || self.programs.is_empty() {
+        if !(2..=32768).contains(&self.capacity) || self.programs.is_empty() {
             return Err("Invalid row execution capacity/programs".into());
         }
         if self.program_capacities.iter().any(|(name, &capacity)| {

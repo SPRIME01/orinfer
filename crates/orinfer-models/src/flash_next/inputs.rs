@@ -24,10 +24,10 @@ pub(super) fn layout<'a>(
     tokens: usize,
 ) -> Result<(&'a str, usize)> {
     if let Some(plan) = verification.iter().find(|p| p.program == program) {
-        if plan.tokens != tokens {
+        if !plan.accepts(tokens) {
             return Err("Verification input extent does not match its program".into());
         }
-        return Ok(("target", tokens));
+        return Ok(("target", plan.tokens));
     }
     if program == "batch_target" {
         return Ok(("target", tokens));
@@ -400,14 +400,14 @@ impl Inputs {
         history: &[u32],
         capacity: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let draft = program.starts_with("mtp_warm_m") || program == "mtp_draft";
+        let draft = program.starts_with("mtp_warm") || program == "mtp_draft";
         if !draft && program != "target" {
             return Err("Unknown Flash input program".into());
         }
         if tokens.is_empty()
             || tokens.len() > capacity
-            || !matches!(capacity, 1..=16 | 128 | 512 | 2048 | 4096)
-            || (draft && capacity != tokens.len())
+            || !(1..=4096).contains(&capacity)
+            || (draft && program != "mtp_warm" && capacity != tokens.len())
             || tokens
                 .iter()
                 .chain(history)
@@ -463,10 +463,24 @@ impl Inputs {
             }
         }
         if draft {
-            return Ok(vec![(
-                format!("DraftM{}_Embedding", tokens.len()),
+            let mut prepared = vec![(
+                format!(
+                    "DraftM{}_Embedding",
+                    if program == "mtp_warm" {
+                        capacity
+                    } else {
+                        tokens.len()
+                    }
+                ),
                 embedding,
-            )]);
+            )];
+            if program == "mtp_warm" {
+                prepared.push((
+                    "MtpLength".into(),
+                    (tokens.len() as u32).to_le_bytes().to_vec(),
+                ));
+            }
+            return Ok(prepared);
         }
         Ok(vec![
             (
@@ -549,6 +563,7 @@ mod tests {
         let verification: Vec<_> = (2..=8)
             .map(|tokens| orinfer_model_sdk::mtp::VerificationPlan {
                 tokens,
+                min_tokens: 0,
                 program: format!("verify_m{tokens}"),
                 restore_program: format!("restore_m{tokens}"),
                 capture_program: format!("capture_m{tokens}"),

@@ -2,6 +2,7 @@ mod decode_template;
 mod flash_batch;
 mod single_decode;
 mod single_row;
+mod vision_rows;
 use super::*;
 use serde::Deserialize;
 use serde_json::json;
@@ -1065,7 +1066,8 @@ fn validate_flash_mtp() {
             .plan_snapshot(ranges, &BTreeSet::new(), &[])
             .unwrap();
         let saved = model.execution.snapshot(&plan).unwrap().unwrap();
-        for verify in &spec.verification_plans {
+        for width in spec.verification_widths() {
+            let verify = spec.verification_plan(width).unwrap();
             for accepted in 1..=verify.tokens {
                 let tokens: Vec<u32> = (0..verify.tokens).map(|i| 11 + i as u32 * 71).collect();
                 let mut expected = None;

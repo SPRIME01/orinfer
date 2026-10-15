@@ -45,7 +45,12 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
 
 pub(super) fn causal_begin(m: &Manifest, tokens: usize, gather: bool) -> Vec<Operation> {
     let mut ops = Vec::new();
-    if tokens != 512 {
+    if tokens != 512
+        && !(gather
+            && m.mtp
+                .as_ref()
+                .is_some_and(|s| s.warm_plans.iter().any(|p| p.min_tokens > 0)))
+    {
         ops.push(Operation::Copy {
             source: format!("DraftM{tokens}_Embedding"),
             destination: "DraftM512_Embedding".into(),
@@ -118,18 +123,28 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
         if causal {
             body = causal_begin(m, n, true);
         }
-        body.extend([
-            Operation::Copy {
-                source: format!("DraftM{}_Embedding", if causal { 512 } else { n }),
-                destination: "DraftRows_Embedding".into(),
-                bytes: n * 5120,
-            },
-            Operation::Copy {
-                source: format!("DraftM{}_Condition", if causal { 512 } else { n }),
-                destination: "DraftRows_Condition".into(),
-                bytes: n * 20480,
-            },
-        ]);
+        if warm.min_tokens > 0 {
+            body.extend(
+                ["embedding", "condition"]
+                    .into_iter()
+                    .map(|name| Operation::Kernel {
+                        name: format!("causal_rows/warm/{name}"),
+                    }),
+            );
+        } else {
+            body.extend([
+                Operation::Copy {
+                    source: format!("DraftM{}_Embedding", if causal { 512 } else { n }),
+                    destination: "DraftRows_Embedding".into(),
+                    bytes: n * 5120,
+                },
+                Operation::Copy {
+                    source: format!("DraftM{}_Condition", if causal { 512 } else { n }),
+                    destination: "DraftRows_Condition".into(),
+                    bytes: n * 20480,
+                },
+            ]);
+        }
         for stage in ["begin", "pre"] {
             body.extend(m.programs[&format!("draft_rows/{stage}")].clone());
         }
@@ -157,12 +172,12 @@ pub(super) fn configure(m: &mut Manifest) -> Result<()> {
                 },
             },
         ]);
-        if n == 1 {
+        if n == 1 || warm.min_tokens > 0 {
             let mut draft = body[1..].to_vec();
             if causal {
                 // Replace gather with the carried endpoint condition.
                 draft = causal_begin(m, 1, false);
-                draft.extend(body[causal_begin(m, 1, true).len()..].to_vec());
+                draft.extend(body[causal_begin(m, n, true).len()..].to_vec());
             }
             draft.extend(head_program.clone());
             m.programs.insert(spec.draft_program.clone(), draft);

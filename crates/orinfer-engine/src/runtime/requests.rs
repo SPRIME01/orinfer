@@ -950,16 +950,43 @@ impl ModelRuntime {
                 break;
             }
             let remaining = Self::prefill_boundary(requests[i]) - requests[i].offset;
-            let chunk = shapes
-                .iter()
-                .copied()
-                .filter(|&n| n <= cap - used && n <= remaining && n <= per_request_cap)
-                .filter(|&n| {
+            let dynamic_cap = self
+                .manifest
+                .batch_layout
+                .as_ref()
+                .map_or(0, |l| l.segment_tokens);
+            let chunk = if dynamic_cap > 0 {
+                let limit = dynamic_cap
+                    .min(cap - used)
+                    .min(remaining)
+                    .min(per_request_cap);
+                let mut low = 1;
+                let mut high = limit;
+                let mut best = None;
+                while low <= high {
+                    let n = low + (high - low) / 2;
                     let mut trial = selected.clone();
                     trial.push((i, n));
-                    self.predict_iteration(requests, &trial) * 1000. <= budget_ms
-                })
-                .max();
+                    if self.predict_iteration(requests, &trial) * 1000. <= budget_ms {
+                        best = Some(n);
+                        low = n + 1;
+                    } else {
+                        high = n - 1;
+                    }
+                }
+                best
+            } else {
+                shapes
+                    .iter()
+                    .copied()
+                    .filter(|&n| n <= cap - used && n <= remaining && n <= per_request_cap)
+                    .filter(|&n| {
+                        let mut trial = selected.clone();
+                        trial.push((i, n));
+                        self.predict_iteration(requests, &trial) * 1000. <= budget_ms
+                    })
+                    .max()
+            };
             if let Some(chunk) = chunk {
                 selected.push((i, chunk));
                 used += chunk;
@@ -1361,9 +1388,8 @@ impl ModelRuntime {
             let req = &requests[i];
             let spec = self.manifest.mtp.as_ref().unwrap();
             let plans: Vec<_> = spec
-                .verification_plans
-                .iter()
-                .map(|p| p.tokens)
+                .verification_widths()
+                .into_iter()
                 .filter(|&n| {
                     n <= options.max_batch_tokens
                         && n <= spec.default_verification_tokens
@@ -1418,7 +1444,9 @@ impl ModelRuntime {
             }
         }
         let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
-            !layout.small_mixed_shapes.is_empty() || self.manifest.batch_profiles.is_empty()
+            layout.segment_tokens > 0
+                || !layout.small_mixed_shapes.is_empty()
+                || self.manifest.batch_profiles.is_empty()
         });
         let mut cap = options
             .max_batch_tokens
@@ -1756,12 +1784,18 @@ impl ModelRuntime {
                 )?;
             }
             self.upload_segment_controls(chunk)?;
-            let program = if let Some(program) = self
-                .manifest
-                .batch_layout
-                .as_ref()
-                .and_then(|layout| layout.preparation_programs.get(&chunk))
-            {
+            let program = if let Some(program) =
+                self.manifest.batch_layout.as_ref().and_then(|layout| {
+                    if layout.segment_tokens > 0 && chunk > 1 {
+                        layout
+                            .preparation_programs
+                            .range(chunk..)
+                            .next()
+                            .map(|(_, p)| p)
+                    } else {
+                        layout.preparation_programs.get(&chunk)
+                    }
+                }) {
                 program.clone()
             } else if chunk == 1 {
                 "decode".into()

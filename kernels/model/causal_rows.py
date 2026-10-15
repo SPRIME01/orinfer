@@ -6,6 +6,23 @@ from kernels.model.rows import row_count
 
 
 @orin_jit
+def copy(capacity, width):
+    rows = row_count(capacity, True)
+
+    @T.prim_func
+    def main(
+        Source: T.Tensor((rows, width), T.float16), Destination: T.Tensor((rows, width), T.float16)
+    ):
+        with T.Kernel(rows, T.ceildiv(width, 256), threads=128) as (row, block):
+            for j in T.Parallel(256):
+                col = block * 256 + j
+                if col < width:
+                    Destination[row, col] = Source[row, col]
+
+    return main
+
+
+@orin_jit
 def length(capacity=512):
     rows = row_count(capacity, True)
 

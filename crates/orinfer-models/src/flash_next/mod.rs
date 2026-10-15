@@ -43,6 +43,10 @@ impl Adapter for Flash {
                 let plan = mixed::mixed_verification_plan(&self.manifest, segments)?;
                 Ok((if include_plan { plan } else { vec![] }, vec![]))
             }
+            abi::BatchOperation::MixedRows { prefills } => {
+                let plan = mixed::mixed_rows_plan(&self.manifest, segments, usize::from(prefills))?;
+                Ok((if include_plan { plan } else { vec![] }, vec![]))
+            }
             abi::BatchOperation::Draft
             | abi::BatchOperation::Warm
             | abi::BatchOperation::DraftHead => {
@@ -63,9 +67,7 @@ impl Adapter for Flash {
                         return Err("Invalid or repeated MTP commit segment".into());
                     }
                     let restore = spec
-                        .verification_plans
-                        .iter()
-                        .find(|p| p.tokens == segment.tokens)
+                        .verification_plan(segment.tokens)
                         .ok_or("Missing MTP commit profile")?;
                     if include_plan {
                         if causal_rows::present(&self.manifest) {
@@ -118,6 +120,28 @@ impl Adapter for Flash {
         tokens: &[u32],
         history: &[u32],
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        if program == "batch_target"
+            && tokens.len() > 1
+            && self
+                .manifest
+                .batch_layout
+                .as_ref()
+                .is_some_and(|l| l.segment_tokens > 0)
+        {
+            return self.inputs.prepare_for("target", tokens, history, 4096);
+        }
+        if let Some(warm) = self.manifest.mtp.as_ref().and_then(|s| {
+            s.warm_plans
+                .iter()
+                .find(|p| p.program == program && p.min_tokens > 0)
+        }) {
+            if !warm.accepts(tokens.len()) {
+                return Err("Invalid dynamic warm extent".into());
+            }
+            return self
+                .inputs
+                .prepare_for("mtp_warm", tokens, history, warm.tokens);
+        }
         let verification = self
             .manifest
             .mtp
@@ -274,13 +298,17 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 .clone();
             layout.preparation_programs.insert(1, "decode".into());
             for &tokens in layout.profiles.keys() {
-                let program = format!("flash_segment_m{tokens}/layer3/private");
+                let program = if layout.segment_tokens > 0 {
+                    "causal_rows/target/layer3/private".into()
+                } else {
+                    format!("flash_segment_m{tokens}/layer3/private")
+                };
                 if !manifest.programs.contains_key(&program) {
                     return Err("Missing batch causal preparation program".into());
                 }
                 let mut growth = base.clone();
                 growth.tokens = tokens;
-                growth.length = None;
+                growth.length = (layout.segment_tokens > 0).then(|| "Length".into());
                 growth
                     .buffers
                     .retain(|name| !kv.prefill_workspace.contains_key(name));
@@ -314,6 +342,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     }
     unified_decode::configure(&mut request.metadata, &request.kernel_contracts)?;
     causal_rows::configure(&mut request.metadata)?;
+    vision::configure(&mut request.metadata)?;
     parallel::build_rows(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(
@@ -334,7 +363,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             "mtp_restore_draft".into(),
         ]);
         for p in &spec.warm_plans {
-            if p.tokens <= 8 {
+            if p.tokens <= 8 || p.min_tokens > 0 {
                 decode_programs.extend([p.program.clone(), p.head_program.clone()]);
             }
         }

@@ -386,6 +386,7 @@ mod tests {
                 ("Residual".into(), 20480),
             ]),
             profiles: Default::default(),
+            segment_tokens: 0,
             small_mixed_shapes: vec![],
             state_columns: vec![],
             preparation_programs: BTreeMap::new(),
@@ -740,6 +741,15 @@ mod tests {
             "default_verification_tokens":4,"warm_plans":[],"capture_plans":[],"verification_plans":[],
             "batch_verification_tokens":[2,3,4,5,6,7,8]
         })).unwrap());
+        m.mtp.as_mut().unwrap().verification_plans = (2..=8)
+            .map(|tokens| orinfer_model_sdk::mtp::VerificationPlan {
+                tokens,
+                min_tokens: 0,
+                program: format!("verify_m{tokens}"),
+                restore_program: format!("restore_m{tokens}"),
+                capture_program: format!("mtp_capture_m{tokens}"),
+            })
+            .collect();
         m.mtp.as_mut().unwrap().mixed_verification_tokens = vec![2, 4];
         register(&mut m).unwrap();
         m
@@ -789,6 +799,22 @@ mod tests {
                 }
             }
             assert!(plan.iter().any(|call| matches!(&call.operation, Operation::Kernel {name} if name=="causal_rows/verify/selections")));
+        }
+        let layout = m.batch_layout.as_mut().unwrap();
+        layout.segment_tokens = 512;
+        layout.profiles = BTreeMap::from([(512, "flash_recurrent".into())]);
+        layout.small_mixed_shapes.clear();
+        m.prefill_batch_profiles.retain(|p| p.tokens == 1024);
+        super::super::mixed::register(&mut m).unwrap();
+        super::super::causal_rows::configure(&mut m).unwrap();
+        for tokens in [1, 2, 3, 7, 17, 129, 257, 511, 512] {
+            let segments = [
+                BatchSegment { slot: 9, tokens },
+                BatchSegment { slot: 3, tokens: 2 },
+            ];
+            let plan = super::super::mixed::mixed_rows_plan(&m, &segments, 1).unwrap();
+            assert!(plan.iter().any(|call| call.sequence==Some(9) && matches!(&call.operation,Operation::Kernel {name} if name=="causal_rows/target/layer0/private/k0")));
+            assert!(plan.iter().any(|call| call.sequence==Some(3) && matches!(&call.operation,Operation::Kernel {name} if name=="causal_rows/verify/layer0/private/k0")));
         }
     }
     #[test]

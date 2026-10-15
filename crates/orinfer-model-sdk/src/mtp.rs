@@ -61,8 +61,40 @@ pub struct Spec {
 #[serde(deny_unknown_fields)]
 pub struct WarmPlan {
     pub tokens: usize,
+    #[serde(default, skip_serializing_if = "crate::model::is_zero")]
+    pub min_tokens: usize,
     pub program: String,
     pub head_program: String,
+}
+
+impl WarmPlan {
+    pub fn accepts(&self, tokens: usize) -> bool {
+        tokens == self.tokens
+            || (self.min_tokens > 0 && (self.min_tokens..=self.tokens).contains(&tokens))
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::WarmPlan;
+    #[test]
+    fn dynamic_warm_accepts_real_tails_without_padding() {
+        let p = WarmPlan {
+            tokens: 512,
+            min_tokens: 1,
+            program: "warm".into(),
+            head_program: "head".into(),
+        };
+        for n in [1, 3, 17, 129, 257, 511, 512] {
+            assert!(p.accepts(n));
+        }
+        for n in [0, 513] {
+            assert!(!p.accepts(n));
+        }
+        let exact = WarmPlan { min_tokens: 0, ..p };
+        assert!(!exact.accepts(511));
+        assert!(exact.accepts(512));
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -76,12 +108,61 @@ pub struct CapturePlan {
 #[serde(deny_unknown_fields)]
 pub struct VerificationPlan {
     pub tokens: usize,
+    #[serde(default, skip_serializing_if = "crate::model::is_zero")]
+    pub min_tokens: usize,
     pub program: String,
     pub restore_program: String,
     pub capture_program: String,
 }
 
+impl VerificationPlan {
+    pub fn accepts(&self, tokens: usize) -> bool {
+        tokens == self.tokens
+            || (self.min_tokens >= 2 && (self.min_tokens..=self.tokens).contains(&tokens))
+    }
+}
+
 impl Spec {
+    pub fn verification_plan(&self, tokens: usize) -> Option<VerificationPlan> {
+        self.verification_plans
+            .iter()
+            .find(|p| p.accepts(tokens))
+            .map(|p| VerificationPlan {
+                tokens,
+                ..p.clone()
+            })
+    }
+    pub fn verification_widths(&self) -> Vec<usize> {
+        self.verification_plans
+            .iter()
+            .flat_map(|p| {
+                (if p.min_tokens > 0 {
+                    p.min_tokens
+                } else {
+                    p.tokens
+                })..=p.tokens
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+    pub fn best_verification_plan(&self, limit: usize) -> Option<VerificationPlan> {
+        self.verification_widths()
+            .into_iter()
+            .rev()
+            .find(|&n| n <= limit)
+            .and_then(|n| self.verification_plan(n))
+    }
+    pub fn warm_plan(&self, remaining: usize) -> Result<(&WarmPlan, usize)> {
+        self.warm_plans
+            .iter()
+            .filter_map(|p| {
+                let live = p.tokens.min(remaining);
+                p.accepts(live).then_some((p, live))
+            })
+            .max_by_key(|(_, live)| *live)
+            .ok_or_else(|| "No compatible MTP warm plan".into())
+    }
     pub fn validate(&self, model: &Manifest) -> Result<()> {
         let program = |name: &str| -> Result<()> {
             if model.programs.get(name).is_none_or(Vec::is_empty) {
@@ -116,25 +197,45 @@ impl Spec {
         }
         let mut warm_sizes = BTreeSet::new();
         for p in &self.warm_plans {
-            if p.tokens == 0 || p.tokens > model.max_context || !warm_sizes.insert(p.tokens) {
+            if p.tokens == 0
+                || p.tokens > model.max_context
+                || p.min_tokens > p.tokens
+                || !warm_sizes.insert(p.tokens)
+            {
                 return Err("Invalid/duplicate MTP warm plan".into());
             }
             program(&p.program)?;
             program(&p.head_program)?;
         }
-        if !warm_sizes.contains(&1) {
+        if !self.warm_plans.iter().any(|p| p.accepts(1)) {
             return Err("MTP needs a one-token warm fallback".into());
         }
         let mut verify_sizes = BTreeSet::new();
         for p in &self.verification_plans {
-            if p.tokens < 2 || p.tokens > model.max_context || !verify_sizes.insert(p.tokens) {
+            if p.tokens < 2
+                || p.tokens > model.max_context
+                || (p.min_tokens > 0 && !(2..=p.tokens).contains(&p.min_tokens))
+                || !verify_sizes.insert(p.tokens)
+                || (p.min_tokens > 0
+                    && model.row_execution.as_ref().is_none_or(|rows| {
+                        [&p.program, &p.capture_program, &p.restore_program]
+                            .iter()
+                            .any(|name| {
+                                !rows.programs.contains(*name)
+                                    || rows.program_capacity(name) < p.tokens
+                            })
+                    }))
+            {
                 return Err("Invalid/duplicate MTP verification plan".into());
             }
             for name in [&p.program, &p.restore_program, &p.capture_program] {
                 program(name)?;
             }
         }
-        if !verify_sizes.contains(&self.default_verification_tokens) {
+        if self
+            .verification_plan(self.default_verification_tokens)
+            .is_none()
+        {
             return Err("Missing default MTP verification shape".into());
         }
         if self
@@ -144,7 +245,7 @@ impl Spec {
             || self
                 .batch_verification_tokens
                 .iter()
-                .any(|n| !verify_sizes.contains(n))
+                .any(|&n| self.verification_plan(n).is_none())
         {
             return Err("Invalid batched MTP verification shapes".into());
         }
@@ -286,5 +387,29 @@ impl Spec {
             return Err("Invalid/aliased target sequence length".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+    #[test]
+    fn one_verification_entry_preserves_every_draft_width_and_short_tail() {
+        let p = VerificationPlan {
+            tokens: 8,
+            min_tokens: 2,
+            program: "verify".into(),
+            restore_program: "restore".into(),
+            capture_program: "capture".into(),
+        };
+        for n in 2..=8 {
+            assert!(p.accepts(n));
+        }
+        for n in [0, 1, 9] {
+            assert!(!p.accepts(n));
+        }
+        let exact = VerificationPlan { min_tokens: 0, ..p };
+        assert!(!exact.accepts(7));
+        assert!(exact.accepts(8));
     }
 }

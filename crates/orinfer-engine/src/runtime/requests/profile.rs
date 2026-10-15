@@ -20,11 +20,7 @@ fn median(values: &[f64]) -> f64 {
     values[values.len() / 2]
 }
 
-fn prefill_invocations(
-    model: &ModelRuntime,
-    program: &str,
-    rows: usize,
-) -> Result<Vec<Invocation>> {
+fn row_invocations(model: &ModelRuntime, program: &str, rows: usize) -> Result<Vec<Invocation>> {
     let operations = &model.manifest.programs[program];
     if let Some(template) = model
         .manifest
@@ -365,11 +361,7 @@ fn profile_speculative_verification() {
                     .unwrap();
             }
             let spec = model.manifest.mtp.clone().unwrap();
-            let verify = spec
-                .verification_plans
-                .iter()
-                .find(|p| p.tokens == width)
-                .unwrap();
+            let verify = spec.verification_plan(width).unwrap();
             let position = source.input_tokens.len() as u32;
             model
                 .upload_ids(&model.manifest.input, &tokens[..width])
@@ -386,18 +378,9 @@ fn profile_speculative_verification() {
             // instrumented graph. Timing replays advance recurrent state and
             // are diagnostic only; they do not establish output quality.
             model
-                .launch_program(&verify.program, ExecutionPhase::Decode)
+                .launch_rows(&verify.program, width, ExecutionPhase::Decode)
                 .unwrap();
-            let plan: Vec<_> = model.manifest.programs[&verify.program]
-                .iter()
-                .cloned()
-                .map(|operation| Invocation {
-                    operation,
-                    sequence: None,
-                    launch: None,
-                    views: BTreeMap::new(),
-                })
-                .collect();
+            let plan = row_invocations(&model, &verify.program, width).unwrap();
             let trials = model
                 .execution
                 .profile_graph_operations_at_position(
@@ -738,7 +721,7 @@ fn profile_prefill_stages() {
             .execution
             .ensure_sequence_program(0, &program)
             .unwrap();
-        let plan = prefill_invocations(&model, &program, chunk).unwrap();
+        let plan = row_invocations(&model, &program, chunk).unwrap();
         let trials = model
             .execution
             .profile_graph_operations_at_position(
@@ -1109,7 +1092,7 @@ fn capture_prefill_partitions() {
                     )?;
                     m.upload_segment_controls(chunk)?;
                     m.execution.ensure_sequence_program(r.slot, &program)?;
-                    for invocation in prefill_invocations(m, &program, chunk)? {
+                    for invocation in row_invocations(m, &program, chunk)? {
                         let name = match &invocation.operation {
                             crate::model::Operation::Kernel { name } => Some(name.clone()),
                             _ => None,
