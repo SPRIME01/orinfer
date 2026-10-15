@@ -197,6 +197,9 @@ def injection_choices(package, compiler, tuning):
         slots.append((k, p, weight))
     for old, p, weight in slots:
         slot = old["name"]
+        output = next((p[name] for name in ("Out", "C", "Output") if name in p), None)
+        if output is None:
+            raise ValueError(f"Missing HC injection output binding: {slot}")
         legacy = slot.startswith("decode/")
         cap = 1 if legacy else 512 if slot.startswith("draft_rows/") else 1024
         first = report["default"]
@@ -220,9 +223,9 @@ def injection_choices(package, compiler, tuning):
         for name, implementation in selected:
             pointers = dict(A=p["A"])
             if implementation.startswith("tiny"):
-                pointers.update(Weight=weight, Output=p.get("Out", p.get("C")))
+                pointers.update(Weight=weight, Output=output)
             else:
-                pointers.update(W=weight, C=p.get("Out", p.get("C")))
+                pointers.update(W=weight, C=output)
             host = hosts[implementation]
             k = replace_binding(
                 dict(old, name=name),

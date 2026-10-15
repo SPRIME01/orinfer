@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 
 from kernels.model.hyperconnection import hc_injection, hc_down_partial, hc_down_finish
+from kernels.model.flash_next import scalar_bf16_projection
 from tools.operators.common import configure, benchmark, error, export_kernel, write_json
 
 
@@ -20,12 +21,20 @@ def main():
         (3, 4, 10240, "float16"),
         (8, 4, 10240, "float16"),
         (3, 4, 10240, "bfloat16"),
+        (1, 1, 2560, "float16"),
+        (3, 1, 2560, "float16"),
+        (8, 1, 2560, "float16"),
+        (9, 1, 2560, "float16"),
+        (3, 1, 192, "float16"),
+        (3, 1, 2560, "bfloat16"),
     ):
         x = torch.randn((m, k), device="cuda").to(getattr(torch, dtype))
         w = (torch.randn((n, k), device="cuda") / k**0.5).bfloat16()
         guarded = torch.full((m + 1, n), 91.0, device="cuda", dtype=x.dtype)
         out = guarded[:m]
-        kernel = hc_injection(m, n, k, dtype)
+        kernel = (
+            scalar_bf16_projection(m, k, dtype=dtype) if n == 1 else hc_injection(m, n, k, dtype)
+        )
 
         def run():
             kernel(x, w, out)
@@ -53,7 +62,7 @@ def main():
         assert torch.equal(out, original) and bool((guarded[-1] == 91).all())
         report["cases"].append(
             {
-                "kind": "injection",
+                "kind": "scalar" if n == 1 else "injection",
                 "rows": m,
                 "outputs": n,
                 "inner": k,

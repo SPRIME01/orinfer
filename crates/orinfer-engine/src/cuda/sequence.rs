@@ -9,6 +9,54 @@ use std::time::Instant;
 // Oversized plans retain direct execution rather than exceeding this budget.
 const BATCH_GRAPH_NODES: usize = 12288;
 
+/// A shared piece can cut through a certified branch. Only complete regions
+/// may fork. Contiguous helpers replacing one row slot share its boundaries.
+fn parallel_regions(
+    operations: &[Invocation],
+    configured: &[[String; 4]],
+    slots: &BTreeMap<String, String>,
+) -> Result<Vec<[usize; 4]>> {
+    let mut positions = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for (i, operation) in operations.iter().enumerate() {
+        if let Operation::Kernel { name } = &operation.operation {
+            let slot = slots.get(name).unwrap_or(name).as_str();
+            if let Some((_, last)) = positions.get_mut(slot) {
+                if *last + 1 != i {
+                    // Private stages may repeat per owner without making
+                    // unrelated shared branch boundaries ambiguous.
+                    ambiguous.insert(slot);
+                }
+                *last = i;
+            } else {
+                positions.insert(slot, (i, i));
+            }
+        }
+    }
+    let mut regions = Vec::new();
+    for region in configured {
+        if region.iter().any(|name| ambiguous.contains(name.as_str())) {
+            continue;
+        }
+        let [Some(fork), Some(start), Some(last), Some(join)] =
+            region.each_ref().map(|name| positions.get(name.as_str()))
+        else {
+            continue;
+        };
+        let indices = [fork.0, start.0, last.1, join.0];
+        let [fork, start, last, join] = indices;
+        if !(fork < start && start <= last && last + 1 == join) {
+            return Err("Invalid fork/join region".into());
+        }
+        regions.push(indices);
+    }
+    regions.sort();
+    if regions.windows(2).any(|p| p[0][3] >= p[1][0]) {
+        return Err("Overlapping fork/join regions".into());
+    }
+    Ok(regions)
+}
+
 fn batch_graph_victim(
     cache: &super::executor::BatchGraphCache,
     incoming: usize,
@@ -889,11 +937,8 @@ impl Executor {
         Ok(())
     }
     fn capture(&self, operations: &[Invocation]) -> Result<Handle> {
-        self.capture_with_parallel(operations, true)
-    }
-    fn capture_with_parallel(&self, operations: &[Invocation], parallel: bool) -> Result<Handle> {
         self.ensure_invocation_kernels(operations)?;
-        if parallel && !self.parallel_regions.borrow().is_empty() {
+        if !self.parallel_regions.borrow().is_empty() {
             self.ensure_parallel_handles()?;
         }
         // SAFETY: All bindings and backing allocations outlive graph execution;
@@ -907,11 +952,7 @@ impl Executor {
                 "begin request capture",
             )?;
         }
-        let result = if parallel {
-            self.capture_parallel_operations(operations)
-        } else {
-            operations.iter().try_for_each(|op| self.invoke(op))
-        };
+        let result = self.capture_parallel_operations(operations);
         let mut graph = ptr::null_mut();
         // SAFETY: Always end capture, including a failed recorded operation.
         let end = unsafe {
@@ -929,11 +970,7 @@ impl Executor {
             }
             return Err(error);
         }
-        let flags = match if parallel {
-            self.prioritize_parallel_graph(graph, operations)
-        } else {
-            Ok(0)
-        } {
+        let flags = match self.prioritize_parallel_graph(graph, operations) {
             Ok(flags) => flags,
             Err(error) => {
                 // SAFETY: Local graph has not been instantiated or published.
@@ -971,19 +1008,12 @@ impl Executor {
         if policy.is_empty() || policy == "off" {
             return Ok(0);
         }
-        let regions = self.parallel_regions.borrow();
-        let position: std::collections::BTreeMap<_, _> = operations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| {
-                if let Operation::Kernel { name } = &o.operation {
-                    Some((self.row_kernel_slots.get(name).unwrap_or(name).as_str(), i))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !regions.iter().any(|r| position.contains_key(r[0].as_str())) {
+        let regions = parallel_regions(
+            operations,
+            &self.parallel_regions.borrow(),
+            &self.row_kernel_slots,
+        )?;
+        if regions.is_empty() {
             return Ok(0);
         }
         let kernels = self
@@ -993,13 +1023,8 @@ impl Executor {
             .kernels
             .borrow();
         let mut preferred = std::collections::BTreeSet::new();
-        for region in regions
-            .iter()
-            .filter(|r| position.contains_key(r[0].as_str()))
-        {
-            let lo = position[region[0].as_str()];
-            let side = position[region[1].as_str()];
-            let end = position[region[2].as_str()] + 1;
+        for [lo, side, last, _] in regions {
+            let end = last + 1;
             let range = if policy == "main" {
                 lo..side
             } else {
@@ -1009,7 +1034,13 @@ impl Executor {
                 if let Operation::Kernel { name } = &o.operation {
                     let k = &kernels[name];
                     if policy == "main"
-                        || (policy == "small_side" && k.spec.grid.iter().product::<u32>() <= 48)
+                        || (policy == "small_side"
+                            && o.launch
+                                .as_ref()
+                                .map_or(&k.spec.grid, |launch| &launch.grid)
+                                .iter()
+                                .product::<u32>()
+                                <= 48)
                     {
                         preferred.insert(k.function.ok_or("Unresolved priority kernel")? as usize);
                     }
@@ -1112,49 +1143,13 @@ impl Executor {
         Ok(handles)
     }
     fn capture_parallel_operations(&self, operations: &[Invocation]) -> Result<()> {
-        let names: std::collections::BTreeMap<_, _> = operations
-            .iter()
-            .enumerate()
-            .filter_map(|(i, op)| {
-                if let Operation::Kernel { name } = &op.operation {
-                    Some((self.row_kernel_slots.get(name).unwrap_or(name).as_str(), i))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if names.len()
-            != operations
-                .iter()
-                .filter(|op| matches!(op.operation, Operation::Kernel { .. }))
-                .count()
-        {
+        let regions = parallel_regions(
+            operations,
+            &self.parallel_regions.borrow(),
+            &self.row_kernel_slots,
+        )?;
+        if regions.is_empty() {
             return operations.iter().try_for_each(|op| self.invoke(op));
-        }
-        let configured = self.parallel_regions.borrow();
-        if configured.is_empty() || !configured.iter().any(|r| names.contains_key(r[0].as_str())) {
-            return operations.iter().try_for_each(|op| self.invoke(op));
-        }
-        let mut regions = Vec::new();
-        for r in configured
-            .iter()
-            .filter(|r| names.contains_key(r[0].as_str()))
-        {
-            let mut indices = [0; 4];
-            for (i, name) in r.iter().enumerate() {
-                indices[i] = *names
-                    .get(name.as_str())
-                    .ok_or("Missing parallel endpoint")?;
-            }
-            let [fork, start, last, join] = indices;
-            if !(fork < start && start <= last && last + 1 == join) {
-                return Err("Invalid fork/join region".into());
-            }
-            regions.push(indices);
-        }
-        regions.sort();
-        if regions.windows(2).any(|p| p[0][3] >= p[1][0]) {
-            return Err("Overlapping fork/join regions".into());
         }
         let (side, fork_event, join_event) = self.ensure_parallel_handles()?;
         for (i, op) in operations.iter().enumerate() {
@@ -1469,7 +1464,7 @@ impl Executor {
                 } else {
                     self.reserve_graph_nodes(piece.len(), true)?;
                     let at = Instant::now();
-                    let graph = self.capture_with_parallel(piece, false)?;
+                    let graph = self.capture(piece)?;
                     let mut stats = self.batch_statistics.get();
                     stats.capture_s += at.elapsed().as_secs_f64();
                     stats.captured_operations += piece.len();
@@ -1936,6 +1931,100 @@ impl Drop for Executor {
 #[cfg(test)]
 mod graph_cache_tests {
     use super::*;
+
+    fn calls(names: &[&str]) -> Vec<Invocation> {
+        names
+            .iter()
+            .map(|name| Invocation {
+                operation: Operation::Kernel {
+                    name: (*name).into(),
+                },
+                sequence: None,
+                launch: None,
+                views: BTreeMap::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partial_shared_pieces_fork_only_complete_branches() {
+        let region = ["root", "side", "side", "join"].map(str::to_owned);
+        let ops = calls(&["root", "main", "side", "join", "tail"]);
+        assert_eq!(
+            parallel_regions(&ops, std::slice::from_ref(&region), &BTreeMap::new()).unwrap(),
+            vec![[0, 2, 2, 3]]
+        );
+        for piece in [&ops[..3], &ops[1..], &ops[2..3]] {
+            assert!(
+                parallel_regions(piece, std::slice::from_ref(&region), &BTreeMap::new())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn branch_boundaries_include_all_helpers_of_a_row_slot() {
+        let ops = calls(&[
+            "root/pack",
+            "root/gemm",
+            "main",
+            "side/pack",
+            "side/gemm",
+            "join",
+        ]);
+        let slots = [
+            ("root/pack", "root"),
+            ("root/gemm", "root"),
+            ("side/pack", "side"),
+            ("side/gemm", "side"),
+        ]
+        .map(|(name, slot)| (name.into(), slot.into()))
+        .into();
+        let region = ["root", "side", "side", "join"].map(str::to_owned);
+        assert_eq!(
+            parallel_regions(&ops, std::slice::from_ref(&region), &slots).unwrap(),
+            vec![[0, 3, 4, 5]]
+        );
+        // A repeated slot separated by another operation is ambiguous.
+        let ops = calls(&["root/pack", "main", "root/gemm", "side/gemm", "join"]);
+        assert!(
+            parallel_regions(&ops, &[region], &slots)
+                .unwrap()
+                .is_empty()
+        );
+        let ops = calls(&["root", "private", "other", "private", "side", "join"]);
+        let region = ["root", "side", "side", "join"].map(str::to_owned);
+        assert_eq!(
+            parallel_regions(&ops, &[region], &slots).unwrap(),
+            vec![[0, 4, 4, 5]]
+        );
+    }
+
+    #[test]
+    fn malformed_and_overlapping_branches_are_rejected() {
+        let ops = calls(&["a", "b", "c", "d", "e"]);
+        assert!(
+            parallel_regions(
+                &ops,
+                &[["a", "b", "b", "d"].map(str::to_owned)],
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            parallel_regions(
+                &ops,
+                &[
+                    ["a", "b", "b", "c"].map(str::to_owned),
+                    ["c", "d", "d", "e"].map(str::to_owned),
+                ],
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn indirect_graph_identity_tracks_shape_and_workspace_not_request_slots() {
         use super::super::executor::{BatchGraphKey, SharedGraphKey};

@@ -58,11 +58,11 @@ def dense_projection(
     return main
 
 
-_BF16_PAIR = """
+_BF16_LOAD = """
 #include <tl_templates/cuda/instruction/mma.h>
 template <typename V>
-__device__ __forceinline__ unsigned flash_bf16_pair(V a, V b) {
-    return (unsigned)a.raw() | ((unsigned)b.raw() << 16);
+__device__ __forceinline__ unsigned flash_bf16_load(const V* p) {
+    return *reinterpret_cast<const unsigned*>(p);
 }
 """
 
@@ -80,8 +80,9 @@ def scalar_bf16_projection(
     """Narrow output projection, preserving the dense BF16 MMA accumulation order.
 
     Load only live activation rows and the one weight row into transient shared
-    memory once. One warp executes the same m16n8k16 BF16 instructions; the
-    remaining threads help load operands. No split-K or floating reduction.
+    memory once. Replicate these operands into unused MMA rows/columns, avoiding
+    predicated shared loads inside the K loop. The live outputs retain the same
+    m16n8k16 BF16 accumulation order; no split-K or floating reduction.
     """
     if any(type(v) is not int or v <= 0 for v in (M, K)) or K % 64:
         raise ValueError("Invalid scalar BF16 projection dimensions")
@@ -99,7 +100,7 @@ def scalar_bf16_projection(
         Output: T.Tensor((M, outputs), dtype),
     ):
         with T.Kernel(T.ceildiv(M, tile), outputs, threads=128) as (block, col):
-            T.import_source(_BF16_PAIR)
+            T.import_source(_BF16_LOAD)
             a = T.alloc_shared((tile, K), T.bfloat16)
             w = T.alloc_shared((K,), T.bfloat16)
             for r, k in T.Parallel(tile, K, coalesced_width=T.int32(1)):
@@ -119,22 +120,17 @@ def scalar_bf16_projection(
                 for kg in T.serial(K // 64):
                     for ki in T.unroll(4):
                         for i in T.unroll(4):
-                            ar[i] = 0
-                            if row + (i % 2) * 8 < tile:
-                                k = kg * 64 + ki * 16 + tid * 2 + (i // 2) * 8
-                                ar[i] = T.call_pure_extern(
-                                    "uint32",
-                                    "flash_bf16_pair",
-                                    a[row + (i % 2) * 8, k],
-                                    a[row + (i % 2) * 8, k + 1],
-                                )
+                            k = kg * 64 + ki * 16 + tid * 2 + (i // 2) * 8
+                            ar[i] = T.call_pure_extern(
+                                "uint32",
+                                "flash_bf16_load",
+                                T.address_of(a[(row + (i % 2) * 8) % tile, k]),
+                            )
                         for i in T.unroll(2):
-                            br[i] = 0
-                            if row == 0:
-                                k = kg * 64 + ki * 16 + tid * 2 + i * 8
-                                br[i] = T.call_pure_extern(
-                                    "uint32", "flash_bf16_pair", w[k], w[k + 1]
-                                )
+                            k = kg * 64 + ki * 16 + tid * 2 + i * 8
+                            br[i] = T.call_pure_extern(
+                                "uint32", "flash_bf16_load", T.address_of(w[k])
+                            )
                         T.ptx_mma(
                             "float32",
                             "m16n8k16",

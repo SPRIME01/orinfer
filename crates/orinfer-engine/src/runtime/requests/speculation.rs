@@ -987,15 +987,34 @@ impl ModelRuntime {
         let plan = &round.plan;
         let verification = &round.verification;
         let at = Instant::now();
+        let packet = self
+            .manifest
+            .mtp
+            .as_ref()
+            .is_some_and(|spec| spec.batch_verification_tokens.contains(&plan.tokens));
+        self.upload_segment_controls(plan.tokens)?;
+        if packet {
+            self.execution
+                .ensure_sequence_program(req.slot, &plan.program)?;
+        }
         self.upload_ids(&self.manifest.input, verification)?;
         self.prepare_verification_inputs(
             &plan.program,
             verification,
             &req.history[..req.history.len() - 1],
         )?;
-        self.upload_segment_controls(plan.tokens)?;
-        self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
-        self.launch_rows(&plan.capture_program, plan.tokens, ExecutionPhase::Decode)?;
+        if packet {
+            self.execute_spec_packet(
+                &[BatchSegment {
+                    slot: req.slot,
+                    tokens: plan.tokens,
+                }],
+                orinfer_model_sdk::abi::BatchOperation::Verification,
+            )?;
+        } else {
+            self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
+            self.launch_rows(&plan.capture_program, plan.tokens, ExecutionPhase::Decode)?;
+        }
         req.mtp.verification_s += at.elapsed().as_secs_f64();
         Ok(())
     }
