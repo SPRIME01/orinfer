@@ -1,0 +1,20 @@
+"""Dynamic row copies and owner-local length controls for causal segments."""
+
+import tilelang.language as T
+from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
+
+
+@orin_jit
+def length(capacity=512):
+    rows = row_count(capacity, True)
+
+    @T.prim_func
+    def main(Length: T.Tensor((1,), T.int32)):
+        with T.Kernel(1, threads=32):
+            if T.get_thread_binding() == 0:
+                Length[0] = rows
+
+    from kernels.model.rows import explicit_rows
+
+    return explicit_rows(main)

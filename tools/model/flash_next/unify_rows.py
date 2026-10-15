@@ -101,6 +101,11 @@ class Compiler:
                 print("COMPILE", key, flush=True)
                 fn = explicit_rows(build()) if symbolic else build()
                 passes = {}
+                if key.startswith("causal-gdn-"):
+                    passes = {
+                        "tl.disable_thread_storage_sync": True,
+                        "tl.disable_shared_memory_reuse": True,
+                    }
                 if key.startswith("expert-"):
                     from tools.model.flash_next.decode_tuning import EXACT_PASSES
 
@@ -604,6 +609,11 @@ def upgrade(model, destination, output, *, tuning_cache=None):
     wide_integer_tiles(package, compiler)
     wide_raw_hc(package, compiler)
     removed = prune_computation(package, draft=draft)
+    state_removed = 0
+    if draft:
+        from tools.model.flash_next.causal_rows import publish as causal_states
+
+        state_removed = causal_states(data, package, compiler)
     data["metadata"]["buffers"] = list(buffers.values())
     package["buffer_contracts"] = [
         {k: v for k, v in b.items() if k != "data"} for b in buffers.values()
@@ -614,7 +624,7 @@ def upgrade(model, destination, output, *, tuning_cache=None):
         dict(
             capacity=CAPACITY,
             compiled=len(compiler.compiled),
-            removed=len(removed),
+            removed=len(removed) + state_removed,
             execution_package=digest,
         ),
     )

@@ -22,8 +22,10 @@ def selection():
 
 
 @orin_jit
-def selections(rows: int):
+def selections(rows: int, dynamic_rows: bool = False):
     """Split row-wise greedy results into the runtime's independent controls."""
+
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def kernel(

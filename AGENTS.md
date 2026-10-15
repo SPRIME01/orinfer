@@ -27,6 +27,7 @@
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
 - Flash Next普通decode（1–128请求）、混合batch和MTP验证共享1–1024 token行的target执行模板；单／多流草稿和warm共享1–512行draft模板，输出头复用相同实现。因果段、接受前缀因子、捕获、提交和请求隔离独立处理，不复制投影／HC／FFN／专家计算流程。整数投影和专家按1/2/3/4/8/16/32离线特化，其余行数使用动态参数cubin；TileLang自动调优只选择不改变scale、dtype与归约边界的合法tile，路由与专家tile必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子不保留8/16分界。不得恢复旧的逐容量在线batch planner、空行补齐或混合decode子组回退；离线中间绑定只用于构建最终模板，MTP短尾也走一行packet，单请求target程序仅保留状态准备／参考用途。Graph分支按模板槽位注册，全部特化验证读写依赖后复用；不手写batch档位，不在线调优；缓存按源码、编译器和设备身份失效。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
+- Flash Next因果段与MTP状态控制使用动态长度kernel：target段及draft最大512行，验证与接受前缀恢复最大8行；运行时显式传递真实段长，不从程序名推断。GDN head-major因子按真实行数定stride，卷积/PLE历史与隐藏环使用发布buffer的物理几何。协议允许长度、调度分块和轻量程序别名不代表独立cubin；不得恢复逐长度状态kernel枚举。验证/恢复/捕获必须沿动态行launch传递段长，并保持每个请求的owner及状态视图。
 - Cooperative launch需显式声明并校验occupancy，不假定普通launch可跨block同步。
 - 性能以完整链及真实模型为准。合成探针、微测外推和四输出profile不能替代完整请求TPS。
 - 质量对照官方BF16或同模型FP8，固定seed20261002及teacher-forced历史；token不完全一致不是自动失败。任务结果、target NLL和长上下文另行判断。

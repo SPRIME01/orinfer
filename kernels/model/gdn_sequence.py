@@ -257,9 +257,11 @@ def gdn_sequence(
 
 
 @orin_jit
-def gdn_commit(tokens: int, value_tile: int = 32):
+def gdn_commit(tokens: int, value_tile: int = 32, dynamic_rows: bool = False):
     """Replay saved FP32 rank-one updates in their original rounding order."""
     assert 1 <= tokens <= 8 and value_tile in (16, 32, 64, 128)
+
+    tokens = row_count(tokens, dynamic_rows)
 
     @T.prim_func
     def main(

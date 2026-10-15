@@ -2,12 +2,15 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def select_prefix(tokens: int, elements: int, dtype="float32"):
+def select_prefix(tokens: int, elements: int, dtype="float32", dynamic_rows: bool = False):
     """Commit one saved prefix. Caller guarantees 1 <= Count[0] <= tokens."""
     assert tokens > 0 and elements > 0 and dtype in ("float16", "float32")
+
+    tokens = row_count(tokens, dynamic_rows)
 
     @T.prim_func
     def kernel(
@@ -141,9 +144,13 @@ def capture_target_hidden(hidden: int, max_context: int, epsilon: float = 1e-6, 
 
 
 @orin_jit
-def gather_target_hidden(tokens: int, hidden: int, max_context: int, ring: bool = False):
+def gather_target_hidden(
+    tokens: int, hidden: int, max_context: int, ring: bool = False, dynamic_rows: bool = False
+):
     """Pair target h[t] with x[t+1]; ring slots must still hold this prefix."""
     assert tokens > 0 and hidden > 0 and max_context > 0
+
+    tokens = row_count(tokens, dynamic_rows)
 
     @T.prim_func
     def kernel(

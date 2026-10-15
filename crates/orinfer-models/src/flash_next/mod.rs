@@ -1,5 +1,6 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
 mod batching;
+mod causal_rows;
 mod decode_fusions;
 mod draft_batch;
 mod draft_rows;
@@ -67,6 +68,17 @@ impl Adapter for Flash {
                         .find(|p| p.tokens == segment.tokens)
                         .ok_or("Missing MTP commit profile")?;
                     if include_plan {
+                        if causal_rows::present(&self.manifest) {
+                            rows::append(
+                                &self.manifest,
+                                &mut plan,
+                                &restore.restore_program,
+                                segment.tokens,
+                                Some(segment.slot),
+                                &Default::default(),
+                            )?;
+                            continue;
+                        }
                         plan.extend(
                             self.manifest.programs[&restore.restore_program]
                                 .iter()
@@ -247,6 +259,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             programs,
             variants,
         });
+        let dynamic_causal = causal_rows::present(manifest);
         if let Some(layout) = &mut manifest.batch_layout
             && !layout.profiles.is_empty()
         {
@@ -271,7 +284,10 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 growth
                     .buffers
                     .retain(|name| !kv.prefill_workspace.contains_key(name));
-                growth.buffers.push(plan::score_role(tokens, "Target"));
+                growth.buffers.push(plan::score_role(
+                    if dynamic_causal { 512 } else { tokens },
+                    "Target",
+                ));
                 kv.growth.insert(program.clone(), growth);
                 layout.preparation_programs.insert(tokens, program);
             }
@@ -297,6 +313,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         };
     }
     unified_decode::configure(&mut request.metadata, &request.kernel_contracts)?;
+    causal_rows::configure(&mut request.metadata)?;
     parallel::build_rows(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(

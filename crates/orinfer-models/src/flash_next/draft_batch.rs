@@ -9,6 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn register(m: &mut Manifest) -> Result<()> {
     let Some(spec) = &m.mtp else { return Ok(()) };
+    if super::causal_rows::present(m) {
+        return Ok(());
+    }
     if super::draft_rows::present(m) {
         for tokens in 1..=8 {
             let section = format!("draft_rows/warm_m{tokens}/private");
@@ -168,34 +171,73 @@ pub(super) fn plan(
     }
     for (lane, segment) in segments.iter().enumerate() {
         if body {
-            if operation == BatchOperation::Warm {
-                push(
-                    &mut out,
-                    Operation::Kernel {
-                        name: format!("mtp_warm_m{}/begin/k0", segment.tokens),
-                    },
-                    Some(segment.slot),
-                    BTreeMap::new(),
-                );
-            }
-            for i in 1..=usize::from(m.vision.is_some()) + 1 {
-                push(
-                    &mut out,
-                    Operation::Kernel {
-                        name: format!("mtp_warm_m{}/begin/k{i}", segment.tokens),
-                    },
-                    Some(segment.slot),
-                    BTreeMap::new(),
-                );
+            if !super::causal_rows::present(m) {
+                if operation == BatchOperation::Warm {
+                    push(
+                        &mut out,
+                        Operation::Kernel {
+                            name: format!("mtp_warm_m{}/begin/k0", segment.tokens),
+                        },
+                        Some(segment.slot),
+                        BTreeMap::new(),
+                    );
+                }
+                for i in 1..=usize::from(m.vision.is_some()) + 1 {
+                    push(
+                        &mut out,
+                        Operation::Kernel {
+                            name: format!("mtp_warm_m{}/begin/k{i}", segment.tokens),
+                        },
+                        Some(segment.slot),
+                        BTreeMap::new(),
+                    );
+                }
+            } else {
+                for operation in super::draft_rows::causal_begin(
+                    m,
+                    segment.tokens,
+                    operation == BatchOperation::Warm,
+                ) {
+                    let launch = if let Operation::Kernel { name } = &operation {
+                        Some(
+                            m.dynamic_batch_kernels
+                                .get(name)
+                                .ok_or("Missing draft causal control")?
+                                .launch(segment.tokens)?,
+                        )
+                    } else {
+                        None
+                    };
+                    out.push(Invocation {
+                        operation,
+                        sequence: Some(segment.slot),
+                        views: BTreeMap::new(),
+                        launch,
+                    });
+                }
             }
             for (source, destination, bytes) in [
                 (
-                    format!("DraftM{}_Embedding", segment.tokens),
+                    format!(
+                        "DraftM{}_Embedding",
+                        if super::causal_rows::present(m) {
+                            512
+                        } else {
+                            segment.tokens
+                        }
+                    ),
                     &embedding,
                     segment.tokens * 5120,
                 ),
                 (
-                    format!("DraftM{}_Condition", segment.tokens),
+                    format!(
+                        "DraftM{}_Condition",
+                        if super::causal_rows::present(m) {
+                            512
+                        } else {
+                            segment.tokens
+                        }
+                    ),
                     &condition,
                     segment.tokens * 20480,
                 ),
@@ -257,16 +299,38 @@ pub(super) fn plan(
             } else {
                 "private".into()
             };
-            for op in &m.programs[&format!("{prefix}/{section}")] {
-                push(&mut out, op.clone(), Some(segment.slot), views.clone());
+            if super::causal_rows::present(m) {
+                super::rows::append(
+                    m,
+                    &mut out,
+                    "causal_rows/draft",
+                    segment.tokens,
+                    Some(segment.slot),
+                    &views,
+                )?;
+            } else {
+                for op in &m.programs[&format!("{prefix}/{section}")] {
+                    push(&mut out, op.clone(), Some(segment.slot), views.clone());
+                }
             }
             out.push(Invocation {
                 operation: Operation::Kernel {
-                    name: format!("mtp_warm_m{}/end/k0", segment.tokens),
+                    name: if super::causal_rows::present(m) {
+                        "causal_rows/warm/advance".into()
+                    } else {
+                        format!("mtp_warm_m{}/end/k0", segment.tokens)
+                    },
                 },
                 sequence: Some(segment.slot),
                 views: BTreeMap::new(),
-                launch: None,
+                launch: if super::causal_rows::present(m) {
+                    Some(
+                        m.dynamic_batch_kernels["causal_rows/warm/advance"]
+                            .launch(segment.tokens)?,
+                    )
+                } else {
+                    None
+                },
             });
         }
         if shared {

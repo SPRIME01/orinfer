@@ -15,6 +15,7 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
     };
     for plan in &spec.verification_plans {
         let n = plan.tokens;
+        let causal = super::causal_rows::present(m);
         let width = super::plan::arena_width(n);
         let mut ops = Vec::new();
         if m.vision.is_some() {
@@ -45,17 +46,25 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
             if layer == 1 {
                 ops.extend(m.programs["flash_decode/layer1/ple"].clone());
                 ops.extend((0..3).map(|i| Operation::Kernel {
-                    name: format!("verify_rows_m{n}/layer1/ple/k{i}"),
+                    name: if causal {
+                        format!("causal_rows/verify/layer1/ple/k{i}")
+                    } else {
+                        format!("verify_rows_m{n}/layer1/ple/k{i}")
+                    },
                 }));
             }
             ops.extend(m.programs[&format!("flash_decode/layer{layer}/pre")].clone());
             for i in 0..if layer % 4 == 3 { 20 } else { 4 } {
                 ops.push(Operation::Kernel {
-                    name: format!("verify_rows_m{n}/layer{layer}/private/k{i}"),
+                    name: if causal {
+                        format!("causal_rows/verify/layer{layer}/private/k{i}")
+                    } else {
+                        format!("verify_rows_m{n}/layer{layer}/private/k{i}")
+                    },
                 });
                 if layer % 4 != 3 && i == 1 {
                     ops.push(Operation::Copy {
-                        source: format!("M{width}_HistoryOut"),
+                        source: format!("M{}_HistoryOut", if causal { 8 } else { width }),
                         destination: format!("State_{layer}_conv"),
                         bytes: 61440,
                     });
@@ -64,7 +73,11 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
             ops.extend(m.programs[&format!("flash_decode/layer{layer}/post")].clone());
         }
         ops.push(Operation::Kernel {
-            name: format!("verify_m{n}/end/k0"),
+            name: if causal {
+                "causal_rows/verify/advance".into()
+            } else {
+                format!("verify_m{n}/end/k0")
+            },
         });
         ops.extend(m.programs["flash_decode/head"].clone());
         ops.extend([
@@ -79,20 +92,31 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
                 bytes: n * 8,
             },
             Operation::Kernel {
-                name: format!("verify_m{n}/head/k8"),
+                name: if causal {
+                    "causal_rows/verify/selections".into()
+                } else {
+                    format!("verify_m{n}/head/k8")
+                },
             },
         ]);
         m.programs.insert(plan.program.clone(), ops);
         m.programs.insert(
             plan.capture_program.clone(),
             vec![Operation::Kernel {
-                name: format!("verify_rows_capture_m{n}/body/k0"),
+                name: if causal {
+                    "causal_rows/verify/capture".into()
+                } else {
+                    format!("verify_rows_capture_m{n}/body/k0")
+                },
             }],
         );
         let rows = m
             .row_execution
             .as_mut()
             .ok_or("Missing common verification rows")?;
+        rows.programs.insert(plan.capture_program.clone());
+        rows.program_capacities
+            .insert(plan.capture_program.clone(), n);
         rows.programs.insert(plan.program.clone());
         rows.program_capacities.insert(plan.program.clone(), n);
     }

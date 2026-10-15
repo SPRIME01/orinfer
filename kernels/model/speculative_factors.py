@@ -2,12 +2,15 @@
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
+from kernels.model.rows import row_count
 
 
 @orin_jit
-def save_gdn_factors(tokens: int):
+def save_gdn_factors(tokens: int, dynamic_rows: bool = False):
     if type(tokens) is not int or not 2 <= tokens <= 8:
         raise ValueError("Unsupported verification factor width")
+
+    tokens = row_count(tokens, dynamic_rows)
 
     @T.prim_func
     def save(

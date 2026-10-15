@@ -228,7 +228,7 @@ impl ModelRuntime {
             )?;
             self.upload_segment_controls(plan.tokens)?;
             self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
-            self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
+            self.launch_rows(&plan.capture_program, plan.tokens, ExecutionPhase::Decode)?;
             let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
             let status = self.read_controls(&spec.verification_status, plan.tokens)?;
             if target.iter().any(|&x| x as usize >= vocab) || status.iter().any(|&x| x != 0) {
@@ -273,7 +273,7 @@ impl ModelRuntime {
             let at = Instant::now();
             if spec.commit_always || emitted < plan.tokens {
                 self.upload_ids(&spec.accepted_inputs, &[emitted as u32])?;
-                self.launch_program(&plan.restore_program, ExecutionPhase::Decode)?;
+                self.launch_rows(&plan.restore_program, plan.tokens, ExecutionPhase::Decode)?;
                 self.upload_ids(&self.manifest.position, &[(position + emitted) as u32])?;
                 self.upload_ids(&spec.target_length, &[(position + emitted) as u32])?;
             }

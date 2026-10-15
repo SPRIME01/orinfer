@@ -31,7 +31,7 @@ check: lint
 	$(PYTHON) -m unittest tools.model.test_compact -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_decode_package tools.model.flash_next.tests.test_unify_decode tools.model.flash_next.tests.test_kernel_policy tools.model.flash_next.tests.test_exact_experts tools.model.flash_next.tests.test_hc_package tools.model.flash_next.tests.test_repack -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_weights -v
-	$(PYTHON) -m unittest tools.model.flash_next.tests.test_unify_rows -v
+	$(PYTHON) -m unittest tools.model.flash_next.tests.test_unify_rows tools.model.flash_next.tests.test_causal_rows -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_ple tools.model.flash_next.tests.test_chunks tools.model.flash_next.tests.test_validation tools.model.flash_next.tests.test_original tools.model.flash_next.tests.test_teacher_inputs tools.model.flash_next.tests.test_speculation tools.model.flash_next.tests.test_config -v
 	$(PYTHON) -m unittest tools.model.test_prepare tools.model.test_attach_execution tools.model.test_package tools.model.test_catalog tools.model.test_publication tools.model.test_resize_context tools.model.test_optimize_kv tools.model.test_stage_kv_prefill tools.model.test_upgrade_batching tools.model.test_upgrade_dynamic_batch tools.model.test_checkpoint tools.release.test_package tools.test_reference -v
 	$(PYTHON) tools/bench/validate_plan.py

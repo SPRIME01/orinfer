@@ -1097,7 +1097,11 @@ fn validate_flash_mtp() {
                         .upload_ids(&spec.accepted_inputs, &[accepted as u32])
                         .unwrap();
                     model
-                        .launch_program(&verify.restore_program, ExecutionPhase::Decode)
+                        .launch_rows(
+                            &verify.restore_program,
+                            verify.tokens,
+                            ExecutionPhase::Decode,
+                        )
                         .unwrap();
                     model
                         .upload_ids(&model.manifest.position, &[(start + accepted) as u32])

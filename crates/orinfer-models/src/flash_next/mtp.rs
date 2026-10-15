@@ -95,6 +95,7 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
     {
         return Err("Unsupported Flash MTP profile coverage".into());
     }
+    let causal = super::causal_rows::present(manifest);
     let shared_target = super::unified_decode::shared(manifest);
     let shared_draft = super::draft_rows::present(manifest);
     let programs = &mut manifest.programs;
@@ -160,7 +161,11 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                 ));
             }
             commit.extend(section(
-                &restore,
+                if causal {
+                    "causal_rows/restore"
+                } else {
+                    &restore
+                },
                 &format!("layer{layer}"),
                 if layer == 1 {
                     3
@@ -217,7 +222,10 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| !n.starts_with("State_48_"))
                     .cloned()
-                    .chain([super::plan::score_role(p.tokens, "Verify")])
+                    .chain([super::plan::score_role(
+                        if causal { 8 } else { p.tokens },
+                        "Verify",
+                    )])
                     .collect(),
             },
         );
@@ -234,7 +242,10 @@ pub(super) fn build(manifest: &mut Manifest) -> Result<()> {
                     .keys()
                     .filter(|n| n.starts_with("State_48_"))
                     .cloned()
-                    .chain([super::plan::score_role(p.tokens, "Draft")])
+                    .chain([super::plan::score_role(
+                        if causal { 512 } else { p.tokens },
+                        "Draft",
+                    )])
                     .collect(),
             },
         );

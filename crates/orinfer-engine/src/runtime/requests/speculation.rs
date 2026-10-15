@@ -536,7 +536,11 @@ impl ModelRuntime {
                 )?;
             } else {
                 let round = &committed[0].1;
-                self.launch_program(&round.plan.restore_program, ExecutionPhase::Decode)?;
+                self.launch_rows(
+                    &round.plan.restore_program,
+                    round.plan.tokens,
+                    ExecutionPhase::Decode,
+                )?;
             }
             let restore_s = at.elapsed().as_secs_f64() / committed.len() as f64;
             let grouped_warm = self.manifest.mtp.as_ref().is_some_and(|s| s.batch_warm);
@@ -990,7 +994,7 @@ impl ModelRuntime {
         )?;
         self.upload_segment_controls(plan.tokens)?;
         self.launch_rows(&plan.program, plan.tokens, ExecutionPhase::Decode)?;
-        self.launch_program(&plan.capture_program, ExecutionPhase::Decode)?;
+        self.launch_rows(&plan.capture_program, plan.tokens, ExecutionPhase::Decode)?;
         req.mtp.verification_s += at.elapsed().as_secs_f64();
         Ok(())
     }
@@ -1111,7 +1115,7 @@ impl ModelRuntime {
         let at = Instant::now();
         if !restored && (spec.commit_always || committed.len() < plan.tokens) {
             self.upload_ids(&spec.accepted_inputs, &[committed.len() as u32])?;
-            self.launch_program(&plan.restore_program, ExecutionPhase::Decode)?;
+            self.launch_rows(&plan.restore_program, plan.tokens, ExecutionPhase::Decode)?;
         }
         if restored || spec.commit_always || committed.len() < plan.tokens {
             self.upload_ids(

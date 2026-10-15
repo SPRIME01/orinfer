@@ -139,55 +139,58 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             super::plan::section(&prefix, "head", if rows <= 8 { 8 } else { 9 }, None),
         );
     }
-    for tokens in SEGMENTS {
-        let prefix = format!("flash_segment_m{tokens}");
-        for layer in 0..48 {
-            let section = format!("layer{layer}/private");
-            let count = if layer % 4 == 3 { 19 } else { 2 };
-            m.programs.insert(
-                format!("{prefix}/{section}"),
-                super::plan::section(&prefix, &section, count, None),
-            );
-        }
-        m.programs.insert(
-            format!("{prefix}/layer1/ple"),
-            super::plan::section(&prefix, "layer1/ple", 2, None),
-        );
-        if m.mtp.is_some() {
-            let name = format!("flash_mixed_capture_m{tokens}");
-            m.programs
-                .insert(name.clone(), super::plan::section(&name, "body", 1, None));
-        }
-    }
-    if let Some(spec) = &m.mtp {
-        for &tokens in &spec.batch_verification_tokens {
-            if !(2..=8).contains(&tokens) {
-                return Err("Unsupported Flash verification segment".into());
-            }
-            let prefix = format!("flash_verify_segment_m{tokens}");
+    if !super::causal_rows::present(m) {
+        for tokens in SEGMENTS {
+            let prefix = format!("flash_segment_m{tokens}");
             for layer in 0..48 {
                 let section = format!("layer{layer}/private");
+                let count = if layer % 4 == 3 { 19 } else { 2 };
                 m.programs.insert(
                     format!("{prefix}/{section}"),
-                    super::plan::section(
-                        &prefix,
-                        &section,
-                        if layer % 4 == 3 { 20 } else { 4 },
-                        None,
-                    ),
+                    super::plan::section(&prefix, &section, count, None),
                 );
             }
             m.programs.insert(
                 format!("{prefix}/layer1/ple"),
-                super::plan::section(&prefix, "layer1/ple", 3, None),
+                super::plan::section(&prefix, "layer1/ple", 2, None),
             );
-            let capture = format!("flash_verify_capture_m{tokens}");
-            m.programs.insert(
-                capture.clone(),
-                super::plan::section(&capture, "body", 1, None),
-            );
+            if m.mtp.is_some() {
+                let name = format!("flash_mixed_capture_m{tokens}");
+                m.programs
+                    .insert(name.clone(), super::plan::section(&name, "body", 1, None));
+            }
+        }
+        if let Some(spec) = &m.mtp {
+            for &tokens in &spec.batch_verification_tokens {
+                if !(2..=8).contains(&tokens) {
+                    return Err("Unsupported Flash verification segment".into());
+                }
+                let prefix = format!("flash_verify_segment_m{tokens}");
+                for layer in 0..48 {
+                    let section = format!("layer{layer}/private");
+                    m.programs.insert(
+                        format!("{prefix}/{section}"),
+                        super::plan::section(
+                            &prefix,
+                            &section,
+                            if layer % 4 == 3 { 20 } else { 4 },
+                            None,
+                        ),
+                    );
+                }
+                m.programs.insert(
+                    format!("{prefix}/layer1/ple"),
+                    super::plan::section(&prefix, "layer1/ple", 3, None),
+                );
+                let capture = format!("flash_verify_capture_m{tokens}");
+                m.programs.insert(
+                    capture.clone(),
+                    super::plan::section(&capture, "body", 1, None),
+                );
+            }
         }
     }
+    super::causal_rows::register(m);
     Ok(())
 }
 
@@ -248,6 +251,21 @@ fn append(
             .map(|op| invoke(op, slot, views)),
     );
     Ok(())
+}
+
+fn append_causal(
+    out: &mut Vec<Invocation>,
+    m: &Manifest,
+    program: &str,
+    count: usize,
+    slot: Option<usize>,
+    views: &BTreeMap<String, BufferView>,
+) -> Result<()> {
+    if super::causal_rows::present(m) {
+        super::rows::append(m, out, program, count, slot, views)
+    } else {
+        append(out, m, program, slot, views)
+    }
 }
 
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
@@ -513,7 +531,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         if layer == 1 {
             append_body(&mut out, &format!("{prefix}/layer1/ple"))?;
             for (s, (_, _, views)) in segments.iter().zip(&starts) {
-                append(
+                append_causal(
                     &mut out,
                     m,
                     &format!(
@@ -525,6 +543,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                         },
                         s.tokens
                     ),
+                    s.tokens,
                     Some(s.slot),
                     views,
                 )?;
@@ -590,11 +609,29 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 s.tokens
             )];
             for (i, op) in private.iter().enumerate() {
-                out.push(invoke(op.clone(), Some(s.slot), views));
+                let mut invocation = invoke(op.clone(), Some(s.slot), views);
+                if super::causal_rows::present(m)
+                    && let Operation::Kernel { name } = op
+                {
+                    invocation.launch = Some(
+                        m.dynamic_batch_kernels
+                            .get(name)
+                            .ok_or("Missing causal row launch")?
+                            .launch(s.tokens)?,
+                    );
+                }
+                out.push(invocation);
                 if layer % 4 != 3 && i == usize::from(verified(s)) {
                     out.push(invoke(
                         Operation::Copy {
-                            source: format!("M{}_HistoryOut", super::plan::arena_width(s.tokens)),
+                            source: format!(
+                                "M{}_HistoryOut",
+                                if super::causal_rows::present(m) {
+                                    if verified(s) { 8 } else { 4096 }
+                                } else {
+                                    super::plan::arena_width(s.tokens)
+                                }
+                            ),
                             destination: format!("State_{layer}_conv"),
                             bytes: 61440,
                         },
@@ -637,13 +674,19 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     }
     let mut head_lane = 0;
     for (s, (first, program, views)) in segments.iter().zip(&starts) {
-        let name = format!("{program}/end/k0");
+        let name = if super::causal_rows::present(m) && verified(s) {
+            "causal_rows/verify/advance".into()
+        } else {
+            format!("{program}/end/k0")
+        };
         let mut invocation = invoke(
             Operation::Kernel { name: name.clone() },
             Some(s.slot),
             &empty,
         );
-        if m.row_execution.is_some() && !verified(s) && s.tokens > 1 {
+        if (super::causal_rows::present(m) && verified(s))
+            || (m.row_execution.is_some() && !verified(s) && s.tokens > 1)
+        {
             invocation.launch = Some(
                 m.dynamic_batch_kernels
                     .get(&name)
@@ -653,7 +696,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         }
         out.push(invocation);
         if m.mtp.is_some() {
-            append(
+            append_causal(
                 &mut out,
                 m,
                 &format!(
@@ -661,6 +704,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                     if verified(s) { "verify" } else { "mixed" },
                     s.tokens
                 ),
+                s.tokens,
                 Some(s.slot),
                 views,
             )?;
@@ -762,13 +806,25 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                     &views,
                 ));
             }
-            out.push(invoke(
-                Operation::Kernel {
-                    name: format!("verify_m{}/head/k8", s.tokens),
-                },
+            let name = if super::causal_rows::present(m) {
+                "causal_rows/verify/selections".into()
+            } else {
+                format!("verify_m{}/head/k8", s.tokens)
+            };
+            let mut selection = invoke(
+                Operation::Kernel { name: name.clone() },
                 Some(s.slot),
                 &empty,
-            ));
+            );
+            if super::causal_rows::present(m) {
+                selection.launch = Some(
+                    m.dynamic_batch_kernels
+                        .get(&name)
+                        .ok_or("Missing causal selection launch")?
+                        .launch(s.tokens)?,
+                );
+            }
+            out.push(selection);
             head_lane += s.tokens;
             continue;
         }

@@ -745,6 +745,53 @@ mod tests {
         m
     }
     #[test]
+    fn causal_mixed_controls_use_live_segment_lengths_and_owners() {
+        let mut m = verification_manifest();
+        m.mtp.as_mut().unwrap().mixed_verification_tokens = (2..=8).collect();
+        let marker = "causal_rows/verify/layer0/private/k0";
+        m.dynamic_batch_kernels
+            .insert(marker.into(), dynamic(marker, 8));
+        super::super::mixed::register(&mut m).unwrap();
+        for name in m.programs.values().flatten().filter_map(|op| {
+            if let Operation::Kernel { name } = op {
+                name.starts_with("causal_rows/").then_some(name)
+            } else {
+                None
+            }
+        }) {
+            m.dynamic_batch_kernels
+                .insert(name.clone(), dynamic(name, 512));
+        }
+        for name in ["advance", "selections"] {
+            let name = format!("causal_rows/verify/{name}");
+            m.dynamic_batch_kernels
+                .insert(name.clone(), dynamic(&name, 8));
+        }
+        super::super::causal_rows::configure(&mut m).unwrap();
+        for tokens in 2..=8 {
+            let segments = [
+                BatchSegment {
+                    slot: 9,
+                    tokens: 16,
+                },
+                BatchSegment { slot: 3, tokens },
+            ];
+            let plan = super::super::mixed::mixed_verification_plan(&m, &segments).unwrap();
+            for call in &plan {
+                let Operation::Kernel { name } = &call.operation else {
+                    continue;
+                };
+                assert!(!name.starts_with("verify_m") || name.contains("/begin/"));
+                if name.starts_with("causal_rows/") {
+                    let count = if call.sequence == Some(3) { tokens } else { 16 };
+                    assert!(matches!(call.sequence, Some(3 | 9)));
+                    assert_eq!(call.launch.as_ref().unwrap().arguments, [(0, count as i32)]);
+                }
+            }
+            assert!(plan.iter().any(|call| matches!(&call.operation, Operation::Kernel {name} if name=="causal_rows/verify/selections")));
+        }
+    }
+    #[test]
     fn mixed_verification_shares_body_but_keeps_endpoint_ranges_and_commit_private() {
         let m = verification_manifest();
         for segments in [

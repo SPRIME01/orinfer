@@ -57,8 +57,10 @@ def fuse(rows: int, hidden: int, branches: int = 4, dynamic_rows: bool = False):
 
 
 @orin_jit
-def history_prefix(rows: int, width: int, history: int):
+def history_prefix(rows: int, width: int, history: int, dynamic_rows: bool = False):
     """Save every chronological raw/PLE history before its final in-place shift."""
+
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def main(
@@ -81,8 +83,10 @@ def history_prefix(rows: int, width: int, history: int):
 
 
 @orin_jit
-def pending_prefix(rows: int):
+def pending_prefix(rows: int, dynamic_rows: bool = False):
     """Preserve all four physical raw index slots, including inactive old slots."""
+
+    rows = row_count(rows, dynamic_rows)
 
     @T.prim_func
     def main(
