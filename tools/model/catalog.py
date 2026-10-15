@@ -39,7 +39,7 @@ def factor(package):
         return indices[key]
 
     launch = {}
-    for item in dynamic:
+    for item in sorted(dynamic, key=lambda item: item["name"]):
         item = copy.deepcopy(item)
         name = item.pop("name")
         item.setdefault("capacity", 128)
@@ -48,7 +48,7 @@ def factor(package):
         launch[name] = intern(item, templates, template_ids)
     bindings = []
     seen = set()
-    for k in kernels:
+    for k in sorted(kernels, key=lambda k: k["name"]):
         if k["name"] in seen:
             raise ValueError("Duplicate native binding")
         seen.add(k["name"])
@@ -102,7 +102,7 @@ def expand(catalog, bindings):
 
 
 def rust_source(catalog, bindings):
-    roles, role_ids, groups, group_ids = [], {}, [], {}
+    roles, role_ids = [], {}
 
     def role(name):
         if name not in role_ids:
@@ -124,17 +124,34 @@ def rust_source(catalog, bindings):
             raise ValueError("Unknown native argument type")
         return f"A::{constructors[kind]}({a['value']})"
 
-    records = []
-    for b in bindings:
-        key = canonical(b["args"])
-        if key not in group_ids:
-            group_ids[key] = len(groups)
-            groups.append("&[" + ",".join(argument(a) for a in b["args"]) + "]")
-        dynamic = "None" if b["dynamic"] is None else f"Some({b['dynamic']})"
-        grid = ",".join(str(v) for v in b["grid"])
-        name = json.dumps(b["name"], ensure_ascii=False)
-        records.append(
-            f"B{{name:{name},definition:{b['definition']},grid:[{grid}],arguments:{group_ids[key]},dynamic:{dynamic},plan_contract:{str(b['plan_contract']).lower()}}}"
+    from tools.model.binding_templates import factor as layer_templates
+
+    registry = layer_templates(bindings)
+    parameters = [
+        "&[" + ",".join(argument(a) for a in group) + "]" for group in registry["parameters"]
+    ]
+    choices = []
+    for table in registry["choices"]:
+        records = []
+        for variant in table:
+            dynamic = "None" if variant["dynamic"] is None else f"Some({variant['dynamic']})"
+            grid = ",".join(str(v) for v in variant["grid"])
+            indices = ",".join(str(v) for v in variant["arguments"])
+            records.append(
+                f"V{{suffix:{json.dumps(variant['suffix'])},definition:{variant['definition']},"
+                f"grid:[{grid}],arguments:&[{indices}],dynamic:{dynamic},"
+                f"plan_contract:{str(variant['plan_contract']).lower()}}}"
+            )
+        choices.append("&[" + ",".join(records) + "]")
+    templates = []
+    for template in registry["templates"]:
+        layers = []
+        for instance in template["layers"]:
+            layer = "None" if instance["layer"] is None else f"Some({instance['layer']})"
+            layers.append(f"L{{layer:{layer},parameters:{instance['parameters']}}}")
+        templates.append(
+            f"T{{prefix:{json.dumps(template['prefix'])},suffix:{json.dumps(template['suffix'])},"
+            f"choice:{template['choice']},layers:&[{','.join(layers)}]}}"
         )
     identity = hashlib.sha256(
         canonical({k: v for k, v in catalog.items() if k != "binding_signature"})
@@ -143,14 +160,16 @@ def rust_source(catalog, bindings):
     if any(any(ord(c) < 32 or c in '\\"' for c in name) for name in roles):
         raise ValueError("Invalid compiler tensor role name")
     return (
-        "use orinfer_model_sdk::catalog::{RoleArgument as A,RoleBinding as B};\n"
+        "use orinfer_model_sdk::catalog::{RoleArgument as A,BindingRegistry as R,BindingTemplate as T,LayerBinding as L,BindingVariant as V};\n"
         f'pub const SIGNATURE: &str = "{catalog["binding_signature"]}";\n'
         f'pub const CATALOG_ID: &str = "{identity}";\n'
         "pub const ROLES: &[&str] = &["
         + ",".join(json.dumps(v, ensure_ascii=False) for v in roles)
         + "];\n"
-        "pub const ARGUMENTS: &[&[A]] = &[\n" + ",\n".join(groups) + "\n];\n"
-        "pub const BINDINGS: &[B] = &[\n" + ",\n".join(records) + "\n];\n"
+        "pub const PARAMETERS: &[&[A]] = &[\n" + ",\n".join(parameters) + "\n];\n"
+        "pub const CHOICES: &[&[V]] = &[\n" + ",\n".join(choices) + "\n];\n"
+        "pub const TEMPLATES: &[T] = &[\n" + ",\n".join(templates) + "\n];\n"
+        "pub const REGISTRY: R = R{roles:ROLES,parameters:PARAMETERS,choices:CHOICES,templates:TEMPLATES};\n"
     )
 
 
@@ -164,7 +183,9 @@ def seal(package, directory, engine=None):
             field: value for field, value in k.items() if field != "readonly_arguments" or value
         }
 
-    if [normalize(k) for k in reconstructed] != [normalize(k) for k in package["kernels"]]:
+    if {k["name"]: normalize(k) for k in reconstructed} != {
+        k["name"]: normalize(k) for k in package["kernels"]
+    }:
         raise ValueError("Compiled catalog failed exact binding roundtrip")
     if {v["name"]: v for v in dynamic} != {
         v["name"]: dict({"capacity": 128}, **v) for v in package.get("dynamic_batch_kernels", [])
@@ -216,14 +237,20 @@ def build_library(package, bindings, directory, engine=None):
         shutil.copyfile(target / "release/liborinfer_models.so", temporary)
         temporary.replace(library)
         # Corresponding source for the generated LGPL native binding module.
-        shutil.copyfile(source, library.with_name("bindings.rs"))
-        library.with_name("BUILD.txt").write_text(
+        generated = library.with_name("bindings.rs")
+        generated_temporary = generated.with_suffix(".tmp")
+        shutil.copyfile(source, generated_temporary)
+        generated_temporary.replace(generated)
+        instructions = library.with_name("BUILD.txt")
+        instructions_temporary = instructions.with_suffix(".tmp")
+        instructions_temporary.write_text(
             "Use the matching release source.tar.gz (included in the CLI archive).\n"
             "From that workspace, rebuild this library with:\n"
             "ORINFER_BINDINGS_SOURCE=/absolute/path/to/lib/bindings.rs "
             "cargo build --release --locked --offline -p orinfer-models\n"
             "The generated module contains tensor roles and ABI bindings, no weights.\n"
         )
+        instructions_temporary.replace(instructions)
     return execution_identity(library, engine, package["architecture"], package["compute_policy"])
 
 

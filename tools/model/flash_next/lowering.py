@@ -31,7 +31,7 @@ def operand_key(argument):
 def lower(data, package, operator, output):
     from kernels.model.e8p_exact import e8p_exact_grouped, split_a8
     from kernels.model.bf16_single import bf16_single
-    from kernels.model.q4_projection import q4_gemv, q4_projection
+    from tools.model.flash_next.decode_tuning import DecodeTuner
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.rows import explicit_rows
     from tools.model.upgrade_dynamic_batch import contract
@@ -39,6 +39,7 @@ def lower(data, package, operator, output):
     import tilelang
 
     reader, hosts, compiled = AssetReader(operator), {}, {}
+    tuner = DecodeTuner(output / "integer-tuning")
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
     policies = projection_policies(buffers)
     dynamics = {d["name"]: d for d in package.get("dynamic_batch_kernels", [])}
@@ -66,7 +67,7 @@ def lower(data, package, operator, output):
         if key not in compiled:
             print("COMPILE", key, flush=True)
             kernel = factory()
-            if symbolic:
+            if symbolic and not hasattr(kernel, "adapter"):
                 kernel = tilelang.compile(
                     explicit_rows(kernel),
                     out_idx=[],
@@ -217,31 +218,14 @@ def lower(data, package, operator, output):
                 prerequisites[identity] = a, s
                 plan_contracts.update((name, original["name"]))
             a, s = prerequisites[identity]
-            kind = policy.implementation(rows, symbolic)
-            bm = 8 if rows <= 128 else 32 if rows <= 512 else 64
             dtype = {"f16": "float16", "f32": "float32"}[buffers[p["Output"]["name"]]["dtype"]]
-            key = f"q4-{kind}-r{rows}-n{policy.outputs}-k{policy.inputs}-{dtype}-d{int(symbolic)}"
-            if kind == "gemv":
+            kernel, config = tuner.compile(
+                "q4", rows, policy.outputs, policy.inputs, dtype, dynamic=symbolic
+            )
+            key = f"q4-r{rows}-n{policy.outputs}-k{policy.inputs}-{dtype}-d{int(symbolic)}"
 
-                def factory():
-                    return q4_gemv(rows, policy.outputs, policy.inputs, output_dtype=dtype)
-            elif symbolic:
-
-                def factory():
-                    return q4_projection.__wrapped__(
-                        rows,
-                        policy.outputs,
-                        policy.inputs,
-                        block_m=bm,
-                        dynamic_rows=True,
-                        output_dtype=dtype,
-                    )
-            else:
-
-                def factory():
-                    return q4_projection(
-                        rows, policy.outputs, policy.inputs, block_m=bm, output_dtype=dtype
-                    )
+            def factory(kernel=kernel):
+                return kernel
 
             bound = dict(
                 A=a,
@@ -292,7 +276,8 @@ def lower(data, package, operator, output):
             continue
         bm = row_tile(reader.read(original["source"]).decode())
         if bm not in (8, 16):
-            raise ValueError("Unsupported exact expert routing tile")
+            # The coupled route/expert tuner installs a legal exact tile later.
+            continue
         tiles = math.prod(buffers[p["TileExpert"]["name"]]["shape"])
         prefix = f"ComputeE8P_R{assignments}_K{k}"
         args = {

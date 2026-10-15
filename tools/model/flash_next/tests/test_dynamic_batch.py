@@ -10,6 +10,27 @@ from tools.model.flash_next.decode_tuning import make_prim
 
 
 class DynamicRowsTests(unittest.TestCase):
+    def test_metadata_scalars_survive_independent_state_wrapping(self):
+        from kernels.model import qsa
+        from kernels.model.hc_bf16_cache import hc_up13_mix
+        from kernels.model.independent_rows import independent_rows
+
+        hc = explicit_rows(
+            hc_up13_mix.__wrapped__(1024, 2560, 320, base_exp=None, dynamic_rows=True)
+        )
+        self.assertEqual({p.name for p in hc.params if p.dtype == "int32"}, {"m", "base_exp"})
+        for primitive in (qsa.radix_histogram, qsa.radix_choose):
+            fn = primitive.__wrapped__(1, 262144, None)
+            roles = {b.name: ("private", "Scratch") for b in fn.buffer_map.values()}
+            fn, identities = independent_rows(fn, 128, roles, dict(Scratch=0), dynamic=True)
+            self.assertIn("shift", identities)
+            self.assertEqual({p.name for p in fn.params if p.dtype == "int32"}, {"m", "shift"})
+            self.assertFalse(
+                tir.analysis.undefined_vars(
+                    fn.body, list(fn.params) + [b.data for b in fn.buffer_map.values()]
+                )
+            )
+
     def test_moe_combine_bound_tracks_live_assignments_beyond_initial_capacity(self):
         for capacity in [8, 16, 128]:
             fn = explicit_rows(factory(f"combine-{capacity}", capacity))

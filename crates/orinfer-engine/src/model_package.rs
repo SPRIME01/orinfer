@@ -752,6 +752,7 @@ mod tests {
             CreateRequest {
                 catalog: None,
                 expert_contracts: false,
+                build_bindings: false,
                 kernel_contracts: vec![],
                 model_root: String::new(),
                 verify_weights: false,

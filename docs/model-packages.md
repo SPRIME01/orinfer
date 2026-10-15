@@ -24,7 +24,13 @@ MODEL_DIR/
 
 包内 `catalog` 只保存共享资产、编译实现定义和动态行数 launch 模板。定义包含 cubin/source/host ABI 索引、symbol、block、shared memory、cooperative、实际参数类型顺序及只读契约；不保存层号、权重名、逐层参数、grid 或完整执行程序。同一 cubin 可有多个不同 ABI/launch 契约，不能仅按二进制 hash 合并定义。
 
-离线编译得到的参数映射编译为 `.so` 内的 Rust 张量角色表、共享参数组和绑定表；该映射只记录实现与存储角色，执行顺序和融合仍由注册的 Rust 模型适配器生成。目录与映射分别固定身份，交换实现、参数类型、偏移或动态 launch 后必须重新构建匹配的库。运行时校验目录身份、buffer dtype/shape/layout 和边界，不依赖 Python 或在线编译。
+离线编译得到的参数映射编译为 `.so` 内的 Rust 张量角色表、共享调用模板、逐层参数表和去重特化选择表；该映射只记录实现与存储角色，执行顺序和融合仍由注册的 Rust 模型适配器生成。目录与映射分别固定身份，交换实现、参数类型、偏移或动态 launch 后必须重新构建匹配的库。运行时校验目录身份、buffer dtype/shape/layout 和边界，不依赖 Python 或在线编译。
+
+同类层共享调用模板和特化表，每层仅提供层号、权重、状态、workspace 角色及必要标量。模板实例化严格保留实参顺序、slice 偏移、标量位模式、grid 和动态 launch 契约；不会从权重名称推测计算或精度。独立 continuation 参数查找直接查询模板，不为查一个参数展开整个注册表。此因子分解在发布时逐条做精确往返校验，适用于两种模型适配器。
+
+Flash Next 的 HC 无损缓存指数和 QSA radix shift 通过已有 ABI 的整数标量绑定，共享相同计算实现；独立请求的 QSA 复用同一私有状态包装器。QSA 条带数离线测量选择。相邻行数区间仅在全部实参、资产及动态 launch 契约相同时合并。整数投影的固定行数和动态行数使用相同模板与候选空间，动态回退在多个实际行数上测量，选择结果随编译器、设备和源码身份失效；发布包不包含未选中的候选，不在运行时调优。
+
+在线创建只导出最终程序、全部局部特化候选和专家常驻契约引用的绑定；融合前的构建输入不注册为可执行 launch。`plan-model` 和 `validate-model` 通过内部创建参数 `build_bindings` 保留完整构建契约，供离线重建、完整资产校验和诊断。它不改变 schema 1 或 C ABI 1；运行时的实际逐层执行节点仍需实例化，CUDA Graph replay 不查询或解释模板。
 
 创建时用 JSON 传递配置、数据契约与小型编译目录。独立入口 `orinfer_model_plans_v1` 用 C 数组导出生成的 kernel 参数绑定和 kernel/copy/zero 程序；主 `orinfer_model_v1` 表保持 ABI 1。导出接口显式声明表及记录大小，数组、字符串和嵌套参数由同一个 owner 管理并释放。逐层绑定和完整程序不经过 JSON 序列化往返。动态 batch 热路径继续使用 C 数组，一次返回指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
 
@@ -116,3 +122,5 @@ bash tools/operators/run.sh tools/model/validate_model_package_gpu.py artifacts/
 ```
 
 夹具覆盖三种 graph 模式、输入变化和完整 logits，不代替真实模型质量或性能验收。
+
+Flash Next 的当前原生包可通过 `tools/model/flash_next/build.py` 重新生成整数投影与执行包。该入口读取模型固定的架构绑定契约，按真实矩阵调优，支持内容校验与断点恢复；状态、浮点归约和联合专家组合保持输入中的已验证实现。输入须包含匹配的执行包，量化中间权重不能直接作为部署模型。用法见 [Flash Next 构建](../tools/model/flash_next/README.md)。

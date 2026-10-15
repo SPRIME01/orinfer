@@ -9,6 +9,6 @@ fn main() {
         );
         fs::copy(source, destination).expect("copy generated native bindings");
     } else {
-        fs::write(destination, "pub const CATALOG_ID: &str = \"\";\npub const SIGNATURE: &str = \"\";\npub const ROLES: &[&str] = &[];\npub const ARGUMENTS: &[&[orinfer_model_sdk::catalog::RoleArgument]] = &[];\npub const BINDINGS: &[orinfer_model_sdk::catalog::RoleBinding] = &[];\n").expect("write empty binding registry");
+        fs::write(destination, "pub const CATALOG_ID: &str = \"\";\npub const SIGNATURE: &str = \"\";\npub const REGISTRY: orinfer_model_sdk::catalog::BindingRegistry = orinfer_model_sdk::catalog::BindingRegistry { roles: &[], parameters: &[], choices: &[], templates: &[] };\n").expect("write empty binding registry");
     }
 }

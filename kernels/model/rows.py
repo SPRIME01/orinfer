@@ -46,3 +46,18 @@ def explicit_rows(function):
         function.buffer_map,
         function.attrs,
     )
+
+
+def explicit_scalar(function, scalar):
+    """Expose a metadata scalar without changing tensor shapes or row strides."""
+    from tvm import tirx as tir
+
+    if any(p.same_as(scalar) for p in function.params):
+        return function
+    return tir.PrimFunc(
+        list(function.params) + [scalar],
+        function.body,
+        function.ret_type,
+        function.buffer_map,
+        function.attrs,
+    )

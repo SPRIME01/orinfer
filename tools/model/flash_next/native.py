@@ -41,7 +41,7 @@ from kernels.model.moe import (
     expert_histogram_finish,
 )
 from kernels.model.greedy import greedy_partials, greedy_merge
-from kernels.model.int8_projection import int8_projection, int8_gemv, int8_small_projection
+from kernels.model.int8_projection import int8_projection
 from kernels.model.int8_swiglu import int8_swiglu
 from kernels.model.integer_vq import integer_vq_grouped
 from kernels.model.rotation_a8 import rotate_activation_a8
@@ -414,52 +414,18 @@ class Model:
                 n, width = integer.shape
                 q, as_ = quantize(a, rows) if a8 is None else a8
                 od = str(out.dtype).split(".")[-1]
-                gemv = (2048 <= n < self.V and n * width >= 8 * 1024**2) or (
-                    self.decode_w8_optimized and 512 <= n < self.V
+                # Independent reference uses one portable matrix implementation.
+                # Published integer bodies are selected by DecodeTuner, not here.
+                bm, bn, bk, gm = 16, 64, 64, 0
+                call(
+                    f"dense-a8-{rows}-{n}-{width}-{od}-{bm}-{bn}-{bk}-{gm}",
+                    lambda: int8_projection(rows, n, width, od, bm, bn, bk, gm),
+                    q,
+                    integer,
+                    scale,
+                    as_.view(-1),
+                    out,
                 )
-                if rows <= 8 and n == 48 and width % 128 == 0:
-                    call(
-                        f"dense-small-a8-{rows}-{n}-{width}-{od}",
-                        lambda: int8_small_projection(rows, n, width, od),
-                        q.view(torch.int32),
-                        integer.view(torch.int32),
-                        scale,
-                        as_.view(-1),
-                        out,
-                    )
-                elif rows == 1 and gemv and width % 128 == 0:
-                    call(
-                        f"dense-gemv-{n}-{width}-{od}",
-                        lambda: int8_gemv(n, width, od, 8),
-                        q.view(torch.int32),
-                        integer.view(torch.int32),
-                        scale,
-                        as_.view(-1),
-                        out,
-                    )
-                else:
-                    large = rows >= 256 and n >= 512 and width % 128 == 0
-                    bm = (
-                        128
-                        if large
-                        else 64
-                        if rows >= 64 and n >= 512
-                        else 32
-                        if rows >= 32 and n >= 512
-                        else 16
-                    )
-                    bn, bk, gm = (128, 128, 4) if large else (64, 64, 0)
-                    if self.decode_w8_optimized and rows <= 8 and n >= 512 and width % 128 == 0:
-                        bk = 128
-                    call(
-                        f"dense-a8-{rows}-{n}-{width}-{od}-{bm}-{bn}-{bk}-{gm}",
-                        lambda: int8_projection(rows, n, width, od, bm, bn, bk, gm),
-                        q,
-                        integer,
-                        scale,
-                        as_.view(-1),
-                        out,
-                    )
                 labels[-1] = f"{label}:{labels[-1]}"
             else:
                 n, width = weight.shape
@@ -509,8 +475,8 @@ class Model:
                         )
                         labels[-1] = f"{label}:{labels[-1]}"
                         return
-                    # Give all 16 SMs work on the small BF16 router, preserving
-                    # the K traversal and accumulation/rounding semantics.
+                    # Portable reference tile; published row choices are measured
+                    # separately, preserving K traversal and output rounding.
                     bn = router_tile(rows, n, width, e, h)
                     call(
                         f"dense-{rows}-{n}-{width}-{wd}-{od}-{bn}",
@@ -1203,10 +1169,10 @@ class Model:
                 aq_shared, scale_shared = shared_a8
                 call(
                     f"shared-w8-swiglu-{m}",
-                    lambda: int8_swiglu(m, f, h, 4 if m == 1 else 64),
-                    aq_shared.view(torch.int32) if m == 1 else aq_shared,
-                    gate_w.view(torch.int32) if m == 1 else gate_w,
-                    up_w.view(torch.int32) if m == 1 else up_w,
+                    lambda: int8_swiglu(m, f, h),
+                    aq_shared,
+                    gate_w,
+                    up_w,
                     gate_s,
                     up_s,
                     scale_shared.view(-1),

@@ -42,20 +42,8 @@ def main():
             out = guarded[: m * n].view(m, n)
             project = int8_projection(m, n, k)
             activation = swiglu(m, n)
-            fused = int8_swiglu(m, n, k, 4 if m == 1 else 64)
-            operands = (
-                (
-                    x.view(torch.int32),
-                    wg.view(torch.int32),
-                    wu.view(torch.int32),
-                    gscale,
-                    uscale,
-                    scale,
-                    out,
-                )
-                if m == 1
-                else (*tensors, out)
-            )
+            fused = int8_swiglu(m, n, k)
+            operands = (*tensors, out)
 
             def reference():
                 project(x, wg, gscale, scale, g)

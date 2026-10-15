@@ -93,6 +93,9 @@ pub struct CreateRequest {
     pub catalog: Option<crate::catalog::Catalog>,
     #[serde(default)]
     pub expert_contracts: bool,
+    /// Offline inspection retains contracts used only while lowering the model.
+    #[serde(default)]
+    pub build_bindings: bool,
     /// Immutable bindings required by architecture-owned execution and residency contracts.
     #[serde(default)]
     pub kernel_contracts: Vec<crate::artifact::Kernel>,

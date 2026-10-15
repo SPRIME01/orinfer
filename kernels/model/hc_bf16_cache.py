@@ -3,7 +3,7 @@
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.rows import row_count
+from kernels.model.rows import row_count, explicit_scalar
 
 from kernels.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
 
@@ -39,7 +39,7 @@ def hc_up13_mix(
     streams: int = 4,
     dynamic_rows: bool = False,
     stage_count: int = 1,
-    base_exp: int = 99,
+    base_exp: int | None = 99,
     patch_count: int = 0,
     block_m: int = 8,
     weight_left: bool = True,
@@ -54,8 +54,10 @@ def hc_up13_mix(
         or not 0 <= patch_count <= 3
         or block_m not in (8, 16, 32, 64)
         or type(weight_left) is not bool
+        or (base_exp is not None and (type(base_exp) is not int or not 0 <= base_exp <= 224))
     ):
         raise ValueError("Unsupported exact BF16 HC read cache geometry")
+    exponent = T.dynamic("base_exp") if base_exp is None else base_exp
     bm, bn = block_m, 32
     M = row_count(M, dynamic_rows)
 
@@ -108,7 +110,7 @@ def hc_up13_mix(
                         & 1048575
                     )
                     v = T.call_pure_extern(
-                        "uint64", "hc_expand13_four", lo[n, j], q, T.uint32(base_exp)
+                        "uint64", "hc_expand13_four", lo[n, j], q, T.uint32(exponent)
                     )
                     T.call_extern("void", "hc_store13_four", T.access_ptr(w[n, j * 4], "w", 4), v)
                 if patch_count:
@@ -150,4 +152,8 @@ def hc_up13_mix(
                 if by * bm + i < M:
                     Out[by * bm + i, bx * bn + j] = total[i, j] / streams
 
-    return hc_up13_vector_project
+    return (
+        explicit_scalar(hc_up13_vector_project, exponent)
+        if base_exp is None
+        else hc_up13_vector_project
+    )

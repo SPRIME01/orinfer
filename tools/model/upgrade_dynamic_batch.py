@@ -19,8 +19,10 @@ from tools.model.publication import (
 from tools.operators.abi import parse_host, evaluate
 
 
-def expression(source, row_multiplier=1):
+def expression(source, row_multiplier=1, constants=None):
     def visit(node):
+        if isinstance(node, ast.Name) and constants and node.id in constants:
+            return dict(op="constant", value=constants[node.id])
         if (
             isinstance(node, ast.Constant)
             and type(node.value) is int
@@ -56,11 +58,16 @@ def expression(source, row_multiplier=1):
     return visit(ast.parse(source, mode="eval").body)
 
 
-def contract(kernel, host, capacity=128, row_multiplier=1):
+def contract(kernel, host, capacity=128, row_multiplier=1, constants=None):
     if type(row_multiplier) is not int or row_multiplier < 1:
         raise ValueError("Invalid launch row multiplier")
     rows = capacity * row_multiplier
-    dimensions = dict(M=rows, m=rows, rows=rows, batch=rows)
+    constants = constants or {}
+    if set(constants) & {"M", "m", "rows", "batch"} or any(
+        type(v) is not int or v < 0 or v > 0x7FFFFFFF for v in constants.values()
+    ):
+        raise ValueError("Invalid immutable launch scalars")
+    dimensions = dict(M=rows, m=rows, rows=rows, batch=rows, **constants)
     launch = host["launch_expressions"]
     if kernel["grid"] != [evaluate(launch["gridDim" + axis], dimensions) for axis in "XYZ"]:
         raise ValueError("Host grid differs from capacity binding")
@@ -75,13 +82,15 @@ def contract(kernel, host, capacity=128, row_multiplier=1):
         if exported["ctype"] in ("ctypes.c_int32", "c_int32"):
             if bound != dict(kind="i32", value=evaluate(exported["value"], dimensions)):
                 raise ValueError("Host scalar differs from capacity binding")
-            args.append(dict(index=index, value=expression(exported["value"], row_multiplier)))
+            args.append(
+                dict(index=index, value=expression(exported["value"], row_multiplier, constants))
+            )
         elif exported["ctype"] not in ("ctypes.c_void_p", "c_void_p") or bound["kind"] not in (
             "buffer",
             "buffer_slice",
         ):
             raise ValueError("Unsupported dynamic host ABI")
-    grid = [expression(launch["gridDim" + axis], row_multiplier) for axis in "XYZ"]
+    grid = [expression(launch["gridDim" + axis], row_multiplier, constants) for axis in "XYZ"]
     if kernel["name"].startswith("batch_gdn_m128/"):
         # These row-independent CTA bodies address one private arena per b.
         # The fixed capacity export changes only the number of batch CTAs.

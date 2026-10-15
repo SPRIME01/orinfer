@@ -15,16 +15,13 @@ def int8_swiglu(
     block_n: int = 64,
     dynamic_rows: bool = False,
     *,
-    algorithm: str | None = None,
+    algorithm: str = "tensor_core",
     block_m: int = 16,
 ):
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or M > 1024 or K % 128:
         raise ValueError("Invalid decode INT8 SwiGLU geometry")
     if K * 128 * 128 > 2**31 - 1 or block_n not in (4, 8, 16, 32, 64, 128):
         raise ValueError("Invalid INT8 SwiGLU accumulator/tile")
-    if algorithm is None:
-        algorithm = "dp4a" if M == 1 and not dynamic_rows else "tensor_core"
-        block_m = 1 if algorithm == "dp4a" else block_m
     if algorithm not in ("dp4a", "tensor_core"):
         raise ValueError("Invalid INT8 SwiGLU algorithm")
     packed = algorithm == "dp4a"

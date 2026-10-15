@@ -1,6 +1,31 @@
 use crate::artifact::{Access, Argument, Buffer, Kernel, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Include canonical fallbacks and every selected replacement, even rare tails.
+/// Build-only fusion inputs need not become executable host launch records.
+pub fn execution_kernels(
+    programs: &BTreeMap<String, Vec<Operation>>,
+    rows: Option<&crate::operators::rows::RowExecution>,
+) -> BTreeSet<String> {
+    let mut names = programs
+        .values()
+        .flatten()
+        .filter_map(|op| match op {
+            Operation::Kernel { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(rows) = rows {
+        names.extend(
+            rows.variants
+                .values()
+                .flatten()
+                .flat_map(|v| v.kernels.iter().cloned()),
+        );
+    }
+    names
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TensorIdentity {

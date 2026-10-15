@@ -1,22 +1,17 @@
-"""Validated static tiles shared by initial AOT builds and package upgrades."""
+"""Operand and portable reference contracts; published tiles are autotuned."""
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class ProjectionPolicy:
-    """Storage determines precision; row geometry only chooses the implementation."""
+    """Selected quantized operands, independent of execution row count."""
 
     packed: str
     scale: str
     signs: str
     outputs: int
     inputs: int
-
-    def implementation(self, rows, dynamic=False):
-        if type(rows) is not int or rows < 1 or type(dynamic) is not bool:
-            raise ValueError("Invalid projection rows")
-        return "gemv" if rows <= 8 and not dynamic else "tensor_core"
 
 
 def projection_policies(buffers):
@@ -52,31 +47,29 @@ def expert_implementation(rows, packed_k, *, nibble_book):
     expert_tile_config(rows)
     if packed_k not in (64, 128) or type(nibble_book) is not bool:
         raise ValueError("Invalid expert representation")
-    # Verified exact A8 decomposition applies to all small row shapes, not
-    # one named program. Larger causal chunks keep the same compressed bank.
-    return "exact_a8" if rows <= 8 and packed_k == 64 and nibble_book else "int8"
+    # Representation chooses the numerical codec. Legal route/GEMM geometry
+    # is selected separately, with the same compressed bank for every length.
+    return "exact_a8" if packed_k == 64 and nibble_book else "int8"
 
 
 def expert_tile_config(rows):
     if type(rows) is not int or not 1 <= rows <= 4096:
         raise ValueError("Unsupported expert row count")
-    block_m = (
-        64 if rows >= 1024 else 16 if rows == 512 else 32 if rows >= 256 else 8 if rows <= 8 else 16
-    )
-    shortbook = rows <= 8 or rows >= 256
+    # One legal compiler/reference configuration. Final row/expert portfolios
+    # are measured together; neither model rows nor matrix width selects a tile.
     return dict(
-        block_m=block_m,
-        block_n=128 if shortbook else 64,
-        shortbook=shortbook,
-        num_stages=2 if rows <= 4 else 1 if shortbook and block_m <= 32 else 2,
-        byte_permute=rows <= 8 or block_m == 64,
-        selectorbook=shortbook,
-        group_n=rows == 512,
+        block_m=64,
+        block_n=64,
+        shortbook=True,
+        num_stages=2,
+        byte_permute=True,
+        selectorbook=True,
+        group_n=False,
     )
 
 
 def router_tile(rows, outputs, inputs, experts, hidden):
-    return 32 if rows <= 8 and outputs == experts and inputs == hidden else 64
+    return 64
 
 
 def expert_projection_config(rows, inputs, *, parity_xor=False):
@@ -85,13 +78,7 @@ def expert_projection_config(rows, inputs, *, parity_xor=False):
     if type(parity_xor) is not bool:
         raise ValueError("Invalid E8P parity strategy")
     config = expert_tile_config(rows)
-    if rows <= 8:
-        config.update(
-            warp_decode=True,
-            block_n=32 if inputs >= 2048 else 64,
-            split_k=2 if inputs >= 2048 else 1,
-            num_stages=2,
-        )
-    if rows <= 8 and parity_xor:
-        config["parity_xor"] = True
+    if parity_xor:
+        # Explicit codec diagnostic, independent of token count or matrix size.
+        config.update(warp_decode=True, block_m=8, block_n=64, split_k=1, parity_xor=True)
     return config

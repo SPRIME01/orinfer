@@ -105,7 +105,7 @@ def clone_cpu_assets(source, destination):
         )
 
 
-def load_model(model):
+def load_model(model, *, plan=None):
     model = model.resolve(strict=True)
     data = json.loads((model / "cache/model.json").read_text())
     digest = data["execution_package"]
@@ -136,6 +136,8 @@ def load_model(model):
         )
         report = json.loads(completed.stdout)
         manifest = report["manifest"]
+        if plan is not None:
+            plan.update(manifest)
         package.pop("catalog")
         package["kernels"] = manifest["kernels"]
         package["dynamic_batch_kernels"] = list(manifest["dynamic_batch_kernels"].values())

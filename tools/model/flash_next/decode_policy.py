@@ -39,19 +39,27 @@ def selection_name(slot, minimum, maximum, *, skip=False):
 def q4_configs(rows):
     """Small, legal search space, shared by exact and runtime-row compilation."""
     bm = min(rows, 8)
-    return [
-        dict(algorithm="dp4a", block_m=bm, block_n=n, block_k=128, stages=2) for n in (8, 16)
-    ] + [
-        dict(algorithm="tensor_core", block_m=m, block_n=64, block_k=128, stages=2) for m in (8, 16)
-    ]
+    return (
+        [dict(algorithm="dp4a", block_m=bm, block_n=n, block_k=128, stages=2) for n in (8, 16)]
+        + [
+            dict(algorithm="tensor_core", block_m=m, block_n=n, block_k=128, stages=2)
+            for m in (8, 16, 32, 64)
+            for n in (64, 128)
+        ]
+        + [
+            dict(algorithm="tensor_core", block_m=128, block_n=n, block_k=k, stages=s)
+            for n in (64, 128)
+            for k, s in ((128, 1), (128, 2), (256, 1))
+        ]
+    )
 
 
 def w8_configs(rows, outputs):
     if outputs <= 0:
         raise ValueError("Invalid W8 output width")
-    return [dict(block_m=m, block_n=n, block_k=128) for m in (16, 32) for n in (64, 128)] + [
-        dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)
-    ]
+    return [
+        dict(block_m=m, block_n=n, block_k=128) for m in (16, 32, 64, 128) for n in (64, 128)
+    ] + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
 
 
 def swiglu_configs(rows):

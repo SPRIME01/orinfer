@@ -147,10 +147,11 @@ class Driver:
             self.functions[key] = f
         return self.functions[key]
 
-    def call(self, k, host, pointers, rows, multiplier):
+    def call(self, k, host, pointers, rows, multiplier, constants=None):
         import torch
 
         dims = dict(m=rows * multiplier, rows=rows * multiplier)
+        dims.update(constants or {})
         values = [
             C.c_uint64(pointers[a["name"]].data_ptr() + a.get("offset", 0))
             if a["kind"].startswith("buffer")

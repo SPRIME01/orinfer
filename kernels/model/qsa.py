@@ -10,7 +10,7 @@ All arithmetic is TileLang; allocations and request positions belong to callers.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.rows import row_count
+from kernels.model.rows import row_count, explicit_scalar
 
 
 def geometry(m, capacity):
@@ -193,9 +193,12 @@ def index_pending(m: int, dynamic_rows: bool = False):
 
 
 @orin_jit
-def index_scores(m: int, capacity: int, dynamic_rows: bool = False):
+def index_scores(m: int, capacity: int, dynamic_rows: bool = False, stripes: int | None = 8):
     blocks = geometry(m, capacity)
-    stripes = min((blocks + 63) // 64, 8 if m >= 16 else 64)
+    if stripes is not None and (type(stripes) is not int or stripes <= 0):
+        raise ValueError("Invalid QSA stripe count")
+    symbolic_stripes = stripes is None
+    stripes = T.dynamic("stripes") if symbolic_stripes else min((blocks + 63) // 64, stripes)
 
     m = count = row_count(m, dynamic_rows)
 
@@ -237,22 +240,25 @@ def index_scores(m: int, capacity: int, dynamic_rows: bool = False):
                     if qr * 4 + i < m and kb * 64 + j < (Position[0] + qr * 4 + i + 1) // 4:
                         Scores[kb * 64 + j, qr * 4 + i] = reduced[i, j] * 128**-0.5
 
-    return main
+    return explicit_scalar(main, stripes) if symbolic_stripes else main
 
 
 @orin_jit
 def radix_histogram(
     m: int,
     capacity: int,
-    shift: int,
+    shift: int | None,
     tile: int = 1024,
     dynamic_rows: bool = False,
 ):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
     stripes = min(segments, 2)
-    if shift not in (24, 16, 8, 0):
+    if shift is not None and shift not in (24, 16, 8, 0):
         raise ValueError("Invalid radix byte")
+
+    symbolic_shift = shift is None
+    shift = T.dynamic("shift") if symbolic_shift else shift
 
     m = row_count(m, dynamic_rows)
 
@@ -278,19 +284,24 @@ def radix_histogram(
                             T.atomic_add(hist[(key >> shift) & 255], 1)
                 T.copy(hist, Hist[row, segment, :])
 
-    return main
+    return explicit_scalar(main, shift) if symbolic_shift else main
 
 
 @orin_jit
 def radix_choose(
     m: int,
     capacity: int,
-    shift: int,
+    shift: int | None,
     tile: int = 1024,
     dynamic_rows: bool = False,
 ):
     blocks = geometry(m, capacity)
     segments = (blocks + tile - 1) // tile
+    if shift is not None and shift not in (24, 16, 8, 0):
+        raise ValueError("Invalid radix byte")
+
+    symbolic_shift = shift is None
+    shift = T.dynamic("shift") if symbolic_shift else shift
 
     m = row_count(m, dynamic_rows)
 
@@ -329,7 +340,7 @@ def radix_choose(
                 Prefix[row] = prefix
                 Remaining[row] = remain
 
-    return main
+    return explicit_scalar(main, shift) if symbolic_shift else main
 
 
 @orin_jit

@@ -88,8 +88,22 @@ class Compiler:
     def pointers(self, kernel):
         return pointer_bindings(kernel, self.host(kernel), allow_scalars=True)
 
-    def emit(self, old, name, bindings, rows, *, build=None, key=None, multiplier=1, symbolic=True):
-        if build is None:
+    def emit(
+        self,
+        old,
+        name,
+        bindings,
+        rows,
+        *,
+        build=None,
+        key=None,
+        multiplier=1,
+        symbolic=True,
+        constants=None,
+        kernel=None,
+        artifact=None,
+    ):
+        if build is None and kernel is None and artifact is None:
             host, assets = self.host(old), {f: old[f] for f in ("module", "source", "host_abi")}
             source = self.read(old["source"]).decode()
         else:
@@ -99,7 +113,6 @@ class Compiler:
 
             if key not in self.compiled:
                 print("COMPILE", key, flush=True)
-                fn = explicit_rows(build()) if symbolic else build()
                 passes = {}
                 if key.startswith("causal-gdn-"):
                     passes = {
@@ -110,15 +123,18 @@ class Compiler:
                     from tools.model.flash_next.decode_tuning import EXACT_PASSES
 
                     passes = EXACT_PASSES
-                kernel = tilelang.compile(
-                    fn,
-                    out_idx=[],
-                    execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
-                    pass_configs=passes,
-                )
-                folder = self.output / "aot" / key
-                export_kernel(kernel, folder)
+                if artifact is None and kernel is None:
+                    fn = explicit_rows(build()) if symbolic else build()
+                    kernel = tilelang.compile(
+                        fn,
+                        out_idx=[],
+                        execution_backend="nvrtc",
+                        target={"kind": "cuda", "arch": "sm_87"},
+                        pass_configs=passes,
+                    )
+                folder = artifact or self.output / "aot" / key
+                if artifact is None:
+                    export_kernel(kernel, folder)
                 assets = {}
                 for field, filename in [
                     ("module", "kernel.cubin"),
@@ -142,7 +158,7 @@ class Compiler:
             host,
             assets,
             bindings,
-            dimensions=dict(m=rows * multiplier, rows=rows * multiplier),
+            dimensions=dict(m=rows * multiplier, rows=rows * multiplier, **(constants or {})),
         )
         prototype = re.search(r"\b" + re.escape(result["symbol"]) + r"\s*\(([^)]*)\)", source)
         if prototype is None or len(prototype[1].split(",")) != len(result["args"]):
@@ -151,7 +167,7 @@ class Compiler:
             "*" not in value or bool(re.search(r"\bconst\b", value))
             for value in prototype[1].split(",")
         ]
-        launch = contract(result, host, rows, multiplier)
+        launch = contract(result, host, rows, multiplier, constants)
         return result, launch
 
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+resume=false
+if [[ "${1:-}" == --resume ]]; then resume=true; shift; fi
 if [[ $# -lt 2 ]]; then
-    echo "usage: run.sh tools/operators/opXX_name.py artifacts/operators/opXX_name/runNN [runner args]" >&2
+    echo "usage: run.sh [--resume] runner.py output-directory [runner args]" >&2
     exit 2
 fi
 runner="$1"
@@ -10,7 +12,7 @@ output_arg="$2"
 shift 2
 cd "$repo_dir"
 if [[ "$output_arg" = /* ]]; then output_dir="$output_arg"; else output_dir="$repo_dir/$output_arg"; fi
-if [[ -e "$output_dir" ]]; then echo "Refusing existing output: $output_dir" >&2; exit 2; fi
+if [[ -e "$output_dir" && "$resume" != true ]]; then echo "Refusing existing output: $output_dir (use --resume to reuse an offline build)" >&2; exit 2; fi
 mkdir -p "$output_dir"
 mkdir -p "$output_dir/measurement-source"
 cp --parents "$runner" tools/operators/common.py tools/operators/run.sh "$output_dir/measurement-source/"
@@ -110,6 +112,7 @@ cleanup() {
     python3 tools/bench/sample_machine.py --output "$output_dir/machine-after.json" || true
 }
 trap cleanup EXIT
+rm -f "$output_dir/sampler.stop"
 python3 tools/bench/sample_continuous.py --output "$output_dir/machine.jsonl" \
     --phase "$output_dir/phase.txt" --stop "$output_dir/sampler.stop" &
 sampler_pid=$!

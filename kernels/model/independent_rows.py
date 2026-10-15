@@ -57,6 +57,11 @@ def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=Fa
     replacement, data, lets, flat = {}, {}, [], {}
     private_columns = []
     for param in function.params:
+        if param not in function.buffer_map:
+            if param in used:
+                params.append(param)
+                identities.append(param.name)
+            continue
         original = function.buffer_map[param]
         if original.data not in used:
             continue

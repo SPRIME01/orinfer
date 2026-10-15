@@ -13,6 +13,7 @@ use orinfer_model_sdk::{
     architecture::BatchSegment,
 };
 struct Models {
+    bindings: Option<std::collections::BTreeSet<String>>,
     adapter: Box<dyn adapter::Adapter>,
     programs: std::collections::BTreeMap<String, Vec<model::Operation>>,
 }
@@ -37,6 +38,7 @@ impl ModelImplementation for Models {
     }
     fn create(mut request: CreateRequest) -> artifact::Result<(Self, CreatedPlan)> {
         let native = request.catalog.is_some();
+        let build_bindings = request.build_bindings;
         if let Some(catalog) = &request.catalog {
             request.kernel_contracts = bindings::kernels(catalog, request.expert_contracts)?;
             request.metadata.dynamic_batch_kernels = bindings::dynamic(catalog)?;
@@ -50,11 +52,28 @@ impl ModelImplementation for Models {
         if native {
             plan.metadata.dynamic_batch_kernels.clear();
         }
-        Ok((Self { adapter, programs }, plan))
+        let bindings = (!build_bindings).then(|| {
+            let mut names = orinfer_model_sdk::model::execution_kernels(
+                &programs,
+                plan.metadata.row_execution.as_ref(),
+            );
+            for bank in &plan.expert_banks {
+                names.extend(bank.consumers.keys().cloned());
+            }
+            names
+        });
+        Ok((
+            Self {
+                adapter,
+                programs,
+                bindings,
+            },
+            plan,
+        ))
     }
     fn execution(&self) -> artifact::Result<abi::plans::Execution> {
         Ok(abi::plans::Execution {
-            kernels: bindings::export()?,
+            kernels: bindings::export(self.bindings.as_ref())?,
             programs: self.programs.clone(),
         })
     }

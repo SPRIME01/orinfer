@@ -1,9 +1,14 @@
 """Native catalog factoring must preserve real host parameter order and launches."""
 
 import copy
+import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
-from tools.model.catalog import expand, factor, rust_source
+from tools.model.catalog import build_library, expand, factor, rust_source
+from tools.model.binding_templates import factor as templates, expand as expand_templates
 
 
 class CatalogTests(unittest.TestCase):
@@ -102,3 +107,84 @@ class CatalogTests(unittest.TestCase):
         p["plan_kernel_contracts"].append("missing")
         with self.assertRaisesRegex(ValueError, "Missing"):
             factor(p)
+
+    def test_layers_share_specialization_tables_with_exact_parameter_maps(self):
+        bindings = []
+        for layer in range(4):
+            for suffix, width in [("", 1024), ("/rows/1-1", 1), ("/rows/2-2", 2)]:
+                bindings.append(
+                    dict(
+                        name=f"target/layer{layer}/projection{suffix}",
+                        definition=width,
+                        grid=[width, 1, 1],
+                        args=[
+                            dict(kind="buffer", name=f"Weight{layer}"),
+                            dict(kind="buffer_slice", name=f"State{layer}", offset=layer * 64),
+                            dict(kind="i32", value=-width),
+                            dict(kind="f32", value=-0.0),
+                        ],
+                        dynamic=None if width == 1 else 0,
+                        plan_contract=True,
+                    )
+                )
+        registry = templates(bindings)
+        self.assertEqual(len(registry["templates"]), 1)
+        self.assertEqual(len(registry["choices"]), 1)
+        self.assertEqual(len(registry["choices"][0]), 3)
+        self.assertEqual(len(registry["templates"][0]["layers"]), 4)
+        self.assertEqual(
+            {b["name"]: b for b in expand_templates(registry)},
+            {b["name"]: b for b in bindings},
+        )
+        # A different aliasing pattern must get a separate parameter selector.
+        bindings[3]["args"][0] = bindings[3]["args"][1]
+        self.assertEqual(len(templates(bindings)["choices"]), 2)
+
+    def test_singletons_and_leading_zero_layer_names_are_preserved(self):
+        _, bindings = factor(self.package())
+        for name in ("vision/end/k0", "x/layer001/projection", "x/layer2end/projection"):
+            binding = dict(bindings[0], name=name)
+            self.assertEqual(expand_templates(templates([binding])), [binding])
+
+    def test_template_export_order_does_not_change_catalog_or_binding_identity(self):
+        original = self.package()
+        before, bindings = factor(original)
+        reordered = copy.deepcopy(original)
+        reordered["kernels"].reverse()
+        reordered["dynamic_batch_kernels"].reverse()
+        after, again = factor(reordered)
+        self.assertEqual(before, after)
+        self.assertEqual(bindings, again)
+        # Native export traverses templates, not the compiler input order.
+        reconstructed = expand_templates(templates(bindings))
+        kernels, dynamic, contracts = expand(before["catalog"], reconstructed)
+        third, third_bindings = factor(
+            dict(kernels=kernels, dynamic_batch_kernels=dynamic, plan_kernel_contracts=contracts)
+        )
+        self.assertEqual(third, before)
+        self.assertEqual(third_bindings, bindings)
+
+    def test_native_rebuild_preserves_hardlinked_source_package(self):
+        package, bindings = factor(self.package())
+        package.update(architecture="test", compute_policy="int8_quality")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before, after = root / "before/lib", root / "after/lib"
+            before.mkdir(parents=True)
+            after.mkdir(parents=True)
+            for name in ("bindings.rs", "BUILD.txt", "model.so"):
+                (before / name).write_bytes(b"immutable original")
+                os.link(before / name, after / name)
+            target = root / "artifacts/native-build/release/liborinfer_models.so"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"rebuilt library")
+            with (
+                patch("tools.model.catalog.ROOT", root),
+                patch("tools.model.catalog.subprocess.run"),
+                patch("tools.model.package.execution_identity", return_value={}),
+            ):
+                build_library(package, bindings, after.parent)
+            for name in ("bindings.rs", "BUILD.txt", "model.so"):
+                self.assertEqual((before / name).read_bytes(), b"immutable original")
+                self.assertFalse(os.path.samefile(before / name, after / name))
+            self.assertEqual((after / "model.so").read_bytes(), b"rebuilt library")

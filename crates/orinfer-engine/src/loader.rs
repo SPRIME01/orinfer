@@ -49,12 +49,20 @@ pub(crate) struct PreparedModel {
 }
 
 pub(crate) fn load(path: &Path, verify_weights: bool) -> Result<PreparedModel> {
-    load_with_experts(path, verify_weights, false)
+    load_impl(path, verify_weights, false, true)
 }
 pub(crate) fn load_with_experts(
     path: &Path,
     verify_weights: bool,
     expert_contracts: bool,
+) -> Result<PreparedModel> {
+    load_impl(path, verify_weights, expert_contracts, false)
+}
+fn load_impl(
+    path: &Path,
+    verify_weights: bool,
+    expert_contracts: bool,
+    build_bindings: bool,
 ) -> Result<PreparedModel> {
     let descriptor = crate::model::resolve_manifest(path)?;
     let weights_root = descriptor
@@ -108,6 +116,7 @@ pub(crate) fn load_with_experts(
         orinfer_model_sdk::abi::CreateRequest {
             catalog: Some(package.catalog),
             expert_contracts,
+            build_bindings,
             kernel_contracts: vec![],
             model_root: root.display().to_string(),
             verify_weights,
@@ -241,6 +250,76 @@ fn validate_dynamic_contracts(model: &Manifest) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    #[ignore = "Requires a prepared native model; CPU only, no GPU allocation"]
+    fn validate_native_execution_bindings() {
+        let path = std::path::PathBuf::from(std::env::var_os("ORINFER_MODEL").unwrap());
+        let inspection = load(&path, false).unwrap();
+        let runtime = load_with_experts(&path, false, false).unwrap();
+        let used = orinfer_model_sdk::model::execution_kernels(
+            &inspection.plan.programs,
+            inspection.plan.row_execution.as_ref(),
+        );
+        let before: BTreeMap<_, _> = inspection
+            .plan
+            .kernels
+            .iter()
+            .filter(|k| used.contains(&k.name))
+            .map(|k| (k.name.clone(), serde_json::to_value(k).unwrap()))
+            .collect();
+        let after: BTreeMap<_, _> = runtime
+            .plan
+            .kernels
+            .iter()
+            .map(|k| (k.name.clone(), serde_json::to_value(k).unwrap()))
+            .collect();
+        assert_eq!(
+            before, after,
+            "Execution export changed a binding or lost a replacement"
+        );
+        let mut expected = serde_json::to_value(&inspection.plan).unwrap();
+        let mut actual = serde_json::to_value(&runtime.plan).unwrap();
+        for value in [&mut expected, &mut actual] {
+            value.as_object_mut().unwrap().remove("kernels");
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("dynamic_batch_kernels");
+        }
+        assert_eq!(
+            expected, actual,
+            "Execution export changed programs or request state"
+        );
+        let dynamic: BTreeMap<_, _> = inspection
+            .plan
+            .dynamic_batch_kernels
+            .iter()
+            .filter(|(name, _)| used.contains(*name))
+            .map(|(name, k)| (name, serde_json::to_value(k).unwrap()))
+            .collect();
+        let runtime_dynamic: BTreeMap<_, _> = runtime
+            .plan
+            .dynamic_batch_kernels
+            .iter()
+            .map(|(name, k)| (name, serde_json::to_value(k).unwrap()))
+            .collect();
+        assert_eq!(dynamic, runtime_dynamic);
+        // Finite residency must also retain every consumer's routing operand.
+        let finite = load_with_experts(&path, false, true).unwrap();
+        let kernels: std::collections::BTreeSet<_> =
+            finite.plan.kernels.iter().map(|k| &k.name).collect();
+        for bank in &finite.expert_banks {
+            for name in bank.consumers.keys() {
+                assert!(kernels.contains(name));
+            }
+        }
+        eprintln!(
+            "Native bindings: {} build, {} execution; programs/state/launches unchanged",
+            inspection.plan.kernels.len(),
+            runtime.plan.kernels.len()
+        );
+    }
     #[test]
     fn rejects_embedded_user_execution_program_before_loading_resources() {
         let root = std::env::temp_dir().join(format!(
