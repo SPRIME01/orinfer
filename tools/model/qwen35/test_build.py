@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 import numpy as np
 from safetensors.numpy import save_file
@@ -53,6 +54,57 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_prefetch_views_bind_the_owning_kv_and_exported_abi(self):
+        first, merge = (lambda: None), (lambda: None)
+        first.__name__, merge.__name__ = "attention", "merge"
+        selection = dict(
+            configs=[
+                dict(block_m=64, block_n=64, head_group=1, max_splits=8, threads=256, stages=1)
+            ],
+            default="0",
+            selections=[],
+        )
+        builder = Builder.__new__(Builder)
+        builder.context, builder.lock = 262144, None
+        builder.row_tuner = SimpleNamespace(attention=lambda _: selection)
+        launches = []
+        builder.emit = lambda name, key, build, bindings, rows: launches.append(
+            (build(), bindings, rows)
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.attention_rows": SimpleNamespace(
+                        causal_attention_int8=first, merge_attention_int8=merge
+                    )
+                },
+            ),
+            patch("tools.model.qwen35.build.primitive", side_effect=lambda fn, *a, **k: k),
+        ):
+            builder.attention(
+                "draft_attention",
+                q="query",
+                gate="gate",
+                position="pos",
+                length="length",
+                output="output",
+                prefix="Draft",
+                rows=7,
+            )
+        options, bindings, rows = launches[0]
+        self.assertEqual((options["threads"], options["stages"], rows), (256, 1, 7))
+        for name, expected in (
+            ("k", "KPages"),
+            ("v", "VPages"),
+            ("ks", "KPagesScale"),
+            ("vs", "VPagesScale"),
+        ):
+            self.assertEqual(bindings[f"live_{name}"], "Draft" + expected)
+        self.assertEqual(bindings["Lengths"], "length")
+        self.assertNotIn("stages", launches[1][0])
+        self.assertNotIn("live_k", launches[1][1])
+
     def test_projection_publishes_one_dynamic_fallback_and_exact_aot_only(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)

@@ -44,6 +44,8 @@ def causal_attention_int8(
     kv_heads=4,
     dimension=256,
     head_group=None,
+    threads=128,
+    stages=0,
 ):
     groups = query_heads // kv_heads if head_group is None else head_group
     if (
@@ -52,6 +54,8 @@ def causal_attention_int8(
         or dimension % 64
         or block_m not in (16, 32, 64)
         or block_n not in (32, 64)
+        or threads not in (128, 256)
+        or stages not in (0, 1)
         or max_splits not in (1, 2, 4, 8, 16)
         or groups <= 0
         or (query_heads // kv_heads) % groups
@@ -63,7 +67,7 @@ def causal_attention_int8(
     tiles, splits = geometry(m, block_m, target_tiles, max_splits, groups)
     # splits > 1 implies tiles < target_tiles, and tiles*splits < 2*target_tiles.
     workspace_tiles = 2 * target_tiles
-    load_kv = int8_kv_tile(block_n, dimension)
+    load_kv = int8_kv_tile(block_n, dimension, threads)
 
     @T.prim_func
     def main(
@@ -80,7 +84,7 @@ def causal_attention_int8(
         Maximum: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
         Denominator: T.Tensor((work_heads, workspace_tiles, block_m), T.float32),
     ):
-        with T.Kernel(tiles, work_heads, splits, threads=128) as (qb, kh, split):
+        with T.Kernel(tiles, work_heads, splits, threads=threads) as (qb, kh, split):
             T.import_source(HALF2_SOURCE + SCALAR_SOURCE)
             split_count = T.alloc_local((1,), T.int32)
             split_count[0] = T.call_pure_extern(
@@ -90,6 +94,11 @@ def causal_attention_int8(
             k = T.alloc_shared((block_n, dimension), T.float16)
             v = T.alloc_shared((block_n, dimension), T.float16)
             p = T.alloc_shared((block_m, block_n), T.float16)
+            if stages:
+                packed_k = T.alloc_shared((1, block_n, dimension // 4), T.uint32)
+                packed_v = T.alloc_shared((1, block_n, dimension // 4), T.uint32)
+                scale_k = T.alloc_shared((1, block_n, dimension // 64), T.float16)
+                scale_v = T.alloc_shared((1, block_n, dimension // 64), T.float16)
             score = T.alloc_fragment((block_m, block_n), T.float32)
             out = T.alloc_fragment((block_m, dimension), T.float32)
             maximum = T.alloc_fragment((block_m,), T.float32)
@@ -111,14 +120,35 @@ def causal_attention_int8(
             width[0] = T.truncdiv(valid + split_count[0] - 1, split_count[0])
             start = split * width[0]
             end = T.min(start + width[0], valid)
+            if stages:
+                # Restrict the copy's source view to committed KV. Capacity may
+                # reserve uncommitted virtual pages beyond the live sequence.
+                live_k = T.decl_buffer((1, end, kv_heads * dimension // 4), T.uint32, data=K.data)
+                live_v = T.decl_buffer((1, end, kv_heads * dimension // 4), T.uint32, data=V.data)
+                live_ks = T.decl_buffer(
+                    (1, end, kv_heads * dimension // 64), T.float16, data=KS.data
+                )
+                live_vs = T.decl_buffer(
+                    (1, end, kv_heads * dimension // 64), T.float16, data=VS.data
+                )
             for i, d in T.Parallel(block_m, dimension):
                 token = (qb * block_m + i) // groups
                 q[i, d] = 0.0
                 if token < m:
                     q[i, d] = Q[token, kh * groups + (qb * block_m + i) % groups, d]
-            for tile in T.serial(T.ceildiv(T.max(0, end - start), block_n)):
+            for tile in T.Pipelined(T.ceildiv(T.max(0, end - start), block_n), num_stages=stages):
                 base = start + tile * block_n
-                load_kv(K, V, KS, VS, k, v, 0, kh // heads_per_kv, base, end)
+                if stages:
+                    # Prefetch compressed operands, rather than double-buffering
+                    # the larger decoded FP16 tiles. T.copy guards the physical
+                    # source boundary; load_kv also zeroes the live KV tail.
+                    T.copy(live_k[0, base, (kh // heads_per_kv) * (dimension // 4)], packed_k)
+                    T.copy(live_v[0, base, (kh // heads_per_kv) * (dimension // 4)], packed_v)
+                    T.copy(live_ks[0, base, (kh // heads_per_kv) * (dimension // 64)], scale_k)
+                    T.copy(live_vs[0, base, (kh // heads_per_kv) * (dimension // 64)], scale_v)
+                    load_kv(packed_k, packed_v, scale_k, scale_v, k, v, 0, 0, 0, end - base)
+                else:
+                    load_kv(K, V, KS, VS, k, v, 0, kh // heads_per_kv, base, end)
                 T.sync_threads()
                 T.clear(score)
                 T.gemm(q, k, score, transpose_B=True)

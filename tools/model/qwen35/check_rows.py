@@ -248,18 +248,28 @@ def attention_checks(context=1024, kv_length=None):
 
     result = []
     configurations = [
-        (m, n, scale, group, 8)
+        (m, n, scale, group, 8, 128, 0)
         for m, n in [(16, 32), (16, 64), (32, 64), (64, 32)]
         for scale in [1.0, 8.0]
         for group in [1, 6]
-    ] + [(32, 32, scale, 1, 1) for scale in [1.0, 8.0]]
-    for bm, bn, q_scale, head_group, splits in configurations:
+    ] + [(32, 32, scale, 1, 1, 128, 0) for scale in [1.0, 8.0]]
+    configurations += [(64, 64, scale, 1, 8, 256, 1) for scale in [1.0, 8.0]]
+    for bm, bn, q_scale, head_group, splits, threads, stages in configurations:
         target = 16
         valid = (context if kv_length is None else kv_length) - 5
         if not 256 <= valid + 5 <= context:
             raise ValueError("Expected 256 <= live KV length <= context capacity")
         first = primitive(
-            causal_attention_int8, 4096, context, bm, bn, target, splits, head_group=head_group
+            causal_attention_int8,
+            4096,
+            context,
+            bm,
+            bn,
+            target,
+            splits,
+            head_group=head_group,
+            threads=threads,
+            stages=stages,
         )
         second = primitive(merge_attention_int8, 4096, bm, target, splits, head_group=head_group)
         reference = primitive(attention_prefill_int8, 1, 4096, context, dynamic_rows=True)
@@ -270,11 +280,13 @@ def attention_checks(context=1024, kv_length=None):
             q = torch.randn((1, live, 24, 256), device="cuda", dtype=torch.float16) * q_scale
             gate = torch.randn_like(q)
             kv = [
-                torch.randint(-127, 128, (1, context, 4, 256), device="cuda", dtype=torch.int8)
+                # Reserve no readable tail beyond live KV: run under memcheck
+                # with the Torch allocator cache disabled to check prefetches.
+                torch.randint(-127, 128, (1, valid, 4, 256), device="cuda", dtype=torch.int8)
                 for _ in range(2)
             ]
             scales = [
-                torch.rand((1, context, 4, 4), device="cuda", dtype=torch.float16) * 0.003 + 0.00001
+                torch.rand((1, valid, 4, 4), device="cuda", dtype=torch.float16) * 0.003 + 0.00001
                 for _ in range(2)
             ]
             pos = (torch.arange(live, device="cuda", dtype=torch.int32) + valid - live)[None]
@@ -330,6 +342,8 @@ def attention_checks(context=1024, kv_length=None):
                     q_scale=q_scale,
                     head_group=head_group,
                     max_splits=splits,
+                    threads=threads,
+                    stages=stages,
                     context_capacity=context,
                     valid_context=valid,
                     max_abs=max_abs,

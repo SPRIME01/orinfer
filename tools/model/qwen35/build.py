@@ -369,25 +369,26 @@ class Builder:
         ]:
             for suffix, config in self.row_choices(selection, rows):
                 bm, bn, group = config["block_m"], config["block_n"], config["head_group"]
+                threads, stages = config.get("threads", 128), config.get("stages", 0)
+                options = dict(
+                    block_m=bm,
+                    target_tiles=ATTENTION_TARGET,
+                    max_splits=config["max_splits"],
+                    head_group=group,
+                )
+                if fn is causal_attention_int8:
+                    options.update(context=self.context, block_n=bn, threads=threads, stages=stages)
+                bindings = args
+                if fn is causal_attention_int8 and stages:
+                    # The compiler names the shared-pointer KV views in its
+                    # exported host ABI; both names refer to the same buffers.
+                    bindings = args | {f"live_{k.lower()}": args[k] for k in ("K", "V", "KS", "VS")}
                 self.emit(
                     role + suffix,
-                    f"gqa-rows-{fn.__name__}-{self.context}-{bm}-{bn}-{group}-{config['max_splits']}",
-                    lambda fn=fn, bm=bm, bn=bn, group=group, splits=config["max_splits"]: primitive(
-                        fn,
-                        CAPACITY,
-                        **dict(
-                            block_m=bm,
-                            target_tiles=ATTENTION_TARGET,
-                            max_splits=splits,
-                            head_group=group,
-                            **(
-                                dict(context=self.context, block_n=bn)
-                                if fn is causal_attention_int8
-                                else {}
-                            ),
-                        ),
-                    ),
-                    args,
+                    f"gqa-rows-{fn.__name__}-{self.context}-{bm}-{bn}-{group}-"
+                    f"{config['max_splits']}-{threads}-{stages}",
+                    lambda fn=fn, options=options: primitive(fn, CAPACITY, **options),
+                    bindings,
                     rows,
                 )
 

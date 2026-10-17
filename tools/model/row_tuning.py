@@ -15,6 +15,9 @@ from tools.model.publication import write_json
 
 ROTATION_TILES = (256, 512, 1024)
 ATTENTION_TILES = [(g, m, n) for g in (1, 6) for m in (16, 32, 64) for n in (32, 64)]
+ATTENTION_PIPELINES = [
+    dict(head_group=1, block_m=64, block_n=64, threads=256, stages=s) for s in (0, 1)
+]
 ATTENTION_TARGET = 16
 ATTENTION_SPLITS = 8
 GDN_AB_TILES = [
@@ -164,7 +167,7 @@ class RowTuner:
         configs = [
             dict(head_group=g, block_m=m, block_n=n, max_splits=ATTENTION_SPLITS)
             for g, m, n in ATTENTION_TILES
-        ]
+        ] + [c | dict(max_splits=ATTENTION_SPLITS) for c in ATTENTION_PIPELINES]
         # Include the unsplit reference geometry in the same computation body.
         # This removes split bookkeeping at compile time, without a row cutoff.
         configs.append(dict(head_group=1, block_m=32, block_n=32, max_splits=1))
@@ -181,6 +184,8 @@ class RowTuner:
                     ATTENTION_TARGET,
                     c["max_splits"],
                     head_group=c["head_group"],
+                    threads=c.get("threads", 128),
+                    stages=c.get("stages", 0),
                 ),
                 primitive(
                     merge_attention_int8,
@@ -199,11 +204,11 @@ class RowTuner:
                 q = torch.randn((rows, 24, 256), device="cuda", dtype=torch.float16) * 0.1
                 gate = torch.randn_like(q)
                 kv = [
-                    torch.randint(-127, 128, (1, length, 4, 256), device="cuda", dtype=torch.int8)
+                    torch.randint(-127, 128, (1, context, 4, 256), device="cuda", dtype=torch.int8)
                     for _ in range(2)
                 ]
                 scales = [
-                    torch.full((1, length, 4, 4), 0.001, device="cuda", dtype=torch.float16)
+                    torch.full((1, context, 4, 4), 0.001, device="cuda", dtype=torch.float16)
                     for _ in range(2)
                 ]
                 pos = torch.arange(length - rows, length, device="cuda", dtype=torch.int32)
