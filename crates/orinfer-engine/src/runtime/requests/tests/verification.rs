@@ -63,6 +63,14 @@ fn validate_joint_target_verification() {
     let mut results = vec![];
     for mixed in [false, true] {
         for width in [2, 4, 8] {
+            let supported = if mixed {
+                &spec.mixed_verification_tokens
+            } else {
+                &spec.batch_verification_tokens
+            };
+            if !supported.contains(&width) {
+                continue;
+            }
             for count in [1, 2, 4, 8] {
                 let mut expected = vec![];
                 let mut requests = vec![];
@@ -135,38 +143,93 @@ fn validate_joint_target_verification() {
                         .unwrap();
                     prefix = Some(req);
                 }
-                for (req, round) in requests.iter_mut().zip(&rounds) {
-                    model.execution.activate_sequence(req.slot).unwrap();
-                    model.upload_segment_controls(round.plan.tokens).unwrap();
+                // Repeat one fixed-history packet through direct execution,
+                // capture, then the hot replay path. Restore all private state,
+                // not only positions/KV, before presenting identical inputs.
+                let hot_replay = count == 2 && width == 2 && !mixed;
+                let mut snapshots = Vec::new();
+                if hot_replay {
+                    for req in &mut requests {
+                        snapshots.push(
+                            model
+                                .with_request(req, |m, _| {
+                                    let ranges = m
+                                        .execution
+                                        .private_buffer_sizes()
+                                        .into_iter()
+                                        .filter(|(_, bytes)| *bytes > 0)
+                                        .map(|(name, bytes)| {
+                                            (
+                                                name,
+                                                crate::cuda::snapshot::Range { offset: 0, bytes },
+                                            )
+                                        })
+                                        .collect();
+                                    let plan = m.execution.plan_snapshot(
+                                        ranges,
+                                        &Default::default(),
+                                        &[],
+                                    )?;
+                                    m.execution
+                                        .snapshot(&plan)?
+                                        .ok_or("No room for replay state".into())
+                                })
+                                .unwrap(),
+                        );
+                    }
+                }
+                let hits = model.scheduling_statistics().batch_execution.graph_hits;
+                for _ in 0..if hot_replay { 3 } else { 1 } {
+                    if hot_replay {
+                        segments.clear();
+                        for (req, snapshot) in requests.iter_mut().zip(&snapshots) {
+                            model
+                                .with_request(req, |m, _| m.execution.restore_snapshot(snapshot))
+                                .unwrap();
+                        }
+                    }
+                    for (req, round) in requests.iter_mut().zip(&rounds) {
+                        model.execution.activate_sequence(req.slot).unwrap();
+                        model.upload_segment_controls(round.plan.tokens).unwrap();
+                        model
+                            .execution
+                            .ensure_sequence_program(req.slot, &round.plan.program)
+                            .unwrap();
+                        model
+                            .upload_ids(&model.manifest.input, &round.verification)
+                            .unwrap();
+                        model
+                            .prepare_verification_inputs(
+                                &round.plan.program,
+                                &round.verification,
+                                &req.history[..req.history.len() - 1],
+                            )
+                            .unwrap();
+                        segments.push(BatchSegment {
+                            slot: req.slot,
+                            tokens: round.plan.tokens,
+                        });
+                    }
                     model
-                        .execution
-                        .ensure_sequence_program(req.slot, &round.plan.program)
-                        .unwrap();
-                    model
-                        .upload_ids(&model.manifest.input, &round.verification)
-                        .unwrap();
-                    model
-                        .prepare_verification_inputs(
-                            &round.plan.program,
-                            &round.verification,
-                            &req.history[..req.history.len() - 1],
+                        .execute_spec_packet(
+                            &segments,
+                            if mixed {
+                                orinfer_model_sdk::abi::BatchOperation::MixedRows { prefills: 1 }
+                            } else {
+                                orinfer_model_sdk::abi::BatchOperation::Verification
+                            },
                         )
                         .unwrap();
-                    segments.push(BatchSegment {
-                        slot: req.slot,
-                        tokens: round.plan.tokens,
-                    });
                 }
-                model
-                    .execute_spec_packet(
-                        &segments,
-                        if mixed {
-                            orinfer_model_sdk::abi::BatchOperation::MixedRows { prefills: 1 }
-                        } else {
-                            orinfer_model_sdk::abi::BatchOperation::Verification
-                        },
-                    )
-                    .unwrap();
+                if hot_replay && f.cuda_graph != "off" {
+                    assert!(
+                        model.scheduling_statistics().batch_execution.graph_hits > hits,
+                        "Repeated verification did not replay a graph"
+                    );
+                }
+                for snapshot in snapshots {
+                    model.execution.release_snapshot(snapshot).unwrap();
+                }
                 let mut max_kl = 0f64;
                 let mut max_nll = 0f64;
                 let mut compare = |baseline: &[Vec<f64>], actual: Vec<Vec<f64>>| {
@@ -211,7 +274,7 @@ fn validate_joint_target_verification() {
                 }
                 model.execution.reclaim_idle_state().unwrap();
                 assert_eq!(model.execution.resident_kv_bytes(), 0);
-                results.push(serde_json::json!({"mixed":mixed,"width":width,"batch":count,"max_kl":max_kl,"max_selected_nll_delta":max_nll}));
+                results.push(serde_json::json!({"mixed":mixed,"width":width,"batch":count,"hot_replay":hot_replay,"max_kl":max_kl,"max_selected_nll_delta":max_nll}));
                 std::fs::write(&f.output, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
             }
         }

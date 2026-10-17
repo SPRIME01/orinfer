@@ -25,8 +25,7 @@ pub struct TokenLogprob {
 
 pub struct Law {
     pub distribution: Distribution,
-    reporting: Option<Distribution>,
-    top: usize,
+    reporting: Option<super::reporting::Report>,
 }
 #[derive(Default)]
 pub struct Decoder {
@@ -114,39 +113,27 @@ impl Decoder {
                 return Err(error);
             }
         };
-        let distribution = Distribution::from_masked(logits, history, options, mask.as_deref());
-        if let Err(error) = &distribution
+        let scores = super::processed_scores(logits, history, options, mask.as_deref());
+        if let Err(error) = &scores
             && error == "Grammar permits no tokens"
         {
             self.fail(error.clone());
         }
-        let distribution = distribution?;
+        let mut scores = scores?;
         // Report the target law before top-k/nucleus truncation. Greedy selects
         // an argmax but still reports real softmax probabilities at T=1.
         let reporting = if options.top_logprobs.is_some() {
-            let report = Options {
-                temperature: if options.temperature == 0.0 {
-                    1.0
-                } else {
-                    options.temperature
-                },
-                top_p: 1.0,
-                top_k: 0,
-                ..options.clone()
-            };
-            Some(Distribution::from_masked(
-                logits,
-                history,
-                &report,
-                mask.as_deref(),
-            )?)
+            Some(super::reporting::Report::new(
+                &mut scores,
+                logits.len(),
+                options,
+            ))
         } else {
             None
         };
         Ok(Law {
-            distribution,
+            distribution: Distribution::from_scores(logits.len(), scores, options),
             reporting,
-            top: options.top_logprobs.unwrap_or(0),
         })
     }
     pub fn consume(&mut self, token: u32) -> Result<()> {
@@ -161,17 +148,7 @@ impl Decoder {
     pub fn commit(&mut self, token: u32, law: Law) -> Result<()> {
         self.consume(token)?;
         if let Some(reporting) = law.reporting {
-            let log = |p: f64| p.ln().max(-9999.0);
-            self.records.push(TokenLogprob {
-                token,
-                logprob: log(reporting.probability(token)),
-                top: reporting
-                    .ordered
-                    .iter()
-                    .take(law.top)
-                    .map(|&(t, p)| (t, log(p)))
-                    .collect(),
-            });
+            self.records.push(reporting.record(token));
         }
         Ok(())
     }

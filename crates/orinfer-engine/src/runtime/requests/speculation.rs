@@ -870,8 +870,10 @@ impl ModelRuntime {
             ..req.sampling.clone()
         };
         let i = drafts.len();
-        let selected = self.read_control(&spec.token)?;
-        if self.read_control(&spec.status)? != 0 || selected < 0 || selected as usize >= vocab {
+        let [selected, status] = self
+            .execution
+            .read_control_group([&spec.token, &spec.status])?;
+        if status != 0 || selected < 0 || selected as usize >= vocab {
             return Err("Invalid request draft token".into());
         }
         let token = if !host_sampling {

@@ -2,6 +2,54 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## Rust Graph 命中与概率报告（2026-10-17）
+
+完整 batch Graph 命中后复用已有绑定与 kernel 模块，跳过执行计划的地址展开和重复注册检查；COW、live workspace 保存、请求 arena 失效及间接 Graph 的地址校验仍先执行。普通、验证、draft、warm 和 mixed 使用公共执行器，不增加模型或 batch 专用程序；本节对照双方使用相同权重、原生执行库与 cubin。
+
+logprobs 与实际采样共用一次 history／penalty／bias／grammar 处理，通过线性选择取得前 N 个概率，只排序 N 项，按完整词表归一化。实际采样 CDF、随机数与 MTP 接受判定保持原有契约。概率报告不再因累计质量的舍入而丢弃极小但非零的尾部概率；指数真正下溢或被 mask 的概率仍按原有下限报告。
+
+Rust release CLI 的真实 SSE 请求，617-token 输入、MTP 草稿上限 3、`medium` thinking 且思考上限 32 tokens、seed 20261002、`decode_only`、专家全量常驻。每档预热一轮后测三轮完整 prefix 命中请求，取实际输出 tokens / HTTP 总耗时的中位数；这不是 GPU-only decode TPS。普通 greedy 输出预算 128 tokens；非贪心单流为温度 0.7、top-k 20、top-p 0.8、64-token 输出预算。
+
+| 模型／场景 | 改动前总 TPS | 改动后总 TPS | 变化 |
+| --- | ---: | ---: | ---: |
+| Flash Next，greedy，1 并发 | 46.92 | 47.73 | +1.72% |
+| Flash Next，greedy，4 并发 | 75.25 | 74.20 | -1.40% |
+| Flash Next，greedy，8 并发 | 112.68 | 114.76 | +1.85% |
+| Flash Next，非贪心，无 logprobs | 36.24 | 37.63 | +3.84% |
+| Flash Next，非贪心，top-3 logprobs | 22.84 | 33.69 | +47.50% |
+| 27B，greedy，1 并发 | 26.03 | 26.15 | +0.48% |
+| 27B，greedy，4 并发 | 58.60 | 58.99 | +0.67% |
+| 27B，greedy，8 并发 | 80.41 | 80.19 | -0.27% |
+| 27B，非贪心，无 logprobs | 23.49 | 23.67 | +0.78% |
+| 27B，非贪心，top-3 logprobs | 17.81 | 22.07 | +23.89% |
+
+普通 greedy MTP 的变化在约 ±2% 内，不能据此宣称普遍提高 decode 性能；主要收益集中在请求概率报告。独立 CPU 微测使用固定 seed 的 248,320 维合成 logits、8K 历史，top-20 采样加 top-3 logprobs 从 18.75 ms 降到 4.80 ms（约 -74%）；该数字不是模型推理吞吐。
+
+独立 Nsight Systems 四并发 MTP trace 取末尾 100 次紧接 stream 同步的完整 packet Graph，排除共享 Graph 片段与 direct kernel 串联区间。上一 stream 同步返回至 Graph 提交的 host 间隔中位数为 1.051 → 0.856 ms，P95 为 1.160 → 1.189 ms；其中 GPU 执行至少 10 ms 的较大 packet，host 间隔中位数仅从 1.083 降至 1.022 ms。该诊断包含 CPU 准备和小传输 API 工作，不能作为 GPU 执行加速或端到端吞吐结论。
+
+120 对 API 响应中，全部 90 对热态请求的正文、思考、usage 和停止原因相同；5 对冷请求的正文有复现差异，分布在 Flash Next 单流非贪心及 27B 四／八并发，其他字段相同。动态调度的冷请求全程输出不保证逐 token 复现，不能以此替代固定历史概率与状态检查。
+
+27B 的 24 组、Flash Next 的 16 组固定历史 target／mixed 对照，最大 KL 与所选 token NLL 差异均为 0；各增加一组完整私有状态恢复后的直接执行、捕获和热回放检查。两模型各 4 组 draft／commit 对照的最大 KL 同样为 0，位置与清理检查通过。采样单测覆盖 mask、惩罚、bias、概率并列及 top-k 0／1／20／1024，报告前后的完整采样 CDF 和固定 seed 选择相同。 两模型的 Graph `off/full` 下 prefix 恢复、惩罚采样、非贪心 MTP、logprobs、JSON 约束、图片及多图 API 检查通过；`make check` 与最终 Rust fmt／clippy／测试通过。
+
+## Rust 输入传输与控制回读（2026-10-17）
+
+小输入由会话持有的 pinned 缓冲池异步上传，按 stream 顺序消费；槽位复用等待对应 DMA 完成，KV 增长、COW 和请求切换仍保留必要依赖。控制量成组回读，Flash Next 的 CPU embedding/PLE 缓存返回不可变共享行。缓冲池按需分配，上限约 4 MiB；大于 256 KiB 的单次输入保留原有有界同步传输。Flash Next 执行库已重建，权重、GPU kernel 和完整导出执行计划不变。
+
+Rust release CLI 的真实 SSE 请求，617-token 输入、96-token 输出预算、`medium` thinking 且思考上限 32 tokens、greedy、seed 20261002、`decode_only`、专家全量常驻。每个并发档预热一轮，再取两轮完整前缀命中的中位数。下表为每轮实际输出 tokens / HTTP 总耗时，包含恢复、调度与传输；各格为改动前 → 改动后，不能与完整代码生成的纯 decode TPS 混用。
+
+| 模型 | MTP 草稿上限 | 1 并发 | 2 并发 | 4 并发 | 8 并发 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Flash Next | 0 | 27.12 → 26.90 | 46.32 → 46.93 | 77.64 → 79.04 | 120.67 → 123.32 |
+| Flash Next | 3 | 46.92 → 47.56 | 43.54 → 44.40 | 74.49 → 75.98 | 110.73 → 112.95 |
+| 27B | 0 | 10.89 → 10.93 | 20.40 → 20.57 | 37.43 → 37.66 | 60.86 → 63.68 |
+| 27B | 3 | 24.64 → 24.78 | 44.88 → 46.40 | 55.00 → 52.92 | 80.62 → 83.00 |
+
+针对短测中的单流和四并发波动，另以 256-token 输出预算反向运行新旧版本，每版预热一轮后测三轮。Flash Next 单流无 MTP 为 27.15 → 27.11 TPS（-0.14%）；27B 四并发 MTP 为 60.17 → 61.96 TPS（+2.98%）。短测的四并发回退未在这组更长测量中复现，单流收益接近测量波动。
+
+独立 Nsight Systems 单流无 MTP trace 中，热态 Graph 间隔中位数由 0.977 ms 降到 0.751 ms，稳态小输入不再使用 context 全局同步；trace 中 128 个 CLI 输出 token 与对照逐项相同。该 trace 的时间不作为端到端吞吐验收值。
+
+96-token 对照的 180 对 API 响应中，全部 120 对热态请求的正文、思考、usage 和停止原因一致；两条 27B 八并发冷请求的正文存在差异。256-token 的 27B 并发生成在冷、热请求中也有正文复现差异，旧基线自身的冷、热输出同样不完全一致。动态调度下的全程输出复现仍需单独定位。固定历史的单／多路 target、verification 和 mixed 对照覆盖 27B 的 24 组、Flash Next 的 16 组，最大 KL 与所选 token NLL 差异均为 0；Flash Next 包声明的 mixed 验证宽度为 2。`off/full` Graph 的 prefix、惩罚、非贪心 MTP、logprobs、JSON 约束、图片和多图请求通过。
+
 ## 27B 分层 prefill 与批量 MTP（2026-10-17）
 
 27B 与 Flash Next 共用分层注册、动态行调用、私有地址绑定及运行时调度。Prefill 保持原 token 块，在模型声明的层边界暂停；相邻层按剩余时间预算及实测层成本连续执行，不固定每组层数。普通 decode 的私有 GDN／attention 从原单行计算体包装成动态 1–128 请求 kernel。批量 target 验证、draft、commit、warm 和混合 prefill／verification 共用原有计算体及显式请求角色，分别绑定请求状态。

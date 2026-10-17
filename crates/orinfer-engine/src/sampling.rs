@@ -5,6 +5,7 @@
 pub const EVALUATION_SEED: u64 = 20_261_002;
 
 mod constrained;
+mod reporting;
 pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -86,6 +87,68 @@ impl Options {
             && self.logit_bias.is_empty()
     }
 }
+fn processed_scores(
+    logits: &[f32],
+    history: &[u32],
+    options: &Options,
+    mask: Option<&[u32]>,
+) -> Result<Vec<(u32, f64)>, String> {
+    options.validate()?;
+    if logits.is_empty()
+        || logits.len() > u32::MAX as usize
+        || logits.iter().any(|x| !x.is_finite())
+    {
+        return Err("Invalid sampling logits".into());
+    }
+    let mut counts = if options.repetition_penalty != 1.0
+        || options.presence_penalty != 0.0
+        || options.frequency_penalty != 0.0
+    {
+        vec![0usize; logits.len()]
+    } else {
+        vec![]
+    };
+    if !counts.is_empty() {
+        for &id in history {
+            if let Some(n) = counts.get_mut(id as usize) {
+                *n += 1;
+            }
+        }
+    }
+    let mut scores: Vec<(u32, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &value)| {
+            let mut score = f64::from(value);
+            let count = counts.get(i).copied().unwrap_or(0);
+            if count > 0 {
+                score = if score < 0.0 {
+                    score * options.repetition_penalty
+                } else {
+                    score / options.repetition_penalty
+                };
+                score -= options.presence_penalty;
+            }
+            score -= options.frequency_penalty * count as f64;
+            score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
+            (i as u32, score)
+        })
+        .collect();
+    if scores.iter().any(|(_, score)| !score.is_finite()) {
+        return Err("Nonfinite processed sampling logits".into());
+    }
+    if let Some(mask) = mask {
+        scores.retain(|(id, _)| {
+            mask.get(*id as usize / 32)
+                .is_some_and(|bits| bits & (1 << (*id % 32)) != 0)
+        });
+        if scores.is_empty() {
+            return Err("Grammar permits no tokens".into());
+        }
+    }
+    Ok(scores)
+}
+
 /// Normalized target or draft law after applying the same history processors.
 /// Small truncated laws store only their support; large laws retain dense lookup.
 #[derive(Clone, Debug)]
@@ -104,59 +167,12 @@ impl Distribution {
         options: &Options,
         mask: Option<&[u32]>,
     ) -> Result<Self, String> {
-        options.validate()?;
-        if logits.is_empty()
-            || logits.len() > u32::MAX as usize
-            || logits.iter().any(|x| !x.is_finite())
-        {
-            return Err("Invalid sampling logits".into());
-        }
-        let mut counts = if options.repetition_penalty != 1.0
-            || options.presence_penalty != 0.0
-            || options.frequency_penalty != 0.0
-        {
-            vec![0usize; logits.len()]
-        } else {
-            vec![]
-        };
-        if !counts.is_empty() {
-            for &id in history {
-                if let Some(n) = counts.get_mut(id as usize) {
-                    *n += 1;
-                }
-            }
-        }
-        let mut scores: Vec<(u32, f64)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &value)| {
-                let mut score = f64::from(value);
-                let count = counts.get(i).copied().unwrap_or(0);
-                if count > 0 {
-                    score = if score < 0.0 {
-                        score * options.repetition_penalty
-                    } else {
-                        score / options.repetition_penalty
-                    };
-                    score -= options.presence_penalty;
-                }
-                score -= options.frequency_penalty * count as f64;
-                score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
-                (i as u32, score)
-            })
-            .collect();
-        if scores.iter().any(|(_, score)| !score.is_finite()) {
-            return Err("Nonfinite processed sampling logits".into());
-        }
-        if let Some(mask) = mask {
-            scores.retain(|(id, _)| {
-                mask.get(*id as usize / 32)
-                    .is_some_and(|bits| bits & (1 << (*id % 32)) != 0)
-            });
-            if scores.is_empty() {
-                return Err("Grammar permits no tokens".into());
-            }
-        }
+        let scores = processed_scores(logits, history, options, mask)?;
+        Ok(Self::from_scores(logits.len(), scores, options))
+    }
+    // Only called after processing/validation; the score vector may have been
+    // partitioned for reporting, but total ordering fixes the same sampling CDF.
+    fn from_scores(vocab: usize, mut scores: Vec<(u32, f64)>, options: &Options) -> Self {
         let compare =
             |a: &(u32, f64), b: &(u32, f64)| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0));
         if options.temperature == 0.0 {
@@ -191,17 +207,17 @@ impl Distribution {
             }
         }
         let probabilities = (scores.len() > 128).then(|| {
-            let mut dense = vec![0.0; logits.len()];
+            let mut dense = vec![0.0; vocab];
             for &(id, mass) in &scores {
                 dense[id as usize] = mass;
             }
             dense
         });
-        Ok(Self {
+        Self {
             probabilities,
-            vocab: logits.len(),
+            vocab,
             ordered: scores,
-        })
+        }
     }
     pub fn probability(&self, token: u32) -> f64 {
         if let Some(dense) = &self.probabilities {

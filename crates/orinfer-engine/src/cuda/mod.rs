@@ -14,6 +14,7 @@ pub(crate) mod experts;
 mod kernels;
 mod sequence;
 pub(crate) mod snapshot;
+mod transfers;
 mod virtual_memory;
 mod weight_upload;
 pub(crate) use cudarc::driver::sys;
@@ -60,6 +61,7 @@ impl Driver {
             b"cuMemFreeHost\0".as_slice(),
             b"cuMemcpyDtoDAsync_v2\0".as_slice(),
             b"cuMemcpyDtoH_v2\0".as_slice(),
+            b"cuMemcpyDtoHAsync_v2\0".as_slice(),
             b"cuMemsetD8Async\0".as_slice(),
             b"cuModuleLoadData\0".as_slice(),
             b"cuModuleUnload\0".as_slice(),
@@ -141,6 +143,7 @@ pub(crate) struct Session {
     pub(crate) capturing: bool,
     pub(crate) parallel_handles:
         std::cell::RefCell<Option<(sys::CUstream, sys::CUevent, sys::CUevent)>>,
+    transfers: std::cell::RefCell<transfers::Transfers>,
 }
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
@@ -161,6 +164,7 @@ impl Session {
             graphs: Default::default(),
             capturing: false,
             parallel_handles: Default::default(),
+            transfers: Default::default(),
         }
     }
     pub(crate) fn cleanup(&mut self) -> Result<()> {
@@ -183,10 +187,13 @@ impl Session {
                 self.capturing = false;
             }
             if !self.stream.is_null() {
-                record(
-                    sys::cuStreamSynchronize(self.stream),
-                    "cleanup stream synchronize",
-                );
+                let completed = sys::cuStreamSynchronize(self.stream);
+                record(completed, "cleanup stream synchronize");
+                if completed == sys::CUresult::CUDA_SUCCESS {
+                    for (code, operation) in self.transfers.get_mut().release() {
+                        record(code, operation);
+                    }
+                }
             }
             if !self.exec.is_null() {
                 record(sys::cuGraphExecDestroy(self.exec), "destroy graph exec");

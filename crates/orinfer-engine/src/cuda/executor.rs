@@ -893,11 +893,16 @@ impl Executor {
         if self.session.virtual_buffers.borrow().is_empty() {
             return Ok(());
         }
-        self.sync()?;
-        let position = usize::try_from(self.read_control(&growth.position)?)
-            .map_err(|_| "Negative KV write position")?;
-        let count = match &growth.length {
-            Some(name) => usize::try_from(self.read_control(name)?)
+        let (position, length) = match &growth.length {
+            Some(name) => {
+                let [position, length] = self.read_control_group([&growth.position, name])?;
+                (position, Some(length))
+            }
+            None => (self.read_control(&growth.position)?, None),
+        };
+        let position = usize::try_from(position).map_err(|_| "Negative KV write position")?;
+        let count = match length {
+            Some(length) => usize::try_from(length)
                 .ok()
                 .filter(|&n| n > 0 && n <= growth.tokens)
                 .ok_or("Invalid logical KV write length")?,
@@ -970,44 +975,60 @@ impl Executor {
         Ok(())
     }
     pub(crate) fn upload_ids(&self, name: &str, ids: &[u32]) -> Result<()> {
-        if ids.len() * 4 > self.sizes[name] {
-            return Err("Token upload exceeds buffer".into());
-        }
-        self.sync()?;
-        // SAFETY: Synchronous copy borrows live IDs; validated allocation covers it.
-        unsafe {
-            check(
-                sys::cuMemcpyHtoD_v2(self.pointers[name], ids.as_ptr().cast(), ids.len() * 4),
-                "model IDs",
-            )?;
-            check(sys::cuCtxSynchronize(), "model upload dependency")
-        }
+        let bytes = ids
+            .len()
+            .checked_mul(4)
+            .ok_or("Token upload size overflow")?;
+        // SAFETY: All bytes of the borrowed u32 slice are initialized and remain
+        // live until upload_bytes has copied them into session-owned staging.
+        self.upload_bytes(name, unsafe {
+            std::slice::from_raw_parts(ids.as_ptr().cast(), bytes)
+        })
     }
     pub(crate) fn read_control(&self, name: &str) -> Result<i32> {
-        let mut value = 0i32;
-        // SAFETY: Producer is synchronized, the control and destination cover 4 bytes.
-        unsafe {
-            check(
-                sys::cuMemcpyDtoH_v2((&mut value as *mut i32).cast(), self.pointers[name], 4),
-                "model control",
-            )?;
+        self.read_control_group([name]).map(|values| values[0])
+    }
+    pub(crate) fn read_control_group<const N: usize>(&self, names: [&str; N]) -> Result<[i32; N]> {
+        let mut regions = [(0, 4); N];
+        for (region, name) in regions.iter_mut().zip(names) {
+            if self.sizes.get(name).is_none_or(|&size| size < 4) {
+                return Err("Control exceeds allocation".into());
+            }
+            region.0 = self.pointers[name];
         }
-        Ok(value)
+        let mut values = [0i32; N];
+        // SAFETY: The initialized output array covers exactly N four-byte controls;
+        // readback waits for the stream before copying into this borrowed output.
+        let raw = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), N * 4) };
+        self.session
+            .transfers
+            .borrow_mut()
+            .readback(self.session.stream, &regions, raw)?;
+        Ok(values)
     }
     pub(crate) fn upload_bytes(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        let size = self.sizes.get(name).ok_or("Missing image buffer")?;
+        let size = self.sizes.get(name).ok_or("Missing input buffer")?;
         if bytes.len() > *size {
-            return Err("Image upload exceeds buffer".into());
+            return Err("Input upload exceeds buffer".into());
         }
         self.ensure_writable_range(name, 0, bytes.len())?;
+        if bytes.len() <= super::transfers::UPLOAD_BYTES {
+            return self.session.transfers.borrow_mut().upload(
+                self.session.stream,
+                self.pointers[name],
+                bytes,
+            );
+        }
+        // Large image/prefill payloads retain bounded synchronous transfer. Small
+        // inputs are ordered on the explicit stream without a context-wide wait.
         self.sync()?;
         // SAFETY: The synchronized destination is live and covers the borrowed bytes.
         unsafe {
             check(
                 sys::cuMemcpyHtoD_v2(self.pointers[name], bytes.as_ptr().cast(), bytes.len()),
-                "image upload",
+                "model input upload",
             )?;
-            check(sys::cuCtxSynchronize(), "image upload dependency")
+            check(sys::cuCtxSynchronize(), "large input upload dependency")
         }
     }
     pub(crate) fn read_controls(&self, name: &str, count: usize) -> Result<Vec<u32>> {
@@ -1016,6 +1037,18 @@ impl Executor {
             return Err("Control vector exceeds allocation".into());
         }
         let mut values = vec![0u32; count];
+        if bytes <= super::transfers::READBACK_BYTES {
+            // SAFETY: The initialized u32 destination covers the checked byte
+            // extent, and readback completes before returning this allocation.
+            let raw = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), bytes) };
+            self.session.transfers.borrow_mut().readback(
+                self.session.stream,
+                &[(self.pointers[name], bytes)],
+                raw,
+            )?;
+            return Ok(values);
+        }
+        self.sync()?;
         // SAFETY: Producer is synchronized; both extents are checked above.
         unsafe {
             check(

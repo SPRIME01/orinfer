@@ -72,7 +72,8 @@ impl ModelRuntime {
         step: usize,
     ) -> Result<u32> {
         let m = &self.manifest;
-        if self.read_control(&m.status)? != 0 {
+        let [status, selected] = self.execution.read_control_group([&m.status, &m.token])?;
+        if status != 0 {
             return Err("Model token status failure".into());
         }
         if m.greedy_sampling
@@ -106,7 +107,7 @@ impl ModelRuntime {
             return Ok(token as u32);
         }
         if options.is_greedy() {
-            let value = self.read_control(&m.token)?;
+            let value = selected;
             if value < 0 || value as usize >= m.vocab {
                 return Err("Selected token outside vocabulary".into());
             }

@@ -1496,6 +1496,69 @@ impl Executor {
         }
         Ok(())
     }
+    /// COW and live workspace preservation must run before this lookup. Exact
+    /// graphs retain owner-specific addresses and are invalidated on arena
+    /// replacement. Indirect graphs additionally compare the immutable program
+    /// and its current buffer bases; a different workspace takes the bind path.
+    fn replay_cached_batch(
+        &self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: &[(usize, usize)],
+        operations: &[Invocation],
+        decode: bool,
+    ) -> Result<bool> {
+        if !(self.cuda_graph == crate::execution::CudaGraphMode::Full
+            || decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly)
+        {
+            return Ok(false);
+        }
+        let rows = segments.iter().map(|(_, n)| n).sum::<usize>();
+        let views = BTreeMap::new();
+        let graph = self
+            .batch_graphs
+            .borrow_mut()
+            .iter_mut()
+            .find(|(key, _)| {
+                key.operation == operation
+                    && key.rows == rows
+                    && match &key.shared {
+                        None => key.segments == segments,
+                        Some(shared) => {
+                            decode
+                                && segments.iter().all(|(_, n)| *n == 1)
+                                && shared.operations == operations
+                                && !shared.buffers.is_empty()
+                                && shared.buffers.iter().all(|(name, expected)| {
+                                    self.address(name, None, &views)
+                                        .is_ok_and(|actual| actual == *expected)
+                                })
+                        }
+                    }
+            })
+            .map(|(_, (graph, last, _, hits))| {
+                let tick = self.batch_graph_clock.get().wrapping_add(1);
+                self.batch_graph_clock.set(tick);
+                *last = tick;
+                *hits = hits.saturating_add(1);
+                *graph
+            });
+        let Some(graph) = graph else { return Ok(false) };
+        let at = Instant::now();
+        // SAFETY: Same plan, retained addresses and prepared writable state.
+        // Captured modules remain owned by the session until graph destruction.
+        unsafe {
+            check(
+                sys::cuGraphLaunch(graph, self.session.stream),
+                "hot batch graph",
+            )?;
+        }
+        self.sync()?;
+        let mut stats = self.batch_statistics.get();
+        stats.graph_hits += 1;
+        stats.replay_s += at.elapsed().as_secs_f64();
+        self.batch_statistics.set(stats);
+        Ok(true)
+    }
     pub(crate) fn execute_batch_operation(
         &mut self,
         operation: orinfer_model_sdk::abi::BatchOperation,
@@ -1601,6 +1664,9 @@ impl Executor {
             } else {
                 self.ensure_writable_range(name, offset, bytes)?;
             }
+        }
+        if self.replay_cached_batch(operation, &segments, operations, decode)? {
+            return Ok(());
         }
         // A fully indirect plan captures only session-owned table/workspace
         // addresses. Changing request membership cannot invalidate those pointers.

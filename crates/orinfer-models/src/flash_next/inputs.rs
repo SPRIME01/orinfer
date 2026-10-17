@@ -13,6 +13,7 @@ use std::{
     io::Read,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 /// Execution purpose selects the arena, independently of the logical row count.
@@ -88,23 +89,24 @@ struct Source {
     scale_offset: Option<u64>,
     width: usize,
 }
+type Row = Rc<Vec<u16>>;
 #[derive(Default)]
 struct Cache {
     clock: u64,
     bytes: usize,
-    values: HashMap<(usize, usize), (u64, Vec<u16>)>,
+    values: HashMap<(usize, usize), (u64, Row)>,
     order: BTreeMap<u64, (usize, usize)>,
 }
 impl Cache {
-    fn get(&mut self, key: (usize, usize)) -> Option<Vec<u16>> {
+    fn get(&mut self, key: (usize, usize)) -> Option<Row> {
         let (stamp, value) = self.values.get_mut(&key)?;
         self.order.remove(stamp);
         self.clock += 1;
         *stamp = self.clock;
         self.order.insert(*stamp, key);
-        Some(value.clone())
+        Some(Rc::clone(value))
     }
-    fn put(&mut self, key: (usize, usize), value: Vec<u16>, budget: usize) {
+    fn put(&mut self, key: (usize, usize), value: Row, budget: usize) {
         let size = value.len() * 2 + 512;
         if size > budget {
             return;
@@ -337,7 +339,7 @@ impl Inputs {
         cache: &RefCell<Cache>,
         row: usize,
         budget: usize,
-    ) -> Result<Vec<u16>> {
+    ) -> Result<Row> {
         let shard = sources
             .partition_point(|s| s.first <= row)
             .checked_sub(1)
@@ -382,7 +384,8 @@ impl Inputs {
                 .map(|&v| f16::from_f32((v as i8) as f32 * scale).to_bits())
                 .collect()
         };
-        cache.borrow_mut().put(key, value.clone(), budget);
+        let value = Rc::new(value);
+        cache.borrow_mut().put(key, Rc::clone(&value), budget);
         Ok(value)
     }
     #[cfg(test)]
@@ -426,12 +429,13 @@ impl Inputs {
         let mut embedding = Vec::with_capacity(tokens.len() * 5120);
         let mut ple = Vec::with_capacity(embedding.capacity());
         for &token in tokens {
-            for value in self.row(
+            let row = self.row(
                 &self.embedding,
                 &self.embedding_cache,
                 token as usize,
                 8 * 1024 * 1024,
-            )? {
+            )?;
+            for &value in row.iter() {
                 embedding.extend(value.to_le_bytes());
             }
             if draft {
@@ -448,7 +452,8 @@ impl Inputs {
                 for head in (shift - 1) * 8..shift * 8 {
                     let row =
                         (mixed % self.assets.sizes[head] + self.assets.offsets[head]) as usize;
-                    for value in self.row(&self.ple, &self.ple_cache, row, 32 * 1024 * 1024)? {
+                    let row = self.row(&self.ple, &self.ple_cache, row, 32 * 1024 * 1024)?;
+                    for &value in row.iter() {
                         ple.extend(value.to_le_bytes());
                     }
                 }
@@ -657,6 +662,21 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_file(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn cached_rows_share_immutable_storage_and_survive_eviction() {
+        let mut cache = Cache::default();
+        let row = Rc::new(vec![0x3c00; 64]);
+        let budget = row.len() * 2 + 512;
+        cache.put((0, 0), Rc::clone(&row), budget);
+        let hit = cache.get((0, 0)).unwrap();
+        assert!(Rc::ptr_eq(&hit, &row));
+        cache.put((0, 1), Rc::new(vec![0x4000; 64]), budget);
+        assert!(cache.get((0, 0)).is_none());
+        assert_eq!(hit.as_slice(), &[0x3c00; 64]);
+        assert_eq!(cache.get((0, 1)).unwrap().as_slice(), &[0x4000; 64]);
+        assert!(cache.bytes <= budget);
     }
 
     #[test]
