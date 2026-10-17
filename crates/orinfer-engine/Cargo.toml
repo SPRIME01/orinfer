@@ -23,3 +23,10 @@ memmap2 = "=0.9.11"
 safetensors = "=0.8.0"
 
 orinfer-model-sdk.workspace = true
+tar = { version = "=0.4.46", default-features = false }
+flate2 = "=1.1.10"
+tempfile = "=3.27.0"
+lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["std", "xz", "optimization"] }
+
+[dev-dependencies]
+lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["encoder"] }

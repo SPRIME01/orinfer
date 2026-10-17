@@ -75,16 +75,41 @@ PYTHONPATH=. .venv/bin/python -m tools.model.catalog \
 
 在线数据与包均保留 schema 1；当前加载器只接受 `catalog` 和原生绑定导出接口，不保留逐层 `kernels` 包或 schema 2 的兼容加载分支。离线构建输入仍可包含展开的 bindings，用于精确对照与生成 Rust 模块。
 
-发布和安装工具：
+## 安装执行包
+
+下载引擎、匹配的执行包和 `SHA256SUMS` 后，先检查下载内容。安装命令不依赖 Python、CUDA 初始化或 Rust 编译器：
 
 ```bash
-PYTHONPATH=. .venv/bin/python tools/model/package.py archive /path/to/package /path/to/package.tar.gz
-PYTHONPATH=. .venv/bin/python tools/model/package.py install /path/to/package.tar.gz ~/.cache/orinfer/packages
+sha256sum --ignore-missing -c SHA256SUMS
+orinfer package install /path/to/package.tar.xz
 orinfer plan-model /path/to/new-model
 orinfer validate-model /path/to/new-model
 ```
 
-安装校验 `.so` 和 kernel 资产后原子写入缓存。`plan-model` 会在 CPU 加载原生执行库并生成计划；`validate-model` 还完整校验权重、CPU 表和全部 kernel 文件，均不初始化 GPU。在线启动默认只检查大体积权重和 CPU 表的结构，`--verify-weights` 开启完整内容校验；配置签名仍校验，前端资源、CPU 资产元数据、执行库和 kernel 身份仍校验 hash。JSON 创建请求的可选 `verify_weights` 字段由模型库处理 CPU 表，C ABI v1 和 schema 1 不变；更新执行库后即可使用新的 CPU 表加载行为。
+安装器按文件内容识别 `.tar.xz` 和旧 `.tar.gz`，校验 package digest、schema/ABI、SM87 目标、aarch64 ELF 库和全部独立／safetensors 内嵌 kernel 资产的 SHA256；安装期间不执行库代码。路径越界、链接和重复归档成员被拒绝，全部校验成功才原子写入缓存，失败清理临时目录，已安装的同 digest 包不会被覆盖。解压与校验只发生在安装时，不增加后续启动工作。
+
+默认安装位置与运行时一致：优先 `ORINFER_EXECUTION_CACHE`，其次 `$XDG_CACHE_HOME/orinfer/packages`，最后 `~/.cache/orinfer/packages`。`--cache /path/to/packages` 只改变本次安装位置；自定义位置需要同时为后续运行设置 `ORINFER_EXECUTION_CACHE`。
+
+`plan-model` 会在 CPU 加载原生执行库并生成计划；`validate-model` 还完整校验权重、CPU 表和全部 kernel 文件，均不初始化 GPU。在线启动默认只检查大体积权重和 CPU 表的结构，`--verify-weights` 开启完整内容校验；配置签名仍校验，前端资源、CPU 资产元数据、执行库和 kernel 身份仍校验 hash。JSON 创建请求的可选 `verify_weights` 字段由模型库处理 CPU 表，C ABI v1 和 schema 1 不变；更新执行库后即可使用新的 CPU 表加载行为。
+
+### 安装已发布的 v0.1.3
+
+`package install` 尚未包含在 v0.1.3 二进制中。该版本下载并通过 `SHA256SUMS` 校验后，可用系统 tar 将执行包的 digest 目录解压到共享缓存，再运行 `validate-model`：
+
+```bash
+export ORINFER_EXECUTION_CACHE="$HOME/.cache/orinfer/packages"
+mkdir -p "$ORINFER_EXECUTION_CACHE"
+tar -xf /path/to/package.tar.gz -C "$ORINFER_EXECUTION_CACHE"
+orinfer validate-model /path/to/prepared-model
+```
+
+### 离线归档
+
+模型构建者使用 Python 工具生成新的 `.tar.xz` 执行包；普通部署无需此步骤：
+
+```bash
+PYTHONPATH=. .venv/bin/python tools/model/package.py archive /path/to/package /path/to/package.tar.xz
+```
 
 ## 合并发布布局
 

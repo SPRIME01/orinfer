@@ -50,12 +50,12 @@ GPU入口获取`artifacts/gpu-experiment.lock`；锁被占用时退出。它不�
 
 ```bash
 python3 tools/release/package.py --version v0.1.3 \
-  --operators /path/to/qwen3_5-execution.tar.gz \
-  --operators /path/to/flash-next-execution.tar.gz \
+  --operators /path/to/qwen3_5-execution.tar.xz \
+  --operators /path/to/flash-next-execution.tar.xz \
   --output artifacts/releases/v0.1.3
 ```
 
-默认仅生成和校验产物。工具要求工作区干净，使用`Cargo.lock`构建，验证aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。资产名称取自架构、计算策略和GPU目标，`RELEASE.json`列出每个包的digest；完整离线工具及Flash Next文档随包提供。权重不进入发行包。
+默认仅生成和校验产物。工具要求工作区干净，使用`Cargo.lock`构建，验证aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新归档为 XZ，不只是更改后缀。资产名称取自架构、计算策略和GPU目标，`RELEASE.json`列出每个包的digest；完整离线工具及Flash Next文档随包提供。权重不进入发行包。安装执行包使用 `orinfer package install`，不需要 Python；详见[安装说明](../../docs/model-packages.md#安装执行包)。
 
 0.1.2只接受当前schema 1原生执行包（包含`.so`与cubin）；0.1.1发行包中的旧算子资产不兼容。已有旧格式模型需要用当前构建/组装工具重新发布，不能直接复用旧包。当前原生格式的模型可以用[执行库更新工具](../../docs/model-packages.md)生成新目录，保留权重和kernel资产。
 

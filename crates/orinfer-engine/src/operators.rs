@@ -12,6 +12,7 @@ use std::{
 };
 
 pub mod dynamic;
+pub mod install;
 
 pub const RUNTIME_ABI: u32 = orinfer_model_sdk::abi::RUNTIME_ABI;
 
@@ -68,11 +69,26 @@ impl ExecutionPackage {
         policy: &str,
         buffers: &[Buffer<TensorIdentity>],
     ) -> Result<()> {
+        self.validate_metadata()?;
+        if self.architecture != architecture || self.compute_policy != policy {
+            return Err("Incompatible model execution package architecture or policy".into());
+        }
+        let actual: Vec<_> = buffers.iter().map(BufferContract::from).collect();
+        if actual != self.buffer_contracts {
+            return Err(
+                "Model buffer dtype/shape/layout/access contract differs from model execution package"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_metadata(&self) -> Result<()> {
         if self.schema_version != 1
             || self.runtime_abi != RUNTIME_ABI
             || self.target != "sm_87"
-            || self.architecture != architecture
-            || self.compute_policy != policy
+            || self.architecture.is_empty()
+            || self.compute_policy.is_empty()
         {
             return Err(
                 "Incompatible model execution package architecture, policy, target or ABI".into(),
@@ -95,13 +111,6 @@ impl ExecutionPackage {
             || (!self.prefill_batch_profiles.is_empty() && self.batch_profiles.is_empty())
         {
             return Err("Invalid joint prefill profile".into());
-        }
-        let actual: Vec<_> = buffers.iter().map(BufferContract::from).collect();
-        if actual != self.buffer_contracts {
-            return Err(
-                "Model buffer dtype/shape/layout/access contract differs from model execution package"
-                    .into(),
-            );
         }
         Ok(())
     }

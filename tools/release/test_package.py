@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import tarfile
 import unittest
 from unittest.mock import patch
 from tools.release.package import archive, execution_assets, verify
@@ -14,13 +15,17 @@ class ReleaseTests(unittest.TestCase):
             bundle = root / "bundle"
             bundle.mkdir()
             (bundle / "source.txt").write_text("fixed source")
-            archive(bundle, root / "one.tar.gz", 100)
-            archive(bundle, root / "two.tar.gz", 100)
-            self.assertEqual((root / "one.tar.gz").read_bytes(), (root / "two.tar.gz").read_bytes())
-            digest = hashlib.sha256((root / "one.tar.gz").read_bytes()).hexdigest()
-            (root / "SHA256SUMS").write_text(f"{digest}  one.tar.gz\n")
+            archive(bundle, root / "one.tar.xz", 100)
+            archive(bundle, root / "two.tar.xz", 100)
+            self.assertTrue((root / "one.tar.xz").read_bytes().startswith(b"\xfd7zXZ\0"))
+            with tarfile.open(root / "one.tar.xz") as stream:
+                entry = stream.getmember("bundle/source.txt")
+                self.assertEqual((entry.uid, entry.gid, entry.mtime), (0, 0, 100))
+            self.assertEqual((root / "one.tar.xz").read_bytes(), (root / "two.tar.xz").read_bytes())
+            digest = hashlib.sha256((root / "one.tar.xz").read_bytes()).hexdigest()
+            (root / "SHA256SUMS").write_text(f"{digest}  one.tar.xz\n")
             verify(root)
-            (root / "one.tar.gz").write_bytes(b"corrupt")
+            (root / "one.tar.xz").write_bytes(b"corrupt")
             with self.assertRaisesRegex(ValueError, "checksum"):
                 verify(root)
 
@@ -54,10 +59,15 @@ class ExecutionAssetsTests(unittest.TestCase):
                 (package / "lib").mkdir(parents=True)
                 (package / "package.json").write_bytes(raw)
                 (package / "lib/model.so").write_bytes(header)
-                path = root / f"{architecture}.tar.gz"
+                suffix = ".tar.gz" if architecture == "qwen3_5" else ".tar.xz"
+                path = root / (architecture + suffix)
                 from tools.model.package import archive as archive_package
 
-                archive_package(package, path)
+                if suffix == ".tar.gz":
+                    with tarfile.open(path, "w:gz") as stream:
+                        stream.add(package, arcname=package.name)
+                else:
+                    archive_package(package, path)
                 archives.append(path)
             with patch("tools.release.package.execution_identity", return_value=identity):
                 assets = execution_assets(archives, root / "cache", Path("/bin/true"), "v0.1.2")
@@ -68,6 +78,16 @@ class ExecutionAssetsTests(unittest.TestCase):
                 self.assertEqual(
                     [a["metadata"]["architecture"] for a in assets], ["qwen3_5", "flash_next"]
                 )
+                from tools.model.package import install
+
+                for asset in assets:
+                    output = root / asset["metadata"]["file"]
+                    self.assertTrue(output.name.endswith(".tar.xz"))
+                    archive(asset["directory"], output, 100)
+                    self.assertTrue(output.read_bytes().startswith(b"\xfd7zXZ\0"))
+                    self.assertEqual(
+                        install(output, root / "reinstalled"), asset["metadata"]["digest"]
+                    )
             with patch(
                 "tools.release.package.execution_identity",
                 return_value=dict(identity, version="wrong"),

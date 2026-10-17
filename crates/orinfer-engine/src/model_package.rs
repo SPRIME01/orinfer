@@ -27,6 +27,19 @@ pub(crate) fn inspect_library(path: &Path) -> Result<abi::PackageInfo> {
     ModelPackage::open(path, &image)?.describe()
 }
 
+pub(crate) fn validate_library(image: &[u8]) -> Result<()> {
+    if image.len() < 20
+        || &image[..4] != b"\x7fELF"
+        || image[4] != 2
+        || image[5] != 1
+        || u16::from_le_bytes([image[16], image[17]]) != 3
+        || u16::from_le_bytes([image[18], image[19]]) != 183
+    {
+        return Err("Model library must be an aarch64 ELF shared object".into());
+    }
+    Ok(())
+}
+
 #[repr(C)]
 struct Header {
     version: u32,
@@ -57,15 +70,7 @@ pub(crate) struct ModelPackage {
 }
 impl ModelPackage {
     fn open(path: &Path, image: &[u8]) -> Result<Self> {
-        if image.len() < 20
-            || &image[..4] != b"\x7fELF"
-            || image[4] != 2
-            || image[5] != 1
-            || u16::from_le_bytes([image[16], image[17]]) != 3
-            || u16::from_le_bytes([image[18], image[19]]) != 183
-        {
-            return Err("Model library must be an aarch64 ELF shared object".into());
-        }
+        validate_library(image)?;
         // SAFETY: this explicitly selected native library implements the documented
         // C ABI. The model loader verifies its hash before calling open.
         let library = unsafe { Library::new(path) }.map_err(|e| format!("Model library: {e}"))?;

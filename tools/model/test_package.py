@@ -45,7 +45,7 @@ class PackageTests(unittest.TestCase):
         self.package = package.rename(self.root / self.digest)
 
     def test_archive_roundtrip_and_duplicate_install(self):
-        path = self.root / "operators.tar.gz"
+        path = self.root / "operators.tar.xz"
         archive(self.package, path)
         cache = self.root / "installed"
         self.assertEqual(install(path, cache), self.digest)
@@ -59,7 +59,7 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(list(cache.glob(".install-*")))
 
     def assert_rejected(self, pattern):
-        path = self.root / "corrupt.tar.gz"
+        path = self.root / "corrupt.tar.xz"
         archive(self.package, path)
         cache = self.root / "installed"
         with self.assertRaisesRegex(ValueError, pattern):
@@ -82,8 +82,8 @@ class PackageTests(unittest.TestCase):
     def test_unsafe_archive_members_are_rejected_before_extraction(self):
         for kind in ("traversal", "symlink"):
             with self.subTest(kind=kind):
-                path = self.root / (kind + ".tar.gz")
-                with tarfile.open(path, "w:gz") as stream:
+                path = self.root / (kind + ".tar.xz")
+                with tarfile.open(path, "w:xz") as stream:
                     member = tarfile.TarInfo(
                         self.digest + ("/../outside" if kind == "traversal" else "/link")
                     )

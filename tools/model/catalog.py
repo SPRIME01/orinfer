@@ -244,7 +244,7 @@ def build_library(package, bindings, directory, engine=None):
         instructions = library.with_name("BUILD.txt")
         instructions_temporary = instructions.with_suffix(".tmp")
         instructions_temporary.write_text(
-            "Use the matching release source.tar.gz (included in the CLI archive).\n"
+            "Use the matching release source.tar.xz (included in the CLI archive).\n"
             "From that workspace, rebuild this library with:\n"
             "ORINFER_BINDINGS_SOURCE=/absolute/path/to/lib/bindings.rs "
             "cargo build --release --locked --offline -p orinfer-models\n"

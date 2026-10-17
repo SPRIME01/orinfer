@@ -23,6 +23,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Manage precompiled model execution packages without CUDA or Python.
+    Package {
+        #[command(subcommand)]
+        command: PackageCommand,
+    },
     /// Show target and implementation status (default command).
     Info,
     /// Print the benchmark specification as JSON.
@@ -43,6 +48,16 @@ enum Command {
     ScoreModel(ModelArgs),
     /// Serve the OpenAI Chat Completions API.
     Serve(Box<ServeArgs>),
+}
+#[derive(Subcommand)]
+enum PackageCommand {
+    /// Verify and atomically install a .tar.xz or .tar.gz execution package.
+    Install {
+        archive: PathBuf,
+        /// Installation cache; defaults to ORINFER_EXECUTION_CACHE or the user cache.
+        #[arg(long)]
+        cache: Option<PathBuf>,
+    },
 }
 #[derive(Args)]
 struct LoadArgs {
@@ -160,6 +175,12 @@ fn print_json(value: impl serde::Serialize) -> Result<(), String> {
 }
 fn execute(command: Command) -> Result<(), String> {
     match command {
+        Command::Package {
+            command: PackageCommand::Install { archive, cache },
+        } => print_json(orinfer_engine::operators::install::install(
+            &archive,
+            &cache.unwrap_or_else(orinfer_engine::operators::default_cache),
+        )?),
         Command::Info => {
             println!("Orinfer {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -288,6 +309,8 @@ mod tests {
             vec!["orinfer", "--help"],
             vec!["orinfer", "--version"],
             vec!["orinfer", "serve", "--help"],
+            vec!["orinfer", "package", "--help"],
+            vec!["orinfer", "package", "install", "--help"],
         ] {
             assert_eq!(Cli::try_parse_from(args).err().unwrap().exit_code(), 0);
         }
@@ -311,6 +334,34 @@ mod tests {
             ("--output-timeout-ms", "0"),
         ] {
             assert!(serve(&[name, value]).unwrap().validate().is_err());
+        }
+    }
+    #[test]
+    fn package_install_accepts_an_archive_and_optional_cache() {
+        for cache in [None, Some("/tmp/packages")] {
+            let mut args = vec!["orinfer", "package", "install", "model.tar.xz"];
+            if let Some(path) = cache {
+                args.extend(["--cache", path]);
+            }
+            let Some(Command::Package {
+                command:
+                    PackageCommand::Install {
+                        archive,
+                        cache: parsed,
+                    },
+            }) = Cli::try_parse_from(args).unwrap().command
+            else {
+                unreachable!()
+            };
+            assert_eq!(archive, PathBuf::from("model.tar.xz"));
+            assert_eq!(parsed, cache.map(PathBuf::from));
+        }
+        for args in [
+            vec!["orinfer", "package"],
+            vec!["orinfer", "package", "install"],
+            vec!["orinfer", "package", "install", "model.tar.xz", "extra"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
     }
     #[test]

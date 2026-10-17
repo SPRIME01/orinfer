@@ -49,3 +49,4 @@
 - Flash Next适配器仅接受当前动态prefill、target/draft行模板和因果状态契约；不恢复旧固定容量计划的注册、回退或逐长度改写。Q4前置变换按section、激活/scale工作区及符号表关联消费者，QKV/Z共享变换必须先于首个消费者，并对每个程序别名单独生成；禁止以算子序号补丁代替依赖关系。
 - 源码库保留实现、必要构建工具、测试、示例与使用文档。不提交研究过程、agent交付记录、历史实验报告或本机环境证据。
 - 权重、二进制、cubin、cache、日志及trace保留在忽略的artifacts/target目录；不提交密钥或token。
+- 部署使用Rust CLI的`package install`安装执行包，不要求Python或在线编译；新引擎、执行包和源码发行归档统一使用`.tar.xz`，安装器仍接受已发布的`.tar.gz`。Python只用于离线构建、归档和发布校验。

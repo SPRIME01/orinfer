@@ -139,11 +139,13 @@ def validate_plan(directory, source, mapping, engine):
 
 def archive(package, output):
     package = package.resolve(strict=True)
+    if not output.name.endswith(".tar.xz"):
+        raise ValueError("New execution archives must use .tar.xz")
     if output.exists():
         raise ValueError("Archive already exists")
     temporary = output.with_suffix(output.suffix + ".tmp")
     try:
-        with tarfile.open(temporary, "w:gz") as stream:
+        with tarfile.open(temporary, "w:xz", preset=6) as stream:
             stream.add(package, arcname=package.name)
         temporary.rename(output)
     except BaseException:
@@ -155,7 +157,7 @@ def install(archive_path, cache):
     cache.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".install-", dir=cache))
     try:
-        with tarfile.open(archive_path, "r:gz") as stream:
+        with tarfile.open(archive_path, "r:*") as stream:
             members = stream.getmembers()
             roots = {Path(m.name).parts[0] for m in members if Path(m.name).parts}
             if len(roots) != 1 or any(not (m.isfile() or m.isdir()) for m in members):

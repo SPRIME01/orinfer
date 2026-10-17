@@ -1,7 +1,7 @@
 """Build and verify a release from a clean, exact Git revision; publish only with --publish."""
 
 import argparse
-import gzip
+import lzma
 import json
 import re
 from pathlib import Path
@@ -25,7 +25,7 @@ def command(*args, cwd=ROOT):
 def archive(directory, output, epoch):
     with (
         output.open("xb") as destination,
-        gzip.GzipFile(filename="", mode="wb", fileobj=destination, mtime=epoch) as compressed,
+        lzma.LZMAFile(destination, mode="wb", preset=6) as compressed,
     ):
         with tarfile.open(fileobj=compressed, mode="w") as tar:
             for path in [directory, *sorted(directory.rglob("*"))]:
@@ -88,13 +88,13 @@ def execution_assets(archives, cache, binary, tag):
         if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
             raise ValueError("Unsafe execution package asset identity")
         architecture, policy, target = fields
-        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-execution.tar.gz"
+        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-execution.tar.xz"
         if name in names:
             raise ValueError("Duplicate architecture, compute policy and target in release")
         names.add(name)
         assets.append(
             dict(
-                source=archive_path,
+                directory=root,
                 metadata=dict(
                     file=name,
                     digest=digest,
@@ -148,14 +148,21 @@ def build(args):
         ).splitlines():
             (bundle / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, bundle / name)
-        source = bundle / "source.tar.gz"
+        source = bundle / "source.tar.xz"
+        source_tar = Path(temp) / "source.tar"
         subprocess.run(
-            ["git", "archive", "--format=tar.gz", f"--output={source}", revision],
+            ["git", "archive", "--format=tar", f"--output={source_tar}", revision],
             cwd=ROOT,
             check=True,
         )
+        with (
+            source_tar.open("rb") as source_stream,
+            lzma.open(source, "xb", preset=6) as compressed,
+        ):
+            shutil.copyfileobj(source_stream, compressed)
+        source_tar.unlink()
         (bundle / "SOURCE.txt").write_text(
-            f"Revision: {revision}\nSource: source.tar.gz\nBuild: cargo build --release --locked --offline -p orinfer-cli\n"
+            f"Revision: {revision}\nSource: source.tar.xz\nBuild: cargo build --release --locked --offline -p orinfer-cli\n"
         )
         (bundle / "THIRD_PARTY_LICENSES.txt").write_text(notices(metadata))
         (bundle / "RELEASE.json").write_text(
@@ -171,10 +178,10 @@ def build(args):
             + "\n"
         )
         epoch = int(command("git", "show", "-s", "--format=%ct", revision))
-        archive(bundle, output / f"{bundle.name}.tar.gz", epoch)
-    for package in packages:
-        shutil.copyfile(package["source"], output / package["metadata"]["file"])
-    assets = sorted(output.glob("*.tar.gz"))
+        archive(bundle, output / f"{bundle.name}.tar.xz", epoch)
+        for package in packages:
+            archive(package["directory"], output / package["metadata"]["file"], epoch)
+    assets = sorted(output.glob("*.tar.xz"))
     (output / "SHA256SUMS").write_text(
         "".join(f"{file_hash(path)}  {path.name}\n" for path in assets)
     )

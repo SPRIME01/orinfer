@@ -30,7 +30,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 - `compile.py`、`row_contract.py`、`row_selection.py`：动态行工厂、host ABI 合同与离线选择规则。
 - `catalog.py`、`binding_templates.py`：共享编译定义和原生参数模板。
 - `publication.py`、`compact.py`：不可变资产复用、safetensors 合并及原子发布。
-- `package.py`：执行包身份校验、归档、安装及前端资源固定。
+- `package.py`：离线执行包校验、XZ 归档、发布工具内部安装及前端资源固定；部署使用 Rust 的 `orinfer package install`。
 - `attach_execution.py`：为匹配的数据目录安装执行包。
 
 更新执行包须核对完整程序、参数、动态 launch、状态及 buffer 契约。权重布局改变时重新准备权重；仅重新编译相同计算时可复用匹配的权重分片。

@@ -14,20 +14,17 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 ## 快速开始
 
-需要 aarch64 Linux、Rust 工具链和 NVIDIA CUDA Driver。开发工具链固定在 `rust-toolchain.toml`。
+部署需要 aarch64 Linux 和 NVIDIA CUDA Driver，**不需要 Python、PyTorch、TileLang 或 Rust 编译器**。
+
+从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎发行包、模型匹配的执行包和 `SHA256SUMS`，校验下载文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。模型目录单独下载，包含配置、tokenizer、chat template 和原生量化 safetensors；模型描述中的 `execution_package` 必须与执行包 digest 一致。发行包不附带权重，**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**。
+
+以下安装命令已在当前源码实现，将随下次发行提供；已发布的 v0.1.3 使用[原有归档解压步骤](docs/model-packages.md#安装已发布的-v013)。后续发行包统一使用 `.tar.xz`，新安装命令也接受旧 `.tar.gz`。
 
 ```bash
-git clone https://github.com/iMMIQ/orinfer.git
-cd orinfer
-cargo fetch --locked
-make build
-```
-
-先按[模型构建说明](tools/model/README.md)准备引擎原生模型目录及匹配的模型执行包。目录保留 checkpoint 的配置、tokenizer 和 chat template，权重采用带专用物理布局的分片 safetensors。**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**；仓库及发行包不附带模型权重。Python、PyTorch 和 TileLang 仅用于离线准备，在线服务不需要它们。模型与 kernel 在同一工作区维护，执行逻辑通过 `.so + cubin` 部署包加载，详见[执行包接口与构建](docs/model-packages.md)。
-
-```bash
-./target/release/orinfer validate-model /path/to/prepared-model
-./target/release/orinfer serve /path/to/prepared-model --model qwen3.8-27b
+sha256sum --ignore-missing -c SHA256SUMS
+orinfer package install /path/to/matching-execution.tar.xz
+orinfer validate-model /path/to/prepared-model
+orinfer serve /path/to/prepared-model --model qwen3.8-27b
 ```
 
 默认监听 `0.0.0.0:8088`。设置 `ORINFER_API_KEY` 可启用 `/v1` 的 Bearer 鉴权。
@@ -66,9 +63,15 @@ Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包
 ## 开发与文档
 
 ```bash
+git clone https://github.com/iMMIQ/orinfer.git
+cd orinfer
+cargo fetch --locked
+make build       # 仅构建 Rust；工具链固定在 rust-toolchain.toml
 make python-env  # uv 创建并同步 CPU .venv
 make check       # 格式、编译、clippy、Rust/CPU 测试
 ```
+
+自行量化、编译 TileLang 算子或重新构建模型时才需要离线 Python 环境；下载已发布模型及匹配执行包后可直接部署。执行包的 `.so + cubin` 格式见[执行包接口与构建](docs/model-packages.md)。
 
 - [构建与发布](tools/build/README.md)：编译镜像、CPU/GPU 检查与发行包。
 - [模型与执行包](tools/model/README.md)：离线准备、布局、MTP 和上下文扩展。

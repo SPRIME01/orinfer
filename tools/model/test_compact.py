@@ -192,7 +192,7 @@ class CompactTests(unittest.TestCase):
         self.assertEqual(len(reader.headers), 1)
         with safe_open(package / "assets.safetensors", framework="numpy") as sf:
             self.assertEqual(len(sf.keys()), 3)
-        packed = self.root / "operators.tar.gz"
+        packed = self.root / "operators.tar.xz"
         archive(package, packed)
         installed = self.root / "installed"
         self.assertEqual(install(packed, installed), report["execution_package"])
