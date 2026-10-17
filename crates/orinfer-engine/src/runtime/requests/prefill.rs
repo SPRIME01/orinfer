@@ -54,6 +54,7 @@ impl ModelRuntime {
         req: &mut RequestState,
         chunk: usize,
         bounded: bool,
+        budget_s: f64,
     ) -> Result<(usize, Vec<u32>)> {
         let plan = req
             .prefill_frame
@@ -73,7 +74,6 @@ impl ModelRuntime {
             return Err("Invalid resumed prefill extent".into());
         }
         let at = Instant::now();
-        let cold_before = self.execution.batch_statistics.get();
         let mut frame = if let Some(frame) = req.prefill_frame.take() {
             frame
         } else {
@@ -101,7 +101,7 @@ impl ModelRuntime {
         // forward pass, never to recomputing already-mutated recurrent layers.
         loop {
             let began = Instant::now();
-            let load_before = self.execution.batch_statistics.get().kernel_load_s;
+            let before = self.execution.batch_statistics.get();
             let stage = frame.next;
             self.scheduler_statistics.layered_prefill_iterations += 1;
             if stage < frame.plan.stages.len() {
@@ -109,7 +109,7 @@ impl ModelRuntime {
                 self.launch_rows(&frame.plan.stages[stage], chunk, ExecutionPhase::Prefill)?;
                 frame.next += 1;
                 frame.regular_s += began.elapsed().as_secs_f64()
-                    - (self.execution.batch_statistics.get().kernel_load_s - load_before);
+                    - (self.execution.batch_statistics.get().kernel_load_s - before.kernel_load_s);
                 if frame.next == frame.plan.stages.len() {
                     if let Some(spec) = &self.manifest.mtp {
                         self.mtp_capture(spec, chunk, ExecutionPhase::Prefill)?;
@@ -142,7 +142,30 @@ impl ModelRuntime {
             if bounded {
                 self.scheduler_statistics.bounded_prefill_iterations += 1;
             }
+            let after = self.execution.batch_statistics.get();
+            let cold = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
+                - before.sequence_capture_s;
+            self.prefill_costs.observe_stage(
+                chunk,
+                stage,
+                req.offset + chunk,
+                (began.elapsed().as_secs_f64() - cold).max(0.000001),
+            );
             if frame.next < frame.plan.stages.len() {
+                // Short layers share one latency window. Returning after each
+                // one would buy a whole decode burst for only a few ms of
+                // prefill progress. The token tile and layer order stay fixed.
+                if at.elapsed().as_secs_f64()
+                    + self.prefill_costs.stage_upper(
+                        chunk,
+                        frame.next,
+                        req.offset + chunk,
+                        frame.plan.stages.len(),
+                    )
+                    <= budget_s
+                {
+                    continue;
+                }
                 if frame.workspace.is_none() {
                     let reserve = Instant::now();
                     let ranges = frame
@@ -169,14 +192,7 @@ impl ModelRuntime {
                         .peak_prefill_frame_bytes
                         .max(workspace.borrow().bytes());
                     req.prefill_frame = Some(frame);
-                    self.observe_prefill_step(
-                        chunk,
-                        stage,
-                        req.offset + chunk,
-                        at,
-                        cold_before,
-                        bounded,
-                    );
+                    self.observe_prefill_window(at, bounded);
                     return Ok((0, vec![]));
                 }
                 continue;
@@ -190,21 +206,25 @@ impl ModelRuntime {
             let warm_end =
                 end + usize::from(end < req.input.len() && !req.checkpoints.contains(&end));
             if self.manifest.mtp.is_some() && req.warm.tokens + 1 < warm_end {
+                if at.elapsed().as_secs_f64()
+                    + self.prefill_costs.stage_upper(
+                        chunk,
+                        frame.next,
+                        end,
+                        frame.plan.stages.len(),
+                    )
+                    <= budget_s
+                {
+                    continue;
+                }
                 req.prefill_frame = Some(frame);
-                self.observe_prefill_step(
-                    chunk,
-                    stage,
-                    req.offset + chunk,
-                    at,
-                    cold_before,
-                    bounded,
-                );
+                self.observe_prefill_window(at, bounded);
                 return Ok((0, vec![]));
             }
             self.prefill_costs
                 .observe_at(chunk, end, frame.regular_s.max(0.000001));
             let tokens = self.after_prefill(req, chunk)?;
-            self.observe_prefill_step(chunk, stage, end, at, cold_before, bounded);
+            self.observe_prefill_window(at, bounded);
             self.scheduler_statistics.prefill_tokens += chunk;
             *self
                 .scheduler_statistics
@@ -214,21 +234,8 @@ impl ModelRuntime {
             return Ok((chunk, tokens));
         }
     }
-    fn observe_prefill_step(
-        &mut self,
-        chunk: usize,
-        stage: usize,
-        context: usize,
-        began: Instant,
-        before: crate::scheduler::BatchExecutionStatistics,
-        bounded: bool,
-    ) {
+    fn observe_prefill_window(&mut self, began: Instant, bounded: bool) {
         let seconds = began.elapsed().as_secs_f64();
-        let after = self.execution.batch_statistics.get();
-        let cold = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
-            - before.sequence_capture_s;
-        self.prefill_costs
-            .observe_stage(chunk, stage, context, (seconds - cold).max(0.000001));
         if bounded {
             self.scheduler_statistics.max_bounded_prefill_s =
                 self.scheduler_statistics.max_bounded_prefill_s.max(seconds);

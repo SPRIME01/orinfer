@@ -60,6 +60,7 @@ fn recipe(tokens: usize) -> Result<Recipe> {
 /// Freeze layer boundaries only after every fusion and prerequisite has been
 /// inserted. A stage refers to the exact same operations as the full program.
 pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel]) -> Result<()> {
+    let mut registrations = vec![];
     for plan in &mut manifest.prefill_plans {
         if plan.chunk_tokens < 512 {
             continue;
@@ -104,7 +105,6 @@ pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel
                 )
             })
             .collect();
-        plan.stages = stages.iter().map(|(name, _)| name.clone()).collect();
         let initialize = format!(
             "{program}/begin/k{}",
             usize::from(manifest.vision.is_some())
@@ -177,14 +177,14 @@ pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel
         plan.live_buffers.dedup();
         // Position, MRope coordinates, and visual assets already belong to the
         // request's private arena. Only shared cross-layer values need copying.
-        let kv = manifest
-            .kv_cache
-            .as_mut()
-            .ok_or("Missing prefill state growth")?;
-        for (name, operations) in stages {
-            kv.growth.insert(name.clone(), kv.growth[program].clone());
-            manifest.programs.insert(name, operations);
-        }
+        registrations.push((
+            program.clone(),
+            stages.into_iter().map(|(_, ops)| ops).collect(),
+            plan.live_buffers.clone(),
+        ));
+    }
+    for (program, stages, live) in registrations {
+        crate::prefill::register(manifest, &program, stages, live)?;
     }
     Ok(())
 }

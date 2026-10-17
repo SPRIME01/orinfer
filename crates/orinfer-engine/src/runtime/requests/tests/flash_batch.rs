@@ -241,7 +241,7 @@ fn validate_flash_mixed_speculation() {
 
 #[test]
 #[ignore = "Requires layered Flash package and exclusive GPU experiment lock"]
-fn validate_flash_layered_prefill() {
+fn validate_layered_prefill() {
     let fixture: Fixture = crate::model::read(&PathBuf::from(
         std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
     ))
@@ -295,7 +295,7 @@ fn validate_flash_layered_prefill() {
     let expected_state = hash_state(&mut model, &mut reference);
     model.finish_request(&mut reference, false).unwrap();
     let mut rows = vec![];
-    for interruption in [false, true] {
+    for (interruption, budget_s) in [(false, 0.), (true, 0.), (true, 0.2)] {
         let before = model.scheduling_statistics();
         let mut req = model.start_request(input(&source, 1), &|| false).unwrap();
         let mut short = input(&source, 1024);
@@ -310,7 +310,9 @@ fn validate_flash_layered_prefill() {
         let mut steps = 0;
         while req.prefilling {
             model
-                .with_request(&mut req, |m, r| m.advance_prefill_step(r, chunk, true))
+                .with_request(&mut req, |m, r| {
+                    m.advance_prefill_step(r, chunk, true, budget_s)
+                })
                 .unwrap();
             steps += 1;
             assert!(steps < 1000);
@@ -331,7 +333,9 @@ fn validate_flash_layered_prefill() {
                 }
             }
         }
-        assert!(steps >= 48);
+        if budget_s == 0. {
+            assert!(steps >= model.manifest.prefill_plan(chunk).unwrap().stages.len());
+        }
         let scores = distribution(&mut model, &mut req);
         let kl: f64 = expected
             .iter()
@@ -349,7 +353,7 @@ fn validate_flash_layered_prefill() {
             assert_eq!(save_s, 0.);
             assert_eq!(resume_s, 0.);
         }
-        rows.push(json!({"interruption":interruption,"steps":steps,"kl":kl,"state_equal":true,"save_s":save_s,"resume_s":resume_s}));
+        rows.push(json!({"interruption":interruption,"budget_s":budget_s,"steps":steps,"kl":kl,"state_equal":true,"save_s":save_s,"resume_s":resume_s}));
         model.finish_request(&mut req, false).unwrap();
         model.finish_request(&mut decoder, false).unwrap();
     }
@@ -363,7 +367,7 @@ fn validate_flash_layered_prefill() {
         for req in &mut peers {
             if req.prefilling {
                 model
-                    .with_request(req, |m, r| m.advance_prefill_step(r, chunk, true))
+                    .with_request(req, |m, r| m.advance_prefill_step(r, chunk, true, 0.))
                     .unwrap();
             }
         }
@@ -376,7 +380,7 @@ fn validate_flash_layered_prefill() {
     let mut cancelled = model.start_request(input(&source, 1), &|| false).unwrap();
     model
         .with_request(&mut cancelled, |m, r| {
-            m.advance_prefill_step(r, chunk, true)
+            m.advance_prefill_step(r, chunk, true, 0.)
         })
         .unwrap();
     assert!(cancelled.prefill_frame.is_some());
@@ -391,7 +395,7 @@ fn validate_flash_layered_prefill() {
     let mut abandoned = model.start_request(input(&source, 1), &|| false).unwrap();
     model
         .with_request(&mut abandoned, |m, r| {
-            m.advance_prefill_step(r, chunk, true)
+            m.advance_prefill_step(r, chunk, true, 0.)
         })
         .unwrap();
     drop(abandoned);

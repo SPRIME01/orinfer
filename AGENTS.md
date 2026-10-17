@@ -20,6 +20,7 @@
 - Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家bank与路由计数，按需从SSD加载到CUDA VMM页，并共享全局SLRU。有限模式暂关闭CUDA Graph，MTP专家全量常驻；临时路由集合和页粒度不计作严格字节上限，不缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
 - 27B后续实验与部署使用已重新编码的两级E8P Q4A8权重（coefficients=[4,1]、beam8搜索），本机当前模型目录为`artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为`artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。旧量化和TCQ实验仅保留结果记录，不作为权重回退。更换权重值而配置和buffer契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
 - 27B整数投影每种矩阵几何、dtype/stride及压缩布局只发布一个动态fallback；常用1/2/3/4/8/16/32行可保留同源AOT。离线调优汇总多个长度的代价选择一个配置，不输出按prefill长度区间切换投影cubin的选择表；调优候选不等于线上多路径。收敛后检查实际发布包，验证尾部、完整请求性能和全部状态。
+- 27B的prefill以模型声明的层边界暂停，保留同一动态行块，仅将Hidden和FP32 residual列为跨层存活workspace；状态增长与最终提交复用公共Frame流程。普通decode的1–128路私有GDN/attention复用单行TileLang计算体的地址表包装。普通、验证和混合packet复用共享target前后置计算，MixedRows显式携带角色边界；验证输出全部位置，普通请求输出末位置。批量draft/commit/warm沿用公共MTP流程，草稿条件、紧凑GDN因子、卷积历史、KV及隐藏环均按owner绑定。公共packet调用、地址表绑定和prefill分层注册与Flash Next共用，不复制其HC/PLE/QSA或固定层数布局。
 - Flash Next采用已确定的混合量化方案：专家保留整数E8P Q2A8；主干GDN QKV/Z、QSA Q/gate和target/MTP共享输出头采用signed-block128旋转、输出行scale的Q4A8。GDN/QSA输出投影、共享FFN和MTP草稿Q/O保留W8；其余精度敏感部分维持原混合精度。原生适配器校验该策略，不保留逐矩阵试验精度分支。
 - Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
 - E8P可使用无损K64/K128压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。

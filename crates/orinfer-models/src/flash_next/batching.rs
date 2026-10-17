@@ -145,18 +145,7 @@ pub(super) fn state_bindings(
         })
         .collect();
     let rows = super::unified_decode::CAPACITY;
-    let mut result = Vec::with_capacity(rows * (roles.len() + 10));
-    for lane in 0..rows {
-        if let Some(segment) = segments.get(lane) {
-            result.extend(
-                roles
-                    .iter()
-                    .map(|name| name.as_ref().map(|n| (segment.slot, n.clone()))),
-            );
-        } else {
-            result.extend(std::iter::repeat_n(None, roles.len()));
-        }
-    }
+    let mut result = crate::packet::private_bindings(segments, rows, &roles);
     let io = [
         Some("M1_Embedding".to_owned()),
         Some("M1_Ple".to_owned()),

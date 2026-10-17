@@ -147,6 +147,9 @@ class Builder:
         from tools.model.qwen35 import mtp
 
         mtp.build(self)
+        from tools.model.qwen35 import parallel
+
+        parallel.build(self)
 
     def workspace(self):
         w = self.weights
@@ -803,6 +806,13 @@ class Builder:
             ),
             vision=self.vision,
             mtp=self.mtp,
+            batch_layout=dict(
+                layers=self.text["layer_types"],
+                row_strides={},
+                profiles={},
+                hidden=5120,
+                state_columns=self.state_columns,
+            ),
         )
         package = dict(
             schema_version=1,

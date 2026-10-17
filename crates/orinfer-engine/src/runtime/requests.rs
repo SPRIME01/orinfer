@@ -123,7 +123,7 @@ enum Work {
     Speculative(usize, usize, bool),
     SpeculativeBatch(speculation::BatchChoice),
     MixedSpeculative(Vec<(usize, usize)>),
-    Prefill(usize, usize, bool),
+    Prefill(usize, usize, bool, f64),
     Batch(Vec<(usize, usize)>),
     Idle,
 }
@@ -1229,11 +1229,11 @@ impl ModelRuntime {
                     .entry(1)
                     .or_default() += 1;
             }
-            Work::Prefill(i, chunk, bounded) => {
+            Work::Prefill(i, chunk, bounded, budget_s) => {
                 let key = Self::iteration_key(requests, &[(i, chunk)]);
                 let before = self.execution.batch_statistics.get();
                 let (_, tokens) = self.with_request(requests[i], |model, req| {
-                    model.advance_prefill_step(req, chunk, bounded)
+                    model.advance_prefill_step(req, chunk, bounded, budget_s)
                 })?;
                 let after = self.execution.batch_statistics.get();
                 let cold_s = after.kernel_load_s - before.kernel_load_s + after.sequence_capture_s
@@ -1478,7 +1478,12 @@ impl ModelRuntime {
                 }
             }
             self.scheduler_statistics.independent_prefill_choices += 1;
-            return Ok(Work::Prefill(i, native, false));
+            return Ok(Work::Prefill(
+                i,
+                native,
+                false,
+                options.prefill_budget_ms / 1000.,
+            ));
         }
         let rotate = self.scheduler_cursor % decode.len();
         decode.rotate_left(rotate);
@@ -1534,7 +1539,7 @@ impl ModelRuntime {
                 self.scheduler_statistics.prefill_progress_overrides += 1;
             }
             self.scheduler_statistics.independent_prefill_choices += 1;
-            return Ok(Work::Prefill(i, n, true));
+            return Ok(Work::Prefill(i, n, true, window_s.max(0.)));
         }
         if prefill.is_some() {
             self.scheduler_statistics.deadline_decode_iterations += 1;

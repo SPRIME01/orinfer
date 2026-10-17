@@ -1,5 +1,6 @@
 //! Table-Q4A8: shared row computation with request-owned causal state.
 use super::config::Configuration;
+use crate::packet::append;
 use crate::{
     adapter::Adapter,
     artifact::{Access, Dtype, Result},
@@ -17,6 +18,23 @@ use std::collections::{BTreeMap, BTreeSet};
 const CAPACITY: usize = 4096;
 const LANES: usize = 128;
 const PREFIX: &str = "qwen_rows";
+// This order is the address-table contract compiled into the private kernels.
+const STATE_COLUMNS: &[&str] = &[
+    "History",
+    "KPages",
+    "KPagesScale",
+    "MRopePositions",
+    "Positions",
+    "PrepareStatus",
+    "QwenRowScratch",
+    "Requests",
+    "SegmentLength",
+    "SeqLength",
+    "State",
+    "Step",
+    "VPages",
+    "VPagesScale",
+];
 #[path = "mtp.rs"]
 mod mtp;
 const PRE_GDN: &[&str] = &["norm_rotate", "qkv", "z", "ab"];
@@ -203,6 +221,7 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         vec!["prepare", "embedding"]
     };
     let mut forward = section(m, "begin", &begin);
+    let mut layer_ends = Vec::with_capacity(t.layer_types.len());
     let mut strides = BTreeMap::new();
     for (name, width, size) in [
         ("Hidden", 5120, 2),
@@ -245,6 +264,7 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
         forward.extend(private);
         forward.extend(section(m, &format!("layer{layer}/post"), POST));
+        layer_ends.push(forward.len());
     }
     forward.extend(section(m, "end", &["advance"]));
     let gather = section(m, "gather", &["norm"]);
@@ -283,6 +303,10 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         length: "SegmentLength".into(),
         last_index: "LastIndex".into(),
     });
+    let state_columns = m
+        .batch_layout
+        .as_ref()
+        .map_or_else(Vec::new, |l| l.state_columns.clone());
     m.batch_layout = Some(BatchLayout {
         layers: t.layer_types.clone(),
         row_strides: strides,
@@ -290,9 +314,39 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         hidden: t.hidden_size,
         small_mixed_shapes: vec![],
         segment_tokens: CAPACITY,
-        state_columns: vec![],
+        state_columns,
         preparation_programs: BTreeMap::from([(1, "decode".into()), (CAPACITY, "prefill".into())]),
     });
+    {
+        let columns = &m.batch_layout.as_ref().unwrap().state_columns;
+        if columns != STATE_COLUMNS
+            || m.buffers
+                .iter()
+                .find(|b| b.name == "QwenRowPointers")
+                .is_none_or(|b| {
+                    b.dtype != Dtype::U64
+                        || b.shape != [LANES * t.layer_types.len() * columns.len()]
+                })
+        {
+            return Err("Invalid Qwen private address table".into());
+        }
+        m.state_pointer_table = Some(crate::model::StatePointerTable {
+            buffer: "QwenRowPointers".into(),
+            max_rows: LANES,
+        });
+        for (layer, kind) in t.layer_types.iter().enumerate() {
+            let names = if kind == "linear_attention" {
+                &["gates", "conv", "history", "recurrent", "gated_norm"][..]
+            } else {
+                &["prepare", "attention", "attention_merge"][..]
+            };
+            let name = format!("{PREFIX}/state/layer{layer}");
+            m.programs.insert(
+                name,
+                kernels(&format!("{PREFIX}/state/layer{layer}"), names),
+            );
+        }
+    }
     mtp::register(m)?;
     vision(m, c.vision_depth)?;
     let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
@@ -312,10 +366,15 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         "decode"
                         | "mtp_draft"
                         | "mtp_head"
+                        | "mtp_gather"
+                        | "mtp_select"
                         | "qwen_rows/select"
                         | "qwen_rows/head_last" => 1,
-                        "mtp_warm" => 512,
+                        "mtp_warm" | "mtp_begin" | "mtp_pre" | "mtp_private" | "mtp_post"
+                        | "mtp_advance" => 512,
                         "verify" | "restore" => 8,
+                        name if name.starts_with("qwen_rows/state/") => LANES,
+                        name if name.starts_with("qwen_rows/verify/") => 8,
                         "qwen_rows/head" => LANES,
                         _ => CAPACITY,
                     },
@@ -386,6 +445,17 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 .collect(),
         },
     );
+    *layer_ends.last_mut().ok_or("Missing Qwen layer boundary")? = m.programs["prefill"].len();
+    let mut first = 0;
+    let stages = layer_ends
+        .into_iter()
+        .map(|last| {
+            let operations = m.programs["prefill"][first..last].to_vec();
+            first = last;
+            operations
+        })
+        .collect();
+    crate::prefill::register(m, "prefill", stages, vec!["Hidden".into(), "R0".into()])?;
     let metadata = request.metadata;
     Ok((
         Box::new(QwenRows {
@@ -399,32 +469,30 @@ pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     ))
 }
 
-fn append(
-    m: &Manifest,
-    out: &mut Vec<Invocation>,
-    program: &str,
-    rows: usize,
-    owner: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Result<()> {
-    let template = m
-        .row_execution
-        .as_ref()
-        .ok_or("Missing Qwen row template")?;
-    let mut calls = template.specialize(
-        program,
-        &m.programs[program],
-        &m.dynamic_batch_kernels,
-        rows,
-    )?;
-    for call in &mut calls {
-        call.sequence = owner;
-        call.views = views.clone();
-    }
-    out.extend(calls);
-    Ok(())
-}
 impl Adapter for QwenRows {
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+        include_plan: bool,
+    ) -> Result<abi::BatchPlan> {
+        match operation {
+            abi::BatchOperation::Ordinary => self.packet(segments, None, include_plan),
+            abi::BatchOperation::Verification => self.packet(segments, Some(0), include_plan),
+            abi::BatchOperation::MixedRows { prefills }
+                if prefills > 0 && usize::from(prefills) < segments.len() =>
+            {
+                self.packet(segments, Some(usize::from(prefills)), include_plan)
+            }
+            abi::BatchOperation::Draft
+            | abi::BatchOperation::Warm
+            | abi::BatchOperation::DraftHead => {
+                mtp::draft(&self.manifest, segments, operation, include_plan)
+            }
+            abi::BatchOperation::Commit => mtp::commit(&self.manifest, segments, include_plan),
+            _ => Err("Unsupported Qwen packet operation".into()),
+        }
+    }
     fn prepare(
         &self,
         program: &str,
@@ -460,7 +528,50 @@ impl Adapter for QwenRows {
         )
     }
     fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<abi::BatchPlan> {
+        self.packet(segments, None, include_plan)
+    }
+}
+
+impl QwenRows {
+    fn state_bindings(&self, segments: &[BatchSegment]) -> abi::StateBindings {
+        let layout = self.manifest.batch_layout.as_ref().unwrap();
+        let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
+        let roles: Vec<_> = (0..layout.layers.len())
+            .flat_map(|layer| {
+                layout.state_columns.iter().map(move |column| {
+                    let per_layer = format!("L{layer}_{column}");
+                    if self.manifest.buffers.iter().any(|b| b.name == per_layer) {
+                        Some(per_layer)
+                    } else {
+                        self.manifest
+                            .buffers
+                            .iter()
+                            .any(|b| b.name == *column)
+                            .then(|| column.clone())
+                    }
+                })
+            })
+            .collect();
+        crate::packet::private_bindings(&decoders, decoders.len(), &roles)
+    }
+    fn packet(
+        &self,
+        segments: &[BatchSegment],
+        prefills: Option<usize>,
+        include_plan: bool,
+    ) -> Result<abi::BatchPlan> {
         let m = &self.manifest;
+        let ordered: Vec<_> = if prefills.is_none() {
+            segments
+                .iter()
+                .filter(|s| s.tokens == 1)
+                .chain(segments.iter().filter(|s| s.tokens != 1))
+                .cloned()
+                .collect()
+        } else {
+            segments.to_vec()
+        };
+        let segments = ordered.as_slice();
         let total: usize = segments
             .iter()
             .map(|s| s.tokens)
@@ -476,10 +587,36 @@ impl Adapter for QwenRows {
         {
             return Err("Invalid Qwen causal row packet".into());
         }
+        let verified = |lane: usize| prefills.is_some_and(|n| lane >= n);
+        let head_rows: usize = segments
+            .iter()
+            .enumerate()
+            .map(|(lane, s)| if verified(lane) { s.tokens } else { 1 })
+            .sum();
+        if head_rows > LANES
+            || segments.iter().enumerate().any(|(lane, s)| {
+                verified(lane)
+                    && !m
+                        .mtp
+                        .as_ref()
+                        .is_some_and(|spec| spec.batch_verification_tokens.contains(&s.tokens))
+            })
+        {
+            return Err("Invalid Qwen verification rows".into());
+        }
         if !include_plan {
-            return Ok((vec![], vec![]));
+            return Ok((
+                vec![],
+                if prefills.is_none() {
+                    self.state_bindings(segments)
+                } else {
+                    vec![]
+                },
+            ));
         }
         let layout = m.batch_layout.as_ref().ok_or("Missing Qwen row arena")?;
+        let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
+        let parallel = prefills.is_none() && decoders > 0;
         let (mut out, mut offset, mut views) = (Vec::new(), 0, Vec::new());
         let empty = BTreeMap::new();
         for segment in segments {
@@ -528,11 +665,30 @@ impl Adapter for QwenRows {
                 None,
                 &empty,
             )?;
-            for (segment, v) in segments.iter().zip(&views) {
+            if parallel {
                 append(
                     m,
                     &mut out,
-                    &format!("{PREFIX}/layer{layer}/private"),
+                    &format!("{PREFIX}/state/layer{layer}"),
+                    decoders,
+                    None,
+                    &empty,
+                )?;
+            }
+            for (lane, (segment, v)) in segments
+                .iter()
+                .zip(&views)
+                .enumerate()
+                .filter(|(_, (s, _))| !parallel || s.tokens != 1)
+            {
+                append(
+                    m,
+                    &mut out,
+                    &if verified(lane) {
+                        format!("{PREFIX}/verify/layer{layer}/private")
+                    } else {
+                        format!("{PREFIX}/layer{layer}/private")
+                    },
                     segment.tokens,
                     Some(segment.slot),
                     v,
@@ -547,6 +703,8 @@ impl Adapter for QwenRows {
                 &empty,
             )?;
         }
+        let mut head_lane = 0;
+        let mut heads = vec![];
         for (lane, (segment, v)) in segments.iter().zip(&views).enumerate() {
             append(
                 m,
@@ -571,48 +729,59 @@ impl Adapter for QwenRows {
                 "HeadHidden".into(),
                 BufferView {
                     buffer: "HeadHidden".into(),
-                    offset: lane * 5120 * 2,
+                    offset: head_lane * 5120 * 2,
                 },
             );
             append(
                 m,
                 &mut out,
-                &format!("{PREFIX}/gather"),
+                &if verified(lane) {
+                    format!("{PREFIX}/verify/gather")
+                } else {
+                    format!("{PREFIX}/gather")
+                },
                 segment.tokens,
                 Some(segment.slot),
                 &gather,
             )?;
+            heads.push((head_lane, if verified(lane) { segment.tokens } else { 1 }));
+            head_lane += heads.last().unwrap().1;
         }
         append(
             m,
             &mut out,
             &format!("{PREFIX}/head"),
-            segments.len(),
+            head_rows,
             None,
             &empty,
         )?;
         for (lane, segment) in segments.iter().enumerate() {
+            let (first, count) = heads[lane];
             let v = BTreeMap::from([
                 (
                     "HeadLogits".into(),
                     BufferView {
                         buffer: "HeadLogits".into(),
-                        offset: lane * m.vocab * 4,
+                        offset: first * m.vocab * 4,
                     },
                 ),
                 (
                     "Pairs".into(),
                     BufferView {
                         buffer: "Pairs".into(),
-                        offset: lane * 8,
+                        offset: first * 8,
                     },
                 ),
             ]);
             out.push(Invocation {
                 operation: Operation::Copy {
                     source: "HeadLogits".into(),
-                    destination: m.logits.clone(),
-                    bytes: m.vocab * 4,
+                    destination: if verified(lane) {
+                        m.mtp.as_ref().unwrap().verification_logits.clone()
+                    } else {
+                        m.logits.clone()
+                    },
+                    bytes: count * m.vocab * 4,
                 },
                 sequence: Some(segment.slot),
                 launch: None,
@@ -621,13 +790,24 @@ impl Adapter for QwenRows {
             append(
                 m,
                 &mut out,
-                &format!("{PREFIX}/select"),
-                1,
+                &if verified(lane) {
+                    format!("{PREFIX}/verify/select")
+                } else {
+                    format!("{PREFIX}/select")
+                },
+                count,
                 Some(segment.slot),
                 &v,
             )?;
         }
-        Ok((out, vec![]))
+        Ok((
+            out,
+            if prefills.is_none() {
+                self.state_bindings(segments)
+            } else {
+                vec![]
+            },
+        ))
     }
 }
 
@@ -683,12 +863,19 @@ mod tests {
                 q4(format!("{p}.{name}.weight"), *n, 5120);
             }
         }
+        buffers.extend([
+            json!({"name":"Hidden","dtype":"f16","shape":[4096,5120],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"R0","dtype":"f32","shape":[4096,5120],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"QwenRowPointers","dtype":"u64","shape":[128*64*STATE_COLUMNS.len()],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"QwenRowScratch","dtype":"u8","shape":[256],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+        ]);
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
             "architecture":"qwen3_5","compute_policy":"int8_quality",
             "prefill_profiles":[{"tokens":4096,"min_tokens":1,"kind":"qwen_q4_rows"}],
             "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
                 "status":"TokenStatus","logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
+                "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":5120,"state_columns":STATE_COLUMNS},
                 "kv_cache":{"direct_prefill":true,"demand_mapping":true,"buffers":{},"prefill_workspace":{}},
                 "dynamic_batch_kernels":{"qwen_rows/layer0/pre/norm_rotate":{"name":"qwen_rows/layer0/pre/norm_rotate","capacity":4096,
                     "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],"arguments":[]}}}})).unwrap()
@@ -775,10 +962,11 @@ mod tests {
         let conv:Vec<_>=calls.iter().filter(|call|matches!(&call.operation,Operation::Kernel{name} if name=="qwen_rows/layer0/private/conv")).collect();
         assert_eq!(
             conv.iter().map(|call| call.sequence).collect::<Vec<_>>(),
-            [Some(7), Some(2)]
+            [Some(2)]
         );
-        assert_eq!(conv[1].views["QKV"].offset, 10240 * 2);
-        assert!(!conv[1].views.contains_key("Q")); // compact causal scratch is reused, never offset as token-major data
+        assert_eq!(conv[0].views["QKV"].offset, 10240 * 2);
+        assert!(!conv[0].views.contains_key("Q")); // compact causal scratch is reused, never offset as token-major data
+        assert!(calls.iter().any(|call| call.sequence.is_none() && matches!(&call.operation,Operation::Kernel{name} if name=="qwen_rows/state/layer0/conv")));
         let gather:Vec<_>=calls.iter().filter(|call|matches!(&call.operation,Operation::Kernel{name} if name=="qwen_rows/gather/norm")).collect();
         assert_eq!(gather[1].views["HeadHidden"].offset, 5120 * 2);
         assert_eq!(plan.metadata.prefill_plans.len(), 1);
@@ -792,6 +980,131 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op,Operation::Kernel{name} if name=="qwen_rows/head/project"))
         );
+    }
+
+    #[test]
+    fn private_pointer_columns_are_a_pinned_semantic_contract() {
+        let mut r = request();
+        r.metadata
+            .batch_layout
+            .as_mut()
+            .unwrap()
+            .state_columns
+            .clear();
+        assert!(create(r, Policy::Int8Quality).is_err());
+        let mut r = request();
+        r.metadata.batch_layout.as_mut().unwrap().state_columns[0] = "DifferentHistory".into();
+        assert!(create(r, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn stages_preserve_the_full_forward_and_only_shared_live_values() {
+        let (_, plan) = create(request(), Policy::Int8Quality).unwrap();
+        let m = plan.metadata;
+        let p = &m.prefill_plans[0];
+        assert_eq!(p.stages.len(), 64);
+        assert_eq!(p.live_buffers, ["Hidden", "R0"]);
+        let joined: Vec<_> = p
+            .stages
+            .iter()
+            .flat_map(|s| m.programs[s].clone())
+            .collect();
+        assert_eq!(joined, m.programs["prefill"]);
+        for s in &p.stages {
+            assert_eq!(m.row_execution.as_ref().unwrap().program_capacity(s), 4096);
+            assert!(m.kv_cache.as_ref().unwrap().growth.contains_key(s));
+        }
+    }
+
+    fn mtp_request() -> CreateRequest {
+        let mut r = request();
+        r.metadata.mtp=Some(serde_json::from_value(json!({
+            "position":"MtpStep","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
+            "verification_tokens":"SequenceTokens","verification_status":"SequenceStatus",
+            "draft_logits":"MtpLogits","verification_logits":"SequenceLogits","feature_index":"MtpFeatureIndex",
+            "accepted_inputs":"AcceptedInputs","target_length":"SeqLength","draft_program":"mtp_draft",
+            "hidden_ring":"MtpTargetHidden","commit_always":true,"shared_verification_state":true,
+            "default_verification_tokens":4,
+            "warm_plans":[{"tokens":512,"min_tokens":1,"program":"mtp_warm","head_program":"mtp_head"}],
+            "capture_plans":[{"tokens":4096,"program":"capture"}],
+            "verification_plans":[{"tokens":8,"min_tokens":2,"program":"verify","restore_program":"restore","capture_program":"capture"}]
+        })).unwrap());
+        r
+    }
+
+    #[test]
+    fn mixed_roles_are_explicit_and_verification_heads_keep_all_positions() {
+        let (a, _) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        // Equal lengths have different semantics; they cannot identify roles.
+        let segments = [
+            BatchSegment { slot: 7, tokens: 2 },
+            BatchSegment { slot: 3, tokens: 2 },
+        ];
+        let (calls, _) = a
+            .batch_operation(
+                &segments,
+                abi::BatchOperation::MixedRows { prefills: 1 },
+                true,
+            )
+            .unwrap();
+        let prefix:Vec<_>=calls.iter().filter(|c|matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/verify/layer0/history")).map(|c|c.sequence).collect();
+        assert_eq!(prefix, [Some(3)]);
+        for (owner, destination, count) in [(7, "Logits", 1), (3, "SequenceLogits", 2)] {
+            assert!(calls.iter().any(|c| c.sequence==Some(owner) && matches!(&c.operation,Operation::Copy{destination:d,bytes,..} if d==destination && *bytes==count*248320*4)));
+        }
+        let shared:Vec<_>=calls.iter().filter(|c|matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/layer0/pre/qkv")).collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].sequence, None);
+        assert!(
+            a.batch_operation(
+                &segments,
+                abi::BatchOperation::MixedRows { prefills: 0 },
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            a.batch_operation(
+                &[BatchSegment { slot: 1, tokens: 1 }],
+                abi::BatchOperation::Verification,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn draft_warm_joins_projections_and_keeps_conditions_private() {
+        let (a, _) = create(mtp_request(), Policy::Int8Quality).unwrap();
+        let segments = [
+            BatchSegment { slot: 7, tokens: 3 },
+            BatchSegment { slot: 3, tokens: 2 },
+        ];
+        let (calls, _) = a
+            .batch_operation(&segments, abi::BatchOperation::Warm, true)
+            .unwrap();
+        let fc: Vec<_> = calls
+            .iter()
+            .filter(|c| matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/mtp/fc"))
+            .collect();
+        assert_eq!(fc.len(), 1);
+        assert_eq!(fc[0].sequence, None);
+        let conditions:Vec<_>=calls.iter().filter(|c| matches!(&c.operation,Operation::Copy{destination,..} if destination=="MtpCondition")).map(|c|c.sequence).collect();
+        assert_eq!(conditions, [Some(7), Some(3)]);
+        assert!(!calls.iter().any(
+            |c| matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/head/project")
+        ));
+        let endpoints = [
+            BatchSegment { slot: 7, tokens: 1 },
+            BatchSegment { slot: 3, tokens: 1 },
+        ];
+        let (head, _) = a
+            .batch_operation(&endpoints, abi::BatchOperation::DraftHead, true)
+            .unwrap();
+        assert!(!head.iter().any(
+            |c| matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/mtp/final_norm")
+        ));
+        assert_eq!(head.iter().filter(|c|matches!(&c.operation,Operation::Copy{destination,..} if destination=="MtpLogits")).count(),2);
     }
 
     #[test]

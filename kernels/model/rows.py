@@ -61,3 +61,29 @@ def explicit_scalar(function, scalar):
         function.buffer_map,
         function.attrs,
     )
+
+
+def static_rows(function, count=1):
+    """Specialize a row factory before adding independent request CTAs.
+
+    Only tensor-shape row scalars are bound; positions and KV lengths remain
+    request-private device inputs. No arithmetic or reduction is rewritten.
+    """
+    from tvm import tirx as tir
+
+    variables = set()
+
+    def visit(node):
+        if isinstance(node, tir.Var) and node.name in ("m", "rows", "tokens", "batch"):
+            variables.add(node)
+
+    for buffer in function.buffer_map.values():
+        for expression in [*buffer.shape, *buffer.strides]:
+            tir.stmt_functor.post_order_visit(expression, visit)
+    if not variables:
+        return function
+    if len(variables) != 1 or type(count) is not int or count < 1:
+        raise ValueError("Expected one positive row specialization")
+    (rows,) = variables
+    function = explicit_scalar(function, rows)
+    return function.specialize({rows: count})

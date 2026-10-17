@@ -1,10 +1,9 @@
 //! Shared token-row computation; owners and causal segments remain caller-owned.
+pub(super) use crate::packet::append;
 use crate::{
     artifact::Result,
-    execution::{BufferView, Invocation},
     model::{Manifest, Operation},
 };
-use std::collections::BTreeMap;
 
 pub(super) fn verification(m: &mut Manifest) -> Result<()> {
     let Some(spec) = m.mtp.clone() else {
@@ -96,30 +95,5 @@ pub(super) fn verification(m: &mut Manifest) -> Result<()> {
         rows.programs.insert(plan.program.clone());
         rows.program_capacities.insert(plan.program.clone(), n);
     }
-    Ok(())
-}
-
-pub(super) fn append(
-    m: &Manifest,
-    out: &mut Vec<Invocation>,
-    program: &str,
-    count: usize,
-    sequence: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Result<()> {
-    let rows = m
-        .row_execution
-        .as_ref()
-        .ok_or("Missing shared row execution")?;
-    let operations = m
-        .programs
-        .get(program)
-        .ok_or("Missing shared row program")?;
-    let mut calls = rows.specialize(program, operations, &m.dynamic_batch_kernels, count)?;
-    for call in &mut calls {
-        call.sequence = sequence;
-        call.views = views.clone();
-    }
-    out.extend(calls);
     Ok(())
 }

@@ -1199,8 +1199,13 @@ impl ModelRuntime {
 }
 
 #[cfg(test)]
+#[path = "tests/verification.rs"]
+mod verification_tests;
+
+#[cfg(test)]
 mod policy_tests {
     use super::*;
+
     #[test]
     #[ignore = "Requires real MTP model and exclusive GPU experiment lock"]
     fn validate_flash_warm_input_ownership() {
@@ -1300,7 +1305,7 @@ mod policy_tests {
     }
     #[test]
     #[ignore = "Requires real MTP model and exclusive GPU experiment lock"]
-    fn validate_flash_batched_drafts_and_commits() {
+    fn validate_batched_drafts_and_commits() {
         #[derive(serde::Deserialize)]
         struct Fixture {
             model: std::path::PathBuf,
@@ -1323,7 +1328,7 @@ mod policy_tests {
         )
         .unwrap();
         let spec = model.manifest.mtp.clone().unwrap();
-        assert_eq!(spec.batch_draft_profiles.last(), Some(&8));
+        assert!(spec.batch_draft_profiles.last().is_some_and(|&n| n >= 8));
         assert!(spec.batch_commit);
         assert!(spec.batch_warm);
         let options = scheduler::Options {
