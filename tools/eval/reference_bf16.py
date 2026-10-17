@@ -6,8 +6,11 @@ This freezes a full-sequence reference, not a BF16 autoregressive timing test.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import inspect
 import json
+import math
 from pathlib import Path
 import time
 
@@ -16,6 +19,132 @@ from safetensors import safe_open
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
 from transformers.models.qwen3_5 import modeling_qwen3_5 as modeling
 from tools.eval.scoring_common import SEED, context_hash, image_fingerprints
+from tools.model.safetensors_source import Source, SIZES
+
+
+def configure_torch_reference():
+    """Freeze the official Torch equations before optional kernel dispatch."""
+    functions = {}
+    for name in (
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
+        "torch_chunk_gated_delta_rule",
+        "torch_recurrent_gated_delta_rule",
+    ):
+        function = inspect.unwrap(getattr(modeling, name))
+        setattr(modeling, name, function)
+        functions[name] = hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
+    return functions
+
+
+class PinnedTensors:
+    """Bounded concurrent reads of original tensors, without a full checkpoint."""
+
+    def __init__(self, checkpoint, repo, revision, output, workers=8, cache=None):
+        self.source = Source(
+            checkpoint / "model.safetensors.index.json",
+            repo=repo,
+            revision=revision,
+            cache=output.parent / "headers",
+        )
+        self.workers, self.cache = workers, cache
+        self.progress = output.with_suffix(".weights.json")
+        self.records = {}
+
+    def raw(self, name):
+        filename, begin, info = self.source.tensor(name)
+        size = math.prod(info["shape"]) * SIZES[info["dtype"]]
+        raw = bytearray(size)
+        chunk = 32 * 1024**2
+
+        def read(offset):
+            return offset, self.source.read(
+                filename, begin + info["data_offsets"][0] + offset, min(chunk, size - offset)
+            )
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for offset, data in pool.map(read, range(0, size, chunk)):
+                raw[offset : offset + len(data)] = data
+        return raw, info
+
+    def tensor(self, name):
+        cache = (
+            self.cache / (hashlib.sha256(name.encode()).hexdigest() + ".safetensors")
+            if self.cache
+            else None
+        )
+        if cache and cache.exists():
+            with safe_open(cache, framework="pt", device="cpu") as reader:
+                identity = reader.metadata()
+                if (
+                    identity["repo"] != self.source.repo
+                    or identity["revision"] != self.source.revision
+                ):
+                    raise ValueError("Prefetched original tensor identity mismatch")
+                cpu = reader.get_tensor(name)
+                raw = cpu.view(torch.uint8).numpy().tobytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                if digest != identity["sha256"]:
+                    raise ValueError("Prefetched original tensor payload changed")
+                result = cpu.to("cuda")
+            size = len(raw)
+            cache.unlink()
+        else:
+            raw, info = self.raw(name)
+            dtype = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}[
+                info["dtype"]
+            ]
+            result = torch.frombuffer(raw, dtype=dtype).reshape(info["shape"]).to("cuda")
+            digest, size = hashlib.sha256(raw).hexdigest(), len(raw)
+        self.records[name] = dict(bytes=size, sha256=digest)
+        self.progress.write_text(json.dumps(self.records) + "\n")
+        print("BF16 tensor", name, size, flush=True)
+        return result
+
+    def tensors(self, names):
+        """Pool byte ranges across one component, including its small tensors."""
+        result, pending = {}, {}
+        for name in names:
+            path = (
+                self.cache / (hashlib.sha256(name.encode()).hexdigest() + ".safetensors")
+                if self.cache
+                else None
+            )
+            if path and path.exists():
+                result[name] = self.tensor(name)
+                continue
+            filename, begin, info = self.source.tensor(name)
+            size = math.prod(info["shape"]) * SIZES[info["dtype"]]
+            pending[name] = (filename, begin + info["data_offsets"][0], info, bytearray(size))
+        chunk = 32 * 1024**2
+        jobs = [
+            (name, offset)
+            for name, (_, _, _, data) in pending.items()
+            for offset in range(0, len(data), chunk)
+        ]
+
+        def read(job):
+            name, offset = job
+            filename, start, _, raw = pending[name]
+            return (
+                name,
+                offset,
+                self.source.read(filename, start + offset, min(chunk, len(raw) - offset)),
+            )
+
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            for name, offset, data in pool.map(read, jobs):
+                pending[name][3][offset : offset + len(data)] = data
+        for name in list(pending):
+            _, _, info, raw = pending.pop(name)
+            dtype = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}[
+                info["dtype"]
+            ]
+            result[name] = torch.frombuffer(raw, dtype=dtype).reshape(info["shape"]).to("cuda")
+            self.records[name] = dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+            print("BF16 tensor", name, len(raw), flush=True)
+        self.progress.write_text(json.dumps(self.records) + "\n")
+        return result
 
 
 def main():
@@ -24,6 +153,9 @@ def main():
     p.add_argument("--requests", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--revision", required=True)
+    p.add_argument("--remote-repo", help="Read original tensors from this pinned HF repository")
+    p.add_argument("--read-workers", type=int, default=8)
+    p.add_argument("--tensor-cache", type=Path, help="Consume prefetched original safetensors")
     p.add_argument(
         "--batch-size",
         type=int,
@@ -43,6 +175,9 @@ def main():
             raise ValueError("Reference requires explicit teacher-forced target IDs")
     if not 1 <= a.batch_size <= 128:
         raise ValueError("batch-size must be in 1..128")
+    if not 1 <= a.read_workers <= 16:
+        raise ValueError("read-workers must be in 1..16")
+    a.output.parent.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(2)
     torch.manual_seed(requests["seed"])
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -51,11 +186,7 @@ def main():
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     # Use the official Torch equations even when optional FLA/conv packages are
     # installed. Their binary kernels may not support this Orin's SM87 target.
-    modeling.FusedRMSNormGated = None
-    modeling.causal_conv1d_fn = None
-    modeling.causal_conv1d_update = None
-    modeling.chunk_gated_delta_rule = None
-    modeling.fused_recurrent_gated_delta_rule = None
+    reference_functions = configure_torch_reference()
     config_raw = (a.checkpoint / "config.json").read_bytes()
     config_json = json.loads(config_raw)
     config = Qwen3_5TextConfig(**config_json.get("text_config", config_json))
@@ -74,24 +205,41 @@ def main():
     text_model.rotary_emb = modeling.Qwen3_5TextRotaryEmbedding(config, device="cuda")
     index_raw = (a.checkpoint / "model.safetensors.index.json").read_bytes()
     index = json.loads(index_raw)["weight_map"]
-    sources = {
-        filename: safe_open(a.checkpoint / filename, framework="pt", device="cpu")
-        for filename in set(index.values())
-    }
+    sources = (
+        {}
+        if a.remote_repo
+        else {
+            filename: safe_open(a.checkpoint / filename, framework="pt", device="cpu")
+            for filename in set(index.values())
+        }
+    )
+    remote = (
+        PinnedTensors(
+            a.checkpoint, a.remote_repo, a.revision, a.output, a.read_workers, a.tensor_cache
+        )
+        if a.remote_repo
+        else None
+    )
 
     def tensor(name):
+        if remote:
+            return remote.tensor(name)
         return sources[index[name]].get_tensor(name).to("cuda")
 
     def attach(module, prefix):
         def load(current, inputs):
-            state = {name: tensor(prefix + name) for name in current.state_dict()}
+            names = list(current.state_dict())
+            if remote:
+                loaded = remote.tensors([prefix + name for name in names])
+                state = {name: loaded[prefix + name] for name in names}
+            else:
+                state = {name: tensor(prefix + name) for name in names}
             current.load_state_dict(state, strict=True, assign=True)
             if prefix == "model.visual.":
                 # The nonpersistent buffer starts on meta and is unloaded with
                 # the vision weights. Recreate the official formula per call.
-                rope = current.rotary_pos_emb
-                rope.inv_freq = 1.0 / (
-                    rope.theta ** (torch.arange(0, rope.dim, 2, device="cuda").float() / rope.dim)
+                current.rotary_pos_emb = modeling.Qwen3_5VisionRotaryEmbedding(current.config).to(
+                    "cuda"
                 )
 
         def unload(current, inputs, result):
@@ -116,6 +264,7 @@ def main():
         reference_kind="BF16 source checkpoint",
         revision=a.revision,
         transformers=__import__("transformers").__version__,
+        reference_functions=reference_functions,
         execution="teacher-forced full-sequence prefill",
         weights="stored checkpoint dtypes; one component streamed onto CUDA",
         config_sha256=hashlib.sha256(config_raw).hexdigest(),
@@ -125,6 +274,10 @@ def main():
         complete=False,
     )
     report["batch_size"] = a.batch_size
+    if remote:
+        report["remote_source"] = dict(
+            repo=a.remote_repo, revision=a.revision, read_workers=a.read_workers
+        )
     report["padding"] = "right padding masked; only real history positions scored"
     report["modalities"] = "text, images and multiple images" if multimodal else "text"
     report["multimodal_scope"] = (

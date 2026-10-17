@@ -8,7 +8,7 @@ weights without group scale operations inside the dot-product loop.
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
-from kernels.model.integer_core import dp4a, tensor_core
+from kernels.model.integer_core import dp4a, tensor_core_tiles, tile_coordinates
 
 
 MAGNITUDES = (3, 10, 19, 31, 46, 67, 93, 127)
@@ -46,12 +46,16 @@ def q4_gemv(
     *,
     dynamic_rows=False,
     block_m=None,
+    output_stride=None,
 ):
     validate_shape(M, N, K)
     BM = min(M, 8) if block_m is None else block_m
     if type(BM) is not int or not 1 <= BM <= 8 or BN not in (4, 8, 16):
         raise ValueError("Q4 DP4A requires BM=1..8 and BN=4/8/16")
     M = row_count(M, dynamic_rows)
+    stride = N if output_stride is None else output_stride
+    if type(stride) is not int or stride < N:
+        raise ValueError("Q4 output stride must contain the complete output row")
     source = decode_source(magnitudes)
 
     project = dp4a(M, N, K, BM, BN, codec="q4", source=source)
@@ -62,7 +66,7 @@ def q4_gemv(
         W: T.Tensor((N, K // 4), T.uint16),
         S: T.Tensor((N,), T.float16),
         AS: T.Tensor((M,), T.float16),
-        Out: T.Tensor((M, N), output_dtype),
+        Out: T.Tensor((M, stride), output_dtype),
     ):
         with T.Kernel(T.ceildiv(N, BN), T.ceildiv(M, BM), threads=128) as (bx, by):
             project(A, W, W, S, S, AS, Out, by, bx)
@@ -82,9 +86,14 @@ def q4_decode(
     stages=2,
     output_dtype="float16",
     dynamic_rows=False,
+    output_stride=None,
+    tail_m=0,
+    group_m=0,
 ):
     """One AOT entry point; tiling selects DP4A or Tensor Core at build time."""
     if algorithm == "dp4a":
+        if tail_m or group_m:
+            raise ValueError("Tail/group scheduling requires the INT8 Tensor Core path")
         return q4_gemv.__wrapped__(
             rows,
             outputs,
@@ -93,6 +102,7 @@ def q4_decode(
             output_dtype,
             dynamic_rows=dynamic_rows,
             block_m=block_m,
+            output_stride=output_stride,
         )
     if algorithm == "tensor_core":
         return q4_projection.__wrapped__(
@@ -105,6 +115,9 @@ def q4_decode(
             dynamic_rows=dynamic_rows,
             block_m=block_m,
             stages=stages,
+            output_stride=output_stride,
+            tail_m=tail_m,
+            group_m=group_m,
         )
     raise ValueError("Unknown Q4 decode implementation")
 
@@ -122,6 +135,9 @@ def q4_projection(
     block_m=8,
     dynamic_rows=False,
     stages=2,
+    output_stride=None,
+    tail_m=0,
+    group_m=0,
 ):
     validate_shape(M, N, K)
     if BN not in (32, 64, 128) or BK % 128 or K % BK:
@@ -130,12 +146,19 @@ def q4_projection(
         raise ValueError("Invalid Q4 row tile")
     if type(stages) is not int or stages not in (1, 2):
         raise ValueError("Invalid Q4 pipeline depth")
+    if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
+        raise ValueError("Invalid Q4 row grouping")
     BM = block_m
     M = row_count(M, dynamic_rows)
+    stride = N if output_stride is None else output_stride
+    if type(stride) is not int or stride < N:
+        raise ValueError("Q4 output stride must contain the complete output row")
     threads = 64 if BN == 32 else 128
     source = decode_source(magnitudes)
 
-    project = tensor_core(M, N, K, BM, BN, BK, stages=stages, codec="q4", source=source)
+    tiles, project = tensor_core_tiles(
+        M, N, K, BM, BN, BK, stages=stages, codec="q4", source=source, tail_m=tail_m
+    )
 
     @T.prim_func
     def main(
@@ -143,10 +166,15 @@ def q4_projection(
         W: T.Tensor((N, K // 4), T.uint16),
         S: T.Tensor((N,), T.float16),
         AS: T.Tensor((M,), T.float16),
-        Out: T.Tensor((M, N), output_dtype),
+        Out: T.Tensor((M, stride), output_dtype),
     ):
-        with T.Kernel(T.ceildiv(M, BM), T.ceildiv(N, BN), threads=threads) as (by, bx):
-            project(A, W, W, S, S, AS, Out, by, bx)
+        if group_m:
+            with T.Kernel(tiles * T.ceildiv(N, BN), threads=threads) as pid:
+                by, bx = tile_coordinates(pid, tiles, T.ceildiv(N, BN), group_m)
+                project(A, W, W, S, S, AS, Out, by, bx)
+        else:
+            with T.Kernel(tiles, T.ceildiv(N, BN), threads=threads) as (by, bx):
+                project(A, W, W, S, S, AS, Out, by, bx)
 
     return main
 

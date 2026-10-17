@@ -11,7 +11,13 @@ import math
 from pathlib import Path
 import tempfile
 
-from tools.model.flash_next.decode_policy import q4_configs, w8_configs, swiglu_configs
+from tools.model.flash_next.decode_policy import (
+    q4_configs,
+    e8p_q4_configs,
+    w8_configs,
+    swiglu_configs,
+    candidate_scores,
+)
 from tools.model.publication import write_json
 
 
@@ -60,10 +66,26 @@ def make_prim(spec, config):
 
     rows, n, k = spec["rows"], spec["outputs"], spec["inputs"]
     dynamic = spec["dynamic"]
-    if spec["kind"] == "q4":
-        from kernels.model.q4_projection import q4_decode
+    if spec["kind"] in ("q4", "e8p_q4"):
+        options = {}
+        if spec["kind"] == "e8p_q4":
+            from kernels.model.e8p_q4 import projection as q4_decode
 
-        fn = q4_decode(rows, n, k, output_dtype=spec["dtype"], dynamic_rows=dynamic, **config)
+            q4_decode = q4_decode.__wrapped__
+            options = {k: spec[k] for k in ("packed_k", "basis_nonzero") if k in spec}
+        else:
+            from kernels.model.q4_projection import q4_decode
+
+        fn = q4_decode(
+            rows,
+            n,
+            k,
+            output_dtype=spec["dtype"],
+            dynamic_rows=dynamic,
+            output_stride=spec.get("output_stride"),
+            **config,
+            **options,
+        )
     elif spec["kind"] == "w8":
         from kernels.model.int8_projection import int8_projection, int8_small_projection
 
@@ -76,11 +98,18 @@ def make_prim(spec, config):
                 dynamic,
                 block_m=config["block_m"],
                 block_n=config["block_n"],
+                output_stride=spec.get("output_stride"),
             )
         else:
             knobs = {key: value for key, value in config.items() if key != "algorithm"}
             fn = int8_projection.__wrapped__(
-                rows, n, k, spec["dtype"], dynamic_rows=dynamic, **knobs
+                rows,
+                n,
+                k,
+                spec["dtype"],
+                dynamic_rows=dynamic,
+                output_stride=spec.get("output_stride"),
+                **knobs,
             )
     elif spec["kind"] == "swiglu":
         from kernels.model.int8_swiglu import int8_swiglu
@@ -113,13 +142,26 @@ def factory(spec):
     # key. Avoid capturing mutable tensors or factories in the kernel closure.
     encoded = json.dumps(spec, sort_keys=True)
 
-    def build(algorithm="tensor_core", block_m=16, block_n=64, block_k=128, stages=2):
+    def build(
+        algorithm="tensor_core",
+        block_m=16,
+        block_n=64,
+        block_k=128,
+        stages=2,
+        split_k=1,
+        group_m=0,
+        tail_m=0,
+    ):
         decoded = json.loads(encoded)
         cfg = dict(block_m=block_m)
         if decoded["kind"] != "expert":
             cfg.update(algorithm=algorithm, block_n=block_n, block_k=block_k)
-        if decoded["kind"] == "q4":
+        if decoded["kind"] in ("q4", "e8p_q4"):
             cfg["stages"] = stages
+        if decoded["kind"] == "e8p_q4" and algorithm == "int4_direct":
+            cfg["split_k"] = split_k
+        if decoded["kind"] in ("q4", "e8p_q4", "w8") and algorithm == "tensor_core":
+            cfg.update({k: v for k, v in dict(group_m=group_m, tail_m=tail_m).items() if v})
         return make_prim(decoded, cfg)
 
     return build
@@ -148,7 +190,7 @@ class DecodeTuner:
         self.cache.mkdir(parents=True, exist_ok=True)
         self.results = {}
 
-    def compile(
+    def _tune(
         self,
         kind,
         rows,
@@ -162,18 +204,50 @@ class DecodeTuner:
         weights=None,
         weight_identity=None,
         measure_rows=None,
+        output_stride=None,
+        packed_k=0,
+        objective="relative_geomean",
+        candidate_configs=None,
     ):
         import tilelang
         import torch
         from tilelang.autotuner import AutoTuner
         from tools.operators.common import SEED
 
+        if objective not in ("relative_geomean", "total_latency"):
+            raise ValueError("Unknown dynamic tuning objective")
         spec = dict(
-            kind=kind, rows=rows, outputs=outputs, inputs=inputs, dtype=dtype, dynamic=dynamic
+            kind=kind,
+            rows=rows,
+            outputs=outputs,
+            inputs=inputs,
+            dtype=dtype,
+            dynamic=dynamic,
+            objective=objective,
         )
+        if output_stride is not None:
+            if (
+                kind not in ("q4", "e8p_q4", "w8")
+                or type(output_stride) is not int
+                or output_stride < outputs
+            ):
+                raise ValueError("Only Q4/W8 projections support a larger output row stride")
+            spec["output_stride"] = output_stride
         if kind == "expert":
             spec["experts"] = experts
-        if kind == "q4":
+        if kind == "e8p_q4":
+            from tools.quantization.e8p import basis
+            from tools.quantization.vq import e8p_selector_table, e8p_selector_supports_parity_xor
+
+            book = (
+                weights["Book"].cpu().numpy()
+                if weights is not None
+                else e8p_selector_table(basis())
+            )
+            spec.update(packed_k=packed_k, basis_nonzero=e8p_selector_supports_parity_xor(book))
+            configs = e8p_q4_configs(rows, direct=bool(packed_k and spec["basis_nonzero"]))
+            configs = [c for c in configs if inputs % (c["block_k"] * c.get("split_k", 1)) == 0]
+        elif kind == "q4":
             configs = q4_configs(rows)
         elif kind == "w8":
             configs = w8_configs(rows, outputs)
@@ -183,12 +257,18 @@ class DecodeTuner:
             configs = [dict(block_m=m) for m in ((8, 16) if block_m is None else (block_m,))]
         else:
             raise ValueError("Unsupported decode tuning operator")
+        if candidate_configs is not None:
+            if not candidate_configs or any(c not in configs for c in candidate_configs):
+                raise ValueError("Candidate subset must contain legal projection tiles")
+            configs = list(candidate_configs)
         samples = measurement_rows(rows, dynamic, measure_rows)
         sample = samples[0]
         source = hashlib.sha256()
         for file in ("decode_tuning.py", "decode_policy.py"):
             source.update(Path(__file__).with_name(file).read_bytes())
         root = Path(__file__).resolve().parents[3]
+        source.update((root / "tools/model/row_selection.py").read_bytes())
+        source.update((root / "tools/model/compile.py").read_bytes())
         # Include inlined components as well as public wrappers. A change to a
         # shared loader/mainloop/epilogue must invalidate every consumer's tile.
         for path in sorted((root / "kernels").rglob("*.py")):
@@ -283,27 +363,18 @@ class DecodeTuner:
                         )
                         times.append(None)
                         continue
-                    time, _ = benchmark(run, repetitions=8)
+                    # Large dynamic tiles can take tens of milliseconds. Spend
+                    # the same minimum timing budget on every candidate rather
+                    # than replaying the slowest fallback eight times per trial.
+                    pilot, _ = benchmark(run, repetitions=1, warmup=1)
+                    repetitions = max(1, min(8, math.ceil(1.0 / pilot["median_ms"])))
+                    time, _ = benchmark(run, repetitions=repetitions, warmup=0)
                     times.append(time["median_ms"])
                 timings.append(dict(rows=live, times_ms=times))
-            scores = [
-                math.exp(
-                    sum(
-                        math.log(
-                            t["times_ms"][i]
-                            / min(v for j, v in enumerate(t["times_ms"]) if j not in invalid)
-                        )
-                        for t in timings
-                    )
-                    / len(timings)
-                )
-                if i not in invalid
-                else float("inf")
-                for i in range(len(legal))
-            ]
+            scores = candidate_scores(timings, invalid, objective)
             if len(invalid) == len(legal):
                 raise ValueError(f"All dynamic tile candidates failed numerical checks: {rejected}")
-            selected = min(range(len(configs)), key=scores.__getitem__)
+            selected = min(range(len(legal)), key=scores.__getitem__)
             kernel = candidates[selected]
             record = dict(
                 identity=identity,
@@ -351,6 +422,10 @@ class DecodeTuner:
             atomic_json(cached, record)
         self.results[key] = record
         atomic_json(self.output / "tuning.json", list(self.results.values()))
+        return kernel, record
+
+    def compile(self, *args, **kwargs):
+        kernel, record = self._tune(*args, **kwargs)
         return kernel, record["config"]
 
     @staticmethod
@@ -368,8 +443,9 @@ class DecodeTuner:
         a = torch.randint(-128, 128, (live, k), device=device, dtype=torch.int8)
         scales = torch.full((live,), 0.001, device=device, dtype=torch.float16)
         dtype = getattr(torch, spec["dtype"])
-        storage = torch.full((live + 2, n), 91, device=device, dtype=dtype)
-        out = storage[:live]
+        stride = spec.get("output_stride", n)
+        storage = torch.full((live + 2, stride), 91, device=device, dtype=dtype)
+        out = storage[:live, :n]
         expected = torch.empty_like(out)
         kind = spec["kind"]
         if kind == "q4":
@@ -390,6 +466,61 @@ class DecodeTuner:
                 a, weight, ws, scales, expected, stream=torch.cuda.current_stream().cuda_stream
             )
             args = [a, weight, ws, scales, out]
+        elif kind == "e8p_q4":
+            from kernels.model.e8p_q4 import unpack
+            from tools.quantization.e8p import basis
+            from tools.quantization.vq import e8p_selector_table
+
+            weight = (
+                weights["W"]
+                if weights is not None
+                else torch.randint(0, 2**32, (n, k // 8), device=device, dtype=torch.int64).to(
+                    torch.uint32
+                )
+            )
+            ws = (
+                weights["WS"]
+                if weights is not None
+                else torch.full((n,), 0.001, device=device, dtype=torch.float16)
+            )
+            book = (
+                weights["Book"]
+                if weights is not None
+                else torch.from_numpy(e8p_selector_table(basis())).cuda()
+            )
+            packed_k = spec.get("packed_k", 0)
+            if weights is None and packed_k:
+                weight = (
+                    weight.reshape(n, k // packed_k, packed_k // 8).permute(1, 0, 2).contiguous()
+                )
+            expected_shape = (k // packed_k, n, packed_k // 8) if packed_k else (n, k // 8)
+            if tuple(weight.shape) != expected_shape:
+                raise ValueError("E8P tuning weights differ from the compressed layout")
+            decoded = torch.empty((n, k), device=device, dtype=torch.int8)
+            stream = torch.cuda.current_stream().cuda_stream
+            unpack(n, k, packed_k=packed_k).adapter.func(weight, book, decoded, stream=stream)
+            # Keep the independent full-K reference dynamic too: profiling
+            # many row extents must not compile a reference cubin per length.
+            from tools.model.compile import primitive
+
+            reference = primitive(
+                int8_projection,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                k,
+                output_dtype=spec["dtype"],
+                dynamic_rows=spec["dynamic"],
+            )
+            reference.adapter.func(
+                a,
+                decoded,
+                ws,
+                scales,
+                expected,
+                *([live] if spec["dynamic"] else []),
+                stream=stream,
+            )
+            args = [a, weight, book, ws, scales, out]
         elif kind == "w8":
             weight = (
                 weights["W"]
@@ -529,7 +660,11 @@ class DecodeTuner:
             return []
 
         def check(*_):
-            if not torch.equal(out, expected) or not bool(torch.all(storage[scalar:] == 91)):
+            if (
+                not torch.equal(out, expected)
+                or not bool(torch.all(storage[scalar:] == 91))
+                or not bool(torch.all(storage[:scalar, n:] == 91))
+            ):
                 raise AssertionError(
                     "Decode tile changed integer/scaling output or wrote beyond live rows"
                 )
@@ -549,7 +684,8 @@ class DecodeTuner:
         with torch.cuda.graph(graph):
             kernel.adapter.func(*args, stream=torch.cuda.current_stream().cuda_stream)
         # Scratch outputs change after capture; replay must actually run.
-        out = args[12 if spec["kind"] == "expert" else 6 if spec["kind"] == "swiglu" else 4]
+        output_index = {"expert": 12, "swiglu": 6, "e8p_q4": 5}.get(spec["kind"], 4)
+        out = args[output_index]
         out.fill_(91)
         graph.replay()
         torch.cuda.synchronize()

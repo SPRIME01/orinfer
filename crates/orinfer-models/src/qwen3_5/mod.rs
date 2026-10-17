@@ -1,6 +1,7 @@
 //! Qwen3.5 model semantics; quality policy chooses the registered mixed-precision recipe.
 mod config;
 mod plan;
+mod rows;
 use crate::{adapter::Adapter, artifact, model, policy::Policy, vision};
 use model::Manifest;
 use orinfer_model_sdk::{
@@ -50,6 +51,12 @@ pub(crate) fn create(
     mut request: CreateRequest,
     policy: Policy,
 ) -> artifact::Result<crate::registry::Built> {
+    if matches!(
+        request.config["quantization_config"]["quant_method"].as_str(),
+        Some("orinfer_q4_int8" | "orinfer_e8p_q4_int8")
+    ) {
+        return rows::create(request, policy);
+    }
     if request.architecture != "qwen3_5" || policy != Policy::Int8Quality {
         return Err(
             "Qwen A8 package does not support this architecture or precision policy".into(),

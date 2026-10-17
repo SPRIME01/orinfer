@@ -28,15 +28,59 @@ def swiglu(gate, up):
     return g / (1.0 + T.exp(-g)) * u
 
 
-def weight_loader(codec, n, bn, bk, source):
-    if codec not in ("w8", "q4"):
+def tile_coordinates(pid, rows, columns, group_m):
+    """Group neighbouring row tiles while reusing a bounded activation slab."""
+    if group_m:
+        first = (pid // (group_m * columns)) * group_m
+        actual = T.min(rows - first, group_m)
+        return first + (pid % (group_m * columns)) % actual, (pid % (group_m * columns)) // actual
+    return pid % rows, pid // rows
+
+
+def tensor_core_tiles(m, n, k, bm, bn, bk, *, tail_m=0, **options):
+    """Use the same full-K arithmetic for large full tiles and smaller tails."""
+    if (
+        type(tail_m) is not int
+        or tail_m not in (0, 8, 16, 32, 64)
+        or (tail_m and (tail_m >= bm or bm % tail_m))
+    ):
+        raise ValueError("Invalid integer projection tail tile")
+    bulk = tensor_core(m, n, k, bm, bn, bk, **options)
+    if tail_m:
+        tail = tensor_core(m, n, k, tail_m, bn, bk, **options)
+    tiles = T.ceildiv(m, bm)
+
+    @T.macro
+    def project(A, W, U, WS, US, AS, Out, by, bx):
+        if tail_m:
+            if (by + 1) * bm > m and m % bm <= tail_m:
+                tail(A, W, U, WS, US, AS, Out, by * (bm // tail_m), bx)
+            else:
+                bulk(A, W, U, WS, US, AS, Out, by, bx)
+        else:
+            bulk(A, W, U, WS, US, AS, Out, by, bx)
+
+    return tiles, project
+
+
+@T.macro
+def prepare_e8p_book(source, book):
+    # Hoist the 256 possible sign/parity combinations out of every K tile.
+    # The additional 1 KiB is block-local, never a persistent weight cache.
+    for i in T.Parallel(256):
+        book[i, 0] = source[i, 0]
+        book[i + 256, 0] = T.call_pure_extern("uint32", "e8p_q4_flags", T.cast(i, T.uint32))
+
+
+def weight_loader(codec, n, bn, bk, source, *, packed_k=0):
+    if codec not in ("w8", "q4", "e8p_q4"):
         raise ValueError("Unsupported integer weight codec")
 
     @T.macro
-    def load(W, tile, bx, kg):
+    def load(W, Book, tile, bx, kg):
         if codec == "w8":
             T.copy(W[bx * bn, kg * bk], tile)
-        else:
+        elif codec == "q4":
             T.import_source(source)
             decoded = T.alloc_fragment((bn, bk // 4), T.uint32)
             for j, k in T.Parallel(bn, bk // 4):
@@ -47,14 +91,50 @@ def weight_loader(codec, n, bn, bk, source):
                     )
             for j, k in T.Parallel(bn, bk):
                 tile[j, k] = T.cast((decoded[j, k // 4] >> ((k % 4) * 8)) & 255, T.int8)
+        else:
+            T.import_source(source)
+            if packed_k == 128:
+                # Stage contiguous compressed slabs alongside A. The pipeline
+                # can prefetch the next slab while this one is decoded/MMA'd;
+                # the resident weight representation remains compressed.
+                encoded = T.alloc_shared((bk // 128, bn, 16), T.uint32)
+                for part in T.unroll(bk // 128):
+                    T.copy(
+                        W[kg * (bk // 128) + part, bx * bn : bx * bn + bn, 0:16],
+                        encoded[part, :, :],
+                    )
+            decoded = T.alloc_fragment((bn, bk // 4), T.uint32)
+            for j, k in T.Parallel(bn, bk // 4):
+                decoded[j, k] = 0
+                if bx * bn + j < n:
+                    vector = kg * (bk // 8) + k // 2
+                    if packed_k == 128:
+                        code = encoded[k // 32, j, (k // 2) % 16]
+                    elif packed_k:
+                        code = W[vector // (packed_k // 8), bx * bn + j, vector % (packed_k // 8)]
+                    else:
+                        code = W[bx * bn + j, vector]
+                    decoded[j, k] = T.call_pure_extern(
+                        "uint32",
+                        "e8p_q4_decode_flags",
+                        Book[(code >> 8) & 255, 0],
+                        Book[code >> 24, 0],
+                        Book[256 + (code & 255), 0],
+                        Book[256 + ((code >> 16) & 255), 0],
+                        k % 2,
+                    )
+            for j, k in T.Parallel(bn, bk):
+                tile[j, k] = T.cast((decoded[j, k // 4] >> ((k % 4) * 8)) & 255, T.int8)
 
     return load
 
 
-def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=False):
-    load = weight_loader(codec, n, bn, bk, source)
+def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=False, packed_k=0):
+    if codec == "e8p_q4" and dual:
+        raise ValueError("E8P-Q4 reserves the secondary operand for its shared basis")
+    load = weight_loader(codec, n, bn, bk, source, packed_k=packed_k)
     # Keep Q4's weight-left MMA orientation and W8's activation-left layout.
-    left = codec == "q4"
+    left = codec != "w8"
 
     @T.macro
     def project(A, W, U, WS, US, AS, Out, by, bx):
@@ -65,12 +145,19 @@ def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=Fa
             u = T.alloc_shared((bn, bk), T.int8)
             up = T.alloc_fragment((bn, bm) if left else (bm, bn), T.int32)
             T.clear(up)
+        if codec == "e8p_q4":
+            T.import_source(source)
+            book = T.alloc_shared((512, 1), T.uint32)
+            prepare_e8p_book(U, book)
         T.clear(acc)
         for kg in T.Pipelined(k // bk, num_stages=stages):
             T.copy(A[by * bm, kg * bk], a)
-            load(W, w, bx, kg)
+            if codec == "e8p_q4":
+                load(W, book, w, bx, kg)
+            else:
+                load(W, W, w, bx, kg)
             if dual:
-                load(U, u, bx, kg)
+                load(U, U, u, bx, kg)
             if left:
                 T.gemm(w, a, acc, transpose_B=True)
             else:
@@ -94,8 +181,8 @@ def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=Fa
     return project
 
 
-def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False):
-    if codec not in ("w8", "q4"):
+def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False, packed_k=0):
+    if codec not in ("w8", "q4", "e8p_q4"):
         raise ValueError("Unsupported integer weight codec")
     if dual and codec != "w8":
         raise ValueError("The dual DP4A ABI requires two W8 operands")
@@ -129,6 +216,9 @@ def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False):
                     )
                 }
             )
+        if codec == "e8p_q4":
+            book = T.alloc_shared((512, 1), T.uint32)
+            prepare_e8p_book(U, book)
         T.annotate_layout(
             {
                 acc: tilelang.Fragment(
@@ -146,9 +236,25 @@ def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False):
                     if bx * bn + j < n:
                         if codec == "w8":
                             weight[j, l] = W[bx * bn + j, kg * 32 + l]
-                        else:
+                        elif codec == "q4":
                             weight[j, l] = T.call_pure_extern(
                                 "uint32", "q4_decode", T.cast(W[bx * bn + j, kg * 32 + l], T.uint32)
+                            )
+                        else:
+                            vector = kg * 16 + l // 2
+                            code = (
+                                W[vector // (packed_k // 8), bx * bn + j, vector % (packed_k // 8)]
+                                if packed_k
+                                else W[bx * bn + j, vector]
+                            )
+                            weight[j, l] = T.call_pure_extern(
+                                "uint32",
+                                "e8p_q4_decode_flags",
+                                book[(code >> 8) & 255, 0],
+                                book[code >> 24, 0],
+                                book[256 + (code & 255), 0],
+                                book[256 + ((code >> 16) & 255), 0],
+                                l % 2,
                             )
             for i, j, l in T.Parallel(bm, bn, 32):
                 if by * bm + i < m:

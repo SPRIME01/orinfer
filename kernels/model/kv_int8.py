@@ -24,6 +24,42 @@ __device__ __forceinline__ unsigned int kv_dequant_pair(unsigned int code, unsig
 """
 
 
+def int8_kv_tile(block_n, dimension=256, threads=128):
+    """Shared packed-byte loader for prefill, decode and verification tiles."""
+    if threads <= 0 or (block_n * (dimension // 4)) % threads:
+        raise ValueError("KV tile must contain complete thread stripes")
+
+    @T.macro
+    def load(K, V, KS, VS, k, v, batch, head, base, end):
+        for stripe in T.unroll(block_n * (dimension // 4) // threads, unroll_factor=1):
+            j = (stripe * threads + T.get_thread_binding()) // (dimension // 4)
+            d = (stripe * threads + T.get_thread_binding()) % (dimension // 4)
+            token = base + j
+            if token < end:
+                kw = K[batch, token, head * (dimension // 4) + d]
+                vw = V[batch, token, head * (dimension // 4) + d]
+                sk = T.reinterpret(T.uint16, KS[batch, token, head * (dimension // 64) + d // 16])
+                sv = T.reinterpret(T.uint16, VS[batch, token, head * (dimension // 64) + d // 16])
+                k0 = T.call_extern("uint32", "kv_dequant_pair", kw, sk)
+                k1 = T.call_extern("uint32", "kv_dequant_pair", kw >> 16, sk)
+                v0 = T.call_extern("uint32", "kv_dequant_pair", vw, sv)
+                v1 = T.call_extern("uint32", "kv_dequant_pair", vw >> 16, sv)
+                k[j, d * 4] = T.reinterpret(T.float16, T.cast(k0 & 65535, T.uint16))
+                k[j, d * 4 + 1] = T.reinterpret(T.float16, T.cast(k0 >> 16, T.uint16))
+                k[j, d * 4 + 2] = T.reinterpret(T.float16, T.cast(k1 & 65535, T.uint16))
+                k[j, d * 4 + 3] = T.reinterpret(T.float16, T.cast(k1 >> 16, T.uint16))
+                v[j, d * 4] = T.reinterpret(T.float16, T.cast(v0 & 65535, T.uint16))
+                v[j, d * 4 + 1] = T.reinterpret(T.float16, T.cast(v0 >> 16, T.uint16))
+                v[j, d * 4 + 2] = T.reinterpret(T.float16, T.cast(v1 & 65535, T.uint16))
+                v[j, d * 4 + 3] = T.reinterpret(T.float16, T.cast(v1 >> 16, T.uint16))
+            else:
+                for lane in T.unroll(4):
+                    k[j, d * 4 + lane] = 0.0
+                    v[j, d * 4 + lane] = 0.0
+
+    return load
+
+
 @orin_jit
 def dequant_pairs_probe(rows: int):
     """Exhaustive byte/scale correctness probe for the packed converter."""
@@ -181,6 +217,7 @@ def attention_prefill_int8(
     block_n: int = 32,
     threads: int = 128,
     exp_mode: str = "precise",
+    dynamic_rows: bool = False,
 ):
     """Build (Q,K,V,RawGate,Positions,Lengths,Y), all explicit tensors.
 
@@ -191,6 +228,12 @@ def attention_prefill_int8(
     fp32_fused is a separately identified candidate with only output rounding.
     """
     assert (batch is None or batch > 0) and tq > 0 and tkv > 0
+    if dynamic_rows:
+        if batch != 1:
+            raise ValueError("Compact dynamic attention rows require one causal segment")
+        from kernels.model.rows import row_count
+
+        tq = row_count(tq, True)
     batch = T.dynamic("batch") if batch is None else batch
     assert input_layout in ("token_major", "head_major")
     assert output_layout in ("token_major", "head_major")
@@ -206,6 +249,8 @@ def attention_prefill_int8(
     qs = (batch, tq, 6144) if input_layout == "token_major" else (batch, 24, tq, 256)
     ys = (batch, tq, 24, 256) if output_layout == "token_major" else (batch, 24, tq, 256)
     ks = (batch, tkv, 256) if kv_layout == "token_major" else (batch, 4, tkv, 256)
+
+    load_kv = int8_kv_tile(block_n, threads=threads)
 
     @T.prim_func
     def kernel(
@@ -245,29 +290,7 @@ def attention_prefill_int8(
             else:
                 T.copy(Q[b, h, qb * block_m, 0], q, prefer_instruction="sync")
             for kb in T.serial(T.ceildiv(T.max(0, T.min(Lengths[b], maxpos[0] + 1)), block_n)):
-                for j, d in T.Parallel(block_n, 64):
-                    token = kb * block_n + j
-                    if token < Lengths[b] and token < tkv:
-                        kw = K[b, token, (h // 6) * 64 + d]
-                        vw = V[b, token, (h // 6) * 64 + d]
-                        sk = T.reinterpret(T.uint16, KS[b, token, (h // 6) * 4 + d // 16])
-                        sv = T.reinterpret(T.uint16, VS[b, token, (h // 6) * 4 + d // 16])
-                        k0 = T.call_extern("uint32", "kv_dequant_pair", kw, sk)
-                        k1 = T.call_extern("uint32", "kv_dequant_pair", kw >> 16, sk)
-                        v0 = T.call_extern("uint32", "kv_dequant_pair", vw, sv)
-                        v1 = T.call_extern("uint32", "kv_dequant_pair", vw >> 16, sv)
-                        k[j, d * 4] = T.reinterpret(T.float16, T.cast(k0 & 65535, T.uint16))
-                        k[j, d * 4 + 1] = T.reinterpret(T.float16, T.cast(k0 >> 16, T.uint16))
-                        k[j, d * 4 + 2] = T.reinterpret(T.float16, T.cast(k1 & 65535, T.uint16))
-                        k[j, d * 4 + 3] = T.reinterpret(T.float16, T.cast(k1 >> 16, T.uint16))
-                        v[j, d * 4] = T.reinterpret(T.float16, T.cast(v0 & 65535, T.uint16))
-                        v[j, d * 4 + 1] = T.reinterpret(T.float16, T.cast(v0 >> 16, T.uint16))
-                        v[j, d * 4 + 2] = T.reinterpret(T.float16, T.cast(v1 & 65535, T.uint16))
-                        v[j, d * 4 + 3] = T.reinterpret(T.float16, T.cast(v1 >> 16, T.uint16))
-                    else:
-                        for lane in T.unroll(4):
-                            k[j, d * 4 + lane] = 0.0
-                            v[j, d * 4 + lane] = 0.0
+                load_kv(K, V, KS, VS, k, v, b, h // 6, kb * block_n, T.min(Lengths[b], tkv))
                 T.sync_threads()
                 T.clear(score)
                 T.gemm(q, k, score, transpose_B=True)

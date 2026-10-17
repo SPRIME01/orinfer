@@ -1,15 +1,172 @@
 """CPU compiler checks for the affine-shape host ABI regression."""
 
 import unittest
-from tvm.arith import Analyzer
-from tvm import tirx as tir
+from tilelang import tvm
 
 from kernels.model.rows import explicit_rows
 from tools.model.flash_next.dynamic_batch import factory
-from tools.model.flash_next.decode_tuning import make_prim
+from tools.model.flash_next.decode_tuning import factory as projection_factory, make_prim
+
+Analyzer = tvm.arith.Analyzer
+tir = tvm.tirx
 
 
 class DynamicRowsTests(unittest.TestCase):
+    def test_integer_tail_and_grouping_keep_one_runtime_extent(self):
+        for kind, tile in [("e8p_q4", 256), ("q4", 128), ("w8", 128)]:
+            spec = dict(
+                kind=kind, rows=4096, outputs=128, inputs=256, dtype="float16", dynamic=True
+            )
+            config = dict(
+                algorithm="tensor_core",
+                block_m=tile,
+                block_n=64,
+                block_k=128,
+                **({"stages": 1} if kind != "w8" else {}),
+                tail_m=16,
+                group_m=2,
+            )
+            fn = make_prim(spec, config)
+            tvm.ir.assert_structural_equal(fn, projection_factory(spec)(**config))
+            (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+            self.assertFalse(
+                tir.analysis.undefined_vars(
+                    fn.body, list(fn.params) + [b.data for b in fn.buffer_map.values()]
+                )
+            )
+            extents = []
+
+            def visit(node):
+                if (
+                    isinstance(node, tir.For)
+                    and node.thread_binding is not None
+                    and node.thread_binding.thread_tag == "blockIdx.x"
+                ):
+                    extents.append(node.extent)
+
+            tir.stmt_functor.post_order_visit(fn.body, visit)
+            self.assertEqual(len(extents), 1)
+            # Partial last CTAs keep the same host grid and row scalar. Smaller
+            # arithmetic tiles are selected inside the compiled projection.
+            for live in [1, 17, 127, 129, 255, 256, 257, 512, 513, 2049, 4095, 4096]:
+                actual = Analyzer().simplify(tir.stmt_functor.substitute(extents[0], {rows: live}))
+                self.assertEqual(int(actual), ((live + tile - 1) // tile) * 2)
+
+    def test_two_stage_q4_keeps_one_dynamic_row_abi(self):
+        for algorithm, tile, columns in [("dp4a", 4, 16), ("tensor_core", 16, 64)]:
+            for dynamic in [False, True]:
+                fn = make_prim(
+                    dict(
+                        kind="e8p_q4",
+                        rows=4096,
+                        outputs=65,
+                        inputs=256,
+                        dtype="float32",
+                        dynamic=dynamic,
+                        output_stride=68,
+                    ),
+                    dict(algorithm=algorithm, block_m=tile, block_n=columns, block_k=128, stages=2),
+                )
+                buffers = {b.name: b for b in fn.buffer_map.values()}
+                self.assertEqual(str(buffers["W"].dtype), "uint32")
+                self.assertEqual([int(v) for v in buffers["W"].shape], [65, 32])
+                self.assertEqual([int(v) for v in buffers["Book"].shape], [256, 1])
+                self.assertEqual(int(buffers["Out"].shape[1]), 68)
+                scalars = [p for p in fn.params if str(p.dtype) == "int32"]
+                self.assertEqual(len(scalars), int(dynamic))
+                if dynamic:
+                    self.assertTrue(buffers["Out"].shape[0].same_as(scalars[0]))
+
+    def test_k_major_e8p_shares_the_dynamic_abi_across_compute_schedules(self):
+        from kernels.model.e8p_q4 import projection, unpack
+
+        for algorithm, bm, bn, bk in [
+            ("tensor_core", 16, 64, 128),
+            ("dp4a", 4, 16, 128),
+            ("int4_direct", 8, 64, 128),
+        ]:
+            fn = make_prim(
+                dict(
+                    kind="e8p_q4",
+                    rows=4096,
+                    outputs=65,
+                    inputs=256,
+                    dtype="float32",
+                    dynamic=True,
+                    output_stride=68,
+                    packed_k=128,
+                    basis_nonzero=True,
+                ),
+                dict(algorithm=algorithm, block_m=bm, block_n=bn, block_k=bk, stages=2),
+            )
+            buffers = {b.name: b for b in fn.buffer_map.values()}
+            self.assertEqual([int(v) for v in buffers["W"].shape], [2, 65, 16])
+            scalars = [p for p in fn.params if str(p.dtype) == "int32"]
+            self.assertEqual(len(scalars), 1)
+            self.assertTrue(buffers["Out"].shape[0].same_as(scalars[0]))
+        for options in [
+            dict(packed_k=0, basis_nonzero=True),
+            dict(packed_k=128, basis_nonzero=False),
+        ]:
+            with self.assertRaisesRegex(ValueError, "verified nonzero basis"):
+                projection.__wrapped__(1, 65, 256, algorithm="int4_direct", block_k=128, **options)
+        for packed_k in (True, -1, 256, 96):
+            with self.assertRaisesRegex(ValueError, "compressed K layout"):
+                unpack.__wrapped__(65, 256, packed_k=packed_k)
+        for split in (2, 4):
+            fn = make_prim(
+                dict(
+                    kind="e8p_q4",
+                    rows=129,
+                    outputs=65,
+                    inputs=512,
+                    dtype="float16",
+                    dynamic=True,
+                    packed_k=128,
+                    basis_nonzero=True,
+                ),
+                dict(
+                    algorithm="int4_direct",
+                    block_m=8,
+                    block_n=64,
+                    block_k=128,
+                    stages=2,
+                    split_k=split,
+                ),
+            )
+            self.assertEqual(len([p for p in fn.params if str(p.dtype) == "int32"]), 1)
+        for options in (
+            dict(split_k=True),
+            dict(split_k=0),
+            dict(split_k=3),
+            dict(split_k=4, block_n=128),
+        ):
+            with self.assertRaises(ValueError):
+                projection.__wrapped__(
+                    1, 65, 512, algorithm="int4_direct", packed_k=128, basis_nonzero=True, **options
+                )
+
+    def test_planar_swiglu_keeps_affine_input_extent_and_one_live_row_argument(self):
+        from kernels.model.rotation_a8 import rotate_activation_tiles
+
+        fn = explicit_rows(
+            rotate_activation_tiles.__wrapped__(
+                4096, 17408, swiglu=True, dynamic_rows=True, plane_rows=4096
+            )
+        )
+        (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+        buffers = {b.name: b for b in fn.buffer_map.values()}
+        self.assertEqual(int(Analyzer().simplify(buffers["X"].shape[0] - rows)), 4096)
+        self.assertEqual(int(buffers["X"].shape[1]), 17408)
+        self.assertTrue(buffers["Rotated"].shape[0].same_as(rows))
+        for options in (
+            dict(plane_rows=True, swiglu=True),
+            dict(plane_rows=4, swiglu=True),
+            dict(plane_rows=4096, swiglu=False),
+        ):
+            with self.assertRaisesRegex(ValueError, "plane capacity"):
+                rotate_activation_tiles.__wrapped__(8, 256, **options)
+
     def test_metadata_scalars_survive_independent_state_wrapping(self):
         from kernels.model import qsa
         from kernels.model.hc_bf16_cache import hc_up13_mix

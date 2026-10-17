@@ -185,30 +185,7 @@ fn selection(name: &str) -> Result<Option<(&str, KernelVariant)>> {
     if !name.starts_with("flash_decode/") && !name.starts_with("draft_rows/") {
         return Ok(None);
     }
-    let (slot, range, skip) = if let Some((slot, range)) = name.split_once("/rows/") {
-        (slot, range, false)
-    } else if let Some((slot, range)) = name.split_once("/skip/") {
-        (slot, range, true)
-    } else {
-        return Ok(None);
-    };
-    let (first, last) = range
-        .split_once('-')
-        .ok_or("Invalid decode row selection")?;
-    let min_rows: usize = first.parse().map_err(|_| "Invalid decode row bound")?;
-    let max_rows: usize = last.parse().map_err(|_| "Invalid decode row bound")?;
-    if min_rows == 0 || min_rows > max_rows || max_rows > 1024 {
-        return Err("Decode row selection outside its allocation".into());
-    }
-    Ok(Some((
-        slot,
-        KernelVariant {
-            min_rows,
-            max_rows,
-            multiple_of: 1,
-            kernels: if skip { vec![] } else { vec![name.into()] },
-        },
-    )))
+    orinfer_model_sdk::operators::rows::specialization(name, 1024)
 }
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ check: lint
 	$(PYTHON) -m unittest discover -s tools/vision -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/quantization -p 'test_*.py' -v
 	$(PYTHON) -m unittest tools.model.test_safetensors_source -v
+	$(PYTHON) -m unittest tools.model.qwen35.test_build -v
 	$(PYTHON) -m unittest tools.model.test_compact -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_decode_package tools.model.flash_next.tests.test_decode_policy tools.model.flash_next.tests.test_kernel_policy tools.model.flash_next.tests.test_exact_experts tools.model.flash_next.tests.test_hc_package tools.model.flash_next.tests.test_repack -v
 	$(PYTHON) -m unittest tools.model.flash_next.tests.test_weights -v
@@ -44,7 +45,7 @@ compiler-image:
 
 check-offline:
 	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR):$(CURDIR)/tools/operators" --entrypoint python3 orinfer-compiler:0.1.1 -m tools.build.check_imports
-	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
+	docker run --rm --runtime runc --network none -v "$(CURDIR):$(CURDIR):ro" -w "$(CURDIR)" -e PYTHONPATH="$(CURDIR)" --entrypoint python3 orinfer-compiler:0.1.1 -m unittest tools.model.qwen35.test_reference tools.model.test_mtp_weights tools.model.flash_next.tests.test_scenes tools.model.flash_next.tests.test_reference_math tools.model.flash_next.tests.test_teacher tools.model.flash_next.tests.test_qsa_reference tools.model.flash_next.tests.test_native_contract tools.model.flash_next.tests.test_dynamic_batch -v
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

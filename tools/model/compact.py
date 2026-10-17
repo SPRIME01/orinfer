@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from tools.model.publication import (  # noqa: E402
     AssetReader,
+    ROOT,
     file_hash,
     load_model,
     source_path,
@@ -282,6 +283,8 @@ def compact_package(origin, package, cache):
         write_shard(staging / "assets.safetensors", tensors)
         for name in ("lib", "LICENSE", "COPYING.LESSER", "COPYING", "THIRD_PARTY_NOTICES.md"):
             path = origin / name
+            if name != "lib" and not path.exists():
+                path = ROOT / name
             if path.is_dir():
                 shutil.copytree(path, staging / name)
             elif path.is_file():

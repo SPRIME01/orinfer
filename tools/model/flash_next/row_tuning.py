@@ -9,14 +9,13 @@ import argparse
 import ctypes as C
 import hashlib
 import json
-import math
 import re
 from collections import defaultdict
 from pathlib import Path
 
 from tools.model.publication import AssetReader, load_model, write_json
 from tools.model.flash_next.compiler import Compiler
-from tools.model.flash_next.prefill_tuning import ranges
+from tools.model.row_selection import ranges, samples
 from tools.operators.abi import evaluate
 
 
@@ -297,17 +296,7 @@ def tune(model, output):
         candidates = next(iter(entries.values()))["candidates"]
         measures = []
         rejected = set()
-        samples = sorted(
-            set(range(1, 18))
-            | {round(math.exp(math.log(18) + i * math.log(capacity / 18) / 24)) for i in range(25)}
-            | {
-                n + d
-                for n in (32, 64, 128, 256, 512, 1024)
-                for d in (-1, 0, 1)
-                if 1 <= n + d <= capacity
-            }
-        )
-        for rows in samples:
+        for rows in samples(capacity):
             if len(entries) == 3:
                 route = next(name for name in names if "IDs" in roles_by_name[name])
                 roles = roles_by_name[route]

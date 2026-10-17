@@ -35,6 +35,7 @@ impl Lifecycle {
             if value.is_some() {
                 return;
             }
+            eprintln!("GPU worker failed: {failure:?}");
             *value = Some(failure);
             self.phase.store(3, Ordering::Release);
         } else {

@@ -7,7 +7,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 ## 功能
 
 - OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
-- 27B 使用单份 W4；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
+- 27B 使用带旋转的自有码表 Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。两种模型均可通过对应算子包启用连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
@@ -59,7 +59,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包：512-token 输入的执行层 prefill 为 **1008.9 tokens/s**。通过 Rust CLI 的流式 Chat API，从零生成 Rust 代码，开启 `medium` thinking、总输出预算 16K，实际生成 6.2K–7.6K tokens 时，单流 decode 关闭 MTP 为 **29.49–29.72 tokens/s**，开启最多 3 个草稿后为 **44.99–45.82 tokens/s**，提升 **1.51–1.55 倍**。
 
-详细 prefill、API 首 token 时延、代码阶段吞吐、prefix cache 命中及 27B 历史参考见[性能参考](docs/performance.md)。数据对应重建后的执行包，测试配置、预热次数和计时口径均在该文档中说明。
+详细 prefill、API 首 token 时延、代码阶段吞吐、prefix cache 命中及 27B 测量结果见[性能参考](docs/performance.md)。数据对应重建后的执行包，测试配置、预热次数和计时口径均在该文档中说明。
 
 目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
 

@@ -623,7 +623,13 @@ fn validate_continuous_requests() {
     let mut rows = vec![
         json!({"abandoned_request_reaped":true,"production_generation_early_stop_released":true}),
     ];
-    for count in [2, 3, 4, 5, 7, 8, 9, 15, 31] {
+    let batches = if fixture.batches.is_empty() {
+        vec![2, 3, 4, 5, 7, 8, 9, 15, 31]
+    } else {
+        fixture.batches.clone()
+    };
+    assert!(batches.iter().all(|n| (2..=128).contains(n)));
+    for count in batches {
         let mut reference = Vec::new();
         for i in 0..count {
             let source = &fixture.cases[i % fixture.cases.len()];

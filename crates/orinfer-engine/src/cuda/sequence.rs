@@ -1815,6 +1815,54 @@ impl Executor {
     ) -> Result<Vec<Vec<f32>>> {
         self.profile_graph_operations_at_position(operations, None)
     }
+    pub(crate) fn profile_stream_operations_at_position(
+        &mut self,
+        operations: &[Invocation],
+        position: (&str, u32),
+    ) -> Result<Vec<Vec<f32>>> {
+        self.sync()?;
+        self.ensure_invocation_kernels(operations)?;
+        let events = self.profile_events(operations.len() + 1)?;
+        let mut trials = vec![];
+        for trial in 0..4 {
+            self.upload_ids(position.0, &[position.1])?;
+            for (i, operation) in operations.iter().enumerate() {
+                // SAFETY: Owned events and live worker stream; ordinary launches.
+                unsafe {
+                    check(
+                        sys::cuEventRecord(events[i], self.session.stream),
+                        "profile stream boundary",
+                    )?;
+                }
+                self.invoke(operation)?;
+            }
+            // SAFETY: Records completion after all ordinary launches.
+            unsafe {
+                check(
+                    sys::cuEventRecord(*events.last().unwrap(), self.session.stream),
+                    "profile stream end",
+                )?;
+            }
+            self.sync()?;
+            if trial == 0 {
+                continue;
+            }
+            let mut times = vec![];
+            for pair in events.windows(2) {
+                let mut ms = 0.;
+                // SAFETY: Completed events on the same stream, in launch order.
+                unsafe {
+                    check(
+                        sys::cuEventElapsedTime(&mut ms, pair[0], pair[1]),
+                        "profile stream elapsed",
+                    )?;
+                }
+                times.push(ms);
+            }
+            trials.push(times);
+        }
+        Ok(trials)
+    }
     pub(crate) fn profile_graph_operations_at_position(
         &mut self,
         operations: &[Invocation],

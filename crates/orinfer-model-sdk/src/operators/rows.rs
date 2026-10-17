@@ -23,6 +23,32 @@ fn unit_multiple() -> usize {
     1
 }
 
+/// Decode an offline-selected local implementation without model dispatch.
+pub fn specialization(name: &str, capacity: usize) -> Result<Option<(&str, KernelVariant)>> {
+    let (slot, range, skip) = if let Some((slot, range)) = name.split_once("/rows/") {
+        (slot, range, false)
+    } else if let Some((slot, range)) = name.split_once("/skip/") {
+        (slot, range, true)
+    } else {
+        return Ok(None);
+    };
+    let (first, last) = range.split_once('-').ok_or("Invalid row selection")?;
+    let min_rows: usize = first.parse().map_err(|_| "Invalid row minimum")?;
+    let max_rows: usize = last.parse().map_err(|_| "Invalid row maximum")?;
+    if min_rows == 0 || min_rows > max_rows || max_rows > capacity {
+        return Err("Row selection exceeds its allocation".into());
+    }
+    Ok(Some((
+        slot,
+        KernelVariant {
+            min_rows,
+            max_rows,
+            multiple_of: 1,
+            kernels: if skip { vec![] } else { vec![name.into()] },
+        },
+    )))
+}
+
 /// Names are supplied by the native model adapter. Capacity bounds allocation;
 /// it neither rounds the scheduler's rows nor selects an entire forward plan.
 #[derive(Clone, Debug, Deserialize, Serialize)]

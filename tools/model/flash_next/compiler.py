@@ -143,7 +143,12 @@ class Compiler:
             host,
             assets,
             bindings,
-            dimensions=dict(m=rows * multiplier, rows=rows * multiplier, **(constants or {})),
+            dimensions=dict(
+                m=rows * multiplier,
+                rows=rows * multiplier,
+                batch=rows * multiplier,
+                **(constants or {}),
+            ),
         )
         prototype = re.search(r"\b" + re.escape(result["symbol"]) + r"\s*\(([^)]*)\)", source)
         if prototype is None or len(prototype[1].split(",")) != len(result["args"]):

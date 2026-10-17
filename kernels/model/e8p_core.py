@@ -22,6 +22,32 @@ __device__ __forceinline__ int nib_sum(unsigned a,unsigned b){return __dp4a((int
 """
 
 
+# Exact row sums and selector-to-nibble conversion for dense direct operands.
+DENSE_SOURCE = r"""
+__device__ __forceinline__ int direct_reduce4(int s) {
+ s += __shfl_xor_sync(0xffffffff,s,1);
+ return s + __shfl_xor_sync(0xffffffff,s,2);
+}
+__device__ __forceinline__ int direct_row_sum(int s,int row) {
+ int v;
+ asm volatile("shfl.sync.idx.b32 %0, %1, %2, 31, 0xffffffff;" : "=r"(v) : "r"(s), "r"(row*4));
+ return v;
+}
+__device__ __forceinline__ unsigned direct_nibble_basis(unsigned s) {
+ unsigned r=0;
+ #pragma unroll
+ for(unsigned i=0;i<8;i++) {
+  unsigned j=(i&4)|((i&1)<<1)|((i&2)>>1);
+  unsigned c=(s>>(4*j))&7;
+  int v=2*(c&3)+1;
+  if(c&4)v=-v;
+  r|=(unsigned(v)&15)<<(4*i);
+ }
+ return r;
+}
+"""
+
+
 def low_plane(x, y):
     return (
         (x & T.uint32(0x00000F0F))

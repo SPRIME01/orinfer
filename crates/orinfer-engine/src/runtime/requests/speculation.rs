@@ -619,6 +619,7 @@ impl ModelRuntime {
                 if live != tokens {
                     return Err("Accepted warm chain exceeds native capacity".into());
                 }
+                self.execution.activate_sequence(requests[*i].slot)?;
                 self.upload_ids(&spec.input, &round.tokens)?;
                 self.prepare_program_inputs(&warm.program, &round.tokens, &[])?;
                 self.execution
@@ -1200,6 +1201,89 @@ impl ModelRuntime {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    #[ignore = "Requires real MTP model and exclusive GPU experiment lock"]
+    fn validate_flash_warm_input_ownership() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            model: std::path::PathBuf,
+            cases: Vec<GenerationInput>,
+            cuda_graph: String,
+        }
+        let fixture: Fixture = crate::model::read(&std::path::PathBuf::from(
+            std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+        ))
+        .unwrap();
+        let mut model = ModelRuntime::load_with_options(
+            &fixture.model,
+            LoadOptions {
+                cuda_graph: fixture.cuda_graph.parse().unwrap(),
+                prefix_cache_bytes: 0,
+                mtp_drafts: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let spec = model.manifest.mtp.clone().unwrap();
+        let mut requests = Vec::new();
+        let mut committed = Vec::new();
+        for (i, input) in fixture.cases.into_iter().take(2).enumerate() {
+            let mut req = model.start_request(input, &|| false).unwrap();
+            while req.prefilling {
+                model
+                    .with_request(&mut req, |m, r| {
+                        m.advance_prefill(r, r.input.len().min(4096), false)
+                    })
+                    .unwrap();
+            }
+            let round = model
+                .with_request(&mut req, |m, r| {
+                    let Preparation::Round(round) = m.prepare_speculative_round(r, 4)? else {
+                        return Err("Expected a live speculative round".into());
+                    };
+                    m.verify_single_round(r, &round)?;
+                    let committed = m.sample_verified_round(r, round)?;
+                    m.restore_verified_cursor(r, &committed, false)?;
+                    Ok(committed)
+                })
+                .unwrap();
+            committed.push((i, round));
+            requests.push(req);
+        }
+        assert_eq!(requests.len(), 2);
+        for req in &mut requests {
+            model
+                .with_request(req, |m, _| {
+                    // A previous request/round may leave any control value.
+                    // Mapping must use this owner's newly uploaded warm length.
+                    m.upload_ids("MtpLength", &[0])?;
+                    m.upload_ids(&spec.input, &[0; 8])
+                })
+                .unwrap();
+        }
+        model
+            .warm_committed_batch(&mut requests.iter_mut().collect::<Vec<_>>(), &committed)
+            .unwrap();
+        for (i, round) in &committed {
+            model
+                .with_request(&mut requests[*i], |m, _| {
+                    assert_eq!(m.read_control("MtpLength")? as usize, round.tokens.len());
+                    assert_eq!(
+                        m.read_controls(&spec.input, round.tokens.len())?,
+                        round.tokens
+                    );
+                    assert_eq!(
+                        m.read_control(&spec.position)? as usize,
+                        round.position + round.tokens.len()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        for req in &mut requests {
+            model.finish_request(req, false).unwrap();
+        }
+    }
     #[test]
     fn batch_cost_uses_measured_upper_margin_and_rejects_invalid_samples() {
         let mut p = Profile::default();

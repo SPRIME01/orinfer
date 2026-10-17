@@ -48,6 +48,48 @@ fn row_invocations(model: &ModelRuntime, program: &str, rows: usize) -> Result<V
     }
 }
 
+fn profile_native_ncu(model: &mut ModelRuntime, plan: &[Invocation]) {
+    // Keep diagnostic instrumentation out of the production launch path.
+    // SAFETY: The library stays loaded until all synchronous NVTX calls end.
+    unsafe {
+        let library = libloading::Library::new("libnvToolsExt.so.1").unwrap();
+        let push = library
+            .get::<unsafe extern "C" fn(*const std::ffi::c_char) -> i32>(b"nvtxRangePushA\0")
+            .unwrap();
+        let pop = library
+            .get::<unsafe extern "C" fn() -> i32>(b"nvtxRangePop\0")
+            .unwrap();
+        crate::cuda::check(
+            cudarc::driver::sys::cuProfilerStart(),
+            "profile decode chain",
+        )
+        .unwrap();
+        for (index, operation) in plan.iter().enumerate() {
+            let label = match &operation.operation {
+                crate::model::Operation::Kernel { name } => name.clone(),
+                _ => "copy".to_owned(),
+            };
+            let label =
+                std::ffi::CString::new(format!("{index:04}|{}", label.replace('/', "|"))).unwrap();
+            push(label.as_ptr());
+            let launched = model.execution.execute_batch(
+                vec![],
+                std::slice::from_ref(operation),
+                false,
+                false,
+            );
+            pop();
+            launched.unwrap();
+        }
+        model.execution.sync().unwrap();
+        crate::cuda::check(
+            cudarc::driver::sys::cuProfilerStop(),
+            "stop decode chain profile",
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 #[ignore = "Captures real kernel arguments; requires model and exclusive GPU experiment lock"]
 fn capture_kernel_arguments() {
@@ -722,13 +764,29 @@ fn profile_prefill_stages() {
             .ensure_sequence_program(0, &program)
             .unwrap();
         let plan = row_invocations(&model, &program, chunk).unwrap();
-        let trials = model
-            .execution
-            .profile_graph_operations_at_position(
+        if fixture["ncu"].as_bool() == Some(true) {
+            profile_native_ncu(&mut model, &plan);
+            rows.push(json!({"input_tokens":length,"operations":plan}));
+            std::fs::write(
+                &output,
+                serde_json::to_vec_pretty(&json!({"rows":rows})).unwrap(),
+            )
+            .unwrap();
+            continue;
+        }
+        let stream = fixture["stream"].as_bool() == Some(true);
+        let trials = if stream {
+            model.execution.profile_stream_operations_at_position(
+                &plan,
+                (&model.manifest.position, base as u32),
+            )
+        } else {
+            model.execution.profile_graph_operations_at_position(
                 &plan,
                 Some((&model.manifest.position, base as u32)),
             )
-            .unwrap();
+        }
+        .unwrap();
         let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         for (index, op) in plan.iter().enumerate() {
             let values = groups
@@ -739,11 +797,13 @@ fn profile_prefill_stages() {
             }
         }
         rows.push(json!({"input_tokens":length,"profiled_chunk_tokens":chunk,"context_before_chunk":base,
-            "program":program,"operation_count":plan.len(),
-            "instrumented_graph_gpu_median_ms":median(&trials.iter().map(|t|t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
+            "program":program,"operation_count":plan.len(),"launch_mode":if stream { "stream" } else { "graph" },
+            "operations":plan,
+            "operation_median_ms":(0..plan.len()).map(|i|median(&trials.iter().map(|t|f64::from(t[i])).collect::<Vec<_>>())).collect::<Vec<_>>(),
+            "instrumented_gpu_median_ms":median(&trials.iter().map(|t|t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>() }));
-        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,
-            "scope":"Last real-model prefill chunk at fixed target position; three instrumented graph trials after warm-up; head and host submission excluded. Recurrent state advances between replays. Diagnostic only, not end-to-end TPS or quality acceptance."})).unwrap()).unwrap();
+        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,"fingerprint":model.stats.manifest_sha256,
+            "scope":"Last real-model prefill chunk at fixed target position; three instrumented trials after warm-up; event boundaries include any stream launch gaps in stream mode; head excluded. Recurrent state advances between replays. Diagnostic only, not end-to-end TPS or quality acceptance."})).unwrap()).unwrap();
     }
 }
 
@@ -823,6 +883,78 @@ fn capture_decode_projections() {
         .unwrap(),
     )
     .unwrap();
+}
+
+#[test]
+#[ignore = "Full native decode plan; requires real model and exclusive GPU experiment lock"]
+fn profile_decode_chain() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let mut source: GenerationInput = serde_json::from_value(fixture["cases"][0].clone()).unwrap();
+    source.max_new_tokens = 256;
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut request = model.start_request(source, &|| false).unwrap();
+    let options = scheduler::Options::default();
+    while request.prefilling {
+        model
+            .advance_requests(&mut [&mut request], &options)
+            .unwrap();
+    }
+    let mut wall_ms = vec![];
+    let mut tokens = vec![];
+    for iteration in 0..24 {
+        let started = Instant::now();
+        let steps = model
+            .advance_requests(&mut [&mut request], &options)
+            .unwrap();
+        let elapsed = started.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(steps.iter().map(|s| s.tokens.len()).sum::<usize>(), 1);
+        tokens.extend(steps.into_iter().flat_map(|s| s.tokens));
+        if iteration >= 8 {
+            wall_ms.push(elapsed);
+        }
+    }
+    let segments = model
+        .prepare_batch_inputs(&mut [&mut request], &[(0, 1)])
+        .unwrap();
+    let plan = model.model_package.batch_plan(&segments).unwrap();
+    model.execution.sync().unwrap();
+    let mut result = json!({
+        "model": fixture["model"], "fingerprint": model.stats.manifest_sha256,
+        "wall_median_ms": median(&wall_ms),
+        "decode_tps": 1000. * wall_ms.len() as f64 / wall_ms.iter().sum::<f64>(),
+        "tokens": tokens, "operations": plan,
+        "scope": "Normal scheduler, MTP off, 8 warm and 16 measured autoregressive steps. GPU diagnostics below replay the actual native batch plan; their changed states are discarded. Per-operation timing and NCU instrumentation are not request performance."
+    });
+    if fixture["ncu"].as_bool() == Some(true) {
+        profile_native_ncu(&mut model, &plan);
+    } else {
+        let times = model.execution.profile_invocations_hot(&plan, 8).unwrap();
+        result["hot_graph_median_ms"] = json!(median(
+            &times[1..].iter().map(|&v| f64::from(v)).collect::<Vec<_>>()
+        ));
+        let trials = model.execution.profile_graph_operations(&plan).unwrap();
+        result["operation_median_ms"] = json!(
+            (0..plan.len())
+                .map(|i| median(&trials.iter().map(|t| f64::from(t[i])).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        );
+    }
+    model.finish_request(&mut request, false).unwrap();
+    std::fs::write(output, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
 }
 
 #[test]
@@ -1008,7 +1140,7 @@ fn profile_continuous_decode() {
             "target_tokens_per_second":count as f64*1000./(walls.iter().sum::<f64>()/walls.len() as f64),
             "phases_median_ms":phases.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>(),
             "hot_graph_gpu_median_ms":median(&gpu),"operation_count":plan.len(),
-            "instrumented_graph_gpu_median_ms":median(&trials.iter().map(|t| t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
+            "instrumented_gpu_median_ms":median(&trials.iter().map(|t| t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
             "gpu_operations":operations,
             "isolated_subsets":subsets,
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>()});

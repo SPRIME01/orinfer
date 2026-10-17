@@ -2,6 +2,7 @@
 
 import unittest
 from tools.model.flash_next.prefill_tuning import ranges
+from tools.model.row_selection import choices, samples, split_fixed
 
 
 class PrefillTuningTests(unittest.TestCase):
@@ -39,3 +40,48 @@ class PrefillTuningTests(unittest.TestCase):
             result["selections"],
             [dict(min_rows=128, max_rows=512, multiple_of=128, implementation="aligned")],
         )
+
+
+class DynamicProjectionChoicesTests(unittest.TestCase):
+    def test_fixed_specializations_are_not_overlapped_by_dynamic_choices(self):
+        fixed = [1, 2, 3, 4, 8, 16, 32]
+        table = dict(
+            configs=[{"tile": "large"}, {"tile": "small"}],
+            default="0",
+            selections=[dict(min_rows=1, max_rows=64, implementation="1")],
+        )
+        published = list(choices(table, 128, fixed))
+        self.assertEqual(published[0], ("", {"tile": "large"}))
+        selected = {}
+        for suffix, config in published[1:]:
+            low, high = map(int, suffix.removeprefix("/rows/").split("-"))
+            for row in range(low, high + 1):
+                self.assertNotIn(row, fixed)
+                self.assertNotIn(row, selected)
+                selected[row] = config
+        for row in set(range(1, 129)) - set(fixed):
+            self.assertEqual(
+                selected.get(row, published[0][1]), {"tile": "small" if row <= 64 else "large"}
+            )
+
+    def test_unused_default_is_removed_when_winner_only_covers_aot_points(self):
+        table = dict(
+            configs=[{"tile": "unused"}, {"tile": "dynamic"}],
+            default="0",
+            selections=[dict(min_rows=2, max_rows=8, implementation="1")],
+        )
+        self.assertEqual(list(choices(table, 8, [1])), [("", {"tile": "dynamic"})])
+        self.assertEqual(list(choices(table, 8, range(1, 9))), [])
+
+    def test_samples_cover_small_capacities_and_large_tile_boundaries(self):
+        self.assertEqual(samples(1), [1])
+        for capacity in [8, 128, 4096]:
+            rows = samples(capacity)
+            self.assertEqual(rows, sorted(set(rows)))
+            self.assertEqual(rows[0], 1)
+            self.assertEqual(rows[-1], capacity)
+            for n in [512, 2048, 4096]:
+                for delta in [-1, 0, 1]:
+                    if 1 <= n + delta <= capacity:
+                        self.assertIn(n + delta, rows)
+        self.assertEqual(split_fixed(1, 8, [1, 4, 4, 8]), [(2, 3), (5, 7)])

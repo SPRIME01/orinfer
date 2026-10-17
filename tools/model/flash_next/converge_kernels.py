@@ -8,6 +8,7 @@ from pathlib import Path
 
 from tools.model.publication import atomic_model, clone_model, load_model, write_json
 from tools.model.flash_next.compiler import Compiler
+from tools.model.row_selection import split_fixed
 from tools.model.upgrade_dynamic_batch import contract
 
 
@@ -355,17 +356,6 @@ def coalesce_adjacent_selections(package):
         set(package["plan_kernel_contracts"]) - removed | {k["name"] for k in added}
     )
     return len(removed) - len(added)
-
-
-def split_fixed(first, last, fixed):
-    result = []
-    for row in sorted(int(r) for r in fixed if first <= int(r) <= last):
-        if first < row:
-            result.append((first, row - 1))
-        first = row + 1
-    if first <= last:
-        result.append((first, last))
-    return result
 
 
 def main():

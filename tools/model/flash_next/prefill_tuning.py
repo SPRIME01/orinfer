@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from tools.model.publication import write_json
+from tools.model.row_selection import ranges as ranges
 
 CAPACITY = 4096
 ROUTER_TILES = [(16, 64), (32, 64), (64, 128), (32, 128), (64, 64)]
@@ -18,49 +19,6 @@ def samples():
         set(range(1, 18))
         | geometric
         | {n + d for n in range(128, CAPACITY + 1, 128) for d in (-1, 0, 1) if n + d <= CAPACITY}
-    )
-
-
-def ranges(records, capacity=CAPACITY):
-    """Nearest measured length selects a legal implementation, then coalesce."""
-    names = sorted({name for row in records for name in row["times"]})
-    measured = {
-        name: [(r["rows"], r["times"][name]) for r in records if name in r["times"]]
-        for name in names
-    }
-
-    def cost(name, rows):
-        if name == "aligned" and rows % 128:
-            return float("inf")
-        points = measured[name]
-        n, latency = min(points, key=lambda p: abs(math.log(p[0] / rows)))
-        return latency * rows / n
-
-    chosen = [min(names, key=lambda name: cost(name, rows)) for rows in range(1, capacity + 1)]
-    default = "general" if "general" in names else max(sorted(set(chosen)), key=chosen.count)
-    selections = []
-    for name in sorted(set(chosen) - {default}):
-        multiple = 128 if name == "aligned" else 1
-        live = list(range(multiple, capacity + 1, multiple))
-        start = end = None
-        for row in live:
-            if chosen[row - 1] == name:
-                if start is None:
-                    start = row
-                end = row
-            elif start is not None:
-                selections.append(
-                    dict(min_rows=start, max_rows=end, multiple_of=multiple, implementation=name)
-                )
-                start = end = None
-        if start is not None:
-            selections.append(
-                dict(min_rows=start, max_rows=end, multiple_of=multiple, implementation=name)
-            )
-    return dict(
-        default=default,
-        selections=sorted(selections, key=lambda r: r["min_rows"]),
-        used=sorted(set(chosen)),
     )
 
 

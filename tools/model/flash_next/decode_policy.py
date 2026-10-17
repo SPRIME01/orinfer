@@ -1,6 +1,7 @@
 """Build-time decode shapes; serving consumes only compiled row selections."""
 
 from dataclasses import dataclass
+import math
 
 CAPACITY = 128
 SPECIALIZATIONS = (1, 2, 3, 4, 8, 16, 32)
@@ -51,7 +52,37 @@ def q4_configs(rows):
             for n in (64, 128)
             for k, s in ((128, 1), (128, 2), (256, 1))
         ]
+        + [
+            # Measured narrow-N tiles reduce compressed-weight decode overhead.
+            # Keep them in the common search for every codec and live row count.
+            dict(algorithm="tensor_core", block_m=8, block_n=32, block_k=256, stages=2),
+            dict(algorithm="tensor_core", block_m=32, block_n=32, block_k=256, stages=1),
+        ]
     )
+
+
+def e8p_q4_configs(rows, *, direct=False):
+    """Exact INT8 and direct INT4 schedules share one measured selection."""
+    configs = q4_configs(rows) + [
+        # More activation rows reuse each decoded E8P slab. Selection still
+        # measures every workload; larger live sets can make this tile slower.
+        dict(algorithm="tensor_core", block_m=256, block_n=64, block_k=128, stages=1)
+    ]
+    # Traversal and a smaller final tile change scheduling, not quantization.
+    # Both compete at every measured row count, including small decode shapes.
+    large = configs[-1]
+    configs += [
+        large | options
+        for options in ({"group_m": 1}, {"tail_m": 16}, {"group_m": 1, "tail_m": 16})
+    ]
+    if direct:
+        configs += [
+            dict(algorithm="int4_direct", block_m=8, block_n=n, block_k=128, stages=2, split_k=s)
+            for n in (32, 64, 128)
+            for s in (1, 2, 4)
+            if n * s <= 256
+        ]
+    return configs
 
 
 def w8_configs(rows, outputs):
@@ -68,3 +99,32 @@ def swiglu_configs(rows):
         for m in (16, 32)
         for n in (64, 128)
     ] + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
+
+
+def candidate_scores(profiles, invalid, objective="relative_geomean"):
+    """Compare the same measured workload without imposing runtime row cutoffs.
+
+    A dynamic prefill template minimizes total GPU time for its representative
+    requests. Decode fallbacks retain balanced relative costs across row counts.
+    """
+    if objective not in ("relative_geomean", "total_latency"):
+        raise ValueError("Unknown dynamic tuning objective")
+    width = len(profiles[0]["times_ms"])
+    legal = [i for i in range(width) if i not in invalid]
+    if not legal:
+        return [float("inf")] * width
+    minima = [min(p["times_ms"][i] for i in legal) for p in profiles]
+    scores = []
+    for i in range(width):
+        if i in invalid:
+            scores.append(float("inf"))
+        elif objective == "total_latency":
+            scores.append(sum(p["times_ms"][i] for p in profiles) / sum(minima))
+        else:
+            scores.append(
+                math.exp(
+                    sum(math.log(p["times_ms"][i] / best) for p, best in zip(profiles, minima))
+                    / len(profiles)
+                )
+            )
+    return scores

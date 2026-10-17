@@ -122,29 +122,34 @@ impl ModelPackage {
         let image = read_identity(base, &spec.library)?;
         let path = resolve_file(base, &spec.library.file)?;
         let mut model = Self::open(&path, &image)?;
-        let input_api = if request.metadata.input_assets.is_some() {
-            // SAFETY: hash-verified native library exports the documented C extension.
-            let entry = unsafe {
-                model
-                    ._library
-                    .get::<unsafe extern "C" fn(u32) -> *const abi::inputs::Api>(
-                        abi::inputs::ENTRYPOINT,
-                    )
+        // Program preparation also supplies dynamic control lengths; it does
+        // not require model-owned CPU weight assets.
+        // SAFETY: hash-verified library; the optional symbol has a versioned C ABI.
+        let entry = unsafe {
+            model
+                ._library
+                .get::<unsafe extern "C" fn(u32) -> *const abi::inputs::Api>(
+                    abi::inputs::ENTRYPOINT,
+                )
+        };
+        let input_api = match entry {
+            Ok(entry) => {
+                // SAFETY: the static function table is retained by the library.
+                let table = unsafe { entry(1) };
+                if table.is_null() {
+                    return Err("Model rejects input ABI".into());
+                }
+                // SAFETY: ABI v1 supplies the version and size prefix.
+                let header = unsafe { &*table.cast::<Header>() };
+                if header.version != 1 || header.size != std::mem::size_of::<abi::inputs::Api>() {
+                    return Err("Incompatible model input function table".into());
+                }
+                Some(table)
             }
-            .map_err(|e| format!("Model input adapter: {e}"))?;
-            // SAFETY: the extension returns a static table retained by the library.
-            let table = unsafe { entry(1) };
-            if table.is_null() {
-                return Err("Model rejects input ABI".into());
+            Err(error) if request.metadata.input_assets.is_some() => {
+                return Err(format!("Model input adapter: {error}"));
             }
-            // SAFETY: ABI v1 supplies the version and size prefix.
-            let header = unsafe { &*table.cast::<Header>() };
-            if header.version != 1 || header.size != std::mem::size_of::<abi::inputs::Api>() {
-                return Err("Incompatible model input function table".into());
-            }
-            Some(table)
-        } else {
-            None
+            Err(_) => None,
         };
         let input = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         model.input_api = input_api;
@@ -709,13 +714,15 @@ impl Drop for ModelPackage {
 mod tests {
     use super::*;
     fn fixture() -> (std::path::PathBuf, ExecutionLibrary, CreateRequest) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "orinfer-native-model-{}-{}",
+            "orinfer-native-model-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
         let engine = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -824,6 +831,25 @@ mod tests {
         assert_eq!(decode(&command).unwrap().0[0].views.len(), 2);
         command.view_count = 3;
         assert!(decode(&command).is_err());
+    }
+    #[test]
+    fn program_controls_do_not_require_cpu_weight_assets() {
+        let (root, spec, request) = fixture();
+        assert!(request.metadata.input_assets.is_none());
+        let (model, _) = ModelPackage::create(&root, &spec, request).unwrap();
+        let mut uploads = Vec::new();
+        model
+            .prepare_inputs("warm", &[1, 2, 3], &[], |name, data| {
+                uploads.push((name.to_owned(), data.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            uploads,
+            [("SegmentLength".into(), 3u32.to_le_bytes().to_vec())]
+        );
+        drop(model);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn cached_batch_retains_owned_plans_and_isolates_phases_and_membership() {

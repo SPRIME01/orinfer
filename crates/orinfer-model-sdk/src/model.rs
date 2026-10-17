@@ -672,7 +672,17 @@ impl Manifest {
             return Err("Empty prefill".into());
         }
         if let Some(rows) = &self.row_execution {
-            let chunk = tokens.min(rows.capacity);
+            let capacity = self
+                .prefill_plans
+                .iter()
+                .filter(|p| rows.programs.contains(&p.prefill_program))
+                .map(|p| {
+                    p.chunk_tokens
+                        .min(rows.program_capacity(&p.prefill_program))
+                })
+                .max()
+                .ok_or("Missing dynamic prefill template")?;
+            let chunk = tokens.min(capacity);
             let plan = self
                 .prefill_plan(chunk)
                 .ok_or("Missing dynamic prefill template")?;
@@ -795,6 +805,17 @@ mod branch_tests {
             (512, "prefill", "head")
         );
         assert!(manifest.select_prefill_plan(0).is_err());
+        let rows = manifest.row_execution.as_mut().unwrap();
+        rows.capacity = 32768;
+        rows.programs.insert("vision".into());
+        rows.program_capacities =
+            BTreeMap::from([("prefill".into(), 512), ("vision".into(), 32768)]);
+        for tokens in [513, 8192, 65536] {
+            assert_eq!(
+                manifest.select_prefill_plan(tokens).unwrap(),
+                (512, "prefill", "head")
+            );
+        }
     }
     #[test]
     fn permits_shared_reads_and_rejects_cross_branch_dependencies() {

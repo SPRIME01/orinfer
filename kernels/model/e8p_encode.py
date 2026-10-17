@@ -80,3 +80,170 @@ def encode(vectors):
                     Codes[row] = T.cast(code, T.uint16)
 
     return main
+
+
+# Keep only groups whose nearest member can reach the global eighth neighbor.
+# Each group fixes a basis and parity, leaving 128 sign patterns. This retains
+# the full codebook, including groups tied at the boundary; it is not ANN.
+TOP8_SOURCE = r"""
+__device__ __forceinline__ double e8p_score64(
+    const float* x, const signed char* book, unsigned code) {
+    const int bits[8] = {0,4,1,5,2,6,3,7};
+    unsigned low=code & 255u, parity=__popc(low)&1u;
+    double score=0;
+    #pragma unroll
+    for (int d=0; d<8; ++d) {
+        int c=book[(code>>8)*8+d]*(1-2*((int)((low^parity)>>bits[d])&1))
+              +1-2*(int)parity;
+        score += double(c*c)-2.0*double(x[d])*double(c);
+    }
+    return score;
+}
+
+__device__ __forceinline__ bool e8p_before(
+    float a, unsigned ca, float b, unsigned cb, float margin,
+    const float* x, const signed char* book) {
+    if (ca==cb) return false;
+    if (cb==0xffffffffu) return ca!=0xffffffffu;
+    if (ca==0xffffffffu) return false;
+    if (fabsf(a-b)>margin) return a<b;
+    // FP32 is sufficient away from a boundary. Re-evaluate close comparisons
+    // in FP64 and use code order for ties, including zero/symmetric vectors.
+    double da=e8p_score64(x,book,ca), db=e8p_score64(x,book,cb);
+    return da<db || (da==db && ca<cb);
+}
+
+__device__ void orin_e8p_top8(
+    const float* x, const signed char* book, void* output, int lane) {
+    const int bits[8] = {0,4,1,5,2,6,3,7};
+    float bounds[16], sum_abs=0;
+    #pragma unroll
+    for (int d=0; d<8; ++d) sum_abs+=fabsf(x[d]);
+    // Conservative FP32 roundoff allowance for group bounds and code scores.
+    // Reduced distances omit the common ||x||^2 to avoid cancellation there.
+    float margin=64.0f*1.1920928955078125e-7f*(1024.0f+22.0f*sum_abs);
+    #pragma unroll
+    for (int slot=0; slot<16; ++slot) {
+        int group=lane+32*slot, index=group&255, p=group>>8;
+        float score=0, flip=3.402823466e38f;
+        unsigned negative=0, basis_sign=0;
+        #pragma unroll
+        for (int d=0; d<8; ++d) {
+            int c=book[index*8+d], a=abs(c), delta=1-2*p;
+            float y=x[d]-float(delta), v=fabsf(y);
+            negative|=(y<0)<<d;
+            basis_sign|=(c<0)<<d;
+            score += float(a*a+1)-2.0f*float(delta)*x[d]-2.0f*float(a)*v;
+            flip=fminf(flip,4.0f*v*float(a));
+        }
+        if (__popc(negative^basis_sign)&1) score+=flip;
+        bounds[slot]=isfinite(score) ? score : -__int_as_float(0x7f800000);
+    }
+    // Eight distinct group minima give a valid upper bound on the eighth code.
+    unsigned removed=0;
+    float cutoff=__int_as_float(0x7f800000);
+    #pragma unroll
+    for (int rank=0; rank<8; ++rank) {
+        float best=__int_as_float(0x7f800000);
+        int which=-1;
+        #pragma unroll
+        for (int slot=0; slot<16; ++slot) {
+            if (!(removed&(1u<<slot)) && (which<0 || bounds[slot]<best)) {
+                best=bounds[slot]; which=slot;
+            }
+        }
+        float value=best;
+        #pragma unroll
+        for (int offset=16; offset>0; offset/=2)
+            value=fminf(value,__shfl_xor_sync(0xffffffffu,value,offset));
+        unsigned owners=__ballot_sync(0xffffffffu,best==value);
+        int owner=__ffs(owners)-1;
+        if (lane==owner) removed|=1u<<which;
+        cutoff=value;
+    }
+    cutoff=isfinite(cutoff) ? cutoff+2.0f*margin : __int_as_float(0x7f800000);
+    float scores[8];
+    unsigned codes[8];
+    #pragma unroll
+    for (int i=0; i<8; ++i) { scores[i]=__int_as_float(0x7f800000); codes[i]=0xffffffffu; }
+    #pragma unroll
+    for (int slot=0; slot<16; ++slot) {
+        unsigned active=__ballot_sync(0xffffffffu,bounds[slot]<=cutoff);
+        while (active) {
+            int owner=__ffs(active)-1;
+            active&=active-1;
+            int group=owner+32*slot, p=group>>8, index=group&255;
+            #pragma unroll
+            for (int part=0; part<4; ++part) {
+                unsigned low=lane+32*part;
+                low|=((__popc(low)^p)&1u)<<7;
+                unsigned code=(index<<8)|low;
+                float score=0;
+                #pragma unroll
+                for (int d=0; d<8; ++d) {
+                    int c=book[index*8+d]*(1-2*((int)((low^p)>>bits[d])&1))+1-2*p;
+                    score += float(c*c)-2.0f*x[d]*float(c);
+                }
+                if (!isfinite(score) || score<=cutoff) {
+                    if (e8p_before(score,code,scores[7],codes[7],margin,x,book)) {
+                        #pragma unroll
+                        for (int i=0; i<8; ++i) {
+                            if (e8p_before(score,code,scores[i],codes[i],margin,x,book)) {
+                                float old_score=scores[i]; unsigned old_code=codes[i];
+                                scores[i]=score; codes[i]=code;
+                                score=old_score; code=old_code;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int rank=0; rank<8; ++rank) {
+        float score=scores[0]; unsigned code=codes[0];
+        #pragma unroll
+        for (int offset=16; offset>0; offset/=2) {
+            float other=__shfl_xor_sync(0xffffffffu,score,offset);
+            unsigned candidate=__shfl_xor_sync(0xffffffffu,code,offset);
+            if (e8p_before(other,candidate,score,code,margin,x,book)) {
+                score=other; code=candidate;
+            }
+        }
+        if (lane==0) ((unsigned short*)output)[rank]=(unsigned short)code;
+        if (codes[0]==code) {
+            #pragma unroll
+            for (int i=0; i<7; ++i) { scores[i]=scores[i+1]; codes[i]=codes[i+1]; }
+            scores[7]=__int_as_float(0x7f800000); codes[7]=0xffffffffu;
+        }
+    }
+}
+"""
+
+
+@orin_jit
+def encode_top8(vectors):
+    if type(vectors) is not int or vectors <= 0:
+        raise ValueError("Invalid vector count")
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((vectors, 8), T.float32),
+        Book: T.Tensor((256, 8), T.int8),
+        Codes: T.Tensor((vectors, 8), T.uint16),
+    ):
+        with T.Kernel(T.ceildiv(vectors, 4), threads=128) as block:
+            T.import_source(TOP8_SOURCE)
+            tx = T.get_thread_binding()
+            row = block * 4 + tx // 32
+            if row < vectors:
+                T.call_extern(
+                    "void",
+                    "orin_e8p_top8",
+                    T.address_of(X[row, 0]),
+                    Book.data,
+                    T.access_ptr(Codes[row, 0], "w", 8),
+                    tx % 32,
+                )
+
+    return main

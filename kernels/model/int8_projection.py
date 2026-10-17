@@ -8,7 +8,7 @@ import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
-from kernels.model.integer_core import dp4a, tensor_core
+from kernels.model.integer_core import dp4a, tensor_core_tiles, tile_coordinates
 
 
 @orin_jit
@@ -22,6 +22,8 @@ def int8_projection(
     block_k: int = 64,
     group_m: int = 0,
     dynamic_rows: bool = False,
+    output_stride: int | None = None,
+    tail_m: int = 0,
 ):
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 64 or K * 128 * 128 > 2**31 - 1:
         raise ValueError("Invalid INT8 projection geometry")
@@ -34,9 +36,11 @@ def int8_projection(
     if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
         raise ValueError("Invalid INT8 row grouping")
     M = row_count(M, dynamic_rows)
-    mt, nt = (M + block_m - 1) // block_m, (N + block_n - 1) // block_n
-
-    project = tensor_core(M, N, K, block_m, block_n, block_k)
+    stride = N if output_stride is None else output_stride
+    if type(stride) is not int or stride < N:
+        raise ValueError("INT8 output stride must contain the complete output row")
+    nt = (N + block_n - 1) // block_n
+    mt, project = tensor_core_tiles(M, N, K, block_m, block_n, block_k, tail_m=tail_m)
 
     @T.prim_func
     def main(
@@ -44,19 +48,10 @@ def int8_projection(
         Weight: T.Tensor((N, K), T.int8),
         WeightScale: T.Tensor((N,), T.float16),
         TokenScale: T.Tensor((M,), T.float16),
-        Output: T.Tensor((M, N), output_dtype),
+        Output: T.Tensor((M, stride), output_dtype),
     ):
         with T.Kernel(mt * nt, threads=128) as pid:
-            by = T.alloc_var(T.int32)
-            bx = T.alloc_var(T.int32)
-            if group_m:
-                first = (pid // (group_m * nt)) * group_m
-                actual = T.min(mt - first, group_m)
-                by = first + (pid % (group_m * nt)) % actual
-                bx = (pid % (group_m * nt)) // actual
-            else:
-                by = pid % mt
-                bx = pid // mt
+            by, bx = tile_coordinates(pid, mt, nt, group_m)
             project(A, Weight, Weight, WeightScale, WeightScale, TokenScale, Output, by, bx)
 
     return main
@@ -71,6 +66,7 @@ def int8_small_projection(
     dynamic_rows: bool = False,
     block_m: int | None = None,
     block_n: int = 4,
+    output_stride: int | None = None,
 ):
     """Row-tiled DP4A projections; packed views alias the original INT8.
 
@@ -86,6 +82,9 @@ def int8_small_projection(
     if not 1 <= bm <= 8 or bn not in (4, 8, 16):
         raise ValueError("Invalid INT8 DP4A tile")
     M = row_count(M, dynamic_rows)
+    stride = N if output_stride is None else output_stride
+    if type(stride) is not int or stride < N:
+        raise ValueError("INT8 output stride must contain the complete output row")
 
     project = dp4a(M, N, K, bm, bn)
 
@@ -95,7 +94,7 @@ def int8_small_projection(
         Weight: T.Tensor((N, K // 4), T.int32),
         WeightScale: T.Tensor((N,), T.float16),
         TokenScale: T.Tensor((M,), T.float16),
-        Output: T.Tensor((M, N), output_dtype),
+        Output: T.Tensor((M, stride), output_dtype),
     ):
         with T.Kernel(T.ceildiv(M, bm), T.ceildiv(N, bn), threads=128) as (by, bx):
             project(A, Weight, Weight, WeightScale, WeightScale, TokenScale, Output, by, bx)

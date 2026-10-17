@@ -10,6 +10,34 @@ Flash Next 的固定源转换、safetensors 发布、完整请求和 MTP 验证�
 
 Block128 rotations are normalized input-side Hadamard transforms. The corresponding floating weight transform is mathematically equivalent before quantization; A8/FP16 boundaries add numerical error. Store/charge signs, tables, patches, scales and padding in the footprint, and include activation transformation in complete-FFN performance. These codecs do not establish full-model quality, and the E8P decoder is not a reproduction of the full QuIP# quantization/training pipeline.
 
+## 两级整数 E8P Q4A8（实验）
+
+`e8p_q4.py` 的每个 U32 保存两个 E8P U16 码字，描述 8 个权重，载荷恰为 4bit/weight。默认还原为 `q = 4 * E8P(coarse) + E8P(residual)`，整数范围为 `[-55,55]`；两个阶段共享原有 basis。系数是整个 codec 的常数，每个输出行只有一个 FP16 scale，没有逐 group 浮点缩放。保存格式为标准 safetensors，包含 `packed/scales/signs/basis`，metadata 固定 codec、码字顺序、旋转及系数。
+
+CPU `fit()` 是数值参考；`e8p_q4_gpu.Encoder.fit()` 复用 TileLang 最近邻编码器，按真实存储的 FP16 scale 交替拟合两个码字。转换时由调用方分块，例如每次 128 个输出行，不需要完整 BF16 checkpoint 或校准数据。`Weights.dequantize()` 返回旋转坐标中的浮点权重；与原矩阵比较时须使用同一 `vq.rotate()`。
+
+`Encoder.refine(raw, original)` 对已有 `[4,1]` 码字执行 8 次交替更新和两轮 beam8 联合搜索；`raw` 必须是对应的原始浮点权重，不能用已量化权重反量化后替代。每次保留误差更低的行码字及其真实 FP16 scale，不改变存储格式、旋转或在线解码器。调用方同样按输出行分块。
+
+粗码字 top-8 由 `kernels/model/e8p_encode.py` 精确搜索：先求 512 个 basis/parity 组的最优距离，以第八小的组距离界限筛选，再展开可能命中的符号组合。保留边界并列组；距离比较带 FP32 舍入余量，接近的候选用 FP64 复核，以码字顺序打破并列。无需生成 `[vectors,65536]` 距离矩阵；八个候选的残差最近邻批量执行。该 top-8 是精确搜索，但整个两级交替拟合仍不是全局最优加性编码的保证。
+
+```python
+from tools.quantization.e8p_q4_gpu import Encoder
+
+encoder = Encoder()
+initial = encoder.fit(raw, signs)
+improved = encoder.refine(raw, initial)
+```
+
+`kernels/model/e8p_q4.py` 在投影内部解码到 INT8，复用 `integer_core` 的 Tensor Core/DP4A 调度与完整 K 的 INT32 累加。支持动态 token 行及输出 stride，不保留常驻 W8 副本；激活使用同一 signed-block128 旋转和 A8 行 scale。27B 构建器和 Rust 行执行器接受隔离候选的 `orinfer_e8p_q4_int8` 策略，要求固定 `[4,1]` 系数、U32 `[N,K/8]` 码字和匹配的 basis；不改变现有标量 Q4 部署权重。模型质量需另做 BF16 对照。
+
+```bash
+.venv/bin/python -m unittest tools.quantization.test_e8p_q4
+bash tools/operators/run.sh tools/quantization/check_e8p_q4.py artifacts/check-e8p-q4
+bash tools/operators/run.sh tools/quantization/check_e8p_search.py artifacts/check-e8p-search
+```
+
+真实权重组件比较可运行 `evaluate_e8p_q4.py`，使用同一 wrapper，追加 `--weights /path/to/fixtures [--full-matrix /path/to/matrix.safetensors]`。输入为含 F32 `weight` 和 I8 `signs` 的 safetensors，编号样本另附同名 `.json` 源信息；应从固定版本的原始 BF16 转换，不能使用已量化权重作为质量参考。输出分别记录权重重构误差和投影 kernel 时延；这两项不能替代模型 NLL、任务质量或完整请求 TPS 验收。
+
 `block_ldlq.py` provides regularized covariance factors and a CPU oracle for reverse block error feedback following the BlockLDLQ principle. `rotation.py` provides offline forward/inverse transforms for the Flash Next dimensions using an order20 Paley Hadamard and a power-of-two factor. A two-sided transform must restore the output coordinates before nonlinearities; its reference representation is not an online operator package. These helpers do not include QuIP# fine-tuning or full-model calibration.
 
 ## Qwen 27B 码表 Q4A8
@@ -27,4 +55,4 @@ bash tools/quantization/run.sh qwen35 \
 
 `--inventory-only` 仅清点；`--chunk-mib` 默认 32。GPU 编码按块持有共享锁，块完成后同步并释放临时显存。重复相同命令会检查已完成分块并继续；源、编码实现、seed 或分块配置变化会拒绝混用。最终按组件/层合并标准 safetensors，验证后删除临时分块副本。
 
-输出仅为量化权重，仍需支持该编码的 27B 加载与算子构建，不能直接交给现有 27B 部署加载器。
+输出仅为量化权重。继续使用[27B 原生构建器](../model/qwen35/README.md)生成 Rust/TileLang 执行包和在线模型目录，再执行 `validate-model` 与实际生成检查；量化中间目录不能直接部署。

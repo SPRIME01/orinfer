@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 
-from kernels.model.e8p_encode import encode
+from kernels.model.e8p_encode import encode, encode_top8
 from tools.quantization.e8p import basis
 from tools.quantization.rotation import hadamard20
 from tools.quantization.vq import Weights, e8p_decode
@@ -17,6 +17,7 @@ class Encoder:
             e8p_decode(np.arange(65536, dtype=np.uint16), self.table).astype(np.float32)
         ).cuda()
         self.kernels = {}
+        self.top8_kernels = {}
 
     def nearest(self, values):
         count = len(values)
@@ -24,6 +25,17 @@ class Encoder:
             self.kernels[count] = encode(count)
         codes = torch.empty(count, device="cuda", dtype=torch.uint16)
         self.kernels[count](values.contiguous(), self.book, codes)
+        return codes
+
+    def nearest_top8(self, values):
+        """Exact eight nearest E8P codes, ordered by distance then code."""
+        if values.ndim != 2 or values.shape[1] != 8 or values.dtype != torch.float32:
+            raise ValueError("Expected FP32 [vectors,8] inputs")
+        count = len(values)
+        if count not in self.top8_kernels:
+            self.top8_kernels[count] = encode_top8(count)
+        codes = torch.empty((count, 8), device=values.device, dtype=torch.uint16)
+        self.top8_kernels[count](values.contiguous(), self.book, codes)
         return codes
 
     def fit_arrays(self, raw, signs, *, iterations=2, rotation="block128"):

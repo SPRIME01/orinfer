@@ -707,6 +707,16 @@ impl Executor {
 
     /// Submit the same registered program without adding synchronization points.
     pub(crate) fn submit_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
+        // A declared one-row entry may reuse kernels whose default export has
+        // a much larger capacity. Resolve its real row arguments before launch.
+        if self
+            .direct
+            .as_ref()
+            .and_then(|d| d.row_execution.as_ref())
+            .is_some_and(|rows| rows.programs.contains(name) && rows.program_capacity(name) == 1)
+        {
+            return self.submit_program_rows(name, 1, phase);
+        }
         self.ensure_kv(name)?;
         if let Some(operations) = self.direct.as_ref().and_then(|d| d.programs.get(name)) {
             for operation in operations {

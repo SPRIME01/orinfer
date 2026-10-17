@@ -2,6 +2,8 @@
 
 本目录提供checkpoint转换、kernel验证与导出、模型组装和Rust运行入口。Python不参与在线推理。
 
+27B 的自有码表 Q4A8 权重使用 [`qwen35/build.py`](qwen35/README.md)直接生成原生模型目录，包含文本、图片、多图、INT8 KV、prefix cache、动态行 batching 和 MTP。它复用 Flash Next 的公共整数算子与执行包格式，无需串联下文的历史 group-128 构建工具。
+
 ## 外部输入
 
 需要自行准备与模型匹配的checkpoint，并通过构建入口的`--checkpoint`指定HF目录。基线构建器支持asymmetric compressed-tensors W4/group128的Qwen3_5 27B，读取单文件或分片safetensors；其他格式导入不属于此入口。位于仓库外的目录设`ORINFER_CHECKPOINT_DIR`进行只读挂载。

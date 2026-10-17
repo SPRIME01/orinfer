@@ -83,3 +83,23 @@ static int32_t export_plans(void *model, OrinferPlans *out, OrinferOwnedBytes *e
 static void free_plans(OrinferPlans p) {(void)p;}
 static const OrinferPlanApi plan_api = {1, sizeof(OrinferPlanApi), sizeof(OrinferPlanKernel), sizeof(OrinferPlanArgument), sizeof(OrinferPlanProgram), sizeof(OrinferPlanCommand), export_plans, free_plans};
 const OrinferPlanApi *orinfer_model_plans_v1(uint32_t version) {return version == 1 ? &plan_api : NULL;}
+
+typedef struct { uint32_t length; OrinferInputUpload upload; } InputStorage;
+static int32_t prepare_inputs(void *model, const uint32_t *tokens, size_t count,
+    const uint32_t *history, size_t history_count, OrinferInputs *out, OrinferOwnedBytes *error) {
+    (void)model; (void)tokens; (void)history; (void)history_count;
+    InputStorage *storage = malloc(sizeof(*storage));
+    storage->length = (uint32_t)count;
+    storage->upload = (OrinferInputUpload){SPAN("SegmentLength"),
+        {(const uint8_t *)&storage->length, sizeof(storage->length)}};
+    *out = (OrinferInputs){storage, &storage->upload, 1};
+    return bytes(error, "");
+}
+static int32_t prepare_program(void *model, OrinferBytes program, const uint32_t *tokens, size_t count,
+    const uint32_t *history, size_t history_count, OrinferInputs *out, OrinferOwnedBytes *error) {
+    (void)program;
+    return prepare_inputs(model, tokens, count, history, history_count, out, error);
+}
+static void free_inputs(OrinferInputs input) {free(input.owner);}
+static const OrinferInputApi input_api = {1, sizeof(OrinferInputApi), prepare_inputs, free_inputs, prepare_program};
+const OrinferInputApi *orinfer_model_inputs_v1(uint32_t version) {return version == 1 ? &input_api : NULL;}

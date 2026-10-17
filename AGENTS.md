@@ -18,9 +18,11 @@
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
 - Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家bank与路由计数，按需从SSD加载到CUDA VMM页，并共享全局SLRU。有限模式暂关闭CUDA Graph，MTP专家全量常驻；临时路由集合和页粒度不计作严格字节上限，不缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
+- 27B后续实验与部署使用已重新编码的两级E8P Q4A8权重（coefficients=[4,1]、beam8搜索），本机当前模型目录为`artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为`artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。旧量化和TCQ实验仅保留结果记录，不作为权重回退。更换权重值而配置和buffer契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
+- 27B整数投影每种矩阵几何、dtype/stride及压缩布局只发布一个动态fallback；常用1/2/3/4/8/16/32行可保留同源AOT。离线调优汇总多个长度的代价选择一个配置，不输出按prefill长度区间切换投影cubin的选择表；调优候选不等于线上多路径。收敛后检查实际发布包，验证尾部、完整请求性能和全部状态。
 - Flash Next采用已确定的混合量化方案：专家保留整数E8P Q2A8；主干GDN QKV/Z、QSA Q/gate和target/MTP共享输出头采用signed-block128旋转、输出行scale的Q4A8。GDN/QSA输出投影、共享FFN和MTP草稿Q/O保留W8；其余精度敏感部分维持原混合精度。原生适配器校验该策略，不保留逐矩阵试验精度分支。
 - Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
-- E8P可使用无损K64压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。
+- E8P可使用无损K64/K128压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。
 - 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，默认在线校验dtype、shape、物理layout和容器边界；权重payload hash由`--verify-weights`显式开启，`validate-model`始终完整校验。配置签名仍校验，前端资源、CPU资产元数据、原生执行库和kernel身份仍固定并校验hash。模型数据通过execution_package digest固定独立模型执行包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，在线模型数据描述与执行包均保留schema 1，只支持当前原生模型包结构；不提供旧结构或schema 2兼容分支。算子夹具格式独立。
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进Rust模型库；禁止在生成模块逐层复制整份特化绑定，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model保留构建契约以支持离线重建；在线只导出最终程序、局部特化和专家常驻契约引用的绑定，不将融合前的构建输入注册为可执行launch。
@@ -42,7 +44,7 @@
 - 当前原生Flash Next的整数算子重建使用`tools/model/flash_next/build.py`：从权重几何和host ABI读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经Rust计划检查后原子发布。它需要模型固定的执行契约，不是任意裸权重导入；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。不得将历史升级脚本串联目录作为正式重建接口。
 - 可变的HC无损指数、QSA radix shift使用ABI标量复用cubin；私有状态包装器必须保留标量、列stride及字节偏移。QSA条带数离线测量；动态整数投影调优覆盖多个实际行数及容量上限，不只测一个短长度。相邻选择区间仅在完整参数/launch契约一致时合并，不跨越空洞或隐式改变专家路由tile。
 - 新kernel验证数值、非对齐尾部和实际graph replay；状态改动另测分块、恢复和请求隔离。
-- 投影组件按权重读取、计算调度、输出处理组合：W8/Q4及融合SwiGLU复用integer_core，BF16矩阵复用floating_core，E8P的位平面、双INT4乘积和输出复用e8p_core。这些是编译期组件，不因模型、prefill/decode或MTP复制计算循环；访存调度、浮点归约和舍入契约显式保留。27B的码表Q4A8接入复用同一Q4解码和整数计算组件。调优缓存必须包含内联组件源码身份。
+- 投影组件按权重读取、计算调度、输出处理组合：W8/Q4及融合SwiGLU复用integer_core，BF16矩阵复用floating_core，E8P的位平面、双INT4乘积和输出复用e8p_core。这些是编译期组件，不因模型、prefill/decode或MTP复制计算循环；访存调度、浮点归约和舍入契约显式保留。27B两级E8P Q4A8同样复用e8p_core，直接INT4与INT8回退读取同一份K128压缩权重。调优缓存必须包含内联组件源码身份。
 - Flash Next适配器仅接受当前动态prefill、target/draft行模板和因果状态契约；不恢复旧固定容量计划的注册、回退或逐长度改写。Q4前置变换按section、激活/scale工作区及符号表关联消费者，QKV/Z共享变换必须先于首个消费者，并对每个程序别名单独生成；禁止以算子序号补丁代替依赖关系。
 - 源码库保留实现、必要构建工具、测试、示例与使用文档。不提交研究过程、agent交付记录、历史实验报告或本机环境证据。
 - 权重、二进制、cubin、cache、日志及trace保留在忽略的artifacts/target目录；不提交密钥或token。

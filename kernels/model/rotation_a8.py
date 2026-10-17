@@ -6,6 +6,165 @@ from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
 
 
+def _rotation_scale(maximum):
+    return T.if_then_else(
+        maximum > 0,
+        T.max(T.call_extern("float32", "__fdiv_rn", maximum, 127.0), 2**-24),
+        1.0,
+    )
+
+
+@T.macro
+def _rotation_code(value, scale, inv):
+    # Materialize the ratio once in TIR. An ordinary Python expression helper
+    # can duplicate the opaque rounded-division call when the guard is inlined.
+    operand = T.cast(value, T.float32)
+    divisor = T.cast(scale, T.float32)
+    ratio = operand * inv
+    adjusted = T.if_then_else(
+        T.abs(ratio - T.round(ratio)) >= 0.5 - 2**-14,
+        T.call_extern("float32", "__fdiv_rn", operand, divisor),
+        ratio,
+    )
+    return T.max(-127.0, T.min(127.0, T.round(adjusted)))
+
+
+def _block_rotation(width, inputs, swiglu, plane_rows=0):
+    """Shared block128 butterflies; each warp owns consecutive coordinates."""
+
+    @T.macro
+    def transform(X, Signs, row, offset, values, current):
+        for k in T.Parallel(width, coalesced_width=T.int32(1)):
+            values[k] = 0.0
+            if offset + k < inputs:
+                if swiglu:
+                    gate = T.cast(X[row, offset + k], T.float32)
+                    e = T.exp(-T.abs(gate))
+                    sigmoid = T.if_then_else(gate >= 0, 1 / (1 + e), e / (1 + e))
+                    value = T.cast(
+                        T.cast(
+                            (gate * sigmoid)
+                            * T.cast(
+                                X[row + plane_rows, offset + k]
+                                if plane_rows
+                                else X[row, offset + k + inputs],
+                                T.float32,
+                            ),
+                            T.float16,
+                        ),
+                        T.float32,
+                    )
+                    values[k] = value * T.cast(Signs[offset + k], T.float32)
+                else:
+                    values[k] = T.cast(X[row, offset + k], T.float32) * T.cast(
+                        Signs[offset + k], T.float32
+                    )
+        for stage in T.unroll(5):
+            for k in T.Parallel(width):
+                other = T.call_pure_extern(
+                    "float32", "__shfl_xor_sync", T.uint32(0xFFFFFFFF), values[k], 1 << stage, 32
+                )
+                values[k] = other + values[k] * (1 - 2 * ((k >> stage) & 1))
+        for stage in T.unroll(5, 7):
+            T.copy(values, current)
+            T.sync_threads()
+            for k in T.Parallel(width):
+                values[k] = current[k ^ (1 << stage)] + values[k] * (1 - 2 * ((k >> stage) & 1))
+            T.sync_threads()
+        for k in T.Parallel(width):
+            values[k] = T.cast(T.cast(values[k] * 0.08838834764831845, T.float16), T.float32)
+
+    return transform
+
+
+@orin_jit
+def rotate_activation_tiles(M, K, block_k=512, swiglu=False, dynamic_rows=False, *, plane_rows=0):
+    """Parallel transforms plus partial maxima; scale remains one per row."""
+    if min(M, K) <= 0 or K % 128 or block_k not in (128, 256, 512, 1024, 2048):
+        raise ValueError("Invalid tiled block128 rotation")
+    if (
+        type(plane_rows) is not int
+        or plane_rows < 0
+        or (plane_rows and (not swiglu or plane_rows < M))
+    ):
+        raise ValueError("Invalid SwiGLU plane capacity")
+    m = row_count(M, dynamic_rows)
+    blocks = T.ceildiv(K, block_k)
+    transform = _block_rotation(block_k, K, swiglu, plane_rows)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor(
+            (m + plane_rows, K) if plane_rows else (m, K * (2 if swiglu else 1)), T.float16
+        ),
+        Signs: T.Tensor((K,), T.int8),
+        Rotated: T.Tensor((m, K), T.float16),
+        Maxima: T.Tensor((m, blocks), T.float32),
+    ):
+        with T.Kernel(m, blocks, threads=128) as (row, block):
+            current = T.alloc_shared((block_k,), T.float32)
+            values = T.alloc_fragment((block_k,), T.float32)
+            absolute = T.alloc_fragment((block_k,), T.float32)
+            maximum = T.alloc_fragment((1,), T.float32)
+            T.annotate_layout(
+                {
+                    values: tilelang.Fragment(
+                        (block_k,),
+                        forward_thread_fn=lambda k: k % 128,
+                        forward_index_fn=lambda k: k // 128,
+                    )
+                }
+            )
+            transform(X, Signs, row, block * block_k, values, current)
+            for k in T.Parallel(block_k):
+                absolute[k] = T.abs(values[k])
+                if block * block_k + k < K:
+                    Rotated[row, block * block_k + k] = values[k]
+            T.reduce_max(absolute, maximum, dim=0)
+            Maxima[row, block] = maximum[0]
+
+    return main
+
+
+@orin_jit
+def quantize_rotation_tiles(M, K, block_k=512, dynamic_rows=False):
+    """Every CTA derives the same global row scale from the small max table."""
+    if min(M, K) <= 0 or K % 128 or block_k not in (128, 256, 512, 1024, 2048):
+        raise ValueError("Invalid tiled rotation quantization")
+    m = row_count(M, dynamic_rows)
+    blocks = T.ceildiv(K, block_k)
+    reduction_width = 1 << (((K + block_k - 1) // block_k) - 1).bit_length()
+
+    @T.prim_func
+    def main(
+        Rotated: T.Tensor((m, K), T.float16),
+        Maxima: T.Tensor((m, blocks), T.float32),
+        Q: T.Tensor((m, K), T.int8),
+        S: T.Tensor((m, 1), T.float16),
+    ):
+        with T.Kernel(m, blocks, threads=128) as (row, block):
+            maxima = T.alloc_fragment((reduction_width,), T.float32)
+            maximum = T.alloc_fragment((1,), T.float32)
+            scale = T.alloc_fragment((1,), T.float16)
+            inv = T.alloc_fragment((1,), T.float32)
+            for j in T.Parallel(reduction_width):
+                maxima[j] = 0.0
+                if j < blocks:
+                    maxima[j] = Maxima[row, j]
+            T.reduce_max(maxima, maximum, dim=0)
+            scale[0] = _rotation_scale(maximum[0])
+            if block == 0:
+                S[row, 0] = scale[0]
+            inv[0] = T.call_extern("float32", "__fdiv_rn", 1.0, T.cast(scale[0], T.float32))
+            for k in T.Parallel(block_k):
+                if block * block_k + k < K:
+                    Q[row, block * block_k + k] = T.cast(
+                        _rotation_code(Rotated[row, block * block_k + k], scale[0], inv[0]), T.int8
+                    )
+
+    return main
+
+
 @orin_jit
 def rotate_activation_a8(
     M: int,
@@ -38,6 +197,7 @@ def rotate_activation_a8(
     width = 2 * K if swiglu else K
     M = row_count(M, dynamic_rows)
     slots = M * 10 if dispatch else M
+    transform = _block_rotation(K, K, swiglu)
 
     @T.macro
     def body(X, Signs, Q, S, Low, High, Sum, IDs, RelativeSlot, RowOffsets, DS, SlotMap, row):
@@ -61,64 +221,22 @@ def rotate_activation_a8(
                 for v in (values, quant, low, high)
             }
         )
-        # Every warp owns 32 consecutive lanes of each block128 transform.
-        # K is a multiple of 128, so shuffle calls always have a full mask.
-        for k in T.Parallel(K, coalesced_width=T.int32(1)):
-            if swiglu:
-                gate = T.cast(X[row, k], T.float32)
-                e = T.exp(-T.abs(gate))
-                sigmoid = T.if_then_else(gate >= 0, 1 / (1 + e), e / (1 + e))
-                value = T.cast(
-                    T.cast((gate * sigmoid) * T.cast(X[row, k + K], T.float32), T.float16),
-                    T.float32,
-                )
-                values[k] = value * T.cast(Signs[k], T.float32)
-            else:
-                values[k] = T.cast(X[row, k], T.float32) * T.cast(Signs[k], T.float32)
-        for stage in T.unroll(5):
-            for k in T.Parallel(K):
-                other = T.call_pure_extern(
-                    "float32",
-                    "__shfl_xor_sync",
-                    T.uint32(0xFFFFFFFF),
-                    values[k],
-                    1 << stage,
-                    32,
-                )
-                values[k] = other + values[k] * (1 - 2 * ((k >> stage) & 1))
-        for stage in T.unroll(5, 7):
-            # Only the last two butterflies cross warp boundaries. Retain
-            # the original FP32 add order and subsequent FP16 rounding.
-            T.copy(values, current)
-            T.sync_threads()
-            for k in T.Parallel(K):
-                values[k] = current[k ^ (1 << stage)] + values[k] * (1 - 2 * ((k >> stage) & 1))
-            T.sync_threads()
+        transform(X, Signs, row, 0, values, current)
         for k in T.Parallel(K):
-            values[k] = T.cast(T.cast(values[k] * 0.08838834764831845, T.float16), T.float32)
             absolute[k] = T.abs(values[k])
         T.reduce_max(absolute, maximum, dim=0)
-        scale[0] = T.if_then_else(
-            maximum[0] > 0,
-            T.max(T.call_extern("float32", "__fdiv_rn", maximum[0], 127.0), 2**-24),
-            1.0,
-        )
+        scale[0] = _rotation_scale(maximum[0])
         S[row, 0] = scale[0]
         if reciprocal:
             inv[0] = T.call_extern("float32", "__fdiv_rn", 1.0, T.cast(scale[0], T.float32))
         for k in T.Parallel(K):
             if reciprocal:
-                ratio = values[k] * inv[0]
-                ratio = T.if_then_else(
-                    T.abs(ratio - T.round(ratio)) >= 0.5 - 2**-14,
-                    T.call_extern("float32", "__fdiv_rn", values[k], T.cast(scale[0], T.float32)),
-                    ratio,
-                )
+                quant[k] = T.cast(_rotation_code(values[k], scale[0], inv[0]), T.int32)
             else:
                 ratio = T.call_extern(
                     "float32", "__fdiv_rn", values[k], T.cast(scale[0], T.float32)
                 )
-            quant[k] = T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int32)
+                quant[k] = T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int32)
             Q[row, k] = quant[k]
             if exact:
                 position = ((k & 1) << 1) | ((k & 2) >> 1) | (k & 4)
@@ -221,3 +339,58 @@ def rotate_activation_a8(
     if scatter:
         return rotate_dispatch_a8.with_attr("global_symbol", "rows_rotate_scatter")
     return rotate_dispatch_a8
+
+
+@orin_jit
+def residual_norm_rotate_a8(M, K=5120, *, dynamic_rows=False):
+    """Residual RMSNorm, signed rotation and A8 with both FP16 boundaries intact."""
+    from kernels.operators.op02_residual_norm import residual_norm_body
+
+    if type(K) is not int or K <= 0 or K % 256:
+        raise ValueError("Fused residual rotation requires complete 256-column tiles")
+    m = row_count(M, dynamic_rows)
+    threads = 256
+    normalize = residual_norm_body(K, 1e-6, threads, staged=True)
+    transform = _block_rotation(K, K, False)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((m, K), T.float16),
+        R: T.Tensor((m, K), T.float32),
+        W: T.Tensor((K,), T.float16),
+        Y: T.Tensor((m, K), T.float16),
+        RO: T.Tensor((m, K), T.float32),
+        Signs: T.Tensor((K,), T.int8),
+        Q: T.Tensor((m, K), T.int8),
+        S: T.Tensor((m,), T.float16),
+    ):
+        with T.Kernel(m, threads=threads) as row:
+            normalized = T.alloc_shared((1, K), T.float16)
+            current = T.alloc_shared((K,), T.float32)
+            values = T.alloc_fragment((K,), T.float32)
+            absolute = T.alloc_fragment((K,), T.float32)
+            maximum = T.alloc_fragment((1,), T.float32)
+            scale = T.alloc_fragment((1,), T.float16)
+            inv = T.alloc_fragment((1,), T.float32)
+            T.annotate_layout(
+                {
+                    values: tilelang.Fragment(
+                        (K,),
+                        forward_thread_fn=lambda k: k % threads,
+                        forward_index_fn=lambda k: k // threads,
+                    )
+                }
+            )
+            normalize(X, R, W, Y, RO, normalized, row)
+            T.sync_threads()
+            transform(normalized, Signs, 0, 0, values, current)
+            for k in T.Parallel(K):
+                absolute[k] = T.abs(values[k])
+            T.reduce_max(absolute, maximum, dim=0)
+            scale[0] = _rotation_scale(maximum[0])
+            S[row] = scale[0]
+            inv[0] = T.call_extern("float32", "__fdiv_rn", 1.0, T.cast(scale[0], T.float32))
+            for k in T.Parallel(K):
+                Q[row, k] = T.cast(_rotation_code(values[k], scale[0], inv[0]), T.int8)
+
+    return main

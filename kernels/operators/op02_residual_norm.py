@@ -9,6 +9,36 @@ import tilelang.language as T
 from tools.operators.common import orin_jit
 
 
+def residual_norm_body(hidden, epsilon, threads, *, staged=False):
+    """Shared FP32 reduction and FP16 norm boundary, optionally staged for fusion."""
+    columns = ((hidden + threads - 1) // threads) * threads
+
+    @T.macro
+    def normalize(X, R, W, Y, RO, Stage, row):
+        value = T.alloc_fragment((columns,), T.float32)
+        square = T.alloc_fragment((columns,), T.float32)
+        total = T.alloc_fragment((1,), T.float32)
+        for j in T.Parallel(columns):
+            value[j] = 0.0
+            if j < hidden:
+                value[j] = T.cast(X[row, j], T.float32) + T.cast(R[row, j], T.float32)
+                RO[row, j] = value[j]
+            square[j] = value[j] * value[j]
+        T.reduce_sum(square, total, dim=0)
+        for j in T.Parallel(columns):
+            if j < hidden:
+                normalized = T.cast(
+                    (value[j] * T.rsqrt(total[0] / hidden + epsilon))
+                    * (T.cast(W[j], T.float32) + 1.0),
+                    T.float16,
+                )
+                Y[row, j] = normalized
+                if staged:
+                    Stage[0, j] = normalized
+
+    return normalize
+
+
 @orin_jit
 def residual_norm(
     M: int | None = None,
@@ -29,7 +59,7 @@ def residual_norm(
     assert residual_dtype in ("float16", "float32")
     assert output_residual_dtype in ("float16", "float32")
     rows = T.dynamic("rows") if M is None else M
-    columns = ((hidden + threads - 1) // threads) * threads
+    normalize = residual_norm_body(hidden, epsilon, threads)
 
     @T.prim_func
     def kernel(
@@ -40,21 +70,7 @@ def residual_norm(
         RO: T.Tensor((rows, hidden), output_residual_dtype),
     ):
         with T.Kernel(rows, threads=threads) as row:
-            value = T.alloc_fragment((columns,), T.float32)
-            square = T.alloc_fragment((columns,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            for j in T.Parallel(columns):
-                value[j] = 0.0
-                if j < hidden:
-                    value[j] = T.cast(X[row, j], T.float32) + T.cast(R[row, j], T.float32)
-                    RO[row, j] = value[j]
-                square[j] = value[j] * value[j]
-            T.reduce_sum(square, total, dim=0)
-            for j in T.Parallel(columns):
-                if j < hidden:
-                    Y[row, j] = (value[j] * T.rsqrt(total[0] / hidden + epsilon)) * (
-                        T.cast(W[j], T.float32) + 1.0
-                    )
+            normalize(X, R, W, Y, RO, Y, row)
 
     return kernel
 
