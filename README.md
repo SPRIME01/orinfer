@@ -18,7 +18,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎发行包、模型匹配的执行包和 `SHA256SUMS`，校验下载文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。模型目录单独下载，包含配置、tokenizer、chat template 和原生量化 safetensors；模型描述中的 `execution_package` 必须与执行包 digest 一致。发行包不附带权重，**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**。
 
-以下安装命令已在当前源码实现，将随下次发行提供；已发布的 v0.1.3 使用[原有归档解压步骤](docs/model-packages.md#安装已发布的-v013)。后续发行包统一使用 `.tar.xz`，新安装命令也接受旧 `.tar.gz`。
+从 v0.1.4 起，发行包统一使用 `.tar.xz`，执行包通过 `package install` 安装；该命令也接受旧 `.tar.gz`。v0.1.3 的安装方式见[旧版安装说明](docs/model-packages.md#安装已发布的-v013)。
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS

@@ -51,10 +51,10 @@ GPU入口获取`artifacts/gpu-experiment.lock`；锁被占用时退出。它不�
 提交源码、更新workspace版本并建立指向该提交的annotated tag后，运行：
 
 ```bash
-python3 tools/release/package.py --version v0.1.3 \
+python3 tools/release/package.py --version v0.1.4 \
   --operators /path/to/qwen3_5-execution.tar.xz \
   --operators /path/to/flash-next-execution.tar.xz \
-  --output artifacts/releases/v0.1.3
+  --output artifacts/releases/v0.1.4
 ```
 
 默认仅生成和校验产物。工具要求工作区干净，使用`Cargo.lock`构建，验证aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新归档为 XZ，不只是更改后缀。资产名称取自架构、计算策略和GPU目标，`RELEASE.json`列出每个包的digest；完整离线工具及Flash Next文档随包提供。权重不进入发行包。安装执行包使用 `orinfer package install`，不需要 Python；详见[安装说明](../../docs/model-packages.md#安装执行包)。
