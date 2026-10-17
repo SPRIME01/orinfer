@@ -1,5 +1,5 @@
 import unittest
-from tools.model.upgrade_dynamic_batch import expression, contract
+from tools.model.row_contract import expression, contract
 
 
 class DynamicContractTests(unittest.TestCase):
@@ -12,7 +12,7 @@ class DynamicContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 expression(source)
 
-    def test_argument_order_and_fixed_gdn_grid(self):
+    def test_argument_order(self):
         host = dict(
             ordered_arguments=[dict(ctype="ctypes.c_int32", value="M")],
             launch_expressions=dict(
@@ -37,11 +37,6 @@ class DynamicContractTests(unittest.TestCase):
         k["args"][0]["value"] = 64
         with self.assertRaises(ValueError):
             contract(k, host)
-        host["ordered_arguments"] = []
-        host["launch_expressions"]["gridDimX"] = "80"
-        host["launch_expressions"]["gridDimY"] = "128"
-        k.update(name="batch_gdn_m128/layer0/k0", grid=[80, 128, 1], args=[])
-        self.assertEqual(contract(k, host)["grid"][1], dict(op="rows"))
 
     def test_small_capacity_is_verified_against_its_own_export(self):
         host = dict(

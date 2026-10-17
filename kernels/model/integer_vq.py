@@ -1,6 +1,6 @@
-"""Integer VQ4/E8P tiles expanded in shared memory for SM87 INT8 MMA.
+"""Integer E8P tiles expanded in shared memory for SM87 INT8 MMA.
 
-Experimental ABI: group-major indices, integer table, output-row scale, A8
+Reference ABI: group-major indices, integer table, output-row scale, A8
 activation and token scale. Full K is accumulated in INT32. Tables can be
 shared across experts; no persistent expanded W8 or floating inner-K scales.
 """
@@ -78,7 +78,7 @@ def _compile(
     dynamic_rows=False,
 ):
     if (
-        kind not in ("vq4", "e8p")
+        kind != "e8p"
         or any(type(x) is not int or x <= 0 for x in (rows, E, N, K, tiles))
         or K % 128
         or K * 128 * 128 > 2**31 - 1
@@ -88,7 +88,7 @@ def _compile(
         raise ValueError("Invalid VQ output tile")
     if BM not in (8, 16, 32, 64):
         raise ValueError("Invalid VQ row tile")
-    if num_stages not in (1, 2) or shortbook and kind != "e8p":
+    if num_stages not in (1, 2):
         raise ValueError("Invalid VQ decoder/pipeline")
     if type(byte_permute) is not bool or byte_permute and not shortbook:
         raise ValueError("Byte permutation requires the E8P short table")
@@ -96,10 +96,10 @@ def _compile(
         raise ValueError("Selector decoding requires a validated E8P short basis")
     if type(group_n) is not bool:
         raise ValueError("Invalid routed tile order")
-    if type(packed_k) is not int or packed_k not in (64, 128) or packed_k == 64 and kind != "e8p":
+    if type(packed_k) is not int or packed_k not in (64, 128):
         raise ValueError("Invalid integer VQ code layout")
-    D = 4 if kind == "vq4" else 8
-    PD = T.uint8 if D == 4 else T.uint16
+    D = 8
+    PD = T.uint16
     TE = 1 if shared_table else E
     entries, words = (256, 1) if selectorbook else (512, 4) if shortbook else (256, D // 4)
     G = 128
@@ -161,40 +161,35 @@ def _compile(
             # layout-aware shared write lets TileLang vectorize four bytes;
             # a scalar alloc_var in the byte loop prevents that on SM87.
             for n, q in T.Parallel(BN, G // 4):
-                if D == 4:
-                    decoded[n, q] = table[T.cast(packed[n, q], T.int32), 0]
+                code = T.cast(packed[n, q // 2], T.uint32)
+                if selectorbook:
+                    basis = table[T.cast(code >> 8, T.int32), 0]
+                    decoded[n, q] = T.call_pure_extern(
+                        "uint32",
+                        "integer_e8p_selector_quad",
+                        code,
+                        basis,
+                        T.cast(q % 2, T.uint32),
+                    )
+                elif shortbook:
+                    parity = T.call_pure_extern("uint32", "integer_e8p_parity", code)
+                    index = T.cast((code >> 8) + parity * 256, T.int32)
+                    positive = table[index, (q % 2) * 2]
+                    negative = table[index, (q % 2) * 2 + 1]
+                    decoded[n, q] = T.call_pure_extern(
+                        "uint32",
+                        "integer_e8p_sign_quad_prmt" if byte_permute else "integer_e8p_sign_quad",
+                        code,
+                        parity,
+                        positive,
+                        negative,
+                        T.cast(q % 2, T.uint32),
+                    )
                 else:
-                    code = T.cast(packed[n, q // 2], T.uint32)
-                    if selectorbook:
-                        basis = table[T.cast(code >> 8, T.int32), 0]
-                        decoded[n, q] = T.call_pure_extern(
-                            "uint32",
-                            "integer_e8p_selector_quad",
-                            code,
-                            basis,
-                            T.cast(q % 2, T.uint32),
-                        )
-                    elif shortbook:
-                        parity = T.call_pure_extern("uint32", "integer_e8p_parity", code)
-                        index = T.cast((code >> 8) + parity * 256, T.int32)
-                        positive = table[index, (q % 2) * 2]
-                        negative = table[index, (q % 2) * 2 + 1]
-                        decoded[n, q] = T.call_pure_extern(
-                            "uint32",
-                            "integer_e8p_sign_quad_prmt"
-                            if byte_permute
-                            else "integer_e8p_sign_quad",
-                            code,
-                            parity,
-                            positive,
-                            negative,
-                            T.cast(q % 2, T.uint32),
-                        )
-                    else:
-                        word = table[T.cast(code >> 8, T.int32), q % 2]
-                        decoded[n, q] = T.call_pure_extern(
-                            "uint32", "integer_e8p_quad", code, word, T.cast(q % 2, T.uint32)
-                        )
+                    word = table[T.cast(code >> 8, T.int32), q % 2]
+                    decoded[n, q] = T.call_pure_extern(
+                        "uint32", "integer_e8p_quad", code, word, T.cast(q % 2, T.uint32)
+                    )
                 if patched:
                     shift = T.cast((patch[n] & 3) * 8, T.uint32)
                     replacement = (decoded[n, q] & ~(T.uint32(255) << shift)) | (

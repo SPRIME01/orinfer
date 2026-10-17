@@ -21,7 +21,7 @@ from tools.model.publication import (
     source_path,
     link_or_copy,
 )
-from tools.model.upgrade_dynamic_batch import contract, expression
+from tools.model.row_contract import contract, expression
 from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
 

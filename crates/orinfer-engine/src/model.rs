@@ -79,7 +79,7 @@ pub fn resolve_manifest(path: &Path) -> Result<PathBuf> {
         path.to_owned()
     };
     manifest.canonicalize().map_err(|e| format!(
-        "{}: {e}; prepare with tools/model/prepare.py, or split an existing prepared cache with tools/model/package.py",
+        "{}: {e}; build a native model with tools/model/qwen35/build.py or tools/model/flash_next/build.py",
         manifest.display()))
 }
 

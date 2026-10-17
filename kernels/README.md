@@ -1,6 +1,6 @@
 # TileLang kernels
 
-目标为CUDA SM87。`operators/`包含基础算子，`model/`包含模型使用的投影、融合、GDN和attention实现，`projections/`包含基础投影的共用实现。
+目标为CUDA SM87。`operators/`包含基础算子，`model/`包含模型使用的投影、融合、GDN和attention实现。
 
 kernel经离线编译生成cubin和真实host ABI，在线由Rust CUDA Driver执行。导出格式与模型组装入口见[模型工具](../tools/model/README.md)。新增实现应检查完整数值、非对齐尾部、状态语义和改变输入后的graph replay。
 
@@ -10,7 +10,7 @@ kernel经离线编译生成cubin和真实host ABI，在线由Rust CUDA Driver执
 - `model/floating_core.py`提供通用浮点投影、分组BF16、HC投影与视觉Linear共用的MMA循环。输入布局、操作数方向和顺序group归约在编译时固定；K尾部在tile内补零，HC的K16累加与中间舍入不能被平行归约替换。视觉的Conv3D bias舍入与Linear/GELU输出仍由各自epilogue保持。
 - `model/e8p_core.py`提供完整A8位平面拆分、双INT4 MMA和输出恢复/缩放。普通分组、K-major流水和唯一路由缓存输入共享算术组件，保留各自的数据移动调度。唯一路由路径要求每专家至多一行，由调用方的路由契约保证，不绑定某个模型的E/N/K。
 
-组件通过TileLang宏内联，在线不解释Python或选择codec。编译后的host ABI仍是权重/状态buffer与必要的动态行参数。Qwen 27B的码表Q4A8权重可复用相同Q4 decoder、旋转/A8和投影循环；量化权重本身不表示已完成该模型的加载及质量验收。
+组件通过TileLang宏内联，在线不解释Python或选择codec。编译后的host ABI仍是权重/状态buffer与必要的动态行参数。Qwen 27B 的两级 E8P Q4A8 复用相同 E8P 算术、旋转/A8 和动态行调度；其编码与 K128 布局由构建器校验。
 
 BF16视觉epilogue使用显式PTX RNE舍入/写入，保留Conv3D的独立dot舍入及Linear/GELU的精度边界，避免NVRTC生成的BF16向量类型往返转换。FP16保留自动向量化。`tools/vision/validate_kernels.py`验证两种精度、K/N尾部和修改输入后的Graph replay。
 
@@ -20,7 +20,7 @@ BF16视觉epilogue使用显式PTX RNE舍入/写入，保留Conv3D的独立dot舍
 
 `model/hyperconnection.py`提供Qwen4 gated residual的分支归一化、低秩投影、混合及残差更新，保留BF16权重和FP32累加。小行数路径将down/SiLU和up/分支混合分别融合，保持原始FP16中间舍入。`model/ple.py`提供PLE门控、膨胀卷积及历史更新；CPU的n-gram哈希与有容量限制的E8P行缓存入口为`tools/model/flash_next/ple.py`。验证入口为`tools/operators/hyperconnection.py`和`ple.py`。
 
-`model/integer_vq.py`保留离线构建和验证所需的VQ4/E8P INT8参考实现，以及输入侧block128旋转。`model/rotation_a8.py`将旋转、可选SwiGLU和行级A8量化融合，保留原始FP16舍入边界。旋转必须在对应投影前执行，down的旋转位于SwiGLU之后。数值验证入口为`tools/operators/integer_vq.py`，整模型状态和请求验证入口见[Flash Next](../tools/model/flash_next/README.md)。
+`model/integer_vq.py`保留离线构建和验证所需的E8P INT8参考实现，以及输入侧block128旋转。`model/rotation_a8.py`将旋转、可选SwiGLU和行级A8量化融合，保留原始FP16舍入边界。旋转必须在对应投影前执行，down的旋转位于SwiGLU之后。数值验证入口为`tools/operators/e8p_selector.py`，整模型状态和请求验证入口见[Flash Next](../tools/model/flash_next/README.md)。
 
 `model/int8_projection.py`与`model/q4_projection.py`提供行scale的W8和码表Q4投影。`tools/model/flash_next/native.py`组装离线参考模型；正式整数算子重建入口为`tools/model/flash_next/build.py`，部署包由Rust在线执行。QSA使用`model/qsa.py`的group-4压缩索引、精确radix top-k及group-64 INT8 KV，`model/qsa_attention.py`用共享KV tile的FP16 Tensor Core计算attention，softmax和累加保持FP32；上下文上限为262144 token。压缩索引、pending ring和KV scale均纳入请求状态。算子验证入口为`tools/operators/qsa*.py`，真实长上下文执行入口为`tools/model/flash_next/long_context.py`。转换和独立BF16对照用法见[量化工具](../tools/quantization/README.md)。
 

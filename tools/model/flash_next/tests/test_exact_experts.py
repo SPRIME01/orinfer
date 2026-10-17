@@ -10,7 +10,7 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
-from tools.model.flash_next.optimize_experts import live_rows, repack_weights, row_tile
+from tools.model.flash_next.expert_layout import live_rows, repack_weights, row_tile
 
 
 class ExactExpertPackageTests(unittest.TestCase):

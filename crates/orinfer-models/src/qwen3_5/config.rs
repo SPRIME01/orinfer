@@ -1,20 +1,55 @@
 //! Qwen configuration semantics and compiled arithmetic signature.
 //! Weight files contain data; operator packages contain bindings. Control flow
 //! belongs to the registered architecture implementation.
-use crate::{artifact::Result, model::Manifest};
+use crate::artifact::Result;
+use serde::Deserialize;
 use serde_json::Value;
 
-use super::plan;
-pub use orinfer_model_sdk::architecture::*;
+#[derive(Debug, Deserialize)]
+pub(crate) struct TextConfig {
+    pub hidden_size: usize,
+    #[serde(default)]
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub vocab_size: usize,
+    pub layer_types: Vec<String>,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_conv_kernel_dim: usize,
+}
+
+fn parse_text(text_value: &Value) -> Result<TextConfig> {
+    let text: TextConfig =
+        serde_json::from_value(text_value.clone()).map_err(|e| format!("Text config: {e}"))?;
+    if text.hidden_size == 0
+        || text.vocab_size == 0
+        || text.num_hidden_layers == 0
+        || text.layer_types.len() != text.num_hidden_layers
+        || text
+            .layer_types
+            .iter()
+            .any(|s| !matches!(s.as_str(), "linear_attention" | "full_attention"))
+        || text.linear_num_key_heads == 0
+        || text.linear_num_value_heads == 0
+        || text.linear_key_head_dim == 0
+        || text.linear_value_head_dim == 0
+        || text.linear_conv_kernel_dim < 2
+    {
+        return Err("Invalid Qwen3_5 layer/state configuration".into());
+    }
+    Ok(text)
+}
 
 pub(crate) struct Configuration {
-    text: plan::TextConfig,
+    text: TextConfig,
     pub vision_depth: usize,
     pub signature: Value,
 }
 
 impl Configuration {
-    pub(super) fn text(&self) -> &plan::TextConfig {
+    pub(super) fn text(&self) -> &TextConfig {
         &self.text
     }
 
@@ -26,7 +61,7 @@ impl Configuration {
             return Err("Unsupported Qwen model configuration".into());
         }
         let text_value = config.get("text_config").unwrap_or(&config);
-        let text = plan::parse_text(text_value)?;
+        let text = parse_text(text_value)?;
         // These values affect compiled arithmetic, weight contracts or state.
         // Checkpoint identity, naming, dtype labels and quantization provenance
         // deliberately do not determine architecture/operator compatibility.
@@ -54,14 +89,6 @@ impl Configuration {
             signature,
         })
     }
-}
-
-pub(crate) fn build(
-    config: &Configuration,
-    manifest: &mut Manifest,
-    profiles: &[PrefillProfile],
-) -> Result<std::collections::BTreeSet<String>> {
-    plan::build(config, manifest, profiles)
 }
 
 #[cfg(test)]

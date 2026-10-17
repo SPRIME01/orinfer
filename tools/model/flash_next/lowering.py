@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tools.model.flash_next.kernel_policy import expert_implementation, projection_policies
 from tools.model.flash_next.compiler import pointer_bindings, replace_binding
-from tools.model.flash_next.optimize_experts import row_tile
+from tools.model.flash_next.expert_layout import row_tile
 from tools.model.publication import (
     AssetReader,
     atomic_model,
@@ -34,7 +34,7 @@ def lower(data, package, operator, output):
     from tools.model.flash_next.decode_tuning import DecodeTuner
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.rows import explicit_rows
-    from tools.model.upgrade_dynamic_batch import contract
+    from tools.model.row_contract import contract
     from tools.operators.common import export_kernel
     import tilelang
 

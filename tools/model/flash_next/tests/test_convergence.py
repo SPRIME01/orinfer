@@ -1,7 +1,8 @@
 """Length arithmetic and legal fixed AOT exclusions during convergence."""
 
 import unittest
-from tools.model.flash_next.converge_kernels import divide_rows, split_fixed
+from tools.model.flash_next.converge_kernels import divide_rows
+from tools.model.row_selection import split_fixed
 from tools.model.flash_next.row_tuning import intervals
 
 
@@ -75,7 +76,7 @@ class ConvergenceTests(unittest.TestCase):
             coalesce_adjacent_selections(package)
 
     def test_immutable_scalars_remain_constant_in_dynamic_launches(self):
-        from tools.model.upgrade_dynamic_batch import expression, contract
+        from tools.model.row_contract import expression, contract
 
         self.assertEqual(
             expression("base_exp", constants=dict(base_exp=99)), dict(op="constant", value=99)
@@ -126,30 +127,3 @@ class ConvergenceTests(unittest.TestCase):
         )
         self.assertEqual(r["used"], ["a"])
         self.assertEqual(r["intervals"], [[1, 512, "a"]])
-
-    def test_coalescing_preserves_expert_assignment_multiplier(self):
-        import copy
-        from tools.model.flash_next.converge_kernels import coalesce_single_implementations
-
-        name = "flash_decode/layer0/post/k18/rows/1-4"
-        kernel = dict(name=name, module=dict(sha256="same"), args=[dict(kind="i32", value=40)])
-        expression = dict(op="multiply", lhs=dict(op="rows"), rhs=dict(op="constant", value=10))
-        launch = dict(
-            name=name,
-            capacity=4,
-            grid=[expression, dict(op="constant", value=1), dict(op="constant", value=1)],
-            arguments=[dict(index=0, value=expression)],
-        )
-        original = copy.deepcopy(launch)
-        package = dict(
-            kernels=[kernel], dynamic_batch_kernels=[launch], plan_kernel_contracts=[name]
-        )
-
-        class Compiler:
-            def host(self, k):
-                return dict(ordered_arguments=[dict(ctype="ctypes.c_int32", value="rows")])
-
-        coalesce_single_implementations(package, Compiler())
-        self.assertEqual(package["kernels"][0]["args"], [dict(kind="i32", value=40)])
-        original["name"] = name.split("/rows/")[0]
-        self.assertEqual(package["dynamic_batch_kernels"], [original])

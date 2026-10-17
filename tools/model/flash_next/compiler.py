@@ -4,7 +4,7 @@ import copy
 import re
 
 from tools.model.publication import AssetReader, file_hash, link_or_copy
-from tools.model.upgrade_dynamic_batch import contract
+from tools.model.row_contract import contract
 from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
 

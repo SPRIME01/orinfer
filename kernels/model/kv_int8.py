@@ -4,7 +4,15 @@ FP16 tensor-core operands and FP32 accumulation. Scales are stored FP16.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.operators.op22_attention_decode import _check
+
+
+def _check(max_pages, num_pages, block_size, tile_tokens, nsplits):
+    if any(type(v) is not int or v <= 0 for v in (max_pages, num_pages, block_size)):
+        raise ValueError("invalid cache dimensions")
+    if tile_tokens not in (16, 32, 64) or nsplits not in (1, 2, 4, 8, 16):
+        raise ValueError("unsupported tile/splits")
+    if max_pages * block_size > 2147483647:
+        raise ValueError("sequence capacity exceeds int32")
 
 
 HALF2_SOURCE = r"""

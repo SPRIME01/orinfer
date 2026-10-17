@@ -1,7 +1,7 @@
 """Measured selections cover tails without retaining losing implementations."""
 
 import unittest
-from tools.model.flash_next.prefill_tuning import ranges
+from tools.model.row_selection import ranges
 from tools.model.row_selection import choices, samples, split_fixed
 
 

@@ -1,22 +1,8 @@
-"""Publish symbolic-row launch contracts from the verified exported host ABI.
+"""Build symbolic launch contracts from the verified exported host ABI."""
 
-No weights or cubins change. Rust specializes launch/graph plans for exact
-nonstandard rows; common optimized batch profiles retain their existing ABI.
-"""
-
-import argparse
 import ast
-from pathlib import Path
 
-from tools.model.publication import (
-    atomic_model,
-    clone_model,
-    commit_package,
-    file_hash,
-    load_model,
-    write_json,
-)
-from tools.operators.abi import parse_host, evaluate
+from tools.operators.abi import evaluate
 
 
 def expression(source, row_multiplier=1, constants=None):
@@ -91,65 +77,4 @@ def contract(kernel, host, capacity=128, row_multiplier=1, constants=None):
         ):
             raise ValueError("Unsupported dynamic host ABI")
     grid = [expression(launch["gridDim" + axis], row_multiplier, constants) for axis in "XYZ"]
-    if kernel["name"].startswith("batch_gdn_m128/"):
-        # These row-independent CTA bodies address one private arena per b.
-        # The fixed capacity export changes only the number of batch CTAs.
-        slot = kernel["name"].rsplit("/k", 1)[1]
-        axis = {"0": 1, "1": 2}.get(slot)
-        if axis is None or kernel["grid"][axis] != 128 or args:
-            raise ValueError("Unsupported batched GDN launch")
-        grid[axis] = dict(op="rows")
     return dict(name=kernel["name"], capacity=capacity, grid=grid, arguments=args)
-
-
-def upgrade(model, destination):
-    model = model.resolve(strict=True)
-    destination = destination.absolute()
-    if destination.exists():
-        raise ValueError("Destination already exists")
-    data, origin, package = load_model(model)
-    if 128 not in package.get("batch_profiles", []) or package.get("dynamic_batch_kernels"):
-        raise ValueError("Requires capacity128 without dynamic contracts")
-    contracts, parsed = [], {}
-    for kernel in package["kernels"]:
-        if not kernel["name"].startswith(("batch_m128/", "batch_gdn_m128/")):
-            continue
-        identity = kernel["host_abi"]
-        host_path = (origin / identity["file"]).resolve(strict=True)
-        if (
-            not host_path.is_relative_to(origin.resolve())
-            or file_hash(host_path) != identity["sha256"]
-        ):
-            raise ValueError("Host ABI identity mismatch")
-        if host_path not in parsed:
-            parsed[host_path] = parse_host(host_path.read_text())
-        hosts = parsed[host_path]
-        if len(hosts) != 1 or hosts[0]["symbol"] != kernel["symbol"]:
-            raise ValueError("Expected one matching host export")
-        contracts.append(contract(kernel, hosts[0]))
-    if not contracts:
-        raise ValueError("No dynamic capacity kernels")
-    package["dynamic_batch_kernels"] = contracts
-    with atomic_model(destination) as staging:
-        operator = clone_model(model, staging, origin)
-        digest = commit_package(staging, operator, data, package)
-    return dict(
-        execution_package=digest,
-        dynamic_templates=len(contracts),
-        weight_bytes=data["metadata"]["weight_bytes"],
-    )
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--report", type=Path, required=True)
-    args = parser.parse_args()
-    if args.report.exists():
-        parser.error("Report must be a fresh path")
-    write_json(args.report, upgrade(args.model, args.output))
-
-
-if __name__ == "__main__":
-    main()

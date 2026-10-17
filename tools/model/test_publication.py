@@ -127,56 +127,6 @@ class PublicationTests(unittest.TestCase):
             with atomic_model(destination):
                 self.fail("Existing output must not be entered")
 
-    @patch("tools.model.publication.subprocess.run")
-    @patch(
-        "tools.model.upgrade_mtp.bind_rows",
-        side_effect=lambda kernel, directory, names, rows, slot: dict(kernel, name=slot),
-    )
-    def test_mtp_publication_retains_descriptor_changes(self, bind, validate):
-        from tools.model.upgrade_mtp import upgrade
-
-        spec = dict(
-            input="MtpInput",
-            position="MtpPosition",
-            warm_plans=[dict(tokens=2, program="mtp_warm_m2")],
-        )
-        self.data.update(
-            buffer_scopes={},
-            metadata=dict(
-                mtp=spec,
-                vision=dict(mrope_positions="MRope", feature_index="FeatureIndex"),
-                input="Input",
-                position="Position",
-                max_context=128,
-                buffers=[],
-            ),
-        )
-        package = dict(
-            buffer_contracts=[],
-            kernels=[
-                dict(name="decode/begin/k1", args=[]),
-                dict(
-                    name="prefill_m2/layer3/k1", args=[dict(name="MRope"), dict(name="L3_KPages")]
-                ),
-                dict(name="mtp_warm_m2/body/k2", args=[]),
-                dict(name="mtp_warm_m2/body/k8", args=[]),
-            ],
-        )
-        raw = json.dumps(package).encode()
-        digest = hashlib.sha256(raw).hexdigest()
-        self.operator = self.operator.with_name(digest)
-        self.operator.mkdir()
-        (self.operator / "package.json").write_bytes(raw)
-        self.data["execution_package"] = digest
-        (self.source / "cache/model.json").write_text(json.dumps(self.data))
-        output = self.root / "mtp"
-        upgrade(self.source, output, Path("/usr/bin/true"))
-        descriptor = json.loads((output / "cache/model.json").read_text())
-        self.assertEqual(descriptor["metadata"]["mtp"]["feature_index"], "MtpFeatureIndex")
-        self.assertEqual(descriptor["metadata"]["mtp"]["verification_logits"], "SequenceLogits")
-        self.assertEqual(descriptor["metadata"]["buffers"][0]["shape"], [128])
-        self.assertEqual(descriptor["buffer_scopes"]["MtpFeatureIndex"], "sequence")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,8 +44,8 @@
   ],
   "reference_candidates": [
     {
-      "repository": "JonathanColetti/Qwen3.8-27B-Uncensored",
-      "revision": "5bb7aa90f0efef548e87005b1fb7658e522b6b7f",
+      "repository": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
       "format": "BF16"
     }
   ],

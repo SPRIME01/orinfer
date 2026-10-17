@@ -148,28 +148,28 @@ class IntegerVQTests(unittest.TestCase):
 
     def test_fixture_roundtrip_group_major_layout_and_reject_overwrite(self):
         rng = np.random.default_rng(20261002)
-        for kind, d, dtype in [("vq4", 4, np.uint8), ("e8p", 8, np.uint16)]:
-            p = rng.integers(0, 256 if d == 4 else 65536, (3, 256 // d), dtype=dtype)
-            table = (rng.integers(-5, 6, (256, d)) * 2).astype(np.int8)
-            w = Weights(kind, p, table, np.ones(3, np.float16), np.ones(256, np.int8))
-            a, b, s = w.gpu_layout()
-            self.assertEqual(a.shape, (2, 3, 128 // d))
-            self.assertEqual(b.shape, (256, d // 4))
-            np.testing.assert_array_equal(a.transpose(1, 0, 2).reshape(p.shape), p)
-            np.testing.assert_array_equal(b.view(np.int8).reshape(table.shape), table)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "w.safetensors"
+        kind, d, dtype = "e8p", 8, np.uint16
+        p = rng.integers(0, 65536, (3, 256 // d), dtype=dtype)
+        table = (rng.integers(-5, 6, (256, d)) * 2).astype(np.int8)
+        w = Weights(kind, p, table, np.ones(3, np.float16), np.ones(256, np.int8))
+        a, b, s = w.gpu_layout()
+        self.assertEqual(a.shape, (2, 3, 128 // d))
+        self.assertEqual(b.shape, (256, d // 4))
+        np.testing.assert_array_equal(a.transpose(1, 0, 2).reshape(p.shape), p)
+        np.testing.assert_array_equal(b.view(np.int8).reshape(table.shape), table)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "w.safetensors"
+            save(path, w)
+            np.testing.assert_array_equal(load(path).integer_weights(), w.integer_weights())
+            with self.assertRaises(FileExistsError):
                 save(path, w)
-                np.testing.assert_array_equal(load(path).integer_weights(), w.integer_weights())
-                with self.assertRaises(FileExistsError):
-                    save(path, w)
 
     def test_patch_signed_value_position_and_disabled_slot(self):
         patches = np.array([[32768 | (128 << 7) | 127, 0]], np.uint16)
         w = Weights(
-            "vq4",
-            np.zeros((1, 64), np.uint8),
-            np.ones((256, 4), np.int8),
+            "e8p",
+            np.zeros((1, 32), np.uint16),
+            np.zeros((256, 8), np.int8),
             np.ones(1, np.float16),
             np.empty(0, np.int8),
             patches,

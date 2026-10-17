@@ -167,7 +167,7 @@ fn vision(m: &mut Manifest, depth: usize) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
+pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
     if request.architecture != "qwen3_5" || policy != Policy::Int8Quality {
         return Err("Unsupported Qwen row precision policy".into());
     }

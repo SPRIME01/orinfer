@@ -23,7 +23,9 @@ def main():
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    spec = json.loads(args.manifest.read_text())["vision"]
+    path = args.manifest / "cache/model.json" if args.manifest.is_dir() else args.manifest
+    data = json.loads(path.read_text())
+    spec = data.get("metadata", data)["vision"]
     assert spec["max_patches"] == 32768, (
         "This capacity fixture targets the default 32768-patch adapter"
     )

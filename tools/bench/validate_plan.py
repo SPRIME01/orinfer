@@ -51,8 +51,7 @@ def validate():
             plan["workloads"]["nonstandard_batch_rows"]
         ),
         "same-source BF16 reference": protocol["reference_candidates"][0]["format"] == "BF16"
-        and protocol["reference_candidates"][0]["repository"]
-        == "JonathanColetti/Qwen3.8-27B-Uncensored",
+        and protocol["reference_candidates"][0]["repository"] == "Qwen/Qwen3.8-27B",
         "lifecycle/prefix/concurrency metrics": {
             "native_load",
             "import",

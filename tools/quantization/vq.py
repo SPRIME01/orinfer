@@ -1,7 +1,6 @@
-"""Experimental integer VQ fixtures; no full-model acceptance implied.
+"""Integer E8P representation and numerical reference fixtures.
 
-VQ4: one U8 index selects four signed bytes. E8P: one U16 index selects
-eight lattice coordinates, represented exactly on an integer grid. Rotation
+One U16 index selects eight lattice coordinates, represented exactly on an integer grid. Rotation
 is an input-side normalized block128 Hadamard with fixed signs, not a transform
 that can be moved through SwiGLU. Codebook data is supplied by the caller.
 """
@@ -139,9 +138,9 @@ class Weights:
     patches: np.ndarray | None = None  # [N,K/128] U16: valid:1, signed value:8, position:7
 
     def validate(self):
-        d, dtype = {"vq4": (4, np.uint8), "e8p": (8, np.uint16)}.get(self.kind, (0, None))
+        d, dtype = 8, np.uint16
         if (
-            not d
+            self.kind != "e8p"
             or self.indices.ndim != 2
             or min(self.indices.shape) <= 0
             or self.indices.dtype != dtype
@@ -150,7 +149,7 @@ class Weights:
         n, k = self.indices.shape[0], self.indices.shape[1] * d
         if k % 128 or self.table.shape != (256, d) or self.table.dtype != np.int8:
             raise ValueError("Invalid vector table/geometry")
-        if self.kind == "e8p" and (
+        if (
             np.abs(self.table.astype(np.int16)).max() > 126
             or (self.table.astype(np.int16) % 2).any()
         ):
@@ -184,7 +183,7 @@ class Weights:
 
     def integer_weights(self):
         n, k = self.validate()
-        q = self.table[self.indices] if self.kind == "vq4" else e8p_decode(self.indices, self.table)
+        q = e8p_decode(self.indices, self.table)
         q = q.reshape(n, k).copy()
         if self.patches is not None:
             p = self.patches
@@ -199,7 +198,7 @@ class Weights:
 
     def gpu_layout(self):
         n, k = self.validate()
-        d = 4 if self.kind == "vq4" else 8
+        d = 8
         p = np.ascontiguousarray(self.indices.reshape(n, k // 128, 128 // d).transpose(1, 0, 2))
         table = np.ascontiguousarray(self.table).view("<u4").reshape(256, d // 4)
         return p, table, self.scales.copy()
