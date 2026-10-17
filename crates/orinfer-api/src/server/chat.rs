@@ -1,4 +1,4 @@
-use minijinja::{Environment, context};
+use minijinja::{Environment, context, value::Serde};
 use orinfer_engine::sampling::Options;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -482,7 +482,7 @@ impl ChatCodec {
             .get_template("chat")
             .map_err(|e| e.to_string())?
             .render(context! {
-                messages => messages, tools => tools, add_generation_prompt => true,
+                messages => Serde(&messages), tools => Serde(&tools), add_generation_prompt => true,
                 enable_thinking => thinking, reasoning_effort => effort,
                 preserve_thinking => true,
             })
@@ -770,7 +770,7 @@ mod tests {
     #[test]
     fn template_json_matches_python_separators_unicode_and_string_escaping() {
         let value = json!({"z":["世界", "a,b:c", "\"\\", "<>&'"],"a":{"b":true},"empty":[]});
-        let result = template_json(minijinja::Value::from_serialize(&value)).unwrap();
+        let result = template_json(minijinja::Value::from(Serde(&value))).unwrap();
         assert_eq!(
             result.as_str().unwrap(),
             r#"{"a": {"b": true}, "empty": [], "z": ["世界", "a,b:c", "\"\\", "<>&'"]}"#

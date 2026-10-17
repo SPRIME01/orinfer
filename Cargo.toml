@@ -14,9 +14,9 @@ orinfer-api = { path = "crates/orinfer-api" }
 orinfer-engine = { path = "crates/orinfer-engine" }
 orinfer-model-sdk = { path = "crates/orinfer-model-sdk" }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 half = "=2.7.1"
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 hex = "=0.4.3"
 
 [workspace.lints.rust]

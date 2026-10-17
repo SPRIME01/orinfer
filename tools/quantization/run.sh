@@ -24,4 +24,4 @@ exec docker run --rm --name "orinfer-quantizer-$module-$$" --runtime nvidia --ne
     -e TILELANG_CACHE_DIR="$repo_dir/artifacts/quantization/compiler-cache" \
     -e PYTHONDONTWRITEBYTECODE=1 \
     -e LD_PRELOAD=/usr/lib/aarch64-linux-gnu/nvidia/libcuda.so.1 \
-    orinfer-compiler:0.1.1 -m "tools.quantization.$module" "$@"
+    orinfer-compiler:0.1.2 -m "tools.quantization.$module" "$@"

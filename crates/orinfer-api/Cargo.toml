@@ -9,16 +9,16 @@ license.workspace = true
 [dependencies]
 axum = "=0.8.9"
 futures-util = "=0.3.34"
-libc = "=0.2.190"
-minijinja = { version = "=2.24.0", features = ["json"] }
-minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
-jsonschema = { version = "=0.58.6", default-features = false }
+libc = "=0.2.191"
+minijinja = { version = "=3.0.1", features = ["json", "serde"] }
+minijinja-contrib = { version = "=3.0.1", features = ["pycompat"] }
+jsonschema = { version = "=0.59.0", default-features = false }
 orinfer-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error = "=0.1.20"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
 
 base64 = "=0.23.1"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }

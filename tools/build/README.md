@@ -9,9 +9,11 @@ make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15和Transformers 5.19.0编译/参考栈，不复制模型或编译缓存。`compiler-requirements.txt`固定覆盖包版本，其余依赖由基底镜像 digest 固定；移除未使用的vLLM、PyGObject和CUTLASS Python包以避免遗留依赖约束。TVM FFI、Z3受TileLang版本约束，Hub受Tokenizers的`<2`约束，NumPy使用Python3.10兼容版本。默认镜像名为`orinfer-compiler:0.1.1`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
+`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15、Transformers 5.20.1、Tokenizers 0.23.3和Hub 2.2.0，不复制模型或编译缓存。`compiler-requirements.txt`固定完整Python依赖和构建工具，由uv同步并移除基底遗留的无关服务依赖。Jetson原生Torch 2.9.1/torchvision 0.24.1保持不变，构建后检查Torch仍链接CUDA12.6；系统依赖由基底镜像digest固定。GPU编译环境保留Python3.10和NumPy2.2.6；TVM FFI、Z3遵守TileLang约束。默认镜像名为`orinfer-compiler:0.1.2`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
 
 GPU编译入口：
+
+NVRTC后端使用CUDA Python 12.6.2.post1；部分离线原生算子参考保留Triton 3.5.1。两者与TileLang一同固定在编译镜像中，在线部署只加载已编译的原生执行包。
 
 ```bash
 ORINFER_CHECKPOINT_DIR=/path/to/converted \
@@ -32,7 +34,7 @@ bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 
 ## 自动检查
 
-`make check`包含Rust/Ruff格式、Python静态检查、编译、clippy、Rust/CPU Python测试和验收配置校验；GitHub Actions在x86_64和aarch64 runner执行同一入口；原生C ABI加载测试在aarch64执行，读取`rust-toolchain.toml`。`make fmt`统一格式，`make lint`执行格式和静态检查；Rust编译拒绝死代码，clippy拒绝警告。使用`uv`隔离CPU依赖：`make python-env`创建Python3.10的`.venv`并同步固定版本；检查默认使用`.venv/bin/python`，无需修改主机Python环境，可通过`PYTHON`覆盖解释器；CI和编译镜像固定uv0.12.23，Rust版本由`rust-toolchain.toml`固定。
+`make check`包含Rust/Ruff格式、Python静态检查、编译、clippy、Rust/CPU Python测试和验收配置校验；GitHub Actions在x86_64和aarch64 runner执行同一入口；原生C ABI加载测试在aarch64执行，读取`rust-toolchain.toml`。`make fmt`统一格式，`make lint`执行格式和静态检查；Rust编译拒绝死代码，clippy拒绝警告。使用`uv`隔离CPU依赖：`make python-env`创建Python3.12的`.venv`并同步固定版本；检查默认使用`.venv/bin/python`，无需修改主机Python环境，可通过`PYTHON`覆盖解释器；CI和编译镜像固定uv0.13.1，Rust版本由`rust-toolchain.toml`固定。Python源码仍兼容GPU编译环境的3.10语法。
 
 `make check-offline`在编译镜像中检查全部离线模块引用，并执行需要Torch的CPU参考数学及动态行数ABI测试，不使用GPU。
 
