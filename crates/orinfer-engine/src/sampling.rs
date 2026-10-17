@@ -100,43 +100,58 @@ fn processed_scores(
     {
         return Err("Invalid sampling logits".into());
     }
-    let mut counts = if options.repetition_penalty != 1.0
-        || options.presence_penalty != 0.0
-        || options.frequency_penalty != 0.0
+    let mut scores = if options.repetition_penalty == 1.0
+        && options.presence_penalty == 0.0
+        && options.frequency_penalty == 0.0
+        && options.logit_bias.is_empty()
     {
-        vec![0usize; logits.len()]
+        // Adding zero preserves the generic processors' signed-zero result.
+        // Input validation already guarantees these f64 scores are finite.
+        logits
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| (i as u32, f64::from(value) + 0.0))
+            .collect()
     } else {
-        vec![]
-    };
-    if !counts.is_empty() {
-        for &id in history {
-            if let Some(n) = counts.get_mut(id as usize) {
-                *n += 1;
+        let mut counts = if options.repetition_penalty != 1.0
+            || options.presence_penalty != 0.0
+            || options.frequency_penalty != 0.0
+        {
+            vec![0usize; logits.len()]
+        } else {
+            vec![]
+        };
+        if !counts.is_empty() {
+            for &id in history {
+                if let Some(n) = counts.get_mut(id as usize) {
+                    *n += 1;
+                }
             }
         }
-    }
-    let mut scores: Vec<(u32, f64)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &value)| {
-            let mut score = f64::from(value);
-            let count = counts.get(i).copied().unwrap_or(0);
-            if count > 0 {
-                score = if score < 0.0 {
-                    score * options.repetition_penalty
-                } else {
-                    score / options.repetition_penalty
-                };
-                score -= options.presence_penalty;
-            }
-            score -= options.frequency_penalty * count as f64;
-            score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
-            (i as u32, score)
-        })
-        .collect();
-    if scores.iter().any(|(_, score)| !score.is_finite()) {
-        return Err("Nonfinite processed sampling logits".into());
-    }
+        let scores: Vec<(u32, f64)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &value)| {
+                let mut score = f64::from(value);
+                let count = counts.get(i).copied().unwrap_or(0);
+                if count > 0 {
+                    score = if score < 0.0 {
+                        score * options.repetition_penalty
+                    } else {
+                        score / options.repetition_penalty
+                    };
+                    score -= options.presence_penalty;
+                }
+                score -= options.frequency_penalty * count as f64;
+                score += options.logit_bias.get(&(i as u32)).copied().unwrap_or(0.0);
+                (i as u32, score)
+            })
+            .collect();
+        if scores.iter().any(|(_, score)| !score.is_finite()) {
+            return Err("Nonfinite processed sampling logits".into());
+        }
+        scores
+    };
     if let Some(mask) = mask {
         scores.retain(|(id, _)| {
             mask.get(*id as usize / 32)
@@ -372,6 +387,73 @@ fn greedy(logits: &[f32], history: &[u32], options: &Options) -> Result<u32, Str
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+    #[test]
+    fn unprocessed_scores_preserve_generic_bits_masks_and_seeded_sampling() {
+        let mut logits = vec![
+            -0.0,
+            0.0,
+            f32::MIN,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+        ];
+        logits.extend((0..1024).map(|i| ((i * 17 % 101) as f32 - 50.0) / 7.0));
+        let mask = vec![0x5555_5555; logits.len().div_ceil(32)];
+        let history = [0, 0, 2, u32::MAX];
+        for frequency in [0.0, -0.0] {
+            let options = Options {
+                frequency_penalty: frequency,
+                ..Options::default()
+            };
+            // An irrelevant bias preserves values while exercising the generic
+            // processor as a reference, including IEEE signed-zero behavior.
+            let generic = Options {
+                logit_bias: [(u32::MAX, 0.0)].into(),
+                ..options.clone()
+            };
+            for mask in [None, Some(mask.as_slice())] {
+                let fast = processed_scores(&logits, &history, &options, mask).unwrap();
+                let reference = processed_scores(&logits, &history, &generic, mask).unwrap();
+                assert_eq!(
+                    fast.iter()
+                        .map(|x| (x.0, x.1.to_bits()))
+                        .collect::<Vec<_>>(),
+                    reference
+                        .iter()
+                        .map(|x| (x.0, x.1.to_bits()))
+                        .collect::<Vec<_>>()
+                );
+                for temperature in [0.0, 0.7, 2.0] {
+                    for top_k in [0, 1, 20] {
+                        let options = Options {
+                            temperature,
+                            top_k,
+                            top_p: 0.8,
+                            ..options.clone()
+                        };
+                        let generic = Options {
+                            logit_bias: generic.logit_bias.clone(),
+                            ..options.clone()
+                        };
+                        // Remove extreme logits here to exercise a broad CDF.
+                        let fast =
+                            Distribution::from_masked(&logits[7..], &history, &options, mask)
+                                .unwrap();
+                        let reference =
+                            Distribution::from_masked(&logits[7..], &history, &generic, mask)
+                                .unwrap();
+                        assert_eq!(fast.ordered, reference.ordered);
+                        for step in 0..100 {
+                            let u = counter_uniform(EVALUATION_SEED, 0, step);
+                            assert_eq!(fast.draw(u), reference.draw(u));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(processed_scores(&[0.0, f32::NAN], &[], &Options::default(), Some(&[1])).is_err());
+    }
     #[test]
     fn sparse_top_k_and_residual_match_dense_probabilities_and_draws() {
         let logits: Vec<_> = (0..257)

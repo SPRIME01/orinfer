@@ -2,6 +2,21 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## CPU 采样预处理（2026-10-17）
+
+无 penalty 和 logit bias 时，将通用处理简化为 FP32 到 FP64 的转换，保留加零以维持 signed-zero 语义；有限值校验与 grammar mask 仍覆盖完整输入。逐位分数、完整 CDF 和固定 seed 选择与通用处理对照相同，GPU kernel、权重及原生执行库保持原版本。248,320 维合成 logits、8K 历史的 top-20 CPU 采样中位数为 1.585 → 1.276 ms（约 -19.5%）。
+
+真实 Rust release SSE 请求采用 617-token 输入、64-token 输出预算、MTP 草稿上限 3、`medium` thinking 且思考上限 32 tokens、温度 0.7、top-k 20、top-p 0.8、seed 20261002、`decode_only`、专家全量常驻。每档预热一轮后测三轮完整 prefix 命中请求，以下为 HTTP 总输出 TPS 中位数。
+
+| 模型／场景 | 改动前总 TPS | 改动后总 TPS | 变化 |
+| --- | ---: | ---: | ---: |
+| Flash Next，无 logprobs | 37.14 | 37.63 | +1.32% |
+| Flash Next，top-3 logprobs | 33.83 | 33.68 | -0.46% |
+| 27B，无 logprobs | 23.73 | 23.96 | +1.00% |
+| 27B，top-3 logprobs | 22.11 | 22.31 | +0.90% |
+
+端到端收益约 1%，带 logprobs 的变化不足 1%，不能将 CPU 微测收益直接当成 decode 加速比。16 对 API 响应的正文、思考、usage 和停止原因一致；两模型的 penalty 与 JSON schema 约束请求通过。`make check` 通过。
+
 ## Rust Graph 命中与概率报告（2026-10-17）
 
 完整 batch Graph 命中后复用已有绑定与 kernel 模块，跳过执行计划的地址展开和重复注册检查；COW、live workspace 保存、请求 arena 失效及间接 Graph 的地址校验仍先执行。普通、验证、draft、warm 和 mixed 使用公共执行器，不增加模型或 batch 专用程序；本节对照双方使用相同权重、原生执行库与 cubin。
