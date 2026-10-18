@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use orinfer_api::{PreprocessingLimits, ServerConfig};
+use orinfer_api::{BatchConfig, PreprocessingLimits, ServerConfig};
 use orinfer_engine::execution::{
     CudaGraphMode, LoadOptions, ResidentExperts, parse_cache_mib, parse_load_workers,
     parse_mtp_drafts,
@@ -48,6 +48,8 @@ enum Command {
     ScoreModel(ModelArgs),
     /// Serve the OpenAI Chat Completions API.
     Serve(Box<ServeArgs>),
+    /// Process Chat requests from JSONL without an HTTP server.
+    Batch(Box<BatchArgs>),
 }
 #[derive(Subcommand)]
 enum PackageCommand {
@@ -85,11 +87,9 @@ struct ModelArgs {
     load: LoadArgs,
 }
 #[derive(Args)]
-struct ServeArgs {
+struct InferenceArgs {
     /// Prepared model directory including tokenizer and execution package.
     model_dir: PathBuf,
-    #[arg(long, default_value_t = ServerConfig::default().listen)]
-    listen: String,
     #[arg(long, default_value_t = ServerConfig::default().model)]
     model: String,
     /// JSON object of Chat request defaults; explicit request fields take priority.
@@ -121,6 +121,13 @@ struct ServeArgs {
     preprocess_workers: usize,
     #[arg(long, default_value_t = PreprocessingLimits::default().memory_mib)]
     preprocess_memory_mib: usize,
+}
+#[derive(Args)]
+struct ServeArgs {
+    #[command(flatten)]
+    inference: InferenceArgs,
+    #[arg(long, default_value_t = ServerConfig::default().listen)]
+    listen: String,
     /// Queue deadline in milliseconds; 0 means unlimited.
     #[arg(long, default_value_t = PreprocessingLimits::default().queue_ms)]
     queue_timeout_ms: u64,
@@ -129,13 +136,25 @@ struct ServeArgs {
     #[arg(long, default_value_t = PreprocessingLimits::default().drain_ms)]
     drain_timeout_ms: u64,
 }
-impl From<ServeArgs> for ServerConfig {
-    fn from(args: ServeArgs) -> Self {
+#[derive(Args)]
+struct BatchArgs {
+    #[command(flatten)]
+    inference: InferenceArgs,
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    /// Skip committed responses and retry failed rows in the same job.
+    #[arg(long)]
+    resume: bool,
+}
+impl From<InferenceArgs> for ServerConfig {
+    fn from(args: InferenceArgs) -> Self {
         Self {
             model_dir: args.model_dir,
             model: args.model,
             default_request_params: args.default_request_params.unwrap_or_default(),
-            listen: args.listen,
+            listen: ServerConfig::default().listen,
             gpu_lock: args.gpu_lock,
             cuda_graph: args.load.cuda_graph,
             verify_weights: args.load.verify_weights,
@@ -154,9 +173,42 @@ impl From<ServeArgs> for ServerConfig {
             limits: PreprocessingLimits {
                 preprocess_workers: args.preprocess_workers,
                 memory_mib: args.preprocess_memory_mib,
-                queue_ms: args.queue_timeout_ms,
-                output_ms: args.output_timeout_ms,
-                drain_ms: args.drain_timeout_ms,
+                ..Default::default()
+            },
+        }
+    }
+}
+impl From<ServeArgs> for ServerConfig {
+    fn from(args: ServeArgs) -> Self {
+        let mut config: Self = args.inference.into();
+        config.listen = args.listen;
+        config.limits.queue_ms = args.queue_timeout_ms;
+        config.limits.output_ms = args.output_timeout_ms;
+        config.limits.drain_ms = args.drain_timeout_ms;
+        config
+    }
+}
+impl From<BatchArgs> for BatchConfig {
+    fn from(args: BatchArgs) -> Self {
+        let config: ServerConfig = args.inference.into();
+        Self {
+            input: args.input,
+            output: args.output,
+            resume: args.resume,
+            model_dir: config.model_dir,
+            model: config.model,
+            gpu_lock: config.gpu_lock,
+            scheduler: config.scheduler,
+            limits: config.limits,
+            default_request_params: config.default_request_params,
+            load: LoadOptions {
+                cuda_graph: config.cuda_graph,
+                verify_weights: config.verify_weights,
+                load_workers: config.load_workers,
+                resident_experts: config.resident_experts,
+                mtp_drafts: config.mtp_drafts,
+                prompt_lookup: config.prompt_lookup,
+                prefix_cache_bytes: config.prefix_cache_bytes,
             },
         }
     }
@@ -198,6 +250,16 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Serve(args) => orinfer_api::run((*args).into()),
+        Command::Batch(args) => {
+            let report = orinfer_api::run_batch((*args).into())?;
+            let failed = report.failed != 0 || report.truncated != 0 || report.interrupted;
+            print_json(report)?;
+            if failed {
+                Err("Batch has errors, truncated responses or was interrupted; inspect the output JSONL".into())
+            } else {
+                Ok(())
+            }
+        }
         Command::ValidateArtifact { manifest } => {
             print_json(orinfer_engine::artifact::validate_artifact(&manifest)?)
         }
@@ -304,11 +366,49 @@ mod tests {
         assert_eq!(config.scheduler.memory_reserve_bytes, 2usize << 30);
     }
     #[test]
+    fn batch_reuses_inference_options_without_http_settings() {
+        let Some(Command::Batch(args)) = Cli::try_parse_from([
+            "orinfer",
+            "batch",
+            "/tmp",
+            "--input",
+            "requests.jsonl",
+            "--output",
+            "results.jsonl",
+            "--resume",
+            "--model",
+            "translation",
+            "--max-active-requests",
+            "64",
+            "--mtp-drafts",
+            "0",
+            "--default-request-params",
+            "{\"seed\":20261002,\"temperature\":0}",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("Expected batch command")
+        };
+        let config: BatchConfig = (*args).into();
+        assert_eq!(config.input, PathBuf::from("requests.jsonl"));
+        assert_eq!(config.output, PathBuf::from("results.jsonl"));
+        assert!(config.resume);
+        assert_eq!(config.model, "translation");
+        assert_eq!(config.scheduler.max_active, 64);
+        assert_eq!(config.load.mtp_drafts, Some(0));
+        assert_eq!(config.default_request_params["seed"], 20261002);
+        assert!(
+            Cli::try_parse_from(["orinfer", "batch", "/tmp", "--input", "requests.jsonl"]).is_err()
+        );
+    }
+    #[test]
     fn syntax_help_and_limits_are_checked_before_loading() {
         for args in [
             vec!["orinfer", "--help"],
             vec!["orinfer", "--version"],
             vec!["orinfer", "serve", "--help"],
+            vec!["orinfer", "batch", "--help"],
             vec!["orinfer", "package", "--help"],
             vec!["orinfer", "package", "install", "--help"],
         ] {

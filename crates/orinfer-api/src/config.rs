@@ -5,6 +5,41 @@ use orinfer_engine::{
 };
 use std::path::PathBuf;
 
+/// File-based Chat inference. Execution and protocol semantics match `serve`.
+#[derive(Clone, Debug)]
+pub struct BatchConfig {
+    pub model_dir: PathBuf,
+    pub model: String,
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub resume: bool,
+    pub load: orinfer_engine::execution::LoadOptions,
+    pub scheduler: scheduler::Options,
+    pub limits: PreprocessingLimits,
+    pub gpu_lock: PathBuf,
+    pub default_request_params: serde_json::Map<String, serde_json::Value>,
+}
+impl BatchConfig {
+    pub(crate) fn settings(&self) -> ServerConfig {
+        ServerConfig {
+            model_dir: self.model_dir.clone(),
+            model: self.model.clone(),
+            default_request_params: self.default_request_params.clone(),
+            gpu_lock: self.gpu_lock.clone(),
+            cuda_graph: self.load.cuda_graph,
+            verify_weights: self.load.verify_weights,
+            load_workers: self.load.load_workers,
+            resident_experts: self.load.resident_experts,
+            mtp_drafts: self.load.mtp_drafts,
+            prompt_lookup: self.load.prompt_lookup,
+            prefix_cache_bytes: self.load.prefix_cache_bytes,
+            scheduler: self.scheduler,
+            limits: self.limits,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     pub model_dir: PathBuf,

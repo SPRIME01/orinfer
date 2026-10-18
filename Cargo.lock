@@ -1640,6 +1640,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "futures-util",
+ "hex",
  "image",
  "jsonschema",
  "libc",
@@ -1651,6 +1652,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_path_to_error",
+ "sha2",
  "tokenizers",
  "tokio",
 ]

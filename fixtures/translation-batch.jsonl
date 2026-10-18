@@ -1,0 +1,2 @@
+{"custom_id":"translation-1","method":"POST","url":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"请将以下英文翻译为简体中文，只输出译文。\nThe first request requires warm-up. Later requests can reuse the cache."}],"temperature":0,"seed":20261002,"max_completion_tokens":128,"enable_thinking":false}}
+{"custom_id":"translation-2","method":"POST","url":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"请将以下中文翻译为英语，只输出译文。\n每个请求拥有独立的状态，模型权重可以共享。"}],"temperature":0,"seed":20261002,"max_completion_tokens":128,"enable_thinking":false}}

@@ -1,0 +1,63 @@
+# JSONL 离线推理
+
+`orinfer batch` 直接加载模型处理本地文件，无需 HTTP 服务或 Python。它与 `serve` 共用 Chat 模板、tokenizer、采样、停止判断、连续批处理、prefix cache 和模型执行包。
+
+```bash
+orinfer batch /path/to/model \
+  --model index-translate-2b \
+  --input requests.jsonl --output results.jsonl \
+  --max-active-requests 64 --mtp-drafts 0 --prefix-cache-mib 512 \
+  --default-request-params '{"temperature":0,"seed":20261002,"enable_thinking":false,"max_completion_tokens":512}'
+```
+
+并发、Graph、MTP、缓存和预处理预算参数与 `serve` 共用，默认最多 32 个活跃请求。完成一条即补位；请求状态仍受内存准入限制。文件任务沿用当前连续调度策略，尚未增加离线全局前缀排序或吞吐专用策略。64 和 128 路哪个更快取决于输入与输出长度，不能按最大并发推算吞吐。
+
+## 输入
+
+UTF-8 JSONL，每行一个 OpenAI Batch 格式的 Chat 请求：
+
+```json
+{"custom_id":"paragraph-1","method":"POST","url":"/v1/chat/completions","body":{"messages":[{"role":"user","content":"请翻译为中文：The service is ready."}]}}
+```
+
+也接受直接 Chat 请求，可附带 `custom_id`：
+
+```json
+{"custom_id":"paragraph-2","messages":[{"role":"user","content":"请翻译为英语：服务已就绪。"}],"max_tokens":128}
+```
+
+缺省 `model` 使用 CLI 的 `--model`，显式指定时必须匹配。其他 Chat 字段遵循[服务指南](serving.md)，包括模型支持的图片、多图和工具调用；本地图片可使用 data URL，远程图片沿用服务端下载限制。每条请求单独应用模型模板，不把不同段落合成一个 prompt。
+
+- `custom_id` 必须唯一且为 1–256 字节的字符串；省略时使用物理行号 `line-N`。空白行跳过，重复 ID 在加载 GPU 模型前报错。
+- 单行最多 32 MiB。语法和请求错误写入该行的错误结果，其他行继续；文件读取失败、超大行等作业级错误终止任务。
+- 离线返回完整响应，显式 `stream=true` 或 `stream_options` 报错。部署默认值中的流式选项被关闭，其余默认值仍按 Chat 的显式覆盖规则合并。
+- 输入、图片资源及模型文件在任务和续跑期间应保持不变。程序检查输入文件变化；不会保存远程图片的永久快照。
+
+[翻译示例](../fixtures/translation-batch.jsonl) 可直接作为输入。设置足够的输出预算，避免把截断译文误当成完整结果。
+
+## 输出与续跑
+
+结果按完成顺序写入，可用 `custom_id` 对应原始记录。成功结果遵循 OpenAI Batch 的响应结构：
+
+```json
+{"id":"batch-paragraph-1","custom_id":"paragraph-1","response":{"status_code":200,"request_id":"chatcmpl-...","body":{"choices":[{"index":0,"message":{"role":"assistant","content":"服务已就绪。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":24,"completion_tokens":8,"total_tokens":32}}},"error":null}
+```
+
+错误结果包含 `custom_id`、`response:null` 和 `error.code/message`。完整响应仍包含正常的模型、usage、thinking 或工具结果等字段。
+
+新任务不会覆盖已有输出。输出旁的 `results.jsonl.meta.json` 保存输入 SHA256、模型描述身份和请求默认值；请连同结果一起保留。续跑使用相同命令加 `--resume`：
+
+```bash
+orinfer batch /path/to/model \
+  --model index-translate-2b \
+  --input requests.jsonl --output results.jsonl \
+  --max-active-requests 64 --mtp-drafts 0 --prefix-cache-mib 512 \
+  --default-request-params '{"temperature":0,"seed":20261002,"enable_thinking":false,"max_completion_tokens":512}' \
+  --resume
+```
+
+已提交的正常和截断响应都会跳过，失败及未完成请求重试。同一 ID 的重试结果追加在末尾，以最后一条为准。截断单独统计，续跑不会使用相同预算反复生成；增加预算后应使用新的输出文件。修改输入、模型描述、模型 ID、请求默认值或 MTP 配置时，拒绝混用旧结果；并发和内存预算可调整。
+
+每条完成结果立即写入，约每秒及正常退出时同步到存储。SIGINT/SIGTERM 停止任务并保留已写结果；续跑只移除末尾未以换行提交的半条记录，已完成行损坏时报错。输出带进程锁，禁止两个进程同时追加。此机制不提供输入副作用的恰好一次执行保证，也不保证断电时保留尚未同步的写入。
+
+标准输出为 JSON 汇总：任务总量、成功、截断、失败、未完成、跳过、本次处理量、实际生成 tokens、峰值活跃请求及耗时。`output_tps` 按本次生成 tokens / 完整调用耗时计算，包含扫描、加载、预处理、排队和落盘，不等于纯 decode TPS。正常全部完成退出码为 0；存在错误、截断或中断时非零。

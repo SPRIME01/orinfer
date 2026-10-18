@@ -140,6 +140,9 @@ impl Mailbox {
         self.delta_scored(model, delta, None)
     }
     fn delta_scored(&mut self, model: &str, delta: Value, logprobs: Option<Value>) -> bool {
+        if !self.job.prepared.stream {
+            return !self.job.events.is_closed();
+        }
         let mut payload = chunk(&self.job, model, delta, None);
         if let Some(logprobs) = logprobs {
             payload["choices"][0]["logprobs"] = logprobs;
@@ -361,11 +364,13 @@ impl<'a> Active<'a> {
             json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
                 "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":logprobs}],"usage":usage})
         };
-        let ending = chunk(job, model, json!({}), Some(reason));
-        let usage_chunk=job.prepared.include_usage.then(||json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[],"usage":usage}));
-        self.mailbox.send(ModelEvent::Chunk(ending));
-        if let Some(usage) = usage_chunk {
-            self.mailbox.send(ModelEvent::Chunk(usage));
+        if job.prepared.stream {
+            let ending = chunk(job, model, json!({}), Some(reason));
+            let usage_chunk=job.prepared.include_usage.then(||json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[],"usage":usage}));
+            self.mailbox.send(ModelEvent::Chunk(ending));
+            if let Some(usage) = usage_chunk {
+                self.mailbox.send(ModelEvent::Chunk(usage));
+            }
         }
         self.mailbox.send(ModelEvent::Complete(response));
         eprintln!(
@@ -796,6 +801,18 @@ mod tests {
         (Mailbox::new(job), receiver)
     }
 
+    #[test]
+    fn complete_responses_skip_stream_chunks_but_keep_disconnect_detection() {
+        let (mut mailbox, receiver) = mailbox();
+        mailbox.job.prepared.stream = false;
+        for _ in 0..100 {
+            assert!(mailbox.delta("test", json!({"content":"译文"})));
+        }
+        assert!(mailbox.pending.is_empty());
+        assert!(receiver.is_empty());
+        drop(receiver);
+        assert!(!mailbox.delta("test", json!({"content":"译文"})));
+    }
     #[test]
     fn long_prefill_does_not_start_the_slow_reader_deadline_early() {
         let (mut mailbox, _receiver) = mailbox();
