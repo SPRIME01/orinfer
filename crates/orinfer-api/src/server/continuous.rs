@@ -408,6 +408,7 @@ pub(super) fn worker(
     let mut active: Vec<Active<'_>> = vec![];
     let mut completed: Vec<Mailbox> = vec![];
     let mut memory_guard: Option<String> = None;
+    let latency = options.policy == scheduler::Policy::Latency;
     loop {
         if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
@@ -462,7 +463,8 @@ pub(super) fn worker(
                 .iter()
                 .filter_map(|a| a.request.decode_slack_s(options.target_tpot_ms))
                 .fold(f64::INFINITY, f64::min);
-            if has_decoders
+            if latency
+                && has_decoders
                 && (slack <= 0.
                     || admission.elapsed().as_secs_f64()
                         >= (options.target_tpot_ms / 1000. * 0.25).min(0.1))
@@ -507,7 +509,8 @@ pub(super) fn worker(
                 if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
                     // Large cold prompts need bounded residency. Small prompts
                     // must still form a cohort to amortize a model weight pass.
-                    if costs[i].remaining_tokens > options.max_batch_tokens
+                    if latency
+                        && costs[i].remaining_tokens > options.max_batch_tokens
                         && active
                             .iter()
                             .filter(|a| a.request.is_prefilling())
@@ -539,7 +542,7 @@ pub(super) fn worker(
                         }
                     }
                 }
-                if has_decoders && costs[i].age_s < 30. {
+                if latency && has_decoders && costs[i].age_s < 30. {
                     if costs[i].startup_s + costs[i].restore_s > slack {
                         deadline_yields += 1;
                         continue;
@@ -637,17 +640,18 @@ pub(super) fn worker(
                 cached_count += usize::from(cached_text);
                 // HTTP arrivals continue while CUDA restores a prefix. Include
                 // already-arrived work in the cohort without a batching timer.
-                if cached_text || !has_decoders {
+                if !latency || cached_text || !has_decoders {
                     receive_waiting(&mut waiting, &mut jobs);
                 }
             }
             if !admitted
-                || scheduler::admission_should_yield(
-                    has_decoders,
-                    admitted_count,
-                    admission.elapsed().as_secs_f64(),
-                    cached_text,
-                )
+                || (latency
+                    && scheduler::admission_should_yield(
+                        has_decoders,
+                        admitted_count,
+                        admission.elapsed().as_secs_f64(),
+                        cached_text,
+                    ))
             {
                 break;
             }

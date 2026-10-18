@@ -92,6 +92,9 @@ struct InferenceArgs {
     model_dir: PathBuf,
     #[arg(long, default_value_t = ServerConfig::default().model)]
     model: String,
+    /// latency (serve default) or throughput (batch default).
+    #[arg(long, value_name = "POLICY")]
+    scheduler_policy: Option<orinfer_engine::scheduler::Policy>,
     /// JSON object of Chat request defaults; explicit request fields take priority.
     #[arg(long, value_name = "JSON", value_parser = parse_request_defaults)]
     default_request_params: Option<serde_json::Map<String, serde_json::Value>>,
@@ -107,12 +110,13 @@ struct InferenceArgs {
     prefix_cache_bytes: usize,
     #[arg(long, default_value_t = ServerConfig::default().scheduler.max_active)]
     max_active_requests: usize,
+    /// Decode/verification row budget; mixed prefill may use the package capacity.
     #[arg(long, default_value_t = ServerConfig::default().scheduler.max_batch_tokens)]
     max_batch_tokens: usize,
-    /// Predicted mixed prefill budget per iteration in milliseconds.
+    /// Predicted mixed prefill budget in milliseconds (latency policy).
     #[arg(long, default_value_t = ServerConfig::default().scheduler.prefill_budget_ms)]
     prefill_budget_ms: f64,
-    /// Soft target for decode token intervals in milliseconds.
+    /// Soft decode token interval target in milliseconds (latency policy).
     #[arg(long, default_value_t = ServerConfig::default().scheduler.target_tpot_ms)]
     target_tpot_ms: f64,
     #[arg(long = "memory-reserve-mib", value_name = "MIB", default_value_t = ServerConfig::default().scheduler.memory_reserve_bytes >> 20, value_parser = parse_cache_mib)]
@@ -164,6 +168,7 @@ impl From<InferenceArgs> for ServerConfig {
             prompt_lookup: args.load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
             scheduler: orinfer_engine::scheduler::Options {
+                policy: args.scheduler_policy.unwrap_or_default(),
                 max_active: args.max_active_requests,
                 max_batch_tokens: args.max_batch_tokens,
                 prefill_budget_ms: args.prefill_budget_ms,
@@ -190,7 +195,12 @@ impl From<ServeArgs> for ServerConfig {
 }
 impl From<BatchArgs> for BatchConfig {
     fn from(args: BatchArgs) -> Self {
-        let config: ServerConfig = args.inference.into();
+        let policy = args
+            .inference
+            .scheduler_policy
+            .unwrap_or(orinfer_engine::scheduler::Policy::Throughput);
+        let mut config: ServerConfig = args.inference.into();
+        config.scheduler.policy = policy;
         Self {
             input: args.input,
             output: args.output,
@@ -329,6 +339,10 @@ mod tests {
         assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.scheduler.max_active, 32);
+        assert_eq!(
+            config.scheduler.policy,
+            orinfer_engine::scheduler::Policy::Latency
+        );
         assert_eq!(config.mtp_drafts, None);
         assert_eq!(config.resident_experts, ResidentExperts::Full);
         assert!(!config.prompt_lookup);
@@ -396,10 +410,44 @@ mod tests {
         assert!(config.resume);
         assert_eq!(config.model, "translation");
         assert_eq!(config.scheduler.max_active, 64);
+        assert_eq!(
+            config.scheduler.policy,
+            orinfer_engine::scheduler::Policy::Throughput
+        );
         assert_eq!(config.load.mtp_drafts, Some(0));
         assert_eq!(config.default_request_params["seed"], 20261002);
         assert!(
             Cli::try_parse_from(["orinfer", "batch", "/tmp", "--input", "requests.jsonl"]).is_err()
+        );
+    }
+    #[test]
+    fn scheduler_policy_is_explicit_and_batch_defaults_do_not_change_serve() {
+        let config = serve(&["--scheduler-policy", "throughput"]).unwrap();
+        assert_eq!(
+            config.scheduler.policy,
+            orinfer_engine::scheduler::Policy::Throughput
+        );
+        assert!(serve(&["--scheduler-policy", "unknown"]).is_err());
+        let Some(Command::Batch(args)) = Cli::try_parse_from([
+            "orinfer",
+            "batch",
+            "/tmp",
+            "--input",
+            "input.jsonl",
+            "--output",
+            "output.jsonl",
+            "--scheduler-policy",
+            "latency",
+        ])
+        .unwrap()
+        .command
+        else {
+            unreachable!()
+        };
+        let config: BatchConfig = (*args).into();
+        assert_eq!(
+            config.scheduler.policy,
+            orinfer_engine::scheduler::Policy::Latency
         );
     }
     #[test]

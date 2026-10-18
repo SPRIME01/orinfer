@@ -10,6 +10,7 @@ use futures_util::stream::FuturesUnordered;
 
 #[derive(Default, Debug, serde::Serialize)]
 pub struct BatchReport {
+    pub scheduler_policy: orinfer_engine::scheduler::Policy,
     pub total: usize,
     pub succeeded: usize,
     pub truncated: usize,
@@ -43,6 +44,7 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
         "prompt_lookup":config.load.prompt_lookup});
     let mut journal = Journal::open(&config.output, config.resume, &identity, &input)?;
     let mut report = BatchReport {
+        scheduler_policy: config.scheduler.policy,
         total: input.ids.len(),
         skipped: journal
             .states

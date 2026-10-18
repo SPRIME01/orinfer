@@ -209,14 +209,15 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--listen` | `0.0.0.0:8088` | HTTP 监听地址 |
 | `--model` | `qwen3.8-27b` | API 模型 ID |
 | `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
+| `--scheduler-policy` | `latency` | 在线延迟优先；`throughput` 以整批吞吐为目标 |
 | `--cuda-graph` | `decode_only` | Graph 模式 |
 | `--resident-experts` | `full` | 主干专家每层等效常驻容量；有限模式全局缓存，MTP 全量常驻 |
 | `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
 | `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，1–128 |
-| `--max-batch-tokens` | `128` | 每轮 target 计算 token 预算，1–128 |
-| `--prefill-budget-ms` | `200` | 混合块的预测耗时上限，非严格延迟上限 |
-| `--target-tpot-ms` | `400` | 引擎提交 token 的软间隔目标 |
+| `--max-batch-tokens` | `128` | decode/验证行预算，1–128；混合 prefill 可使用执行包的行容量 |
+| `--prefill-budget-ms` | `200` | `latency` 混合块的预测耗时上限，非严格延迟上限 |
+| `--target-tpot-ms` | `400` | `latency` 引擎提交 token 的软间隔目标 |
 | `--memory-reserve-mib` | `1024` | 系统余量以外的准入保留内存 |
 | `--preprocess-workers` | `2` | 同时执行图片/模板/tokenizer CPU 任务数 |
 | `--preprocess-memory-mib` | `2048` | 预处理和排队图片张量预算 |
@@ -225,7 +226,7 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 | `--drain-timeout-ms` | `30000` | SIGINT/SIGTERM 后 HTTP 排空期限 |
 | `--gpu-lock` | `artifacts/gpu-experiment.lock` | GPU worker 使用的共享锁 |
 
-调度按完整迭代成本选择联合或独立 prefill。多个冷请求不会自动把长请求降为小块；尚未测量的联合路径不会覆盖可用的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
+默认 `latency` 策略按完整迭代成本选择联合或独立 prefill。多个冷请求不会自动把长请求降为小块；尚未测量的联合路径不会覆盖可用的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`throughput` 策略放开时间配额和冷 prefill 数限制，允许探测未知联合形状，仍保留内存准入与请求隔离，适合[离线任务](batch.md)。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
 
 `/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
 

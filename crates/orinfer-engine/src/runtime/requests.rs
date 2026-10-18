@@ -335,7 +335,10 @@ impl ModelRuntime {
         prompt_tokens: usize,
         options: &scheduler::Options,
     ) -> bool {
-        if active.len() < 2 || active.iter().any(|r| r.prefilling) {
+        if options.policy == scheduler::Policy::Throughput
+            || active.len() < 2
+            || active.iter().any(|r| r.prefilling)
+        {
             return true;
         }
         let context: usize = active.iter().map(|r| r.history.len()).sum();
@@ -1267,7 +1270,10 @@ impl ModelRuntime {
             }
             Work::Idle => {}
         }
-        if does_prefill && requests.iter().any(|r| !r.prefilling && !r.is_finished()) {
+        if options.policy == scheduler::Policy::Latency
+            && does_prefill
+            && requests.iter().any(|r| !r.prefilling && !r.is_finished())
+        {
             self.decode_until = Some(
                 Instant::now()
                     + std::time::Duration::from_secs_f64(scheduler::decode_quantum_s(
@@ -1309,8 +1315,17 @@ impl ModelRuntime {
         for (&i, credit) in prefills.iter().zip(credits) {
             requests[i].credit_s = credit;
         }
+        // Freeze clock-dependent scores for the entire sort. Reading elapsed()
+        // in a comparator can reverse its ordering as time advances and panic
+        // with a large cold cohort.
+        let ordering_at = Instant::now();
+        let age = |i: usize| {
+            ordering_at
+                .saturating_duration_since(requests[i].last_prefill)
+                .as_secs_f64()
+        };
         prefills.sort_unstable_by(|&a, &b| {
-            let urgent = |i: usize| requests[i].last_prefill.elapsed().as_secs_f64() >= 30.;
+            let urgent = |i: usize| age(i) >= 30.;
             // Finish short tails before switching to another request's large
             // native tile. Hard aging still wins over this bounded preference.
             let near_end =
@@ -1318,7 +1333,7 @@ impl ModelRuntime {
             let score = |i: usize| {
                 self.prefill_costs
                     .remaining(requests[i].offset, requests[i].input.len())
-                    / (1. + requests[i].last_prefill.elapsed().as_secs_f64() / 2.)
+                    / (1. + age(i) / 2.)
             };
             urgent(b)
                 .cmp(&urgent(a))
@@ -1328,6 +1343,7 @@ impl ModelRuntime {
                 .then_with(|| requests[a].slot.cmp(&requests[b].slot))
         });
         let prefill = prefills.first().copied();
+        let throughput = options.policy == scheduler::Policy::Throughput;
         let mut decode: Vec<_> = requests
             .iter()
             .enumerate()
@@ -1340,7 +1356,8 @@ impl ModelRuntime {
                 >= (options.target_tpot_ms / 1000. * 4.).max(2.)
         });
         let decode_round = prefill.is_none()
-            || (!decode.is_empty()
+            || (!throughput
+                && !decode.is_empty()
                 && !progress_due
                 && self
                     .decode_until
@@ -1396,11 +1413,15 @@ impl ModelRuntime {
                         && n <= req.limit - req.generated
                 })
                 .collect();
-            let slack = decode
-                .iter()
-                .filter(|&&j| j != i)
-                .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
-                .fold(f64::INFINITY, f64::min);
+            let slack = if throughput {
+                f64::INFINITY
+            } else {
+                decode
+                    .iter()
+                    .filter(|&&j| j != i)
+                    .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
+                    .fold(f64::INFINITY, f64::min)
+            };
             // A long matching suffix predicts a different proposal source
             // from the model draft whose earlier timings ranked these rows.
             // Try the widest eligible copy, still bounded by peer deadlines.
@@ -1461,6 +1482,32 @@ impl ModelRuntime {
                 .unwrap_or(cap)
                 .max(cap);
         }
+        if throughput && let Some(i) = prefill {
+            // The existing packet template and native prefill execute identical
+            // state transitions. Offline scheduling compares total work cost,
+            // without buying a decode burst after every prompt fragment.
+            let native = self
+                .native_prefill_chunk(requests, i, f64::INFINITY, false)
+                .ok_or("Missing native prefill progress")?;
+            if mixed {
+                let mut joint: Vec<_> = decode
+                    .iter()
+                    .take(options.max_batch_tokens.min(cap))
+                    .map(|&i| (i, 1))
+                    .collect();
+                self.pack_prefill(requests, &prefills, &mut joint, cap, f64::INFINITY)?;
+                if joint.len() > 1
+                    && joint.iter().any(|(i, _)| requests[*i].prefilling)
+                    && self.prefer_joint_prefill(requests, &joint, f64::INFINITY, true)
+                {
+                    self.scheduler_statistics.joint_prefill_choices += 1;
+                    joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
+                    return Ok(Work::Batch(joint));
+                }
+            }
+            self.scheduler_statistics.independent_prefill_choices += 1;
+            return Ok(Work::Prefill(i, native, false, f64::INFINITY));
+        }
         if decode.is_empty() {
             let Some(i) = prefill else {
                 return Ok(Work::Idle);
@@ -1471,7 +1518,9 @@ impl ModelRuntime {
             if mixed && prefills.len() > 1 {
                 let mut joint = vec![];
                 self.pack_prefill(requests, &prefills, &mut joint, cap, f64::INFINITY)?;
-                if joint.len() > 1 && self.prefer_joint_prefill(requests, &joint, f64::INFINITY) {
+                if joint.len() > 1
+                    && self.prefer_joint_prefill(requests, &joint, f64::INFINITY, false)
+                {
                     self.scheduler_statistics.joint_prefill_choices += 1;
                     joint.sort_unstable_by_key(|(i, _)| requests[*i].slot);
                     return Ok(Work::Batch(joint));
@@ -1517,7 +1566,8 @@ impl ModelRuntime {
                 cap,
                 (decode_s + window_s).min(slack_s).max(0.) * 1000.,
             )?;
-            if joint.len() > selected.len() && self.prefer_joint_prefill(requests, &joint, window_s)
+            if joint.len() > selected.len()
+                && self.prefer_joint_prefill(requests, &joint, window_s, false)
             {
                 self.scheduler_statistics.joint_prefill_choices += 1;
                 for &(i, _) in &joint {
@@ -1553,7 +1603,14 @@ impl ModelRuntime {
         requests: &[&mut RequestState],
         joint: &[(usize, usize)],
         native_budget_s: f64,
+        probe: bool,
     ) -> bool {
+        // Reuse measured packet timings. An offline job can pay the first two
+        // real executions to discover useful shapes instead of permanently
+        // rejecting an unmeasured mixed path with a latency-oriented prior.
+        if probe && !self.measured_iteration(requests, joint) {
+            return true;
+        }
         let mut loses_large_tile = false;
         let decoders: Vec<_> = joint
             .iter()

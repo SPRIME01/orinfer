@@ -48,7 +48,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--resident-experts` | `full` | 专家全量常驻；Flash Next 可指定每层等效容量，按需从 SSD 加载 |
 | `--prefix-cache-mib` | `12288` | GPU 前缀缓存预算；0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，支持 1–128 |
-| `--max-batch-tokens` | `128` | 每轮计算 token 预算 |
+| `--max-batch-tokens` | `128` | decode/验证行预算；混合 prefill 可使用执行包容量 |
 | `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
 
 实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer serve --help`。

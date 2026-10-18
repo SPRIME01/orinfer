@@ -2,6 +2,33 @@
 //! number of queued clients; physical memory and iteration cost govern admission.
 use crate::artifact::Result;
 use serde::Serialize;
+use std::{fmt, str::FromStr};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    #[default]
+    Latency,
+    Throughput,
+}
+impl fmt::Display for Policy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Latency => "latency",
+            Self::Throughput => "throughput",
+        })
+    }
+}
+impl FromStr for Policy {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "latency" => Ok(Self::Latency),
+            "throughput" => Ok(Self::Throughput),
+            _ => Err("Scheduler policy must be latency or throughput".into()),
+        }
+    }
+}
 
 /// Orin CUDA allocations consume system RAM. CUDA's free-memory counter alone
 /// does not protect the host or account for other processes' resident memory.
@@ -46,6 +73,7 @@ fn usable_host_bytes_from_meminfo(text: &str) -> Result<usize> {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Options {
+    pub policy: Policy,
     pub max_active: usize,
     pub max_batch_tokens: usize,
     pub prefill_budget_ms: f64,
@@ -55,6 +83,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            policy: Policy::Latency,
             max_active: 32,
             max_batch_tokens: 128,
             prefill_budget_ms: 200.,

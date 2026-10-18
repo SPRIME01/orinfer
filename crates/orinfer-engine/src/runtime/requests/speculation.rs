@@ -247,10 +247,14 @@ impl ModelRuntime {
     ) -> Option<BatchChoice> {
         let spec = self.manifest.mtp.as_ref()?;
         let limit = (options.max_batch_tokens / decode.len()).min(spec.default_verification_tokens);
-        let slack = decode
-            .iter()
-            .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
-            .fold(f64::INFINITY, f64::min);
+        let slack = if options.policy == scheduler::Policy::Throughput {
+            f64::INFINITY
+        } else {
+            decode
+                .iter()
+                .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
+                .fold(f64::INFINITY, f64::min)
+        };
         let progress: usize = decode.iter().map(|&i| requests[i].generated).sum();
         let last_probe: usize = decode
             .iter()

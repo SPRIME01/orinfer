@@ -26,6 +26,8 @@ struct Fixture {
     verification_tokens: Option<usize>,
     #[serde(default = "numerical_tokens")]
     numerical_tokens: usize,
+    #[serde(default)]
+    scheduling_policy: scheduler::Policy,
 }
 
 fn numerical_tokens() -> usize {
@@ -405,9 +407,16 @@ fn validate_joint_prefill_requests() {
     .unwrap();
     assert!(!model.manifest.prefill_batch_profiles.is_empty());
     model.manifest.mtp = None;
-    let options = scheduler::Options::default();
+    let options = scheduler::Options {
+        policy: fixture.scheduling_policy,
+        ..Default::default()
+    };
     let mut rows = vec![];
-    for count in [2, 4, 8] {
+    for count in if fixture.batches.is_empty() {
+        vec![2, 4, 8]
+    } else {
+        fixture.batches.clone()
+    } {
         let mut requests: Vec<_> = (0..count)
             .map(|i| {
                 model
@@ -478,9 +487,9 @@ fn validate_joint_prefill_requests() {
             .map(|i| fixture.cases[i % fixture.cases.len()].input_tokens.len())
             .sum();
         let wall_s = at.elapsed().as_secs_f64();
-        // Use the same 512-token chunk and LUT4 FFN law as the joint route.
-        // A 2048-token serial route intentionally has a different codebook;
-        // its quality relative to BF16 is evaluated separately.
+        // Cap the serial reference at the available 512-token plans (or its
+        // default chunk), keeping the same weight payload. Different causal
+        // chunking can change rounding; BF16 quantization acceptance is separate.
         let saved_plans = model.manifest.prefill_plans.clone();
         model
             .manifest
@@ -588,7 +597,10 @@ fn validate_continuous_requests() {
         },
     )
     .unwrap();
-    let options = scheduler::Options::default();
+    let options = scheduler::Options {
+        policy: fixture.scheduling_policy,
+        ..Default::default()
+    };
     let orphan = model
         .start_request(input(&fixture.cases[0], 8), &|| false)
         .unwrap();
