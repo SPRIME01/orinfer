@@ -409,6 +409,7 @@ pub(super) fn worker(
     let mut completed: Vec<Mailbox> = vec![];
     let mut memory_guard: Option<String> = None;
     let latency = options.policy == scheduler::Policy::Latency;
+    let mut output_lengths = scheduler::OutputLengths::default();
     loop {
         if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
@@ -424,6 +425,9 @@ pub(super) fn worker(
         while index < active.len() {
             if active[index].finished() {
                 let mut a = active.remove(index);
+                if !latency && a.ending.as_ref().is_some_and(Ending::cacheable) {
+                    output_lengths.observe(a.mailbox.job.prepared.input.len(), a.count);
+                }
                 let cache = a.ending.as_ref().is_none_or(Ending::cacheable)
                     && a.count == a.request.generated_tokens()
                     && a.request.failure().is_none();
@@ -497,15 +501,44 @@ pub(super) fn worker(
                 .collect();
             let mut admitted = false;
             let mut cached_text = false;
-            let mut untried: Vec<_> = (0..waiting.len())
-                .filter(|&i| memory_guard.as_ref().is_none_or(|id| id == &waiting[i].id))
-                .collect();
+            let mut untried: Vec<_> = if latency {
+                (0..waiting.len()).collect()
+            } else {
+                let mut remaining: Vec<_> = active
+                    .iter()
+                    .map(|a| {
+                        (output_lengths.estimate(
+                            a.mailbox.job.prepared.input.len(),
+                            a.mailbox.job.prepared.max_tokens,
+                        ) - a.count as f64)
+                            .max(1.)
+                    })
+                    .collect();
+                remaining.sort_unstable_by(f64::total_cmp);
+                let cohort = remaining.get(remaining.len() / 2).copied();
+                let expected: Vec<_> = waiting
+                    .iter()
+                    .map(|job| {
+                        output_lengths.estimate(job.prepared.input.len(), job.prepared.max_tokens)
+                    })
+                    .collect();
+                // Pop the highest priority candidate without rescanning and
+                // allocating a new cost vector for every rejected admission.
+                let mut order = scheduler::rank_throughput_waiting(&costs, &expected, cohort);
+                order.reverse();
+                order
+            };
+            untried.retain(|&i| memory_guard.as_ref().is_none_or(|id| id == &waiting[i].id));
             while !untried.is_empty() {
-                let relative = scheduler::select_waiting(
-                    &untried.iter().map(|&i| costs[i]).collect::<Vec<_>>(),
-                )
-                .expect("nonempty candidates");
-                let i = untried.remove(relative);
+                let i = if latency {
+                    let relative = scheduler::select_waiting(
+                        &untried.iter().map(|&i| costs[i]).collect::<Vec<_>>(),
+                    )
+                    .expect("nonempty candidates");
+                    untried.remove(relative)
+                } else {
+                    untried.pop().expect("nonempty candidates")
+                };
                 if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
                     // Large cold prompts need bounded residency. Small prompts
                     // must still form a cohort to amortize a model weight pass.
@@ -576,6 +609,9 @@ pub(super) fn worker(
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
                             Ok(mut request) => {
+                                if let Some(shared) = job.shared_prefix {
+                                    request.retain_shared_prefixes_only(shared >= prompt_tokens);
+                                }
                                 if let Some(constraint) = job.prepared.constraint.take() {
                                     request
                                         .set_constraint(constraint)
@@ -801,6 +837,7 @@ mod tests {
             created: 0,
             queued: Instant::now(),
             hint: None,
+            shared_prefix: None,
         };
         (Mailbox::new(job), receiver)
     }

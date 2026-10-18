@@ -170,6 +170,79 @@ pub fn select_waiting(requests: &[Waiting]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// Bounded, online output-length estimates. Completion limits are ceilings,
+/// never training labels. Callers only observe naturally completed requests.
+pub struct OutputLengths {
+    bins: [(u64, f64); usize::BITS as usize],
+}
+impl Default for OutputLengths {
+    fn default() -> Self {
+        Self {
+            bins: [(0, 0.); usize::BITS as usize],
+        }
+    }
+}
+impl OutputLengths {
+    pub fn observe(&mut self, input: usize, output: usize) {
+        if input == 0 || output == 0 {
+            return;
+        }
+        let bin = &mut self.bins[input.ilog2() as usize];
+        // Exponential forgetting handles language/task changes in a long file.
+        bin.1 = if bin.0 == 0 {
+            output as f64 / input as f64
+        } else {
+            bin.1 * 0.95 + output as f64 / input as f64 * 0.05
+        };
+        bin.0 = bin.0.saturating_add(1);
+    }
+    pub fn estimate(&self, input: usize, limit: usize) -> f64 {
+        let key = input.max(1).ilog2() as usize;
+        let ratio = self
+            .bins
+            .iter()
+            .enumerate()
+            .filter(|(_, (samples, _))| *samples > 0)
+            .min_by_key(|(i, _)| i.abs_diff(key))
+            .map_or(1., |(_, (_, ratio))| *ratio);
+        (input as f64 * ratio).max(1.).min(limit as f64)
+    }
+}
+
+/// Offline admission groups similar remaining output lengths, while starting
+/// long work first when there is no existing cohort. Hard aging still wins.
+pub fn rank_throughput_waiting(
+    requests: &[Waiting],
+    expected: &[f64],
+    cohort_remaining: Option<f64>,
+) -> Vec<usize> {
+    assert_eq!(requests.len(), expected.len());
+    let mut order: Vec<_> = (0..requests.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        let old_a = requests[a].age_s >= 30.;
+        let old_b = requests[b].age_s >= 30.;
+        old_b
+            .cmp(&old_a)
+            .then_with(|| {
+                if old_a {
+                    requests[b].age_s.total_cmp(&requests[a].age_s)
+                } else {
+                    let mismatch = |i: usize| {
+                        cohort_remaining.map_or(0., |cohort| {
+                            (expected[i].max(1.) / cohort.max(1.)).ln().abs()
+                        })
+                    };
+                    mismatch(a)
+                        .total_cmp(&mismatch(b))
+                        .then_with(|| expected[b].total_cmp(&expected[a]))
+                        .then_with(|| requests[a].cost_s().total_cmp(&requests[b].cost_s()))
+                }
+            })
+            .then(a.cmp(&b))
+    });
+    order
+}
+
 /// EWMA plus a rolling positive-residual P95 allowance. This is a soft deadline
 /// estimate, not a guarantee; invalid measurements never poison later decisions.
 #[derive(Clone, Copy, Default)]
@@ -331,6 +404,42 @@ pub struct Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lengths_learn_completions_and_cohorts_keep_aging() {
+        let mut lengths = OutputLengths::default();
+        assert_eq!(lengths.estimate(50, 128), lengths.estimate(50, 4096));
+        for _ in 0..10 {
+            lengths.observe(50, 10);
+            lengths.observe(500, 200);
+        }
+        assert!((lengths.estimate(50, 4096) - 10.).abs() < 1e-6);
+        assert!((lengths.estimate(500, 4096) - 200.).abs() < 1e-6);
+        assert_eq!(lengths.estimate(500, 100), 100.);
+        let mut requests = vec![
+            Waiting {
+                age_s: 0.,
+                remaining_s: 1.,
+                restore_s: 0.,
+                startup_s: 0.,
+                remaining_tokens: 50
+            };
+            3
+        ];
+        let expected = [10., 100., 40.];
+        assert_eq!(
+            rank_throughput_waiting(&requests, &expected, None),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            rank_throughput_waiting(&requests, &expected, Some(35.)),
+            vec![2, 1, 0]
+        );
+        requests[0].age_s = 31.;
+        assert_eq!(
+            rank_throughput_waiting(&requests, &expected, Some(35.))[0],
+            0
+        );
+    }
     #[test]
     fn joint_prefill_must_pay_for_fragmenting_a_large_native_tile() {
         assert!(!joint_prefill_worthwhile(true, false, 0.2, 0.8));

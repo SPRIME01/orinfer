@@ -51,6 +51,8 @@ pub struct RequestState {
     prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
     decoder: crate::sampling::Decoder,
+    cache_prompt: bool,
+    cache_generated: bool,
 }
 impl Drop for RequestState {
     fn drop(&mut self) {
@@ -62,6 +64,12 @@ impl Drop for RequestState {
     }
 }
 impl RequestState {
+    /// Offline lookahead can retain shared branches without copying one-off
+    /// prompts and generated continuations into the cache.
+    pub fn retain_shared_prefixes_only(&mut self, full_prompt_shared: bool) {
+        self.cache_prompt = full_prompt_shared;
+        self.cache_generated = false;
+    }
     pub fn set_constraint(
         &mut self,
         constraint: Box<dyn crate::sampling::Constraint>,
@@ -311,7 +319,11 @@ impl ModelRuntime {
         {
             return Ok(false);
         }
-        if common == req.input.len() || req.checkpoints.contains(&common) {
+        if common == req.input.len() {
+            req.cache_prompt = true;
+            return Ok(true);
+        }
+        if req.checkpoints.contains(&common) {
             return Ok(true);
         }
         if common <= req.offset || req.prefill_frame.is_some() {
@@ -613,6 +625,8 @@ impl ModelRuntime {
                 prompt_lookup: Default::default(),
                 mtp_blocked: false,
                 decoder: Default::default(),
+                cache_prompt: true,
+                cache_generated: true,
             })
         })();
         if let Ok(req) = &result {
@@ -725,13 +739,15 @@ impl ModelRuntime {
                 req.warm.tokens = req.input.len() - 1;
             }
         }
-        self.store_prefix(
-            &req.input,
-            &req.media,
-            req.warm.tokens,
-            true,
-            &mut req.prefix,
-        )?;
+        if req.cache_prompt {
+            self.store_prefix(
+                &req.input,
+                &req.media,
+                req.warm.tokens,
+                true,
+                &mut req.prefix,
+            )?;
+        }
         let pending = match self.select_request_token(req) {
             Ok(token) => token,
             Err(_) if req.failure().is_some() => return Ok(vec![]),
@@ -2045,7 +2061,7 @@ impl ModelRuntime {
             return Ok(());
         }
         let stored = self.with_request(req, |model, req| {
-            if cache && !req.prefilling && model.prefix_cache.budget != 0 {
+            if cache && req.cache_generated && !req.prefilling && model.prefix_cache.budget != 0 {
                 let consistent = model.refresh_request_mtp(req, false)?;
                 if consistent {
                     model.store_decoded_prefix(

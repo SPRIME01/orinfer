@@ -1038,24 +1038,10 @@ impl Executor {
             return Err("Input upload exceeds buffer".into());
         }
         self.ensure_writable_range(name, 0, bytes.len())?;
-        if bytes.len() <= super::transfers::UPLOAD_BYTES {
-            return self.session.transfers.borrow_mut().upload(
-                self.session.stream,
-                self.pointers[name],
-                bytes,
-            );
-        }
-        // Large image/prefill payloads retain bounded synchronous transfer. Small
-        // inputs are ordered on the explicit stream without a context-wide wait.
-        self.sync()?;
-        // SAFETY: The synchronized destination is live and covers the borrowed bytes.
-        unsafe {
-            check(
-                sys::cuMemcpyHtoD_v2(self.pointers[name], bytes.as_ptr().cast(), bytes.len()),
-                "model input upload",
-            )?;
-            check(sys::cuCtxSynchronize(), "large input upload dependency")
-        }
+        self.session
+            .transfers
+            .borrow_mut()
+            .upload(self.session.stream, self.pointers[name], bytes)
     }
     pub(crate) fn read_controls(&self, name: &str, count: usize) -> Result<Vec<u32>> {
         let bytes = count.checked_mul(4).ok_or("Control vector size overflow")?;

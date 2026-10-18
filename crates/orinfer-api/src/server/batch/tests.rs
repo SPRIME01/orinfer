@@ -147,3 +147,49 @@ fn input_mutation_is_rejected() {
     fs::write(d.0.join("input.jsonl"), "{}\n{}\n").unwrap();
     assert!(input.next().is_err());
 }
+
+#[test]
+fn global_order_preserves_physical_ids_skips_blank_lines_and_can_reset() {
+    let d = Directory::new();
+    let mut input = d.input("\n{}\n{\"custom_id\":\"named\"}\n\n{}\n");
+    input
+        .reorder(vec![2, 0, 1], vec![None, Some(32), None])
+        .unwrap();
+    assert_eq!(input.next().unwrap().unwrap().id, "line-5");
+    assert_eq!(input.next().unwrap().unwrap().line, 2);
+    let named = input.next().unwrap().unwrap();
+    assert_eq!(named.id, "named");
+    assert_eq!(named.prefix_hint, Some(32));
+    assert!(input.next().unwrap().is_none());
+    assert!(input.reorder(vec![0, 0, 1], vec![]).is_err());
+    assert!(input.reorder(vec![0, 1, 3], vec![]).is_err());
+    input.reorder(vec![], vec![]).unwrap();
+    assert_eq!(input.next().unwrap().unwrap().id, "line-2");
+}
+
+#[tokio::test]
+async fn queued_results_are_drained_before_resume() {
+    let d = Directory::new();
+    let input = d.input("{}\n{}\n{}\n");
+    let path = d.0.join("queued.jsonl");
+    let identity = json!({"model":"test"});
+    let mut journal = Journal::open(&path, false, &identity, &input).unwrap();
+    let writer = files::Writer::start(&journal, 1).unwrap();
+    for i in 1..=3 {
+        writer
+            .append(
+                &mut journal,
+                Completed {
+                    value: response(&format!("line-{i}"), "stop"),
+                    bytes: 0,
+                    _memory: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    writer.finish().await.unwrap();
+    drop(journal);
+    let journal = Journal::open(&path, true, &identity, &input).unwrap();
+    assert_eq!(journal.states.len(), 3);
+}

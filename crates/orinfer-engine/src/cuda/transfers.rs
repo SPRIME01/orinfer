@@ -18,6 +18,7 @@ struct Slot {
     pointer: *mut c_void,
     event: sys::CUevent,
     pending: Pending,
+    used: usize,
 }
 #[derive(Default)]
 pub(super) struct Transfers {
@@ -33,13 +34,39 @@ impl Transfers {
         destination: u64,
         bytes: &[u8],
     ) -> Result<()> {
+        destination
+            .checked_add(bytes.len() as u64)
+            .ok_or("Input address overflow")?;
+        for (i, chunk) in bytes.chunks(UPLOAD_BYTES).enumerate() {
+            self.upload_chunk(stream, destination + (i * UPLOAD_BYTES) as u64, chunk)?;
+        }
+        Ok(())
+    }
+    fn upload_chunk(
+        &mut self,
+        stream: sys::CUstream,
+        destination: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         if bytes.len() > UPLOAD_BYTES {
             return Err("Input exceeds pinned upload slot".into());
         }
-        if self.uploads.len() < UPLOAD_SLOTS {
+        if let Some(slot) = self.uploads.get_mut(self.next)
+            && bytes.len() > UPLOAD_BYTES - slot.used
+        {
+            // Seal an append-only slab, rather than synchronizing each scalar.
+            slot.pending = Pending::Stream;
+            // SAFETY: The event covers all queued reads from this live slab.
+            unsafe {
+                check(sys::cuEventRecord(slot.event, stream), "seal input staging")?;
+            }
+            slot.pending = Pending::Event;
+            self.next = (self.next + 1) % UPLOAD_SLOTS;
+        }
+        if self.next == self.uploads.len() {
             let mut pointer = ptr::null_mut();
             // SAFETY: Current session owns this allocation until synchronized cleanup.
             unsafe {
@@ -53,8 +80,8 @@ impl Transfers {
                 pointer,
                 event: ptr::null_mut(),
                 pending: Pending::None,
+                used: 0,
             });
-            self.next = self.uploads.len() - 1;
             // SAFETY: The newly registered slot owns the timing-disabled event.
             unsafe {
                 check(
@@ -67,28 +94,28 @@ impl Transfers {
         // SAFETY: A slot is overwritten only after its preceding DMA completed.
         // A failed event record retains the stronger stream dependency.
         unsafe {
-            match slot.pending {
-                Pending::None => (),
-                Pending::Event => {
-                    check(sys::cuEventSynchronize(slot.event), "reuse input staging")?
+            if matches!(slot.pending, Pending::Event) || slot.used + bytes.len() > UPLOAD_BYTES {
+                match slot.pending {
+                    Pending::None => (),
+                    Pending::Event => {
+                        check(sys::cuEventSynchronize(slot.event), "reuse input staging")?
+                    }
+                    Pending::Stream => {
+                        check(sys::cuStreamSynchronize(stream), "recover input staging")?
+                    }
                 }
-                Pending::Stream => {
-                    check(sys::cuStreamSynchronize(stream), "recover input staging")?
-                }
+                slot.used = 0;
+                slot.pending = Pending::None;
             }
-            ptr::copy_nonoverlapping(bytes.as_ptr(), slot.pointer.cast(), bytes.len());
+            let source = slot.pointer.add(slot.used);
+            ptr::copy_nonoverlapping(bytes.as_ptr(), source.cast(), bytes.len());
+            slot.used += bytes.len();
             slot.pending = Pending::Stream;
             check(
-                sys::cuMemcpyHtoDAsync_v2(destination, slot.pointer, bytes.len(), stream),
+                sys::cuMemcpyHtoDAsync_v2(destination, source, bytes.len(), stream),
                 "enqueue model input",
             )?;
-            check(
-                sys::cuEventRecord(slot.event, stream),
-                "record input completion",
-            )?;
         }
-        slot.pending = Pending::Event;
-        self.next = (self.next + 1) % UPLOAD_SLOTS;
         Ok(())
     }
 
@@ -167,7 +194,12 @@ mod tests {
         let mut transfers = Transfers::default();
         assert!(
             transfers
-                .upload(ptr::null_mut(), 0, &vec![0; UPLOAD_BYTES + 1])
+                .upload_chunk(ptr::null_mut(), 0, &vec![0; UPLOAD_BYTES + 1])
+                .is_err()
+        );
+        assert!(
+            transfers
+                .upload(ptr::null_mut(), u64::MAX, &[0; 2])
                 .is_err()
         );
         assert!(
@@ -284,6 +316,24 @@ mod tests {
                 .unwrap();
             assert_eq!(tail, [i as u8; 4]);
         }
+        let mut large = vec![91; UPLOAD_BYTES * 3 + 17];
+        session
+            .transfers
+            .borrow_mut()
+            .upload(session.stream, allocation, &large)
+            .unwrap();
+        large.fill(255);
+        let mut ends = [0; 8];
+        session
+            .transfers
+            .borrow_mut()
+            .readback(
+                session.stream,
+                &[(allocation, 4), (allocation + (large.len() - 4) as u64, 4)],
+                &mut ends,
+            )
+            .unwrap();
+        assert_eq!(ends, [91; 8]);
         session.cleanup().unwrap();
         assert!(session.transfers.borrow().uploads.is_empty());
         assert!(session.transfers.borrow().readback.is_null());

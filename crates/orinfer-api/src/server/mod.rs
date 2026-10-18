@@ -68,6 +68,8 @@ struct Job {
     created: u64,
     queued: Instant,
     hint: Option<orinfer_engine::scheduler::RequestHint>,
+    /// Offline lookahead: Some retains only known shared prompt branches.
+    shared_prefix: Option<usize>,
 }
 enum ModelEvent {
     Chunk(Value),
@@ -360,6 +362,7 @@ async fn completions(
         created,
         queued: Instant::now(),
         hint: None,
+        shared_prefix: None,
     };
     if let Err(e) = state.jobs.try_send(job) {
         return match e {

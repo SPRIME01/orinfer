@@ -1,16 +1,21 @@
 //! Local JSONL inference uses the same protocol and continuous GPU worker as HTTP.
 mod files;
+mod planning;
 #[cfg(test)]
 mod tests;
 
 use super::*;
-use crate::BatchConfig;
+use crate::{BatchConfig, BatchOrder};
 use files::{Input, Journal, Outcome, Record};
 use futures_util::stream::FuturesUnordered;
 
 #[derive(Default, Debug, serde::Serialize)]
 pub struct BatchReport {
     pub scheduler_policy: orinfer_engine::scheduler::Policy,
+    pub batch_order: BatchOrder,
+    pub planned_requests: usize,
+    pub planning_prefix_tokens: usize,
+    pub planning_s: f64,
     pub total: usize,
     pub succeeded: usize,
     pub truncated: usize,
@@ -45,6 +50,7 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
     let mut journal = Journal::open(&config.output, config.resume, &identity, &input)?;
     let mut report = BatchReport {
         scheduler_policy: config.scheduler.policy,
+        batch_order: config.order,
         total: input.ids.len(),
         skipped: journal
             .states
@@ -61,13 +67,25 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
             .map_err(|e| e.to_string())?;
         let result = runtime.block_on(async {
             let worker = startup::start(&settings).await?;
-            let result = execute(
-                &mut input,
-                &mut journal,
-                worker.state.clone(),
-                &defaults,
-                &mut report,
-            )
+            let result = async {
+                if config.order == BatchOrder::Auto
+                    && config.scheduler.policy == orinfer_engine::scheduler::Policy::Throughput
+                {
+                    tokio::select! {
+                        result = planning::prepare(&mut input, &worker.state, &defaults,
+                            config.load.prefix_cache_bytes > 0, &mut report) => result?,
+                        _ = shutdown_signal() => { report.interrupted = true; return Ok(()); }
+                    }
+                }
+                execute(
+                    &mut input,
+                    &mut journal,
+                    worker.state.clone(),
+                    &defaults,
+                    &mut report,
+                )
+                .await
+            }
             .await;
             let stopped = worker.stop(settings.limits.drain_ms).await;
             result.and(stopped)
@@ -150,17 +168,26 @@ async fn submit(
         let context = state.context;
         let cancellation = preparation::Cancellation::default();
         let flag = cancellation.flag();
+        let prefix_hint = record.prefix_hint;
         let prepared = tokio::task::spawn_blocking(move || {
             let (_cpu, memory) = (cpu, reserved);
             let mut context_budget =
                 preparation::Context::new(flag, memory_mib as usize * 1024 * 1024);
-            let prepared = codec.prepare(
+            let mut prepared = codec.prepare(
                 request,
                 &model,
                 context,
                 vision.as_ref(),
                 &mut context_budget,
             )?;
+            if let Some(prefix_hint) = prefix_hint
+                && prefix_hint >= 32
+                && prefix_hint < prepared.input.len()
+            {
+                prepared.prefix_hints.push(prefix_hint);
+                prepared.prefix_hints.sort_unstable();
+                prepared.prefix_hints.dedup();
+            }
             context_budget.checkpoint(0)?;
             Ok::<_, String>((prepared, slot, memory))
         })
@@ -187,6 +214,7 @@ async fn submit(
                 created,
                 queued: Instant::now(),
                 hint: None,
+                shared_prefix: record.prefix_hint,
             })
             .await
             .map_err(|_| "GPU worker disconnected")?;
@@ -221,50 +249,56 @@ async fn execute(
 ) -> Result<()> {
     let mut pending = FuturesUnordered::new();
     let window = state.scheduler.max_active + 128;
+    let writer = files::Writer::start(journal, window)?;
     let byte_budget = state.limits.memory_mib * (1 << 20) / 4;
     let mut bytes = 0;
     let mut eof = false;
     let signal = shutdown_signal();
     tokio::pin!(signal);
-    loop {
-        while !eof && pending.len() < window && bytes < byte_budget {
-            match input.next()? {
-                Some(record) if !journal.done(&record.id) => {
-                    bytes += record.bytes;
-                    pending.push(submit(state.clone(), record, defaults));
+    let result = async {
+        loop {
+            while !eof && pending.len() < window && bytes < byte_budget {
+                match input.next()? {
+                    Some(record) if !journal.done(&record.id) => {
+                        bytes += record.bytes;
+                        pending.push(submit(state.clone(), record, defaults));
+                    }
+                    Some(_) => {}
+                    None => eof = true,
                 }
-                Some(_) => {}
-                None => eof = true,
             }
-        }
-        if pending.is_empty() {
-            break;
-        }
-        let completed = tokio::select! {
-            _ = &mut signal => { report.interrupted = true; break; },
-            completed = pending.next() => completed.unwrap(),
-        };
-        bytes -= completed.bytes;
-        journal.append(&completed.value)?;
-        report.processed += 1;
-        report.completion_tokens +=
-            completed.value["response"]["body"]["usage"]["completion_tokens"]
+            if pending.is_empty() {
+                break;
+            }
+            let completed = tokio::select! {
+                _ = &mut signal => { report.interrupted = true; break; },
+                completed = pending.next() => completed.unwrap(),
+            };
+            bytes -= completed.bytes;
+            let tokens = completed.value["response"]["body"]["usage"]["completion_tokens"]
                 .as_u64()
                 .unwrap_or(0) as usize;
-        if report.processed.is_multiple_of(100) {
-            eprintln!(
-                "BATCH {}/{} records written",
-                report.skipped + report.processed,
-                report.total
-            );
+            writer.append(journal, completed).await?;
+            report.processed += 1;
+            report.completion_tokens += tokens;
+            if report.processed.is_multiple_of(100) {
+                eprintln!(
+                    "BATCH {}/{} records completed",
+                    report.skipped + report.processed,
+                    report.total
+                );
+            }
+            if state.activity.lifecycle.name() == "failed" {
+                return Err(format!(
+                    "GPU worker failed: {:?}",
+                    state.activity.lifecycle.failure()
+                ));
+            }
         }
-        if state.activity.lifecycle.name() == "failed" {
-            return Err(format!(
-                "GPU worker failed: {:?}",
-                state.activity.lifecycle.failure()
-            ));
-        }
+        Ok(())
     }
+    .await;
+    drop(pending);
     // Dropping pending futures closes receivers and cancels in-flight CPU work;
     // the worker owns/reclaims every GPU arena before its caller joins it.
     report.peak_active = state
@@ -273,5 +307,5 @@ async fn execute(
         .lock()
         .map(|s| s.peak_active)
         .unwrap_or(0);
-    Ok(())
+    writer.finish().await.and(result)
 }

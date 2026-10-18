@@ -17,6 +17,7 @@
 - GDN持续状态为FP32；KV、卷积、GDN和位置状态均属于请求私有状态。
 - Index-Translate-2B复用27B的动态GDN/GQA、FFN、视觉、MTP和请求状态组件，按配置传递头数与维度，不复制模型执行流程。主干、embedding/共享输出头和视觉大矩阵使用两级E8P Q4A8，敏感输出/MTP投影保留W8；tied embedding与输出头共享同一份K128压缩bank，embedding按需解码并逆旋转选中行，输出头使用旋转A8输入，不重复存储或常驻展开大权重。
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
+- KV增长契约可以同时引用请求私有KV和按上下文增长的共享workspace；私有映射按owner查找，共享映射从会话查找，不能假定增长列表全部属于请求arena。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
 - Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家bank与路由计数，按需从SSD加载到CUDA VMM页，并共享全局SLRU。有限模式暂关闭CUDA Graph，MTP专家全量常驻；临时路由集合和页粒度不计作严格字节上限，不缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
 - 27B后续实验与部署使用已重新编码的两级E8P Q4A8权重（coefficients=[4,1]、beam8搜索），本机当前模型目录为`artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为`artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。旧量化和TCQ实验仅保留结果记录，不作为权重回退。更换权重值而配置和buffer契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
@@ -29,6 +30,8 @@
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
 - JSONL离线入口与HTTP复用Chat前端、模型加载和连续worker，不复制推理或状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
 - `serve`默认latency、`batch`默认throughput调度。吞吐策略复用动态packet和原生prefill，不沿用在线准入时间门限、两个长prefill限制或decode时间配额；物理内存、状态隔离和输出预算保持共同约束，联合路径按实测成本选择。排序使用一次性冻结的时间，不能在比较函数内反复读取elapsed导致顺序变化。
+- JSONL全局规划复用Chat前端提取实际token前缀，索引与工作区受预处理预算的四分之一约束，每条最多保留4096个前缀token，预算不足或不适合规划的内容保留流式处理。重排保持物理行号、custom_id、输入身份和续跑语义；缓存提示只影响快照选择，不能截断输入或输出。长度估计只观察自然完成的请求，不能把输出预算当成真实长度。异步结果队列保留内存计费，返回成功或中断结果前须排空并确认写入/同步；错误必须传播。
+- 主机输入通过有界、只追加的pinned slab按stream顺序上传，大输入同样分块，禁止因超过单slab容量而退回全context同步。调用者的内存可在上传方法返回后释放；slab复用和退出清理必须等待对应DMA完成，读回结果仍须确认GPU完成。
 - 离线构建将HF tokenizer_config的added_tokens_decoder合并到部署tokenizer.json，逐项验证ID不变。验收按Transformers实际生成的token ID比较，不只比较渲染字符串；缺失的thinking/工具标记不能当作普通文本切分。
 - 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进Rust模型库；禁止在生成模块逐层复制整份特化绑定，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model保留构建契约以支持离线重建；在线只导出最终程序、局部特化和专家常驻契约引用的绑定，不将融合前的构建输入注册为可执行launch。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
@@ -46,6 +49,7 @@
 - 先用rg检查调用者和依赖；保持修改小而完整。不要默认启动subagent。
 - CPU Python依赖用uv管理项目`.venv`，通过`make python-env`同步固定版本，不直接更新主机Python环境。`make check`执行Rust格式/编译/clippy/测试及CPU评测检查；GPU验证用`bash tools/operators/run.sh`的固定编译镜像。
 - GPU工作通过`artifacts/gpu-experiment.lock`串行，保留其他服务；不自行改全局频率、功耗或清缓存。
+- GPU单测使用本轮构建输出的测试可执行文件，核对测试确实执行；不硬编码或复用历史`target/deps`可执行文件路径。
 - 当前原生Flash Next的整数算子重建使用`tools/model/flash_next/build.py`：从权重几何和host ABI读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经Rust计划检查后原子发布。它需要模型固定的执行契约，不是任意裸权重导入；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。不得将历史升级脚本串联目录作为正式重建接口。
 - 可变的HC无损指数、QSA radix shift使用ABI标量复用cubin；私有状态包装器必须保留标量、列stride及字节偏移。QSA条带数离线测量；动态整数投影调优覆盖多个实际行数及容量上限，不只测一个短长度。相邻选择区间仅在完整参数/launch契约一致时合并，不跨越空洞或隐式改变专家路由tile。
 - 新kernel验证数值、非对齐尾部和实际graph replay；状态改动另测分块、恢复和请求隔离。

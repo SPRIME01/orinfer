@@ -5,6 +5,33 @@ use orinfer_engine::{
 };
 use std::path::PathBuf;
 
+/// File traversal only; GPU work still uses the shared continuous scheduler.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchOrder {
+    #[default]
+    Auto,
+    Input,
+}
+impl std::str::FromStr for BatchOrder {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "input" => Ok(Self::Input),
+            _ => Err("Batch order must be auto or input".into()),
+        }
+    }
+}
+impl std::fmt::Display for BatchOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Input => "input",
+        })
+    }
+}
+
 /// File-based Chat inference. Execution and protocol semantics match `serve`.
 #[derive(Clone, Debug)]
 pub struct BatchConfig {
@@ -13,6 +40,7 @@ pub struct BatchConfig {
     pub input: PathBuf,
     pub output: PathBuf,
     pub resume: bool,
+    pub order: BatchOrder,
     pub load: orinfer_engine::execution::LoadOptions,
     pub scheduler: scheduler::Options,
     pub limits: PreprocessingLimits,

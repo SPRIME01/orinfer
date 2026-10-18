@@ -880,7 +880,16 @@ impl Executor {
             };
             let mut ready = true;
             for name in &growth.buffers {
-                let b = reservations.get(name).ok_or("Missing demand KV buffer")?;
+                // Growth can include shared, context-sized workspace as well
+                // as private KV. Switching owners only swaps private mappings.
+                let owner = if self.sequence_strides.contains_key(name) {
+                    reservations
+                } else {
+                    &*current
+                };
+                let b = owner
+                    .get(name)
+                    .ok_or_else(|| format!("Missing demand KV buffer {name} for {program}"))?;
                 let start = position.checked_mul(b.stride).ok_or("KV write overflow")?;
                 let bytes = tokens.checked_mul(b.stride).ok_or("KV write overflow")?;
                 ready &= b.extent(end)? <= b.mapped && b.writable_bytes(start, bytes)? == 0;
@@ -912,9 +921,7 @@ impl Executor {
             if bytes.len() > arena.sizes[name] {
                 return Err("Sequence input exceeds allocation".into());
             }
-            if !self.sequence_strides.contains_key(name)
-                && bytes.len() <= super::transfers::UPLOAD_BYTES
-            {
+            if !self.sequence_strides.contains_key(name) {
                 return self.session.transfers.borrow_mut().upload(
                     self.session.stream,
                     address,

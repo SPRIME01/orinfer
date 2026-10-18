@@ -151,6 +151,9 @@ struct BatchArgs {
     /// Skip committed responses and retry failed rows in the same job.
     #[arg(long)]
     resume: bool,
+    /// auto plans file-wide prefix/length order; input preserves file traversal.
+    #[arg(long, default_value_t = orinfer_api::BatchOrder::Auto)]
+    batch_order: orinfer_api::BatchOrder,
 }
 impl From<InferenceArgs> for ServerConfig {
     fn from(args: InferenceArgs) -> Self {
@@ -205,6 +208,7 @@ impl From<BatchArgs> for BatchConfig {
             input: args.input,
             output: args.output,
             resume: args.resume,
+            order: args.batch_order,
             model_dir: config.model_dir,
             model: config.model,
             gpu_lock: config.gpu_lock,

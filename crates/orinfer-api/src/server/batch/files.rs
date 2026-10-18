@@ -29,6 +29,7 @@ pub(super) struct Record {
     pub line: usize,
     pub bytes: usize,
     pub body: Result<Value>,
+    pub prefix_hint: Option<usize>,
 }
 fn record(bytes: &[u8], line: usize) -> Record {
     let mut id = format!("line-{line}");
@@ -67,12 +68,17 @@ fn record(bytes: &[u8], line: usize) -> Record {
         line,
         bytes: bytes.len(),
         body,
+        prefix_hint: None,
     }
 }
 
 pub(super) struct Input {
     reader: BufReader<File>,
-    line: usize,
+    locations: Vec<(u64, usize)>,
+    order: Vec<usize>,
+    prefix_hints: Vec<Option<usize>>,
+    cursor: usize,
+    read_at: u64,
     pub ids: BTreeMap<String, usize>,
     pub sha256: String,
     metadata: std::fs::Metadata,
@@ -88,6 +94,8 @@ impl Input {
         let mut digest = Sha256::new();
         let mut ids = BTreeMap::new();
         let mut n = 0;
+        let mut offset = 0;
+        let mut locations = vec![];
         loop {
             let bytes = line(&mut reader, INPUT_LIMIT)?;
             if bytes.is_empty() {
@@ -95,10 +103,13 @@ impl Input {
             }
             digest.update(&bytes);
             n += 1;
+            let start = offset;
+            offset += bytes.len() as u64;
             if bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             let r = record(&bytes, n);
+            locations.push((start, n));
             if let Some(previous) = ids.insert(r.id.clone(), n) {
                 return Err(format!(
                     "Duplicate custom_id {:?} at lines {previous} and {n}",
@@ -109,7 +120,11 @@ impl Input {
         reader.rewind().map_err(|e| e.to_string())?;
         Ok(Self {
             reader,
-            line: 0,
+            locations,
+            order: vec![],
+            prefix_hints: vec![],
+            cursor: 0,
+            read_at: 0,
             ids,
             sha256: hex::encode(digest.finalize()),
             metadata,
@@ -126,16 +141,45 @@ impl Input {
         {
             return Err("Input changed during batch execution".into());
         }
-        loop {
-            let bytes = line(&mut self.reader, INPUT_LIMIT)?;
-            if bytes.is_empty() {
-                return Ok(None);
-            }
-            self.line += 1;
-            if !bytes.iter().all(u8::is_ascii_whitespace) {
-                return Ok(Some(record(&bytes, self.line)));
+        if self.cursor == self.locations.len() {
+            return Ok(None);
+        }
+        let index = self.order.get(self.cursor).copied().unwrap_or(self.cursor);
+        let (offset, physical_line) = self.locations[index];
+        if offset != self.read_at {
+            self.reader
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| e.to_string())?;
+        }
+        let bytes = line(&mut self.reader, INPUT_LIMIT)?;
+        if bytes.is_empty() {
+            return Err("Input ended before indexed record".into());
+        }
+        self.read_at = offset + bytes.len() as u64;
+        self.cursor += 1;
+        let mut record = record(&bytes, physical_line);
+        record.prefix_hint = self.prefix_hints.get(index).copied().flatten();
+        Ok(Some(record))
+    }
+    pub fn reorder(&mut self, order: Vec<usize>, prefix_hints: Vec<Option<usize>>) -> Result<()> {
+        if !prefix_hints.is_empty() && prefix_hints.len() != self.locations.len() {
+            return Err("Prefix hints must match the input index".into());
+        }
+        if !order.is_empty() {
+            let mut seen = vec![false; self.locations.len()];
+            if order.len() != seen.len()
+                || order.iter().any(|&i| {
+                    seen.get_mut(i)
+                        .is_none_or(|value| std::mem::replace(value, true))
+                })
+            {
+                return Err("Batch order must contain every input record exactly once".into());
             }
         }
+        self.order = order;
+        self.prefix_hints = prefix_hints;
+        self.cursor = 0;
+        Ok(())
     }
 }
 
@@ -165,7 +209,6 @@ fn outcome(value: &Value) -> Result<Outcome> {
 pub(super) struct Journal {
     file: File,
     pub states: BTreeMap<String, Outcome>,
-    synced: Instant,
 }
 impl Journal {
     pub fn open(path: &Path, resume: bool, identity: &Value, input: &Input) -> Result<Self> {
@@ -237,42 +280,117 @@ impl Journal {
         }
         file.seek(std::io::SeekFrom::End(0))
             .map_err(|e| e.to_string())?;
-        Ok(Self {
-            file,
-            states,
-            synced: Instant::now(),
-        })
+        Ok(Self { file, states })
     }
     pub fn done(&self, id: &str) -> bool {
         self.states.get(id).is_some_and(|s| *s != Outcome::Failed)
     }
-    pub fn append(&mut self, value: &Value) -> Result<()> {
+    fn entry(value: &Value) -> Result<(String, Outcome, Vec<u8>)> {
         let id = value["custom_id"].as_str().ok_or("Result ID missing")?;
         let status = outcome(value)?;
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         if bytes.len() as u64 >= RESULT_LIMIT {
             return Err("Result exceeds JSONL line limit".into());
         }
-        self.file
-            .write_all(&bytes)
-            .and_then(|_| self.file.write_all(b"\n"))
-            .map_err(|e| e.to_string())?;
-        self.states.insert(id.to_owned(), status);
-        if self.synced.elapsed().as_secs() >= 1 {
-            self.sync()?;
-        }
+        let mut bytes = bytes;
+        bytes.push(b'\n');
+        Ok((id.to_owned(), status, bytes))
+    }
+    #[cfg(test)]
+    pub fn append(&mut self, value: &Value) -> Result<()> {
+        let (id, status, bytes) = Self::entry(value)?;
+        self.file.write_all(&bytes).map_err(|e| e.to_string())?;
+        self.states.insert(id, status);
         Ok(())
     }
     pub fn sync(&mut self) -> Result<()> {
         self.file.sync_data().map_err(|e| e.to_string())?;
-        self.synced = Instant::now();
         Ok(())
+    }
+}
+
+struct WriteEntry {
+    bytes: Vec<u8>,
+    _memory: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+/// One ordered writer overlaps serialization/durable I/O with further requests.
+/// Its bounded queue retains each response's memory charge until the write.
+pub(super) struct Writer {
+    sender: mpsc::Sender<WriteEntry>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
+impl Writer {
+    pub fn start(journal: &Journal, capacity: usize) -> Result<Self> {
+        let mut file = journal.file.try_clone().map_err(|e| e.to_string())?;
+        let (sender, mut receiver) = mpsc::channel::<WriteEntry>(capacity);
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut synced = Instant::now();
+            while let Some(entry) = receiver.blocking_recv() {
+                file.write_all(&entry.bytes).map_err(|e| e.to_string())?;
+                if synced.elapsed().as_secs() >= 1 {
+                    file.sync_data().map_err(|e| e.to_string())?;
+                    synced = Instant::now();
+                }
+            }
+            file.sync_data().map_err(|e| e.to_string())
+        });
+        Ok(Self { sender, handle })
+    }
+    pub async fn append(&self, journal: &mut Journal, completed: Completed) -> Result<()> {
+        let (id, status, bytes) = Journal::entry(&completed.value)?;
+        self.sender
+            .send(WriteEntry {
+                bytes,
+                _memory: completed._memory,
+            })
+            .await
+            .map_err(|_| "Batch writer disconnected".to_owned())?;
+        // Exposed as completed only if finish() later confirms all writes/sync.
+        journal.states.insert(id, status);
+        Ok(())
+    }
+    pub async fn finish(self) -> Result<()> {
+        drop(self.sender);
+        self.handle
+            .await
+            .map_err(|e| format!("Batch writer failed: {e}"))?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn writer_error_after_queue_acceptance_is_not_success() {
+        let path = std::env::temp_dir().join(format!(
+            "orinfer-readonly-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"").unwrap();
+        let mut journal = Journal {
+            file: File::open(&path).unwrap(),
+            states: Default::default(),
+        };
+        let writer = Writer::start(&journal, 1).unwrap();
+        let _ = writer
+            .append(
+                &mut journal,
+                Completed {
+                    value: json!({"custom_id":"one","error":null,"response":{"status_code":200,
+                "body":{"choices":[{"finish_reason":"stop"}]}}}),
+                    bytes: 0,
+                    _memory: None,
+                },
+            )
+            .await;
+        assert!(writer.finish().await.is_err());
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn line_limit_is_checked_before_growing_to_the_rest_of_the_input() {
         let mut input = std::io::Cursor::new(b"123456789\nrest\n");
