@@ -8,7 +8,6 @@ use serde_json::Value;
 #[derive(Debug, Deserialize)]
 pub(crate) struct TextConfig {
     pub hidden_size: usize,
-    #[serde(default)]
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
     pub vocab_size: usize,
@@ -18,6 +17,42 @@ pub(crate) struct TextConfig {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default = "query_heads")]
+    pub num_attention_heads: usize,
+    #[serde(default = "kv_heads")]
+    pub num_key_value_heads: usize,
+    #[serde(default = "head_dim")]
+    pub head_dim: usize,
+}
+
+fn query_heads() -> usize {
+    24
+}
+fn kv_heads() -> usize {
+    4
+}
+fn head_dim() -> usize {
+    256
+}
+
+impl TextConfig {
+    pub fn qkv(&self) -> usize {
+        (2 * self.linear_num_key_heads + self.linear_num_value_heads) * self.linear_key_head_dim
+    }
+    pub fn mixer(&self) -> usize {
+        self.linear_num_value_heads * self.linear_value_head_dim
+    }
+    pub fn full_q(&self) -> usize {
+        self.num_attention_heads * self.head_dim
+    }
+    pub fn kv(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+    pub fn full_x(&self) -> usize {
+        2 * (self.full_q() + self.kv())
+    }
 }
 
 fn parse_text(text_value: &Value) -> Result<TextConfig> {
@@ -95,7 +130,7 @@ impl Configuration {
 mod tests {
     use super::*;
     fn config() -> Value {
-        serde_json::json!({"model_type":"qwen3_5_text","hidden_size":8,"vocab_size":16,
+        serde_json::json!({"model_type":"qwen3_5_text","hidden_size":8,"intermediate_size":16,"vocab_size":16,
             "num_hidden_layers":2,"layer_types":["linear_attention","full_attention"],
             "linear_num_key_heads":1,"linear_num_value_heads":2,
             "linear_key_head_dim":2,"linear_value_head_dim":3,"linear_conv_kernel_dim":4})

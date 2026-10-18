@@ -27,8 +27,15 @@ def gated_norm_epilogue(x, z, weight, rstd):
 
 @tilelang.jit(out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"})
 def _compile_gated_norm(
-    M: int | None = None, x_dtype: str = "float16", heads_per_block: int = 4, threads: int = 128
+    M: int | None = None,
+    x_dtype: str = "float16",
+    heads_per_block: int = 4,
+    threads: int = 128,
+    heads: int = 48,
 ):
+    HEADS = heads
+    if type(HEADS) is not int or HEADS <= 0:
+        raise ValueError("Invalid GDN value heads")
     assert x_dtype in ("float16", "float32")
     assert heads_per_block in (1, 2, 4, 8)
     assert threads in (32, 64, 128, 256)

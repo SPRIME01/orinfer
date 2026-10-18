@@ -38,17 +38,21 @@ class Weights:
         """Publish one physical W4 copy; all other tensor bytes pass through."""
         metadata = dict(header.get("__metadata__", {}))
         packed = [name for name in header if name.endswith(".packed")]
-        if not packed or not self.packed_k:
+        missing_layout = any(
+            name != "__metadata__" and f"orin.layout.{name}" not in metadata for name in header
+        )
+        if (not packed or not self.packed_k) and not missing_layout:
             return path, begin, header
         tensors = []
         with tempfile.TemporaryDirectory(prefix=".repack-", dir=self.directory) as tmp:
             for name, info in header.items():
                 if name == "__metadata__":
                     continue
+                metadata.setdefault(f"orin.layout.{name}", "native_contiguous")
                 first, last = info["data_offsets"]
                 shape = info["shape"]
                 segments = [(path, begin + first, last - first)]
-                if name in packed:
+                if name in packed and self.packed_k:
                     if (
                         info["dtype"] != "U32"
                         or len(shape) != 2

@@ -21,6 +21,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     {
         return Err("Unsupported Qwen compact MTP contract".into());
     }
+    let hidden = m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden;
     let warm = kernels(
         "qwen_rows/mtp",
         &[
@@ -64,7 +65,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     head.push(Operation::Copy {
         source: "MtpLastHidden".into(),
         destination: "MtpCondition".into(),
-        bytes: 5120 * 2,
+        bytes: hidden * 2,
     });
     let mut draft = vec![Operation::Copy {
         source: "MtpToken".into(),
@@ -262,20 +263,34 @@ pub(super) fn draft(
         return Ok((out, vec![]));
     }
     let empty = BTreeMap::new();
-    let strides = [
-        ("MtpEmbedding", 5120 * 2),
-        ("MtpConcat", 10240 * 2),
-        ("MtpHidden", 5120 * 2),
-        ("MtpNorm", 5120 * 2),
-        ("MtpR0", 5120 * 4),
-        ("MtpR1", 5120 * 4),
-        ("MtpFullX", 14336 * 2),
-        ("MtpFullQ", 6144 * 2),
-        ("MtpFullGate", 6144 * 2),
-        ("MtpMixer", 6144 * 2),
-        ("MtpMix", 5120 * 2),
-        ("MtpGateUp", 34816 * 2),
-    ];
+    let hidden = m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden;
+    let strides: Vec<(&str, usize)> = [
+        "MtpEmbedding",
+        "MtpConcat",
+        "MtpHidden",
+        "MtpNorm",
+        "MtpR0",
+        "MtpR1",
+        "MtpFullX",
+        "MtpFullQ",
+        "MtpFullGate",
+        "MtpMixer",
+        "MtpMix",
+        "MtpGateUp",
+    ]
+    .iter()
+    .map(|&name| {
+        let b = m
+            .buffers
+            .iter()
+            .find(|b| b.name == name)
+            .ok_or("Missing draft row buffer")?;
+        Ok((
+            name,
+            b.shape[1..].iter().product::<usize>() * b.dtype.bytes(),
+        ))
+    })
+    .collect::<Result<_>>()?;
     let mut offset = 0;
     let views: Vec<BTreeMap<String, BufferView>> = segments
         .iter()
@@ -346,7 +361,7 @@ pub(super) fn draft(
             "HeadHidden".into(),
             BufferView {
                 buffer: "HeadHidden".into(),
-                offset: lane * 5120 * 2,
+                offset: lane * hidden * 2,
             },
         )]);
         if body {
@@ -356,7 +371,7 @@ pub(super) fn draft(
                 &mut out,
                 "MtpLastHidden",
                 "MtpCondition",
-                5120 * 2,
+                hidden * 2,
                 s.slot,
                 &empty,
             );
@@ -366,7 +381,7 @@ pub(super) fn draft(
                 &mut out,
                 "MtpCondition",
                 "HeadHidden",
-                5120 * 2,
+                hidden * 2,
                 s.slot,
                 &hv,
             );

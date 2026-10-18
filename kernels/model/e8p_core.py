@@ -4,7 +4,10 @@ import tilelang.language as T
 from kernels.model.integer_core import rescale
 
 SOURCE = r"""
-__device__ __forceinline__ unsigned nib_fast(unsigned c,unsigned b){unsigned pp=__popc(c&255u)&1u,ss=c^pp;unsigned sel=(ss&0x33u)|((ss&0xccu)<<6);unsigned f=0xeee00e00u^(pp*0x11111111u);return b^__byte_perm(f,0u,sel);}
+// Parity toggles every nibble's low bit and the first coordinate's sign.
+// Fold both into one final XOR; PRMT then uses a constant source and does
+// not depend on the population count. Selector nibbles contain only 0..3.
+__device__ __forceinline__ unsigned nib_fast(unsigned c,unsigned b){unsigned pp=__popc(c&255u)&1u;unsigned sel=(c&0x33u)|((c&0xccu)<<6),r;asm("prmt.b32 %0, %1, 0, %2;":"=r"(r):"r"(0xeee00e00u),"r"(sel));return b^r^(pp*0x1111111fu);}
 
 __device__ __forceinline__ unsigned nib_pair(const unsigned short* p){return *reinterpret_cast<const unsigned*>(p);}
 __device__ __forceinline__ void nib_store2(signed char* p,unsigned a,unsigned b){*reinterpret_cast<uint2*>(p)=make_uint2(a,b);}

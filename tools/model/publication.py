@@ -223,7 +223,7 @@ def seed_compile_cache(source_cache, cache):
     if not cache.exists():
         cache.symlink_to(source_cache, target_is_directory=True)
     elif cache.resolve() != source_cache:
-        for entry in source_cache.glob("*/kernels/*"):
+        for entry in source_cache.glob("*/**/kernels/*"):
             if not entry.is_dir():
                 continue
             destination = cache / entry.relative_to(source_cache)

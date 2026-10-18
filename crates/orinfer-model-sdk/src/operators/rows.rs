@@ -114,7 +114,7 @@ impl RowExecution {
                 }
                 previous = variant.max_rows;
                 for replacement in &variant.kernels {
-                    let bound = slots[name];
+                    let bound = variant.max_rows;
                     slots
                         .entry(replacement)
                         .and_modify(|v| *v = (*v).max(bound))
@@ -268,6 +268,29 @@ mod tests {
             BTreeMap::from([("prefill".into(), program)]),
             dynamic,
         )
+    }
+
+    #[test]
+    fn bounded_dynamic_variants_use_the_selected_interval_capacity() {
+        let (rows, programs, mut dynamic) = fixture();
+        dynamic.get_mut("fused").unwrap().capacity = 128;
+        let kernels = BTreeSet::from([
+            "projection".into(),
+            "fused".into(),
+            "mix".into(),
+            "state".into(),
+        ]);
+        rows.validate(&programs, &kernels, &dynamic).unwrap();
+        let short = rows
+            .specialize("prefill", &programs["prefill"], &dynamic, 127)
+            .unwrap();
+        assert!(matches!(&short[0].operation, Operation::Kernel {name} if name == "fused"));
+        let long = rows
+            .specialize("prefill", &programs["prefill"], &dynamic, 129)
+            .unwrap();
+        assert!(matches!(&long[0].operation, Operation::Kernel {name} if name == "projection"));
+        dynamic.get_mut("fused").unwrap().capacity = 127;
+        assert!(rows.validate(&programs, &kernels, &dynamic).is_err());
     }
 
     #[test]

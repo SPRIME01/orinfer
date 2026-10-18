@@ -202,7 +202,7 @@ def main():
         else:
             model = modeling.Qwen3_5TextModel(config).to(dtype=torch.bfloat16).eval()
             text_model = model
-    text_model.rotary_emb = modeling.Qwen3_5TextRotaryEmbedding(config, device="cuda")
+    text_model.rotary_emb = modeling.Qwen3_5TextRotaryEmbedding(config).to("cuda")
     index_raw = (a.checkpoint / "model.safetensors.index.json").read_bytes()
     index = json.loads(index_raw)["weight_map"]
     sources = (
@@ -257,7 +257,7 @@ def main():
     head = torch.nn.Linear(
         config.hidden_size, config.vocab_size, bias=False, device="meta", dtype=torch.bfloat16
     )
-    attach(head, "lm_head.")
+    attach(head, "model.language_model.embed_tokens." if config.tie_word_embeddings else "lm_head.")
     started = time.monotonic()
     report = dict(
         seed=requests["seed"],

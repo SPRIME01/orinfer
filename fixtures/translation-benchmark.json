@@ -1,0 +1,20 @@
+{
+  "cases": [
+    {
+      "id": "complete_translation",
+      "request": {
+        "model": "index-translate-2b",
+        "messages": [
+          {
+            "role": "user",
+            "content": "请将以下英文逐段完整翻译为简体中文。保留所有信息、标识符和时间，不要概括。只输出译文。\n\nThe project consists of three components: a model loader written in Rust, an offline operator compiler, and an HTTP service. The loader reads a single compressed weight bank and checks the tensor shapes before allocating GPU memory. If a file is missing or corrupted, it must return an error instead of starting with incomplete data.\n\nEach request owns its key/value cache, recurrent state, convolution history, and token position. These states must never be shared between unrelated requests. A completed prompt may be reused only when its cache key and model configuration match exactly.\n\nAt 09:30 on Monday, Mina will test two simultaneous translation requests. At 14:45 on Tuesday, Daniel will repeat the test with eight requests and an 8,192-token input. The deployment should remain offline until both tests finish. Please preserve the identifiers ORIN-64 and CODE-641 exactly."
+          }
+        ],
+        "temperature": 0.0,
+        "seed": 20261002,
+        "max_tokens": 512,
+        "enable_thinking": false
+      }
+    }
+  ]
+}

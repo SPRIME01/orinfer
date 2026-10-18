@@ -179,6 +179,55 @@ impl Executor {
         }
         self.upload_bytes(name, &bytes)
     }
+    /// Read controls from leased arenas without rebinding the active sequence.
+    /// All producers and copies share the worker stream; a cohort needs only
+    /// one completion wait, bounded by the existing pinned readback allocation.
+    pub(crate) fn read_sequence_controls<const N: usize>(
+        &self,
+        slots: &[usize],
+        names: [&str; N],
+    ) -> Result<Vec<[i32; N]>> {
+        let bytes = N.checked_mul(4).ok_or("Control size overflow")?;
+        if bytes == 0 || bytes > super::transfers::READBACK_BYTES {
+            return Err("Invalid sequence control extent".into());
+        }
+        let mut regions = Vec::with_capacity(slots.len() * N);
+        for &slot in slots {
+            let arena = self
+                .sequences
+                .get(slot)
+                .filter(|s| s.leased && !s.quarantined)
+                .ok_or("Controls require a live leased arena")?;
+            for name in names {
+                if arena.sizes.get(name).is_none_or(|&size| size < 4) {
+                    return Err("Sequence control exceeds allocation".into());
+                }
+                regions.push((
+                    *arena
+                        .addresses
+                        .get(name)
+                        .ok_or("Missing sequence control")?,
+                    4,
+                ));
+            }
+        }
+        let mut values = vec![[0i32; N]; slots.len()];
+        let capacity = super::transfers::READBACK_BYTES / bytes;
+        for (i, chunk) in values.chunks_mut(capacity).enumerate() {
+            let start = i * capacity * N;
+            // SAFETY: Each initialized array contains exactly N i32 controls.
+            // The retained arenas remain leased until readback has completed.
+            let raw = unsafe {
+                std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast(), chunk.len() * bytes)
+            };
+            self.session.transfers.borrow_mut().readback(
+                self.session.stream,
+                &regions[start..start + chunk.len() * N],
+                raw,
+            )?;
+        }
+        Ok(values)
+    }
     #[cfg(test)]
     pub(crate) fn private_buffer_sizes(&self) -> BTreeMap<String, usize> {
         let reservations = self.session.virtual_buffers.borrow();
@@ -797,6 +846,84 @@ impl Executor {
     pub(crate) fn ensure_sequence_program(&mut self, slot: usize, program: &str) -> Result<()> {
         self.activate_sequence(slot)?;
         self.ensure_kv(program)
+    }
+    pub(crate) fn ensure_sequence_program_at(
+        &mut self,
+        slot: usize,
+        program: &str,
+        position: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        // Mapped, private KV pages can be checked without rebinding the arena.
+        // Only growth or COW needs the slower reservation-switching path.
+        if let Some(growth) = self.growth.get(program) {
+            if tokens == 0
+                || tokens > growth.tokens
+                || (growth.length.is_none() && tokens != growth.tokens)
+            {
+                return Err("Invalid logical KV write length".into());
+            }
+            let end = position.checked_add(tokens).ok_or("KV position overflow")?;
+            let current = self.session.virtual_buffers.borrow();
+            if current.is_empty() {
+                return Ok(());
+            }
+            let arena = self
+                .sequences
+                .get(slot)
+                .filter(|s| s.leased && !s.quarantined)
+                .ok_or("KV preparation requires a live arena")?;
+            let reservations = if slot == self.active_sequence {
+                &*current
+            } else {
+                &arena.reservations
+            };
+            let mut ready = true;
+            for name in &growth.buffers {
+                let b = reservations.get(name).ok_or("Missing demand KV buffer")?;
+                let start = position.checked_mul(b.stride).ok_or("KV write overflow")?;
+                let bytes = tokens.checked_mul(b.stride).ok_or("KV write overflow")?;
+                ready &= b.extent(end)? <= b.mapped && b.writable_bytes(start, bytes)? == 0;
+            }
+            if ready {
+                return Ok(());
+            }
+        }
+        self.activate_sequence(slot)?;
+        self.ensure_kv_extent(program, position, tokens)
+    }
+    pub(crate) fn prepare_batch_workspace(&mut self) -> Result<()> {
+        self.save_live_workspace()
+    }
+    /// Upload to stable private storage without changing the current bindings.
+    /// Virtual storage keeps the regular COW/mapping and staging safeguards.
+    pub(crate) fn upload_sequence_bytes(
+        &mut self,
+        slot: usize,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let arena = self
+            .sequences
+            .get(slot)
+            .filter(|s| s.leased && !s.quarantined)
+            .ok_or("Input requires a live leased arena")?;
+        if let Some(&address) = arena.addresses.get(name) {
+            if bytes.len() > arena.sizes[name] {
+                return Err("Sequence input exceeds allocation".into());
+            }
+            if !self.sequence_strides.contains_key(name)
+                && bytes.len() <= super::transfers::UPLOAD_BYTES
+            {
+                return self.session.transfers.borrow_mut().upload(
+                    self.session.stream,
+                    address,
+                    bytes,
+                );
+            }
+            self.activate_sequence(slot)?;
+        }
+        self.upload_bytes(name, bytes)
     }
     fn address(
         &self,

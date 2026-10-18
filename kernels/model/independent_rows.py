@@ -187,18 +187,21 @@ def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=Fa
     return tir.PrimFunc(params, body, function.ret_type, buffers, function.attrs), identities
 
 
-def history_commit(columns, source_column, destination_column, row_stride=None):
+def history_commit(columns, source_column, destination_column, row_stride=None, channels=10240):
     """One stream-ordered copy launch for every request's convolution history."""
     import tilelang.language as T
     from tools.operators.common import orin_jit
 
     stride = row_stride or columns
+    if type(channels) is not int or channels <= 0:
+        raise ValueError("Invalid convolution history width")
+    elements = 3 * channels
 
     @orin_jit
     def build():
         @T.prim_func
         def kernel(Pointers: T.Tensor((128, stride), "uint64"), m: T.int32):
-            with T.Kernel(120, m, threads=256) as (chunk, lane):
+            with T.Kernel(T.ceildiv(elements, 256), m, threads=256) as (chunk, lane):
                 T.import_source(POINTER_SOURCE)
                 if Pointers[lane, source_column] != 0:
                     source = T.bind(
@@ -211,10 +214,11 @@ def history_commit(columns, source_column, destination_column, row_stride=None):
                         ),
                         var=T.ptr("float16"),
                     )
-                    X = T.decl_buffer((30720,), "float16", data=source)
-                    Y = T.decl_buffer((30720,), "float16", data=destination)
+                    X = T.decl_buffer((elements,), "float16", data=source)
+                    Y = T.decl_buffer((elements,), "float16", data=destination)
                     for i in T.Parallel(256):
-                        Y[chunk * 256 + i] = X[chunk * 256 + i]
+                        if chunk * 256 + i < elements:
+                            Y[chunk * 256 + i] = X[chunk * 256 + i]
 
         return kernel
 

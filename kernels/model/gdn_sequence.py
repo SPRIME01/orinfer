@@ -25,7 +25,12 @@ def _gdn_sequence(
     prefetch_qk: bool = False,
     dynamic_rows: bool = False,
     token_unroll: int = 1,
+    key_heads: int = 16,
+    value_heads: int = 48,
 ):
+    HK, HV = key_heads, value_heads
+    if min(HK, HV) <= 0 or HV % HK:
+        raise ValueError("Invalid GDN head geometry")
     assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
@@ -55,7 +60,7 @@ def _gdn_sequence(
         Out: T.Tensor((tokens, HV * DV), T.float16),
     ):
         with T.Kernel(DV // value_tile, HV, threads=threads) as (bv, h):
-            kh = h // 3
+            kh = h // (HV // HK)
             if prefetch_qk:
                 tid = T.get_thread_binding()
                 qs = T.alloc_shared((2, DK), T.float16)
@@ -236,6 +241,8 @@ def gdn_sequence(
     prefetch_qk: bool = False,
     dynamic_rows: bool = False,
     token_unroll: int = 1,
+    key_heads: int = 16,
+    value_heads: int = 48,
 ):
     """Preserve the recurrence and reductions while overlapping input reads.
 
@@ -253,12 +260,23 @@ def gdn_sequence(
         prefetch_qk,
         dynamic_rows,
         token_unroll,
+        key_heads,
+        value_heads,
     )
 
 
 @orin_jit
-def gdn_commit(tokens: int, value_tile: int = 32, dynamic_rows: bool = False):
+def gdn_commit(
+    tokens: int,
+    value_tile: int = 32,
+    dynamic_rows: bool = False,
+    key_heads: int = 16,
+    value_heads: int = 48,
+):
     """Replay saved FP32 rank-one updates in their original rounding order."""
+    HK, HV = key_heads, value_heads
+    if min(HK, HV) <= 0 or HV % HK:
+        raise ValueError("Invalid GDN head geometry")
     assert 1 <= tokens <= 8 and value_tile in (16, 32, 64, 128)
 
     tokens = row_count(tokens, dynamic_rows)
@@ -281,7 +299,8 @@ def gdn_commit(tokens: int, value_tile: int = 32, dynamic_rows: bool = False):
                         state[i, j] = state[i, j] * T.exp(G[t, h])
                         state[i, j] = (
                             state[i, j]
-                            + T.cast(K[h // 3, t, i], T.float32) * Update[t, h, bv * value_tile + j]
+                            + T.cast(K[h // (HV // HK), t, i], T.float32)
+                            * Update[t, h, bv * value_tile + j]
                         )
             for i, j in T.Parallel(DK, value_tile):
                 State[h, i, bv * value_tile + j] = state[i, j]

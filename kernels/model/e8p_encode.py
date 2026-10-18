@@ -119,6 +119,18 @@ __device__ void orin_e8p_top8(
     float bounds[16], sum_abs=0;
     #pragma unroll
     for (int d=0; d<8; ++d) sum_abs+=fabsf(x[d]);
+    // With sum(abs(x)) <= 2^-64, every term c*c-2*x*c rounds
+    // to c*c in e8p_score64 (odd integer |c| <= 11). The existing
+    // FP64 comparator therefore orders all codes by norm then ID.
+    // Avoid expanding hundreds of tied groups for underflow-sized rows.
+    if (sum_abs<=0x1p-64f) {
+        const unsigned short zero_codes[8] = {ORINFER_ZERO_TOP8};
+        if (lane==0) {
+            #pragma unroll
+            for (int i=0; i<8; ++i) ((unsigned short*)output)[i]=zero_codes[i];
+        }
+        return;
+    }
     // Conservative FP32 roundoff allowance for group bounds and code scores.
     // Reduced distances omit the common ||x||^2 to avoid cancellation there.
     float margin=64.0f*1.1920928955078125e-7f*(1024.0f+22.0f*sum_abs);
@@ -225,6 +237,15 @@ __device__ void orin_e8p_top8(
 def encode_top8(vectors):
     if type(vectors) is not int or vectors <= 0:
         raise ValueError("Invalid vector count")
+    # Derive the constants from the same canonical basis as Encoder.book.
+    # Code ordering is part of the representation, never a handwritten list.
+    import numpy as np
+    from tools.quantization.e8p import basis
+    from tools.quantization.vq import e8p_decode
+
+    grid = e8p_decode(np.arange(65536, dtype=np.uint16), basis()).astype(np.int32)
+    zero_codes = np.argsort((grid * grid).sum(1), kind="stable")[:8]
+    source = TOP8_SOURCE.replace("ORINFER_ZERO_TOP8", ",".join(map(str, zero_codes)))
 
     @T.prim_func
     def main(
@@ -233,7 +254,7 @@ def encode_top8(vectors):
         Codes: T.Tensor((vectors, 8), T.uint16),
     ):
         with T.Kernel(T.ceildiv(vectors, 4), threads=128) as block:
-            T.import_source(TOP8_SOURCE)
+            T.import_source(source)
             tx = T.get_thread_binding()
             row = block * 4 + tx // 32
             if row < vectors:

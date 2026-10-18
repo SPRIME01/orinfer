@@ -34,6 +34,12 @@ class AdapterCompatibility(unittest.TestCase):
     def test_supported_layout(self):
         validate_vision(self.config["vision_config"], 5120)
 
+    def test_small_dense_vision_reuses_the_same_adapter(self):
+        vision = self.config["vision_config"] | dict(
+            hidden_size=1024, intermediate_size=4096, depth=24, out_hidden_size=2048
+        )
+        validate_vision(vision, 2048)
+
     def test_other_vision_variants_need_an_adapter(self):
         for key, value in [
             ("hidden_act", "gelu"),

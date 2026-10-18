@@ -13,7 +13,7 @@ def build(b):
     from kernels.vision.features import overlay
 
     v = b.config["vision_config"]
-    validate_vision(v, 5120)
+    validate_vision(v, b.h)
     w = b.weights
     h, f, out = v["hidden_size"], v["intermediate_size"], v["out_hidden_size"]
     for name, shape, dtype in [
@@ -36,6 +36,12 @@ def build(b):
     w.fixed("Features", "f16", [FEATURES, out], "sequence")
     w.fixed("FeatureIndex", "i32", [b.context], "sequence")
 
+    if b.config["quantization_config"].get("vision") == "e8p_q4":
+        width = max(h, f, 4 * h)
+        w.fixed("VActivationA8", "i8", [PATCHES * width])
+        w.fixed("VActivationScale", "f16", [PATCHES])
+        w.fixed("VProduct", "f32", [PATCHES * max(3 * h, f, 4 * h, out)])
+
     def weight(name, shape=None):
         return w.immutable("model.visual." + name, cast="float16", shape=shape)
 
@@ -52,6 +58,47 @@ def build(b):
     def dense(
         section, role, n, k, inp, dest, prefix, activation="none", divisor=1, separate_bias=False
     ):
+        source_weight = "model.visual." + prefix + ".weight"
+        if source_weight + ".packed" in w.index["weight_map"]:
+            from kernels.model.rotation_a8 import rotate_activation_a8
+
+            capacity = PATCHES // divisor
+            if separate_bias:
+                raise ValueError("Quantized patch embedding needs an explicit convolution boundary")
+            emit(
+                section,
+                role + "_rotate",
+                f"rotation-a8-{k}",
+                lambda: primitive(rotate_activation_a8, PATCHES, k, dynamic_rows=True),
+                dict(X=inp, Signs=b.signs[k], Q="VActivationA8", S="VActivationScale"),
+                divisor=divisor,
+            )
+            emit(
+                section,
+                role + "_project",
+                f"q4-a8-{capacity}-{n}-{k}",
+                lambda: b.compile_projection(
+                    source_weight, "e8p_q4", n, k, capacity, True, "float32"
+                ),
+                dict(
+                    A="VActivationA8",
+                    W=w.immutable(source_weight + ".packed"),
+                    Book=b.book,
+                    S=w.immutable(source_weight + ".scale"),
+                    AS="VActivationScale",
+                    Out="VProduct",
+                ),
+                divisor=divisor,
+            )
+            emit(
+                section,
+                role,
+                f"bias-{n}-{activation}",
+                lambda: primitive(e.bias_activation, n, activation),
+                dict(X="VProduct", Bias=weight(prefix + ".bias"), Y=dest),
+                divisor=divisor,
+            )
+            return
         emit(
             section,
             role,
@@ -123,7 +170,7 @@ def build(b):
     b.emit(
         "begin/overlay",
         f"vision-overlay-{b.context}",
-        lambda: primitive(overlay, 4096, 5120, b.context, FEATURES, dynamic_rows=True),
+        lambda: primitive(overlay, 4096, b.h, b.context, FEATURES, dynamic_rows=True),
         dict(Embedding="Hidden", Features="Features", Index="FeatureIndex", Position="Step"),
     )
     b.vision = dict(

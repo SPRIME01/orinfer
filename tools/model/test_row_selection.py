@@ -43,6 +43,23 @@ class PrefillTuningTests(unittest.TestCase):
 
 
 class DynamicProjectionChoicesTests(unittest.TestCase):
+    def test_bounded_choices_cover_only_non_aot_rows_with_measured_configs(self):
+        fixed = [1, 2, 3, 4, 8, 16, 32]
+        table = dict(
+            configs=[{"tile": "large"}, {"tile": "small"}],
+            default="0",
+            selections=[dict(min_rows=1, max_rows=23, implementation="1")],
+        )
+        selected = {}
+        for suffix, config in choices(table, 64, fixed, bounded=True):
+            low, high = map(int, suffix.removeprefix("/rows/").split("-"))
+            for row in range(low, high + 1):
+                self.assertNotIn(row, selected)
+                selected[row] = config
+        self.assertEqual(set(selected), set(range(1, 65)) - set(fixed))
+        self.assertEqual(selected[23], {"tile": "small"})
+        self.assertEqual(selected[24], {"tile": "large"})
+
     def test_fixed_specializations_are_not_overlapped_by_dynamic_choices(self):
         fixed = [1, 2, 3, 4, 8, 16, 32]
         table = dict(

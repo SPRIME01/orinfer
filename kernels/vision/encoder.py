@@ -10,6 +10,38 @@ from tools.operators.common import orin_jit
 from kernels.model.floating_core import mma_loop, rounded_float, BF16_SOURCE
 
 
+def activation_value(x, activation):
+    if activation == "gelu_tanh":
+        return 0.5 * x * (1 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
+    if activation == "gelu":
+        return 0.5 * x * (1 + T.call_extern("float32", "erff", x * 0.7071067811865476))
+    return x
+
+
+@orin_jit
+def bias_activation(hidden: int, activation: str = "none"):
+    """Preserve the Linear FP16 bias boundary after a shared Q4A8 product."""
+    assert activation in ("none", "gelu", "gelu_tanh")
+    rows = T.dynamic("rows")
+
+    @T.prim_func
+    def kernel(
+        X: T.Tensor((rows, hidden), T.float32),
+        Bias: T.Tensor((hidden,), T.float16),
+        Y: T.Tensor((rows, hidden), T.float16),
+    ):
+        with T.Kernel(rows, T.ceildiv(hidden, 256), threads=128) as (row, block):
+            for j in T.Parallel(256):
+                col = block * 256 + j
+                if col < hidden:
+                    value = T.cast(
+                        T.cast(X[row, col] + T.cast(Bias[col], T.float32), T.float16), T.float32
+                    )
+                    Y[row, col] = activation_value(value, activation)
+
+    return kernel
+
+
 @orin_jit
 def linear(
     n: int,
@@ -58,32 +90,12 @@ def linear(
                     else:
                         product = accum[i, j]
                     value = rounded_float(product + T.cast(Bias[bx * bn + j], T.float32), dtype)
-                    if activation == "none":
-                        store(Y, by * bm + i, bx * bn + j, value)
-                    else:
-                        x = T.cast(value, T.float32)
-                        if activation == "gelu_tanh":
-                            store(
-                                Y,
-                                by * bm + i,
-                                bx * bn + j,
-                                (
-                                    0.5
-                                    * x
-                                    * (1 + T.tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))
-                                ),
-                            )
-                        else:
-                            store(
-                                Y,
-                                by * bm + i,
-                                bx * bn + j,
-                                (
-                                    0.5
-                                    * x
-                                    * (1 + T.call_extern("float32", "erff", x * 0.7071067811865476))
-                                ),
-                            )
+                    store(
+                        Y,
+                        by * bm + i,
+                        bx * bn + j,
+                        activation_value(T.cast(value, T.float32), activation),
+                    )
 
     return kernel
 

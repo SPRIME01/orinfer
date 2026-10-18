@@ -1,6 +1,6 @@
-"""Build native Qwen 27B Q4A8 model data and a schema-1 Rust/TileLang package.
+"""Build native dense Qwen3.5 data and a schema-1 Rust/TileLang package.
 
-Consumes only the completed checkpoint produced by tools.quantization.qwen35.
+Consumes completed scalar or two-stage E8P Q4A8 checkpoints.
 Weight shards are linked or losslessly K-repacked; transforms, scales and the
 single packed weight copy remain fixed. All online scheduling and layer order are registered Rust code.
 """
@@ -30,7 +30,7 @@ LANES = 128
 
 def configuration(config, context):
     if config.get("model_type") != "qwen3_5":
-        raise ValueError("Expected Qwen3_5 27B checkpoint")
+        raise ValueError("Expected dense Qwen3_5 checkpoint")
     t = config["text_config"]
     expected = dict(
         hidden_size=5120,
@@ -49,10 +49,23 @@ def configuration(config, context):
         hidden_act="silu",
         tie_word_embeddings=False,
     )
+    if t.get("hidden_size") == 2048:
+        expected.update(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            linear_num_value_heads=16,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            tie_word_embeddings=True,
+        )
     if any(t.get(k) != v or type(t.get(k)) is not type(v) for k, v in expected.items()) or t.get(
         "layer_types"
-    ) != ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(64)]:
-        raise ValueError("Unsupported Qwen 27B arithmetic geometry")
+    ) != [
+        "full_attention" if i % 4 == 3 else "linear_attention"
+        for i in range(expected["num_hidden_layers"])
+    ]:
+        raise ValueError("Unsupported dense Qwen arithmetic geometry")
     rope = t["rope_parameters"]
     if any(
         rope.get(k) != v
@@ -64,7 +77,7 @@ def configuration(config, context):
             mrope_interleaved=True,
         ).items()
     ):
-        raise ValueError("Unsupported Qwen 27B RoPE contract")
+        raise ValueError("Unsupported dense Qwen RoPE contract")
     q = config.get("quantization_config", {})
     if any(
         q.get(k) != v or type(q.get(k)) is not type(v)
@@ -88,6 +101,17 @@ def configuration(config, context):
             ).items()
         ) or any(type(v) is not int for v in q["coefficients"]):
             raise ValueError("Unsupported two-stage E8P-Q4 contract")
+    if t["tie_word_embeddings"] and (
+        q["quant_method"] != "orinfer_e8p_q4_int8" or q.get("embedding") != "e8p_q4"
+    ):
+        raise ValueError("Tied embedding/head requires the shared E8P Q4 bank")
+    if any(q.get(role) not in (None, "e8p_q4") for role in ("embedding", "vision")):
+        raise ValueError("Unsupported embedding or vision codec")
+    if (
+        any(q.get(role) for role in ("embedding", "vision"))
+        and q["quant_method"] != "orinfer_e8p_q4_int8"
+    ):
+        raise ValueError("Embedding/vision Q4 requires the two-stage E8P codec")
     if type(context) is not int or not 1 <= context <= min(t["max_position_embeddings"], 262144):
         raise ValueError("Invalid context capacity")
     return t
@@ -119,6 +143,20 @@ class Builder:
         self.source, self.root, self.output = source, root, output
         self.config = json.loads((source / "config.json").read_text())
         self.text = configuration(self.config, context)
+        t = self.text
+        self.tied = t.get("tie_word_embeddings", False)
+        self.h, self.v = t["hidden_size"], t["vocab_size"]
+        self.f = t["intermediate_size"]
+        self.hk, self.hv = t["linear_num_key_heads"], t["linear_num_value_heads"]
+        self.qh, self.kvh = t["num_attention_heads"], t["num_key_value_heads"]
+        self.qkv, self.mixdim = (2 * self.hk + self.hv) * 128, self.hv * 128
+        self.qproj, self.kv_width = self.qh * 512, self.kvh * 256
+        self.fullx = self.qproj + 2 * self.kv_width
+        self.architecture = "qwen3_5"
+        self.head_weight = (
+            "model.language_model.embed_tokens.weight" if self.tied else "lm_head.weight"
+        )
+        self.embedding_q4 = self.config["quantization_config"].get("embedding") == "e8p_q4"
         self.q4_codec = (
             "e8p_q4"
             if self.config["quantization_config"]["quant_method"] == "orinfer_e8p_q4_int8"
@@ -135,9 +173,10 @@ class Builder:
             root / "cache", output, cache, self.weights.buffers, compile_lock=lambda: gpu_lock(lock)
         )
         self.aot.identity["weights"] = hashlib.sha256(state["contract"].encode()).hexdigest()
+        self.aot.identity["context"] = str(context)
         from tools.model.row_tuning import RowTuner
 
-        self.row_tuner = RowTuner(output / "row-tuning", self.aot.identity)
+        self.row_tuner = RowTuner(output / "row-tuning", self.aot.identity, self.text)
         self.workspace()
         from tools.model.qwen35 import vision
 
@@ -153,39 +192,39 @@ class Builder:
 
     def workspace(self):
         w = self.weights
-        h, f, v = 5120, 17408, 248320
+        h, f, v = self.h, self.f, self.v
         c = CAPACITY
         for name, dtype, shape in [
             ("Hidden", "f16", [c, h]),
             ("R0", "f32", [c, h]),
             ("R1", "f32", [c, h]),
             ("Norm", "f16", [c, h]),
-            ("QKV", "f16", [c, 10240]),
-            ("Zout", "f16", [c, 6144]),
-            ("AB", "f16", [c, 96]),
-            ("g", "f32", [c, 48]),
-            ("Beta", "f32", [c, 48]),
+            ("QKV", "f16", [c, self.qkv]),
+            ("Zout", "f16", [c, self.mixdim]),
+            ("AB", "f16", [c, 2 * self.hv]),
+            ("g", "f32", [c, self.hv]),
+            ("Beta", "f32", [c, self.hv]),
             ("Q", "f16", [16, c, 128]),
             ("K", "f16", [16, c, 128]),
-            ("V", "f16", [48, c, 128]),
-            ("HistoryOut", "f16", [1, 3, 10240]),
+            ("V", "f16", [self.hv, c, 128]),
+            ("HistoryOut", "f16", [1, 3, self.qkv]),
             ("PositionOut", "i32", [1]),
             ("GdnScratch", "f32", [1]),
-            ("Y", "f16", [c, 6144]),
-            ("MixerIn", "f16", [c, 6144]),
-            ("FullX", "f16", [c, 14336]),
-            ("FullQ", "f16", [c, 24, 256]),
-            ("FullGate", "f16", [c, 24, 256]),
+            ("Y", "f16", [c, self.mixdim]),
+            ("MixerIn", "f16", [c, self.mixdim]),
+            ("FullX", "f16", [c, self.fullx]),
+            ("FullQ", "f16", [c, self.qh, 256]),
+            ("FullGate", "f16", [c, self.qh, 256]),
             ("Mix", "f16", [c, h]),
             ("GateUp", "f16", [2 * c, f]),
             ("RotationValues", "f16", [c, f]),
             ("RotationMaxima", "f32", [c, math.ceil(f / 256)]),
-            ("AttentionPartial", "f32", [24, 32, 64, 256]),
-            ("AttentionMaximum", "f32", [24, 32, 64]),
-            ("AttentionDenominator", "f32", [24, 32, 64]),
-            ("A8", "i8", [c * f]),
+            ("AttentionPartial", "f32", [self.qh, 32, 64, 256]),
+            ("AttentionMaximum", "f32", [self.qh, 32, 64]),
+            ("AttentionDenominator", "f32", [self.qh, 32, 64]),
+            ("A8", "i8", [c * max(f, h, self.mixdim, 2 * h)]),
             ("AS", "f16", [c]),
-            ("UnusedA8Mask", "u8", [f]),
+            ("UnusedA8Mask", "u8", [max(f, h, self.mixdim, 2 * h)]),
             ("HeadHidden", "f16", [LANES, h]),
             ("HeadA8", "i8", [LANES, h]),
             ("HeadAS", "f16", [LANES]),
@@ -216,18 +255,18 @@ class Builder:
         for i, kind in enumerate(self.text["layer_types"]):
             if kind == "linear_attention":
                 for suffix, dtype, shape in [
-                    ("History", "f16", [1, 3, 10240]),
-                    ("State", "f32", [48, 128, 128]),
+                    ("History", "f16", [1, 3, self.qkv]),
+                    ("State", "f32", [self.hv, 128, 128]),
                 ]:
                     name = f"L{i}_{suffix}"
                     w.fixed(name, dtype, shape, "sequence")
                     self.reset.append(name)
             else:
                 for suffix, dtype, width in [
-                    ("KPages", "i8", 1024),
-                    ("VPages", "i8", 1024),
-                    ("KPagesScale", "f16", 16),
-                    ("VPagesScale", "f16", 16),
+                    ("KPages", "i8", self.kv_width),
+                    ("VPages", "i8", self.kv_width),
+                    ("KPagesScale", "f16", self.kv_width // 64),
+                    ("VPagesScale", "f16", self.kv_width // 64),
                 ]:
                     name = f"L{i}_{suffix}"
                     w.fixed(name, dtype, [self.context, width], "sequence")
@@ -240,7 +279,15 @@ class Builder:
             "Rotary", np.concatenate([np.cos(angles), np.sin(angles)], axis=-1).astype(np.float16)
         )
         self.signs = {}
-        for k in [h, f]:
+        widths = {h, f}
+        if self.config["quantization_config"].get("vision") == "e8p_q4":
+            v = self.config["vision_config"]
+            widths.update(
+                k
+                for k in (v["hidden_size"], v["intermediate_size"], 4 * v["hidden_size"])
+                if k % 128 == 0
+            )
+        for k in sorted(widths):
             name = f"orinfer.rotation.k{k}.signs"
             signs = w.array(name)
             if signs.dtype != np.int8 or signs.shape != (k,) or not np.isin(signs, [-1, 1]).all():
@@ -263,23 +310,54 @@ class Builder:
                 raise ValueError("Q4 integer table differs from compiled decoder")
             w.constant("orinfer.q4.table", table)
 
-    def emit(self, name, key, build, bindings, rows=CAPACITY, *, dynamic=True):
-        return self.aot.emit("qwen_rows/" + name, key, build, bindings, rows, dynamic=dynamic)
+    def emit(self, name, key, build, bindings, rows=CAPACITY, *, dynamic=True, row_divisor=1):
+        return self.aot.emit(
+            "qwen_rows/" + name,
+            key,
+            build,
+            bindings,
+            rows,
+            dynamic=dynamic,
+            row_divisor=row_divisor,
+        )
+
+    def embedding(self, name, input, output, rows=CAPACITY):
+        from kernels.model import qwen35, e8p_q4
+
+        weight = "model.language_model.embed_tokens.weight"
+        args = dict(IDs=input, Scale=self.weights.immutable(weight + ".scale"), Output=output)
+        if self.embedding_q4:
+            args.update(
+                Weight=self.weights.immutable(weight + ".packed"),
+                Book=self.book,
+                Signs=self.signs[self.h],
+            )
+        else:
+            args["Weight"] = self.weights.immutable(weight + ".int8")
+        self.emit(
+            name,
+            f"embedding-{self.embedding_q4}-{rows}",
+            lambda: primitive(
+                e8p_q4.embedding if self.embedding_q4 else qwen35.embedding, rows, self.v, self.h
+            ),
+            args,
+            rows,
+        )
 
     def norm_rotation(self, section, input, residual, weight, output_residual):
         from kernels.model.rotation_a8 import residual_norm_rotate_a8
 
         self.emit(
             section + "/norm_rotate",
-            "norm-rotation-a8-5120",
-            lambda: primitive(residual_norm_rotate_a8, CAPACITY, dynamic_rows=True),
+            f"norm-rotation-a8-{self.h}",
+            lambda: primitive(residual_norm_rotate_a8, CAPACITY, self.h, dynamic_rows=True),
             dict(
                 X=input,
                 R=residual,
                 W=self.weights.immutable(weight, cast="float16"),
                 Y="Norm",
                 RO=output_residual,
-                Signs=self.signs[5120],
+                Signs=self.signs[self.h],
                 Q="A8",
                 S="AS",
             ),
@@ -377,6 +455,8 @@ class Builder:
                     block_m=bm,
                     target_tiles=ATTENTION_TARGET,
                     max_splits=config["max_splits"],
+                    query_heads=self.qh,
+                    kv_heads=self.kvh,
                     head_group=group,
                 )
                 if fn is causal_attention_int8:
@@ -395,6 +475,28 @@ class Builder:
                     rows,
                 )
 
+    def convolution(self, name, bindings):
+        from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
+
+        with gpu_lock(self.lock):
+            selection = self.row_tuner.gdn_convolution()
+        for suffix, config in self.row_choices(selection, CAPACITY):
+            tile = config["tile_tokens"]
+            self.emit(
+                name + suffix,
+                f"gdn-conv-{self.hk}-{self.hv}-tile{tile}",
+                lambda tile=tile: primitive(
+                    gdn_conv_prep,
+                    1,
+                    CAPACITY,
+                    tile_tokens=tile,
+                    dynamic_tokens=True,
+                    key_heads=self.hk,
+                    value_heads=self.hv,
+                ),
+                bindings,
+            )
+
     def projection(
         self,
         name,
@@ -410,10 +512,9 @@ class Builder:
         head=False,
         kind="q4",
     ):
-        from tools.model.flash_next.decode_tuning import DecodeTuner
-        from tools.model.row_selection import samples
-
         w = self.weights
+        if stride == n:
+            stride = None
         if kind == "q4":
             kind = self.q4_codec
         compressed = kind in ("q4", "e8p_q4")
@@ -422,7 +523,11 @@ class Builder:
         scale = w.immutable(weight + ".scale")
 
         target = (
-            dict(kind="buffer_slice", name=output, offset=offset * 4 if head else offset * 2)
+            dict(
+                kind="buffer_slice",
+                name=output,
+                offset=offset * 4 if head else offset * 2,
+            )
             if offset
             else output
         )
@@ -435,7 +540,13 @@ class Builder:
                 Out=target,
             )
             if compressed
-            else dict(A="A8", Weight=data, WeightScale=scale, TokenScale="AS", Output=target)
+            else dict(
+                A="HeadA8" if head else "A8",
+                Weight=data,
+                WeightScale=scale,
+                TokenScale="HeadAS" if head else "AS",
+                Output=target,
+            )
         )
         if kind == "e8p_q4":
             bind["Book"] = self.book
@@ -448,46 +559,83 @@ class Builder:
             key = f"{kind}-{live}-{symbolic}-{n}-{k}-{stride}-{head}-pk{w.packed_k if kind == 'e8p_q4' else 0}"
 
             def build():
-                import torch
-
-                actual = dict(
-                    W=torch.from_numpy(w.array(weight + suffix).copy()).cuda(),
-                    WS=torch.from_numpy(w.array(weight + ".scale").copy()).cuda(),
+                return self.compile_projection(
+                    weight, kind, n, k, live, symbolic, "float32" if head else "float16", stride
                 )
-                if kind == "q4":
-                    actual["W"] = actual["W"].view(torch.uint16)
-                if kind == "e8p_q4":
-                    actual["Book"] = torch.from_numpy(w.extra[self.book].copy()).cuda()
-                tuner = DecodeTuner(self.output / "tuning", self.aot.cache.root / "tuning")
-                return tuner.compile(
-                    kind,
-                    live,
-                    n,
-                    k,
-                    "float32" if head else "float16",
-                    dynamic=symbolic,
-                    weights=actual,
-                    weight_identity=hashlib.sha256(
-                        (
-                            w.buffers[data]["data"]["sha256"]
-                            + (w.buffers[self.book]["data"]["sha256"] if kind == "e8p_q4" else "")
-                        ).encode()
-                    ).hexdigest(),
-                    measure_rows=samples(live) if symbolic and live == CAPACITY else None,
-                    objective="total_latency"
-                    if symbolic and live == CAPACITY
-                    else "relative_geomean",
-                    output_stride=stride,
-                    packed_k=w.packed_k if kind == "e8p_q4" else 0,
-                )[0]
 
             self.emit(binding, key, build, bind, live, dynamic=symbolic)
+
+        if dynamic and rows > 1:
+            if not hasattr(self, "bounded_projection_choices"):
+                self.bounded_projection_choices = {}
+            geometry = (kind, n, k, min(rows, 128), head, stride, w.packed_k)
+            if geometry not in self.bounded_projection_choices:
+                with gpu_lock(self.lock):
+                    self.bounded_projection_choices[geometry] = list(
+                        self.compile_projection(
+                            weight,
+                            kind,
+                            n,
+                            k,
+                            min(rows, 128),
+                            True,
+                            "float32" if head else "float16",
+                            stride,
+                            select_rows=True,
+                        )
+                    )
+            for suffix, config, kernel in self.bounded_projection_choices[geometry]:
+                key = (
+                    f"{kind}-bounded-{min(rows, 128)}-{n}-{k}-{stride}-{head}-{w.packed_k}-"
+                    + json.dumps(config, sort_keys=True)
+                )
+                self.emit(name + suffix, key, lambda kernel=kernel: kernel, bind, min(rows, 128))
+
+    def compile_projection(
+        self, weight, kind, n, k, rows, dynamic, dtype, stride=None, *, select_rows=False
+    ):
+        import torch
+        from tools.model.flash_next.decode_tuning import DecodeTuner
+        from tools.model.row_selection import samples
+
+        w = self.weights
+        suffix = ".packed" if kind in ("q4", "e8p_q4") else ".int8"
+        actual = dict(
+            W=torch.from_numpy(w.array(weight + suffix).copy()).cuda(),
+            WS=torch.from_numpy(w.array(weight + ".scale").copy()).cuda(),
+        )
+        if kind == "q4":
+            actual["W"] = actual["W"].view(torch.uint16)
+        if kind == "e8p_q4":
+            actual["Book"] = torch.from_numpy(w.extra[self.book].copy()).cuda()
+        identity = w.buffers[weight + suffix]["data"]["sha256"]
+        if kind == "e8p_q4":
+            identity += w.buffers[self.book]["data"]["sha256"]
+        tuner = DecodeTuner(self.output / "tuning", self.aot.cache.root / "tuning")
+        compile = tuner.compile_choices if select_rows else tuner.compile
+        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+
+        result = compile(
+            kind,
+            rows,
+            n,
+            k,
+            dtype,
+            dynamic=dynamic,
+            weights=actual,
+            weight_identity=hashlib.sha256(identity.encode()).hexdigest(),
+            measure_rows=samples(rows) if dynamic and (rows >= CAPACITY or select_rows) else None,
+            objective="total_latency" if dynamic and rows >= CAPACITY else "relative_geomean",
+            output_stride=stride,
+            packed_k=w.packed_k if kind == "e8p_q4" else 0,
+            **(dict(fixed=SPECIALIZATIONS) if select_rows else {}),
+        )
+        return result if select_rows else result[0]
 
     def forward(self):
         from kernels.model import qwen35, control, kv_int8
         from kernels.model.gdn_sequence import _gdn_sequence
         from kernels.operators.op07_gdn_ab import gdn_ab_tensorcore
-        from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
         from kernels.operators.op09_gdn_gates import _compile_gates
         from kernels.operators.op17_gdn_gated_norm import _compile_gated_norm
         from kernels.operators.op30_activation_quantization import _compile as a8_compile
@@ -496,7 +644,7 @@ class Builder:
         self.emit(
             "begin/prepare",
             "prepare",
-            lambda: primitive(qwen35.prepare, CAPACITY, 5120, self.context, mrope_input=True),
+            lambda: primitive(qwen35.prepare, CAPACITY, self.h, self.context, mrope_input=True),
             dict(
                 Step="Step",
                 Positions="Positions",
@@ -508,18 +656,7 @@ class Builder:
                 Residual="R0",
             ),
         )
-        e = "model.language_model.embed_tokens.weight"
-        self.emit(
-            "begin/embedding",
-            "embedding",
-            lambda: primitive(qwen35.embedding, CAPACITY, 248320, 5120),
-            dict(
-                IDs="Input",
-                Weight=w.immutable(e + ".int8"),
-                Scale=w.immutable(e + ".scale"),
-                Output="Hidden",
-            ),
-        )
+        self.embedding("begin/embedding", "Input", "Hidden")
         for i, kind in enumerate(self.text["layer_types"]):
             p = f"model.language_model.layers.{i}"
             pre = f"layer{i}/pre"
@@ -528,8 +665,8 @@ class Builder:
             self.norm_rotation(pre, "Hidden", "R0", p + ".input_layernorm.weight", "R1")
             if kind == "linear_attention":
                 base = p + ".linear_attn"
-                self.projection(pre + "/qkv", base + ".in_proj_qkv.weight", 10240, 5120, "QKV")
-                self.projection(pre + "/z", base + ".in_proj_z.weight", 6144, 5120, "Zout")
+                self.projection(pre + "/qkv", base + ".in_proj_qkv.weight", self.qkv, self.h, "QKV")
+                self.projection(pre + "/z", base + ".in_proj_z.weight", self.mixdim, self.h, "Zout")
                 ab = w.combined(
                     f"L{i}_AB", [base + ".in_proj_a.weight", base + ".in_proj_b.weight"]
                 )
@@ -542,6 +679,8 @@ class Builder:
                         lambda config=config: primitive(
                             gdn_ab_tensorcore,
                             __import__("tilelang.language", fromlist=["dynamic"]).dynamic("m"),
+                            N=2 * self.hv,
+                            K=self.h,
                             **config,
                         ),
                         dict(X="Norm", W_ab=ab, Y="AB"),
@@ -549,7 +688,7 @@ class Builder:
                 self.emit(
                     private + "/gates",
                     "gdn-gates",
-                    lambda: primitive(_compile_gates, packed_ab=True),
+                    lambda: primitive(_compile_gates, packed_ab=True, heads=self.hv),
                     dict(
                         A="AB",
                         B="AB",
@@ -559,13 +698,11 @@ class Builder:
                         Beta="Beta",
                     ),
                 )
-                self.emit(
+                self.convolution(
                     private + "/conv",
-                    "gdn-conv",
-                    lambda: primitive(gdn_conv_prep, 1, CAPACITY, dynamic_tokens=True),
                     dict(
                         X="QKV",
-                        W=w.immutable(base + ".conv1d.weight", cast="float16", shape=[10240, 4]),
+                        W=w.immutable(base + ".conv1d.weight", cast="float16", shape=[self.qkv, 4]),
                         HI=f"L{i}_History",
                         lengths="SegmentLength",
                         positions="Step",
@@ -600,6 +737,8 @@ class Builder:
                             threads=32,
                             prefetch_qk=True,
                             dynamic_rows=True,
+                            key_heads=self.hk,
+                            value_heads=self.hv,
                             **config,
                         ),
                         recurrent_bindings,
@@ -607,7 +746,7 @@ class Builder:
                 self.emit(
                     private + "/gated_norm",
                     "gdn-gated-norm",
-                    lambda: primitive(_compile_gated_norm, None),
+                    lambda: primitive(_compile_gated_norm, None, heads=self.hv),
                     dict(
                         X="Y",
                         Z="Zout",
@@ -617,14 +756,18 @@ class Builder:
                 )
             else:
                 base = p + ".self_attn"
-                for role, n, offset in [("q", 12288, 0), ("k", 1024, 12288), ("v", 1024, 13312)]:
+                for role, n, offset in [
+                    ("q", self.qproj, 0),
+                    ("k", self.kv_width, self.qproj),
+                    ("v", self.kv_width, self.qproj + self.kv_width),
+                ]:
                     self.projection(
                         pre + "/" + role,
                         base + f".{role}_proj.weight",
                         n,
-                        5120,
+                        self.h,
                         "FullX",
-                        stride=14336,
+                        stride=self.fullx,
                         offset=offset,
                     )
                 pages = math.ceil(self.context / 128)
@@ -637,6 +780,8 @@ class Builder:
                         self.context,
                         (11, 11, 10),
                         max_position=self.context,
+                        query_heads=self.qh,
+                        kv_heads=self.kvh,
                     ),
                     dict(
                         X="FullX",
@@ -667,33 +812,33 @@ class Builder:
                 )
             self.emit(
                 post + "/quantize",
-                "a8-6144",
-                lambda: primitive(a8_compile, 6144, 6144, False, False, 256),
+                "a8-self.mixdim",
+                lambda: primitive(a8_compile, self.mixdim, self.mixdim, False, False, 256),
                 dict(X="MixerIn", Mask="UnusedA8Mask", Q="A8", S="AS"),
             )
             self.projection(
                 post + "/out",
                 base + (".out_proj.weight" if kind == "linear_attention" else ".o_proj.weight"),
-                5120,
-                6144,
+                self.h,
+                self.mixdim,
                 "Mix",
                 kind="w8",
             )
             self.norm_rotation(post, "Mix", "R1", p + ".post_attention_layernorm.weight", "R0")
-            for role, offset in [("gate", 0), ("up", CAPACITY * 17408)]:
+            for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
                 self.projection(
                     post + "/" + role,
                     p + f".mlp.{role}_proj.weight",
-                    17408,
-                    5120,
+                    self.f,
+                    self.h,
                     "GateUp",
-                    stride=17408,
+                    stride=self.f,
                     offset=offset,
                 )
             self.rotation(
-                post + "/swiglu_rotate", 17408, "GateUp", swiglu=True, plane_rows=CAPACITY
+                post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
             )
-            self.projection(post + "/down", p + ".mlp.down_proj.weight", 5120, 17408, "Hidden")
+            self.projection(post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden")
             print("BOUND layer", i, flush=True)
         self.emit(
             "end/advance",
@@ -711,7 +856,7 @@ class Builder:
         self.emit(
             "gather/norm",
             "final-norm",
-            lambda: primitive(final_norm, None, 1),
+            lambda: primitive(final_norm, None, 1, hidden=self.h),
             dict(
                 X="Hidden",
                 R="R0",
@@ -722,13 +867,13 @@ class Builder:
         )
         for name, rows, dynamic in [("head", LANES, True), ("head_last", 1, False)]:
             self.rotation(
-                name + "/rotate", 5120, "HeadHidden", rows=rows, dynamic=dynamic, head=True
+                name + "/rotate", self.h, "HeadHidden", rows=rows, dynamic=dynamic, head=True
             )
             self.projection(
                 name + "/project",
-                "lm_head.weight",
-                248320,
-                5120,
+                self.head_weight,
+                self.v,
+                self.h,
                 "HeadLogits",
                 rows=rows,
                 dynamic=dynamic,
@@ -737,7 +882,7 @@ class Builder:
             self.emit(
                 name + "/partials",
                 f"greedy-partials-{rows}-{dynamic}",
-                lambda: primitive(greedy_partials, 248320, rows, dynamic_rows=dynamic),
+                lambda: primitive(greedy_partials, self.v, rows, dynamic_rows=dynamic),
                 dict(
                     Logits="HeadLogits",
                     Values="GreedyValues",
@@ -750,7 +895,7 @@ class Builder:
             self.emit(
                 name + "/merge",
                 f"greedy-merge-{rows}-{dynamic}",
-                lambda: primitive(greedy_merge, 248320, rows, dynamic_rows=dynamic),
+                lambda: primitive(greedy_merge, self.v, rows, dynamic_rows=dynamic),
                 dict(
                     Values="GreedyValues",
                     Indices="GreedyIndices",
@@ -770,9 +915,12 @@ class Builder:
         )
 
     def publish(self, engine):
+        from tools.model.frontend import prepare_tokenizer
+
         w = self.weights
         total = w.finish()
         for name in [
+            "LICENSE",
             "config.json",
             "tokenizer.json",
             "tokenizer_config.json",
@@ -783,13 +931,14 @@ class Builder:
         ]:
             if (self.source / name).is_file():
                 shutil.copyfile(self.source / name, self.root / name)
+        prepare_tokenizer(self.source, self.root / "tokenizer.json")
         metadata = dict(
             schema_version=2,
             target="sm_87",
-            model="Qwen3.8-27B-Q4A8",
+            model=f"{self.config.get('quantization_config', {}).get('source', 'Qwen3.5')}-{self.q4_codec}-A8",
             chunk_tokens=CAPACITY,
             max_context=self.context,
-            vocab=248320,
+            vocab=self.v,
             toolchain=self.aot.identity,
             buffers=list(w.buffers.values()),
             reset_buffers=self.reset,
@@ -800,7 +949,7 @@ class Builder:
             position="Step",
             weight_bytes=total,
             weight_parameters=self.state["parameters"],
-            weight_scope=f"Original BF16 -> signed-block128 {self.q4_codec} Q4A8; W8 embedding/output projections/MTP exceptions; one packed resident copy; no permanent W8 expansion",
+            weight_scope=f"Original BF16 -> signed-block128 {self.q4_codec} Q4A8; embedding/vision precision from quantization policy, sensitive output/MTP projections W8; one packed resident copy; no permanent W8 expansion",
             kv_cache=dict(
                 direct_prefill=True, demand_mapping=True, buffers=self.kv, prefill_workspace={}
             ),
@@ -810,7 +959,7 @@ class Builder:
                 layers=self.text["layer_types"],
                 row_strides={},
                 profiles={},
-                hidden=5120,
+                hidden=self.h,
                 state_columns=self.state_columns,
             ),
         )
@@ -818,7 +967,7 @@ class Builder:
             schema_version=1,
             runtime_abi=1,
             target="sm_87",
-            architecture="qwen3_5",
+            architecture=self.architecture,
             compute_policy="int8_quality",
             config_signature=config_signature(self.config),
             prefill_profiles=[dict(tokens=CAPACITY, min_tokens=1, kind="qwen_q4_rows")],
@@ -828,13 +977,15 @@ class Builder:
                 {k: v for k, v in b.items() if k != "data"} for b in w.buffers.values()
             ],
             toolchain=self.aot.identity,
-            execution=execution_identity(model_library(), engine, "qwen3_5", "int8_quality"),
+            execution=execution_identity(
+                model_library(), engine, self.architecture, "int8_quality"
+            ),
             plan_kernel_contracts=[k["name"] for k in self.aot.kernels if "/rows/" in k["name"]],
         )
         digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
         data = dict(
             schema_version=1,
-            architecture="qwen3_5",
+            architecture=self.architecture,
             compute_policy="int8_quality",
             execution_package=digest,
             buffer_scopes=w.scopes,

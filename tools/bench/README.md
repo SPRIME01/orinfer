@@ -21,6 +21,8 @@ python3 -m tools.bench.code_generation --requests code-requests.json \
 
 每个 case 先执行一次预热，再重复请求；输出保留全部正文、思考文本、usage、首 token、首正文时间、实际缓存 token 命中率和 scheduler 差值。吞吐按已提交的 completion tokens 除以完整 HTTP 耗时计算，包含 thinking、prefill 和传输，不将 MTP 草稿或 SSE chunk 当作 token。报告单独列出空正文及预算截断，不能用提前结束的响应替代完整代码性能或质量验收。测冷请求需先重启自己的服务或使用新前缀；服务配置和输入保持一致，测量期间应独占接口。
 
+该工具也适用于翻译任务：以 `--requests fixtures/translation-benchmark.json` 测量完整译文，核对三个段落、时间和标识符。固定 batch 的 `benchmark_flash_decode_template` 诊断由引擎输出预算控制长度，不额外添加 EOS logit bias，避免将普通 greedy 测成需要整词表回读的 CPU 采样路径；它不包含 HTTP 或排队时间。
+
 `concurrency.py`以真实SSE请求测量1..128并发，输入为`{ "cases": [{ "id": "case", "request": { ...Chat API body... } }] }`：
 
 ```bash
@@ -75,3 +77,5 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
 `validate_flash_long_generation_reuse` 使用相同夹具格式，前两条 case 为压力提示和后续验证提示；后者须包含原生 4096-token prefill。它先记录后续提示的冷请求 logits 与完整已提交状态，再强制执行 16384 个 decode tokens（含 MTP）、保存生成缓存并复用槽位，检查冷请求和完整 prefix 命中与参考的分块、logits、KV/GDN/卷积/PLE/MTP 状态一致。引擎测试刻意继续处理 EOS 来保证压力长度，任务输出正确性另用真实 Chat API 验证；同样需要独占 GPU 锁。
 
 固定到达时间的混合请求验收使用 `python -m tools.bench.scheduling --requests TRACE.json --output RESULT.json`。输入为 `{"requests":[{"id":"short-1","at_s":0.1,"request":{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}}]}`，最多 128 条；同一时刻可提交多条请求。到达时间不依赖前一请求是否完成，报告客户端到达误差、TTFT、整请求耗时和最大流式 chunk 间隔的 P50/P95/P99，以及失败数、有效输出吞吐、成功请求的 prefix 请求/token 命中率和调度统计。chunk 间隔不能当成 token ITL。比较调度版本时使用相同 trace、模型包、缓存/MTP/Graph 配置，分别测试冷缓存与预热后的缓存。
+
+`profile_vision_stages` 是默认跳过的真实模型诊断，使用 `ORINFER_BATCH_FIXTURE` 中的 `model`、新 `output` 路径和带 `images` 的 `GenerationInput` cases。它按实际图片网格绑定视觉程序，记录整段热 Graph 与逐算子 GPU 时延；`ncu: true` 对实际 launch 添加 NVTX 区间。图片解码、resize、特征复制和文本生成不在该计时内，完整图片翻译性能须另测 Chat API。通过同一个 GPU 锁运行 `cargo test --release -p orinfer-engine profile_vision_stages -- --ignored --nocapture --test-threads=1`。

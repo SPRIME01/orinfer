@@ -252,11 +252,7 @@ fn benchmark_flash_decode_template() {
         eprintln!("Benchmark decode batch {count}");
         let mut requests = Vec::new();
         for lane in 0..count {
-            let mut source = input(&fixture.cases[lane % fixture.cases.len()], 64);
-            source
-                .sampling
-                .logit_bias
-                .extend([(248044, -100.), (248046, -100.)]);
+            let source = input(&fixture.cases[lane % fixture.cases.len()], 64);
             let mut request = model.start_request(source, &|| false).unwrap();
             while request.prefilling {
                 model

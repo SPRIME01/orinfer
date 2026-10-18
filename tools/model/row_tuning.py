@@ -14,12 +14,11 @@ from tools.model.row_selection import ranges
 from tools.model.publication import write_json
 
 ROTATION_TILES = (256, 512, 1024)
-ATTENTION_TILES = [(g, m, n) for g in (1, 6) for m in (16, 32, 64) for n in (32, 64)]
 ATTENTION_PIPELINES = [
     dict(head_group=1, block_m=64, block_n=64, threads=256, stages=s) for s in (0, 1)
 ]
 ATTENTION_TARGET = 16
-ATTENTION_SPLITS = 8
+ATTENTION_SPLITS = [8, 16]
 GDN_AB_TILES = [
     dict(BM=16, BN=n, BK=k, threads=t)
     for n, k, t in ((8, 512, 32), (16, 256, 64), (16, 512, 64), (32, 256, 128), (64, 64, 128))
@@ -33,18 +32,30 @@ def launch(kernel, *args):
 
 
 class RowTuner:
-    def __init__(self, output, identity):
+    def __init__(self, output, identity, text=None):
         self.output = Path(output)
         self.output.mkdir(parents=True, exist_ok=True)
         self.identity = identity
         self.records = {}
+        text = text or {}
+        self.h = text.get("hidden_size", 5120)
+        self.hk = text.get("linear_num_key_heads", 16)
+        self.hv = text.get("linear_num_value_heads", 48)
+        self.qh = text.get("num_attention_heads", 24)
+        self.kvh = text.get("num_key_value_heads", 4)
 
-    def select(self, spec, configs, build, inputs):
+    def select(self, spec, configs, build, inputs, *, measure_rows=None):
         from tools.operators.common import benchmark, SEED
         import torch
 
+        measured = [1, 2, 3, 4, 8, 17, 64, 129, 512, 4096] if measure_rows is None else measure_rows
+        if not measured or any(type(r) is not int or not 1 <= r <= 4096 for r in measured):
+            raise ValueError("Invalid row tuning measurements")
+        measured = sorted(set(measured))
         torch.manual_seed(SEED)
-        identity = dict(toolchain=self.identity, spec=spec, configs=configs, seed=SEED)
+        identity = dict(
+            toolchain=self.identity, spec=spec, configs=configs, seed=SEED, samples=measured
+        )
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         path = self.output / (key + ".json")
         if path.exists():
@@ -54,7 +65,7 @@ class RowTuner:
             return cached
         kernels = [build(c) for c in configs]
         records = []
-        for rows in [1, 2, 3, 4, 8, 17, 64, 129, 512, 4096]:
+        for rows in measured:
             times = {str(i): [] for i in range(len(configs))}
             for fixture in inputs(rows):
                 for index, pair in enumerate(kernels):
@@ -159,19 +170,32 @@ class RowTuner:
         spec = dict(
             kind="attention",
             context=context,
+            query_heads=self.qh,
+            kv_heads=self.kvh,
             target_tiles=ATTENTION_TARGET,
             max_splits=ATTENTION_SPLITS,
         )
         if str(spec) in self.records:
             return self.records[str(spec)]
         configs = [
-            dict(head_group=g, block_m=m, block_n=n, max_splits=ATTENTION_SPLITS)
-            for g, m, n in ATTENTION_TILES
-        ] + [c | dict(max_splits=ATTENTION_SPLITS) for c in ATTENTION_PIPELINES]
+            dict(head_group=g, block_m=m, block_n=n, max_splits=s)
+            for s in ATTENTION_SPLITS
+            for g in (1, self.qh // self.kvh)
+            for m in (16, 32, 64)
+            for n in (32, 64)
+        ] + [c | dict(max_splits=s) for s in ATTENTION_SPLITS for c in ATTENTION_PIPELINES]
         # Include the unsplit reference geometry in the same computation body.
         # This removes split bookkeeping at compile time, without a row cutoff.
         configs.append(dict(head_group=1, block_m=32, block_n=32, max_splits=1))
-        reference = primitive(attention_prefill_int8, 1, 4096, context, dynamic_rows=True)
+        reference = primitive(
+            attention_prefill_int8,
+            1,
+            4096,
+            context,
+            dynamic_rows=True,
+            query_heads=self.qh,
+            kv_heads=self.kvh,
+        )
 
         def build(c):
             return (
@@ -184,6 +208,8 @@ class RowTuner:
                     ATTENTION_TARGET,
                     c["max_splits"],
                     head_group=c["head_group"],
+                    query_heads=self.qh,
+                    kv_heads=self.kvh,
                     threads=c.get("threads", 128),
                     stages=c.get("stages", 0),
                 ),
@@ -194,6 +220,8 @@ class RowTuner:
                     ATTENTION_TARGET,
                     c["max_splits"],
                     head_group=c["head_group"],
+                    query_heads=self.qh,
+                    kv_heads=self.kvh,
                 ),
             )
 
@@ -201,14 +229,16 @@ class RowTuner:
             # Autoregressive positions usually end inside a tile. Exact tile
             # multiples alone hide loading/masking and instruction-cache costs.
             for length in sorted({max(rows, 536), max(rows, 8216)}):
-                q = torch.randn((rows, 24, 256), device="cuda", dtype=torch.float16) * 0.1
+                q = torch.randn((rows, self.qh, 256), device="cuda", dtype=torch.float16) * 0.1
                 gate = torch.randn_like(q)
                 kv = [
-                    torch.randint(-127, 128, (1, context, 4, 256), device="cuda", dtype=torch.int8)
+                    torch.randint(
+                        -127, 128, (1, context, self.kvh, 256), device="cuda", dtype=torch.int8
+                    )
                     for _ in range(2)
                 ]
                 scales = [
-                    torch.full((1, context, 4, 4), 0.001, device="cuda", dtype=torch.float16)
+                    torch.full((1, context, self.kvh, 4), 0.001, device="cuda", dtype=torch.float16)
                     for _ in range(2)
                 ]
                 pos = torch.arange(length - rows, length, device="cuda", dtype=torch.int32)
@@ -228,12 +258,12 @@ class RowTuner:
                 ):
                     first, second = pair
                     bm = c["block_m"]
-                    heads = 24 // c["head_group"]
+                    heads = self.qh // c["head_group"]
                     partial = torch.empty((heads, 2 * ATTENTION_TARGET, bm, 256), device="cuda")
                     maximum = torch.empty((heads, 2 * ATTENTION_TARGET, bm), device="cuda")
                     denom = torch.empty_like(maximum)
                     storage = torch.full(
-                        (rows + 1, 24, 256), 91, device="cuda", dtype=torch.float16
+                        (rows + 1, self.qh, 256), 91, device="cuda", dtype=torch.float16
                     )
                     out = storage[:rows]
 
@@ -273,21 +303,23 @@ class RowTuner:
         import torch
         from kernels.operators.op07_gdn_ab import gdn_ab_tensorcore
 
-        spec = dict(kind="gdn_ab", k=5120, n=96)
+        spec = dict(kind="gdn_ab", k=self.h, n=2 * self.hv)
         if str(spec) in self.records:
             return self.records[str(spec)]
-        reference = primitive(gdn_ab_tensorcore, T.dynamic("m"))
+        reference = primitive(gdn_ab_tensorcore, T.dynamic("m"), N=2 * self.hv, K=self.h)
 
         def build(config):
-            return primitive(gdn_ab_tensorcore, T.dynamic("m"), **config)
+            return primitive(gdn_ab_tensorcore, T.dynamic("m"), N=2 * self.hv, K=self.h, **config)
 
         def inputs(rows):
-            x = torch.randn((rows, 5120), device="cuda", dtype=torch.float16) * 0.1
-            w = torch.randn((96, 5120), device="cuda", dtype=torch.float16) * 0.1
-            expected = torch.empty((rows, 96), device="cuda", dtype=torch.float16)
+            x = torch.randn((rows, self.h), device="cuda", dtype=torch.float16) * 0.1
+            w = torch.randn((2 * self.hv, self.h), device="cuda", dtype=torch.float16) * 0.1
+            expected = torch.empty((rows, 2 * self.hv), device="cuda", dtype=torch.float16)
 
             def fixture(kernel, _config):
-                storage = torch.full((rows + 1, 96), 91, device="cuda", dtype=torch.float16)
+                storage = torch.full(
+                    (rows + 1, 2 * self.hv), 91, device="cuda", dtype=torch.float16
+                )
                 out = storage[:rows]
 
                 def run():
@@ -306,12 +338,89 @@ class RowTuner:
         self.records[str(spec)] = result
         return result
 
+    def gdn_convolution(self):
+        """Choose time tiles while preserving the native per-row reduction."""
+        import torch
+        from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
+        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+
+        spec = dict(kind="gdn_convolution", key_heads=self.hk, value_heads=self.hv)
+        if str(spec) in self.records:
+            return self.records[str(spec)]
+        configs = [dict(tile_tokens=t) for t in (1, 2, 4, 8, 16)]
+        channels = (2 * self.hk + self.hv) * 128
+
+        def build(config):
+            return primitive(
+                gdn_conv_prep,
+                1,
+                4096,
+                dynamic_tokens=True,
+                key_heads=self.hk,
+                value_heads=self.hv,
+                **config,
+            )
+
+        reference = build(configs[-1])
+
+        def inputs(rows):
+            x = torch.randn((1, rows, channels), device="cuda", dtype=torch.float16)
+            w = torch.randn((channels, 4), device="cuda", dtype=torch.float16) * 0.1
+            history = torch.randn((1, 3, channels), device="cuda", dtype=torch.float16)
+            length = torch.full((1,), rows, device="cuda", dtype=torch.int32)
+            position = torch.full_like(length, 512)
+
+            def outputs():
+                return [
+                    torch.empty((1, h, rows, 128), device="cuda", dtype=torch.float16)
+                    for h in (self.hk, self.hk, self.hv)
+                ] + [torch.empty_like(history), torch.empty_like(position)]
+
+            expected = outputs()
+
+            def fixture(kernel, _config):
+                shapes = [tuple(value.shape) for value in expected]
+                storage = [
+                    torch.full((value.numel() + 128,), 91, device="cuda", dtype=value.dtype)
+                    for value in expected
+                ]
+                actual = [
+                    s[: v.numel()].view(shape) for s, v, shape in zip(storage, expected, shapes)
+                ]
+
+                def run():
+                    launch(kernel, x, w, history, length, position, *actual)
+
+                def check():
+                    launch(reference, x, w, history, length, position, *expected)
+                    for value, wanted, allocated in zip(actual, expected, storage):
+                        assert torch.equal(value, wanted), "Convolution tile changed output/history"
+                        assert bool(torch.all(allocated[value.numel() :] == 91))
+
+                return run, check, lambda: x.neg_()
+
+            yield fixture
+
+        # Include the exact AOT rows: a tail at 17 can favour a smaller tile,
+        # while an aligned 32-row chunk needs its own measured cost.
+        measured = sorted(set(SPECIALIZATIONS) | {17, 64, 129, 512, 4096})
+        result = self.select(spec, configs, build, inputs, measure_rows=measured)
+        self.records[str(spec)] = result
+        return result
+
     def gdn_sequence(self):
         """Select loop unrolling without changing the sequential FP32 recurrence."""
         import torch
         from kernels.model.gdn_sequence import _gdn_sequence
 
-        spec = dict(kind="gdn_sequence", value_tile=16, threads=32, prefetch_qk=True)
+        spec = dict(
+            kind="gdn_sequence",
+            key_heads=self.hk,
+            value_heads=self.hv,
+            value_tile=16,
+            threads=32,
+            prefetch_qk=True,
+        )
         if str(spec) in self.records:
             return self.records[str(spec)]
         configs = [dict(token_unroll=u) for u in (1, 2, 4, 8)]
@@ -325,6 +434,8 @@ class RowTuner:
                 threads=32,
                 prefetch_qk=True,
                 dynamic_rows=True,
+                key_heads=self.hk,
+                value_heads=self.hv,
                 **config,
             )
 
@@ -332,20 +443,22 @@ class RowTuner:
 
         def inputs(rows):
             q = torch.nn.functional.normalize(
-                torch.randn((16, rows, 128), device="cuda"), dim=-1
+                torch.randn((self.hk, rows, 128), device="cuda"), dim=-1
             ).half()
             k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).half()
-            v = torch.randn((48, rows, 128), device="cuda", dtype=torch.float16) * 0.1
-            g = -torch.rand((rows, 48), device="cuda") * 0.1
+            v = torch.randn((self.hv, rows, 128), device="cuda", dtype=torch.float16) * 0.1
+            g = -torch.rand((rows, self.hv), device="cuda") * 0.1
             beta = torch.rand_like(g)
-            initial = torch.randn((48, 128, 128), device="cuda") * 0.01
+            initial = torch.randn((self.hv, 128, 128), device="cuda") * 0.01
             expected_state = torch.empty_like(initial)
-            expected = torch.empty((rows, 6144), device="cuda", dtype=torch.float16)
+            expected = torch.empty((rows, self.hv * 128), device="cuda", dtype=torch.float16)
             scratch = torch.empty(1, device="cuda")
 
             def fixture(kernel, _config):
                 state = torch.empty_like(initial)
-                storage = torch.full((rows + 1, 6144), 91, device="cuda", dtype=torch.float16)
+                storage = torch.full(
+                    (rows + 1, self.hv * 128), 91, device="cuda", dtype=torch.float16
+                )
                 out = storage[:rows]
 
                 def run():

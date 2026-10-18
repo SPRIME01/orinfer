@@ -1768,6 +1768,7 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
     ) -> Result<Vec<BatchSegment>> {
+        self.execution.prepare_batch_workspace()?;
         let segments: Vec<_> = selected
             .iter()
             .map(|&(i, tokens)| BatchSegment {
@@ -1777,8 +1778,8 @@ impl ModelRuntime {
             .collect();
         for &(i, chunk) in selected {
             let req = &mut requests[i];
-            self.execution.activate_sequence(req.slot)?;
             if req.prefilling {
+                self.execution.activate_sequence(req.slot)?;
                 self.upload_ids(
                     if chunk == 1 {
                         &self.manifest.token
@@ -1788,7 +1789,19 @@ impl ModelRuntime {
                     &req.input[req.offset..req.offset + chunk],
                 )?;
             }
-            self.upload_segment_controls(chunk)?;
+            if let Some(controls) = &self.manifest.segment_controls {
+                let tokens = u32::try_from(chunk).map_err(|_| "Segment length exceeds u32")?;
+                self.execution.upload_sequence_bytes(
+                    req.slot,
+                    &controls.length,
+                    &tokens.to_le_bytes(),
+                )?;
+                self.execution.upload_sequence_bytes(
+                    req.slot,
+                    &controls.last_index,
+                    &tokens.checked_sub(1).ok_or("Empty segment")?.to_le_bytes(),
+                )?;
+            }
             let program = if let Some(program) =
                 self.manifest.batch_layout.as_ref().and_then(|layout| {
                     if layout.segment_tokens > 0 && chunk > 1 {
@@ -1811,7 +1824,13 @@ impl ModelRuntime {
                     .prefill_program
                     .clone()
             };
-            self.execution.ensure_sequence_program(req.slot, &program)?;
+            let position = if req.prefilling {
+                req.offset
+            } else {
+                req.input.len() + req.generated - 1
+            };
+            self.execution
+                .ensure_sequence_program_at(req.slot, &program, position, chunk)?;
             let (tokens, history) = if req.prefilling {
                 (
                     &req.input[req.offset..req.offset + chunk],
@@ -1821,7 +1840,7 @@ impl ModelRuntime {
                 let last = req.history.len() - 1;
                 (&req.history[last..], &req.history[..last])
             };
-            self.prepare_batch_target_inputs(tokens, history)?;
+            self.prepare_batch_target_inputs(req.slot, tokens, history)?;
         }
         if let Some(table) = self.manifest.state_pointer_table.as_ref().filter(|table| {
             segments.len() <= table.max_rows && segments.iter().any(|s| s.tokens == 1)
@@ -1839,7 +1858,58 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
+        let fast: Vec<_> = selected
+            .iter()
+            .filter_map(|&(i, _)| {
+                let req = &requests[i];
+                (!req.prefilling
+                    && req.sampling.is_greedy()
+                    && !req.decoder.constrained()
+                    && req.sampling.top_logprobs.is_none())
+                .then_some((i, req.slot))
+            })
+            .collect();
+        for &(i, _) in &fast {
+            if requests[i].owner != self.owner_id || requests[i].released {
+                return Err("Request does not own a live arena in this model".into());
+            }
+        }
+        let controls = self.execution.read_sequence_controls(
+            &fast.iter().map(|&(_, slot)| slot).collect::<Vec<_>>(),
+            [
+                &self.manifest.position,
+                &self.manifest.status,
+                &self.manifest.token,
+            ],
+        )?;
+        let mut controls = fast.iter().zip(controls).peekable();
         for &(i, chunk) in selected {
+            if controls.peek().is_some_and(|((index, _), _)| *index == i) {
+                let (_, [position, status, token]) = controls.next().unwrap();
+                let req = &mut requests[i];
+                if position < 0 || position as usize != req.input.len() + req.generated {
+                    return Err("Batched decode position mismatch".into());
+                }
+                if status != 0 {
+                    return Err("Model token status failure".into());
+                }
+                if token < 0 || token as usize >= self.manifest.vocab {
+                    return Err("Selected token outside vocabulary".into());
+                }
+                let token = token as u32;
+                // The GPU already wrote this token into the owner's private
+                // input. Greedy selection needs neither arena rebinding nor
+                // a redundant host upload before the next packet.
+                req.history.push(token);
+                req.generated += 1;
+                req.mtp.committed_tokens = req.generated;
+                self.scheduler_statistics.decode_tokens += 1;
+                output.push(StepOutput {
+                    request: i,
+                    tokens: vec![token],
+                });
+                continue;
+            }
             let tokens = self.with_request(requests[i], |model, req| {
                 if req.prefilling {
                     model.scheduler_statistics.prefill_tokens += chunk;

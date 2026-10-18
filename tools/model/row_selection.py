@@ -74,7 +74,7 @@ def samples(capacity):
     )
 
 
-def choices(selection, capacity, fixed=()):
+def choices(selection, capacity, fixed=(), *, bounded=False):
     """Publish only used dynamic configs, excluding fixed AOT row extents."""
     live = [selection["default"]] * capacity
     for choice in selection["selections"]:
@@ -87,11 +87,12 @@ def choices(selection, capacity, fixed=()):
     if not usage:
         return
     default = max(usage, key=lambda key: (usage[key], key))
-    yield "", selection["configs"][int(default)]
+    if not bounded:
+        yield "", selection["configs"][int(default)]
     first = 1
     for row in range(2, capacity + 2):
         if row == capacity + 1 or live[row - 1] != live[first - 1]:
-            if live[first - 1] != default:
+            if bounded or live[first - 1] != default:
                 for low, high in split_fixed(first, row - 1, fixed):
                     yield f"/rows/{low}-{high}", selection["configs"][int(live[first - 1])]
             first = row

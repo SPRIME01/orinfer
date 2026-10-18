@@ -34,24 +34,24 @@ def build(b):
         ("MtpSegmentLength", "i32", [1], "sequence"),
         ("MtpLastIndex", "i32", [1], "sequence"),
         ("MtpPositions", "i32", [WARM], "sequence"),
-        ("MtpCondition", "f16", [WARM, 5120], "sequence"),
-        ("MtpTargetHidden", "f16", [4096, 5120], "sequence"),
+        ("MtpCondition", "f16", [WARM, b.h], "sequence"),
+        ("MtpTargetHidden", "f16", [4096, b.h], "sequence"),
         ("MtpFeatureIndex", "i32", [b.context], "sequence"),
-        ("MtpEmbedding", "f16", [WARM, 5120], "workspace"),
-        ("MtpConcat", "f16", [WARM, 10240], "workspace"),
-        ("MtpHidden", "f16", [WARM, 5120], "workspace"),
-        ("MtpNorm", "f16", [WARM, 5120], "workspace"),
-        ("MtpR0", "f32", [WARM, 5120], "workspace"),
-        ("MtpR1", "f32", [WARM, 5120], "workspace"),
-        ("MtpFullX", "f16", [WARM, 14336], "workspace"),
-        ("MtpFullQ", "f16", [WARM, 6144], "workspace"),
-        ("MtpFullGate", "f16", [WARM, 6144], "workspace"),
-        ("MtpMixer", "f16", [WARM, 6144], "workspace"),
-        ("MtpMix", "f16", [WARM, 5120], "workspace"),
-        ("MtpGateUp", "f16", [WARM, 34816], "workspace"),
-        ("MtpLastHidden", "f16", [1, 5120], "workspace"),
-        ("MtpLogits", "f32", [1, 248320], "sequence"),
-        ("SequenceLogits", "f32", [VERIFY, 248320], "sequence"),
+        ("MtpEmbedding", "f16", [WARM, b.h], "workspace"),
+        ("MtpConcat", "f16", [WARM, 2 * b.h], "workspace"),
+        ("MtpHidden", "f16", [WARM, b.h], "workspace"),
+        ("MtpNorm", "f16", [WARM, b.h], "workspace"),
+        ("MtpR0", "f32", [WARM, b.h], "workspace"),
+        ("MtpR1", "f32", [WARM, b.h], "workspace"),
+        ("MtpFullX", "f16", [WARM, b.fullx], "workspace"),
+        ("MtpFullQ", "f16", [WARM, b.mixdim], "workspace"),
+        ("MtpFullGate", "f16", [WARM, b.mixdim], "workspace"),
+        ("MtpMixer", "f16", [WARM, b.mixdim], "workspace"),
+        ("MtpMix", "f16", [WARM, b.h], "workspace"),
+        ("MtpGateUp", "f16", [WARM, 2 * b.f], "workspace"),
+        ("MtpLastHidden", "f16", [1, b.h], "workspace"),
+        ("MtpLogits", "f32", [1, b.v], "sequence"),
+        ("SequenceLogits", "f32", [VERIFY, b.v], "sequence"),
         ("SequenceTokens", "i32", [VERIFY], "sequence"),
         ("SequenceStatus", "i32", [VERIFY], "sequence"),
         ("AcceptedInputs", "i32", [1], "sequence"),
@@ -59,10 +59,10 @@ def build(b):
         w.fixed(name, dtype, shape, scope)
     b.reset.extend(["MtpStep", "MtpToken", "MtpStatus", "MtpCondition"])
     for suffix, dtype, width in [
-        ("KPages", "i8", 1024),
-        ("VPages", "i8", 1024),
-        ("KPagesScale", "f16", 16),
-        ("VPagesScale", "f16", 16),
+        ("KPages", "i8", b.kv_width),
+        ("VPages", "i8", b.kv_width),
+        ("KPagesScale", "f16", b.kv_width // 64),
+        ("VPagesScale", "f16", b.kv_width // 64),
     ]:
         name = "Mtp" + suffix
         w.fixed(name, dtype, [b.context, width], "sequence")
@@ -89,14 +89,14 @@ def build(b):
         "gather",
         "mtp-gather",
         lambda: primitive(
-            speculation.gather_target_hidden, WARM, 5120, 4096, ring=True, dynamic_rows=True
+            speculation.gather_target_hidden, WARM, b.h, 4096, ring=True, dynamic_rows=True
         ),
         dict(Target="MtpTargetHidden", Step="MtpStep", Out="MtpCondition"),
     )
     emit(
         "prepare",
         "mtp-prepare",
-        lambda: primitive(qwen35.prepare, WARM, 5120, b.context, mrope_input=True),
+        lambda: primitive(qwen35.prepare, WARM, b.h, b.context, mrope_input=True),
         dict(
             Step="MtpStep",
             Positions="MtpPositions",
@@ -108,23 +108,12 @@ def build(b):
             Residual="MtpR0",
         ),
     )
-    embed = "model.language_model.embed_tokens.weight"
-    emit(
-        "embedding",
-        "mtp-embedding",
-        lambda: primitive(qwen35.embedding, WARM, 248320, 5120),
-        dict(
-            IDs="MtpInput",
-            Weight=w.immutable(embed + ".int8"),
-            Scale=w.immutable(embed + ".scale"),
-            Output="MtpEmbedding",
-        ),
-    )
+    b.embedding("mtp/embedding", "MtpInput", "MtpEmbedding", WARM)
     emit(
         "overlay",
         "mtp-overlay",
         lambda: primitive(
-            overlay, WARM, 5120, b.context, b.vision["max_features"], dynamic_rows=True
+            overlay, WARM, b.h, b.context, b.vision["max_features"], dynamic_rows=True
         ),
         dict(
             Embedding="MtpEmbedding",
@@ -136,7 +125,7 @@ def build(b):
     emit(
         "concat",
         "mtp-concat",
-        lambda: primitive(speculation.mtp_norm_concat, 5120),
+        lambda: primitive(speculation.mtp_norm_concat, b.h),
         dict(
             Embedding="MtpEmbedding",
             Target="MtpCondition",
@@ -145,12 +134,12 @@ def build(b):
             Out="MtpConcat",
         ),
     )
-    quant("fc_quant", 10240, "MtpConcat")
-    project("fc", "mtp.fc.weight", 5120, 10240, "MtpHidden")
+    quant("fc_quant", 2 * b.h, "MtpConcat")
+    project("fc", "mtp.fc.weight", b.h, 2 * b.h, "MtpHidden")
     emit(
         "pre_norm",
         "norm",
-        lambda: primitive(residual_norm, None),
+        lambda: primitive(residual_norm, None, hidden=b.h),
         dict(
             X="MtpHidden",
             R="MtpR0",
@@ -159,10 +148,14 @@ def build(b):
             RO="MtpR1",
         ),
     )
-    quant("pre_quant", 5120, "MtpNorm")
+    quant("pre_quant", b.h, "MtpNorm")
     p = "mtp.layers.0.self_attn"
-    for role, n, offset in [("q", 12288, 0), ("k", 1024, 12288), ("v", 1024, 13312)]:
-        project(role, p + f".{role}_proj.weight", n, 5120, "MtpFullX", stride=14336, offset=offset)
+    for role, n, offset in [
+        ("q", b.qproj, 0),
+        ("k", b.kv_width, b.qproj),
+        ("v", b.kv_width, b.qproj + b.kv_width),
+    ]:
+        project(role, p + f".{role}_proj.weight", n, b.h, "MtpFullX", stride=b.fullx, offset=offset)
     emit(
         "kv_prepare",
         f"kv-prepare-{b.context}",
@@ -172,6 +165,8 @@ def build(b):
             b.context,
             (11, 11, 10),
             max_position=b.context,
+            query_heads=b.qh,
+            kv_heads=b.kvh,
         ),
         dict(
             X="MtpFullX",
@@ -201,12 +196,12 @@ def build(b):
         prefix="Mtp",
         rows=WARM,
     )
-    quant("out_quant", 6144, "MtpMixer")
-    project("out", p + ".o_proj.weight", 5120, 6144, "MtpMix")
+    quant("out_quant", b.mixdim, "MtpMixer")
+    project("out", p + ".o_proj.weight", b.h, b.mixdim, "MtpMix")
     emit(
         "post_norm",
         "norm",
-        lambda: primitive(residual_norm, None),
+        lambda: primitive(residual_norm, None, hidden=b.h),
         dict(
             X="MtpMix",
             R="MtpR1",
@@ -215,19 +210,19 @@ def build(b):
             RO="MtpR0",
         ),
     )
-    quant("post_quant", 5120, "MtpNorm")
-    for role, offset in [("gate", 0), ("up", 17408)]:
+    quant("post_quant", b.h, "MtpNorm")
+    for role, offset in [("gate", 0), ("up", b.f)]:
         project(
             role,
             "mtp.layers.0.mlp." + role + "_proj.weight",
-            17408,
-            5120,
+            b.f,
+            b.h,
             "MtpGateUp",
-            stride=34816,
+            stride=2 * b.f,
             offset=offset,
         )
-    quant("down_quant", 17408, "MtpGateUp", True)
-    project("down", "mtp.layers.0.mlp.down_proj.weight", 5120, 17408, "MtpHidden")
+    quant("down_quant", b.f, "MtpGateUp", True)
+    project("down", "mtp.layers.0.mlp.down_proj.weight", b.h, b.f, "MtpHidden")
     emit(
         "advance",
         "advance",
@@ -237,7 +232,7 @@ def build(b):
     emit(
         "final_norm",
         "mtp-final-norm",
-        lambda: primitive(final_norm, WARM, 1),
+        lambda: primitive(final_norm, WARM, 1, hidden=b.h),
         dict(
             X="MtpHidden",
             R="MtpR0",
@@ -248,12 +243,12 @@ def build(b):
         1,
         dynamic=False,
     )
-    b.rotation("mtp/head_rotate", 5120, "MtpLastHidden", rows=1, dynamic=False, head=True)
+    b.rotation("mtp/head_rotate", b.h, "MtpLastHidden", rows=1, dynamic=False, head=True)
     b.projection(
         "mtp/head_project",
-        "lm_head.weight",
-        248320,
-        5120,
+        b.head_weight,
+        b.v,
+        b.h,
         "MtpLogits",
         rows=1,
         dynamic=False,
@@ -262,7 +257,7 @@ def build(b):
     emit(
         "partials",
         "greedy-partials-1-False",
-        lambda: primitive(greedy_partials, 248320),
+        lambda: primitive(greedy_partials, b.v),
         dict(
             Logits="MtpLogits",
             Values="GreedyValues",
@@ -275,7 +270,7 @@ def build(b):
     emit(
         "merge",
         "greedy-merge-1-False",
-        lambda: primitive(greedy_merge, 248320),
+        lambda: primitive(greedy_merge, b.v),
         dict(
             Values="GreedyValues", Indices="GreedyIndices", Invalid="GreedyInvalid", Output="Pairs"
         ),
@@ -293,7 +288,7 @@ def build(b):
     b.emit(
         "capture/hidden",
         "target-hidden-capture",
-        lambda: primitive(speculation.capture_target_hidden, 5120, 4096, ring=True),
+        lambda: primitive(speculation.capture_target_hidden, b.h, 4096, ring=True),
         dict(
             X="Hidden",
             Residual="R0",
@@ -306,16 +301,16 @@ def build(b):
         if kind != "linear_attention":
             continue
         for suffix, dtype, shape in [
-            ("VerifyUpdate", "f32", [VERIFY, 48, 128]),
+            ("VerifyUpdate", "f32", [VERIFY, b.hv, 128]),
             ("VerifyK", "f16", [16, VERIFY, 128]),
-            ("VerifyG", "f32", [VERIFY, 48]),
-            ("HistoryPrefixes", "f16", [VERIFY, 3, 10240]),
+            ("VerifyG", "f32", [VERIFY, b.hv]),
+            ("HistoryPrefixes", "f16", [VERIFY, 3, b.qkv]),
         ]:
             w.fixed(f"L{i}_{suffix}", dtype, shape, "sequence")
         b.emit(
             f"verify/layer{i}/history",
             "verify-history",
-            lambda: primitive(flash_mtp.history_prefix, VERIFY, 10240, 3, dynamic_rows=True),
+            lambda: primitive(flash_mtp.history_prefix, VERIFY, b.qkv, 3, dynamic_rows=True),
             dict(X="QKV", State=f"L{i}_History", Prefix=f"L{i}_HistoryPrefixes"),
             VERIFY,
         )
@@ -323,7 +318,14 @@ def build(b):
             f"verify/layer{i}/recurrent",
             "verify-recurrent",
             lambda: primitive(
-                _gdn_sequence, VERIFY, value_tile=16, threads=32, compact=True, dynamic_rows=True
+                _gdn_sequence,
+                VERIFY,
+                value_tile=16,
+                threads=32,
+                compact=True,
+                dynamic_rows=True,
+                key_heads=b.hk,
+                value_heads=b.hv,
             ),
             dict(
                 Q="Q",
@@ -340,14 +342,27 @@ def build(b):
         b.emit(
             f"verify/layer{i}/factors",
             "verify-factors",
-            lambda: primitive(speculative_factors.save_gdn_factors, VERIFY, dynamic_rows=True),
+            lambda: primitive(
+                speculative_factors.save_gdn_factors,
+                VERIFY,
+                dynamic_rows=True,
+                key_heads=b.hk,
+                value_heads=b.hv,
+            ),
             dict(K="K", G="g", SavedK=f"L{i}_VerifyK", SavedG=f"L{i}_VerifyG"),
             VERIFY,
         )
         b.emit(
             f"restore/layer{i}/state",
             "verify-commit",
-            lambda: primitive(gdn_commit, VERIFY, value_tile=16, dynamic_rows=True),
+            lambda: primitive(
+                gdn_commit,
+                VERIFY,
+                value_tile=16,
+                dynamic_rows=True,
+                key_heads=b.hk,
+                value_heads=b.hv,
+            ),
             dict(
                 K=f"L{i}_VerifyK",
                 G=f"L{i}_VerifyG",
@@ -361,7 +376,7 @@ def build(b):
             f"restore/layer{i}/history",
             "verify-history-commit",
             lambda: primitive(
-                speculation.select_prefix, VERIFY, 3 * 10240, "float16", dynamic_rows=True
+                speculation.select_prefix, VERIFY, 3 * b.qkv, "float16", dynamic_rows=True
             ),
             dict(Prefix=f"L{i}_HistoryPrefixes", Count="AcceptedInputs", State=f"L{i}_History"),
             VERIFY,
@@ -370,7 +385,7 @@ def build(b):
     b.emit(
         "verify/norm",
         "verify-norm",
-        lambda: primitive(final_norm, None, None),
+        lambda: primitive(final_norm, None, None, hidden=b.h),
         dict(
             X="Hidden",
             R="R0",
@@ -383,7 +398,7 @@ def build(b):
     b.emit(
         "verify/logits",
         "verify-logits",
-        lambda: primitive(causal_rows.copy, VERIFY, 248320, "float32"),
+        lambda: primitive(causal_rows.copy, VERIFY, b.v, "float32"),
         dict(Source="HeadLogits", Destination="SequenceLogits"),
         VERIFY,
     )

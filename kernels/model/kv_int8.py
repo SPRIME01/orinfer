@@ -99,12 +99,20 @@ def full_prepare_mrope_int8(
     section: tuple[int, int, int],
     block_size: int = 128,
     max_position: int = 8704,
+    query_heads: int = 24,
+    kv_heads: int = 4,
 ):
+    if min(query_heads, kv_heads) <= 0 or query_heads % kv_heads:
+        raise ValueError("Invalid full-attention heads")
+    qwidth = query_heads * 512
+    vstart = qwidth + kv_heads * 256
+    width = vstart + kv_heads * 256
+    heads = query_heads + kv_heads
     rows = T.dynamic("rows")
 
     @T.prim_func
     def kernel(
-        X: T.Tensor((rows, 14336), T.float16),
+        X: T.Tensor((rows, width), T.float16),
         WQ: T.Tensor((256,), T.float16),
         WK: T.Tensor((256,), T.float16),
         Cache: T.Tensor((max_position, 64), T.float16),
@@ -113,16 +121,16 @@ def full_prepare_mrope_int8(
         Pages: T.Tensor((1, max_pages), T.int32),
         Status: T.Tensor((1,), T.int32),
         MRope: T.Tensor((context, 3), T.int32),
-        Q: T.Tensor((rows, 24, 256), T.float16),
-        Gate: T.Tensor((rows, 24, 256), T.float16),
-        K: T.Tensor((max_pages, block_size, 4, 256), T.int8),
-        V: T.Tensor((max_pages, block_size, 4, 256), T.int8),
-        KS: T.Tensor((max_pages, block_size, 4, 4), T.float16),
-        VS: T.Tensor((max_pages, block_size, 4, 4), T.float16),
+        Q: T.Tensor((rows, query_heads, 256), T.float16),
+        Gate: T.Tensor((rows, query_heads, 256), T.float16),
+        K: T.Tensor((max_pages, block_size, kv_heads, 256), T.int8),
+        V: T.Tensor((max_pages, block_size, kv_heads, 256), T.int8),
+        KS: T.Tensor((max_pages, block_size, kv_heads, 4), T.float16),
+        VS: T.Tensor((max_pages, block_size, kv_heads, 4), T.float16),
     ):
-        with T.Kernel(rows * 28, threads=128) as work:
-            row = work // 28
-            head = work % 28
+        with T.Kernel(rows * heads, threads=128) as work:
+            row = work // heads
+            head = work % heads
             values = T.alloc_fragment((256,), T.float32)
             square = T.alloc_fragment((256,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
@@ -135,15 +143,17 @@ def full_prepare_mrope_int8(
             vs = T.alloc_shared((4,), T.float16)
             if Status[0] == 0:
                 for j in T.Parallel(256):
-                    if head < 24:
+                    if head < query_heads:
                         values[j] = T.cast(X[row, head * 512 + j], T.float32)
                         Gate[row, head, j] = X[row, head * 512 + 256 + j]
                     else:
-                        values[j] = T.cast(X[row, 12288 + (head - 24) * 256 + j], T.float32)
+                        values[j] = T.cast(
+                            X[row, qwidth + (head - query_heads) * 256 + j], T.float32
+                        )
                     square[j] = values[j] * values[j]
                 T.reduce_sum(square, total, dim=0)
                 for j in T.Parallel(256):
-                    weight = T.if_then_else(head < 24, WQ[j], WK[j])
+                    weight = T.if_then_else(head < query_heads, WQ[j], WK[j])
                     norm[j] = (values[j] * T.rsqrt(total[0] / 256 + 1e-6)) * (
                         1 + T.cast(weight, T.float32)
                     )
@@ -173,14 +183,16 @@ def full_prepare_mrope_int8(
                             T.cast(a, T.float32) - T.cast(b, T.float32),
                             T.cast(a, T.float32) + T.cast(b, T.float32),
                         )
-                    if head < 24:
+                    if head < query_heads:
                         Q[row, head, j] = values[j]
-                if head >= 24:
+                if head >= query_heads:
                     # Quantize the exact FP16 values the reference cache stores.
                     for g, d in T.Parallel(4, 64):
                         ka[g, d] = T.abs(T.cast(T.cast(values[g * 64 + d], T.float16), T.float32))
                         va[g, d] = T.abs(
-                            T.cast(X[row, 13312 + (head - 24) * 256 + g * 64 + d], T.float32)
+                            T.cast(
+                                X[row, vstart + (head - query_heads) * 256 + g * 64 + d], T.float32
+                            )
                         )
                     T.reduce_max(ka, km, dim=1)
                     T.reduce_max(va, vm, dim=1)
@@ -191,21 +203,21 @@ def full_prepare_mrope_int8(
                     T.sync_threads()
                     page = Pages[Req[row], Pos[row] // block_size]
                     for g in T.Parallel(4):
-                        KS[page, Pos[row] % block_size, head - 24, g] = ks[g]
-                        VS[page, Pos[row] % block_size, head - 24, g] = vs[g]
+                        KS[page, Pos[row] % block_size, head - query_heads, g] = ks[g]
+                        VS[page, Pos[row] % block_size, head - query_heads, g] = vs[g]
                     for j in T.Parallel(256):
                         kval = T.cast(T.cast(values[j], T.float16), T.float32)
-                        vval = T.cast(X[row, 13312 + (head - 24) * 256 + j], T.float32)
+                        vval = T.cast(X[row, vstart + (head - query_heads) * 256 + j], T.float32)
                         kr = T.call_extern(
                             "float32", "__fdiv_rn", kval, T.cast(ks[j // 64], T.float32)
                         )
                         vr = T.call_extern(
                             "float32", "__fdiv_rn", vval, T.cast(vs[j // 64], T.float32)
                         )
-                        K[page, Pos[row] % block_size, head - 24, j] = T.cast(
+                        K[page, Pos[row] % block_size, head - query_heads, j] = T.cast(
                             T.max(-127.0, T.min(127.0, T.round(kr))), T.int8
                         )
-                        V[page, Pos[row] % block_size, head - 24, j] = T.cast(
+                        V[page, Pos[row] % block_size, head - query_heads, j] = T.cast(
                             T.max(-127.0, T.min(127.0, T.round(vr))), T.int8
                         )
 
@@ -226,6 +238,8 @@ def attention_prefill_int8(
     threads: int = 128,
     exp_mode: str = "precise",
     dynamic_rows: bool = False,
+    query_heads: int = 24,
+    kv_heads: int = 4,
 ):
     """Build (Q,K,V,RawGate,Positions,Lengths,Y), all explicit tensors.
 
@@ -254,9 +268,17 @@ def attention_prefill_int8(
     def probability_exp(value):
         return T.call_extern("float32", "__expf", value) if exp_mode == "fast" else T.exp(value)
 
-    qs = (batch, tq, 6144) if input_layout == "token_major" else (batch, 24, tq, 256)
-    ys = (batch, tq, 24, 256) if output_layout == "token_major" else (batch, 24, tq, 256)
-    ks = (batch, tkv, 256) if kv_layout == "token_major" else (batch, 4, tkv, 256)
+    qs = (
+        (batch, tq, query_heads * 256)
+        if input_layout == "token_major"
+        else (batch, query_heads, tq, 256)
+    )
+    ys = (
+        (batch, tq, query_heads, 256)
+        if output_layout == "token_major"
+        else (batch, query_heads, tq, 256)
+    )
+    ks = (batch, tkv, kv_heads * 64) if kv_layout == "token_major" else (batch, kv_heads, tkv, 256)
 
     load_kv = int8_kv_tile(block_n, threads=threads)
 
@@ -269,10 +291,10 @@ def attention_prefill_int8(
         Positions: T.Tensor((batch, tq), T.int32),
         Lengths: T.Tensor((batch,), T.int32),
         Y: T.Tensor(ys, T.float16),
-        KS: T.Tensor((batch, tkv, 16), T.float16),
-        VS: T.Tensor((batch, tkv, 16), T.float16),
+        KS: T.Tensor((batch, tkv, kv_heads * 4), T.float16),
+        VS: T.Tensor((batch, tkv, kv_heads * 4), T.float16),
     ):
-        with T.Kernel(T.ceildiv(tq, block_m), 24, batch, threads=threads) as (qb, h, b):
+        with T.Kernel(T.ceildiv(tq, block_m), query_heads, batch, threads=threads) as (qb, h, b):
             T.import_source(HALF2_SOURCE)
             q = T.alloc_shared((block_m, 256), T.float16)
             k = T.alloc_shared((block_n, 256), T.float16)
@@ -298,7 +320,18 @@ def attention_prefill_int8(
             else:
                 T.copy(Q[b, h, qb * block_m, 0], q, prefer_instruction="sync")
             for kb in T.serial(T.ceildiv(T.max(0, T.min(Lengths[b], maxpos[0] + 1)), block_n)):
-                load_kv(K, V, KS, VS, k, v, b, h // 6, kb * block_n, T.min(Lengths[b], tkv))
+                load_kv(
+                    K,
+                    V,
+                    KS,
+                    VS,
+                    k,
+                    v,
+                    b,
+                    h // (query_heads // kv_heads),
+                    kb * block_n,
+                    T.min(Lengths[b], tkv),
+                )
                 T.sync_threads()
                 T.clear(score)
                 T.gemm(q, k, score, transpose_B=True)

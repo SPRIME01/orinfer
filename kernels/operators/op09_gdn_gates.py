@@ -30,7 +30,11 @@ def _compile_gates(
     parameter_mode: str = "a_log",
     packed_ab: bool = False,
     beta_round_fp16: bool = False,
+    heads: int = 48,
 ):
+    HEADS = heads
+    if type(HEADS) is not int or HEADS <= 0:
+        raise ValueError("Invalid GDN value heads")
     assert dtype in ("float16", "float32")
     assert parameter_mode in ("a_log", "exp_a")
     assert block >= threads and block % threads == 0

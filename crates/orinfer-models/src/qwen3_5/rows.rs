@@ -55,6 +55,24 @@ const HEAD: &[&str] = &["rotate", "project", "partials", "merge"];
 
 struct QwenRows {
     manifest: Manifest,
+    private_roles: Vec<Option<String>>,
+}
+fn private_roles(m: &Manifest) -> Vec<Option<String>> {
+    let layout = m.batch_layout.as_ref().unwrap();
+    let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
+    (0..layout.layers.len())
+        .flat_map(|layer| {
+            let buffers = &buffers;
+            layout.state_columns.iter().map(move |column| {
+                let per_layer = format!("L{layer}_{column}");
+                if buffers.contains(per_layer.as_str()) {
+                    Some(per_layer)
+                } else {
+                    buffers.contains(column.as_str()).then(|| column.clone())
+                }
+            })
+        })
+        .collect()
 }
 fn kernels(prefix: &str, names: &[&str]) -> Vec<Operation> {
     names
@@ -70,7 +88,12 @@ fn section(m: &mut Manifest, suffix: &str, names: &[&str]) -> Vec<Operation> {
     m.programs.insert(name, ops.clone());
     ops
 }
-fn validate_weights(m: &Manifest, config: &Configuration, e8p: bool) -> Result<()> {
+fn validate_weights(
+    m: &Manifest,
+    config: &Configuration,
+    e8p: bool,
+    embedding_q4: bool,
+) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
     let check = |name: String, dtype: Dtype, shape: Vec<usize>| -> Result<()> {
@@ -98,7 +121,16 @@ fn validate_weights(m: &Manifest, config: &Configuration, e8p: bool) -> Result<(
         }
         check(format!("{name}.scale"), Dtype::F16, vec![n])
     };
-    q4("lm_head.weight".into(), t.vocab_size, t.hidden_size)?;
+    if embedding_q4 {
+        q4(
+            "model.language_model.embed_tokens.weight".into(),
+            t.vocab_size,
+            t.hidden_size,
+        )?;
+    }
+    if !t.tie_word_embeddings {
+        q4("lm_head.weight".into(), t.vocab_size, t.hidden_size)?;
+    }
     for (layer, kind) in t.layer_types.iter().enumerate() {
         let p = format!("model.language_model.layers.{layer}");
         for (name, n, k) in [
@@ -110,14 +142,14 @@ fn validate_weights(m: &Manifest, config: &Configuration, e8p: bool) -> Result<(
         }
         let shapes: &[(&str, usize)] = if kind == "linear_attention" {
             &[
-                ("linear_attn.in_proj_qkv", 10240),
-                ("linear_attn.in_proj_z", 6144),
+                ("linear_attn.in_proj_qkv", t.qkv()),
+                ("linear_attn.in_proj_z", t.mixer()),
             ]
         } else {
             &[
-                ("self_attn.q_proj", 12288),
-                ("self_attn.k_proj", 1024),
-                ("self_attn.v_proj", 1024),
+                ("self_attn.q_proj", 2 * t.full_q()),
+                ("self_attn.k_proj", t.kv()),
+                ("self_attn.v_proj", t.kv()),
             ]
         };
         for &(name, n) in shapes {
@@ -127,12 +159,12 @@ fn validate_weights(m: &Manifest, config: &Configuration, e8p: bool) -> Result<(
     Ok(())
 }
 
-fn vision(m: &mut Manifest, depth: usize) -> Result<()> {
+fn vision(m: &mut Manifest, depth: usize, hidden: usize) -> Result<()> {
     let Some(v) = m.vision.as_ref() else {
         return Ok(());
     };
-    if depth != 27
-        || v.hidden != 5120
+    if !matches!(depth, 24 | 27)
+        || v.hidden != hidden
         || v.max_patches > 32768
         || v.plans.len() != 1
         || v.plans[0].min_patches != 4
@@ -142,27 +174,56 @@ fn vision(m: &mut Manifest, depth: usize) -> Result<()> {
         return Err("Unsupported Qwen compact vision contract".into());
     }
     let mut operations = kernels("qwen_rows/vision/begin", &["patch", "position"]);
+    let append = |ops: &mut Vec<Operation>, section: &str, role: &str, weight: Option<String>| {
+        if weight.is_some_and(|name| {
+            m.buffers
+                .iter()
+                .any(|b| b.name == format!("model.visual.{name}.weight.packed"))
+        }) {
+            ops.extend(kernels(
+                &format!("qwen_rows/vision/{section}"),
+                &[&format!("{role}_rotate"), &format!("{role}_project")],
+            ));
+        }
+        ops.extend(kernels(&format!("qwen_rows/vision/{section}"), &[role]));
+    };
     for layer in 0..depth {
-        operations.extend(kernels(
-            &format!("qwen_rows/vision/layer{layer}"),
-            &[
-                "norm1",
-                "qkv",
-                "rope",
-                "attention",
-                "projection",
-                "residual1",
-                "norm2",
-                "fc1",
-                "fc2",
-                "residual2",
-            ],
-        ));
+        for role in [
+            "norm1",
+            "qkv",
+            "rope",
+            "attention",
+            "projection",
+            "residual1",
+            "norm2",
+            "fc1",
+            "fc2",
+            "residual2",
+        ] {
+            let weight = match role {
+                "qkv" => Some("attn.qkv"),
+                "projection" => Some("attn.proj"),
+                "fc1" => Some("mlp.linear_fc1"),
+                "fc2" => Some("mlp.linear_fc2"),
+                _ => None,
+            }
+            .map(|name| format!("blocks.{layer}.{name}"));
+            append(&mut operations, &format!("layer{layer}"), role, weight);
+        }
     }
-    operations.extend(kernels(
-        "qwen_rows/vision/end",
-        &["norm", "merge1", "merge2"],
-    ));
+    append(&mut operations, "end", "norm", None);
+    append(
+        &mut operations,
+        "end",
+        "merge1",
+        Some("merger.linear_fc1".into()),
+    );
+    append(
+        &mut operations,
+        "end",
+        "merge2",
+        Some("merger.linear_fc2".into()),
+    );
     m.programs.insert("vision".into(), operations);
     Ok(())
 }
@@ -194,26 +255,46 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             return Err(format!("Unsupported Qwen Q4A8 {key}"));
         }
     }
+    let embedding_q4 = quant["embedding"] == "e8p_q4";
+    for role in ["embedding", "vision"] {
+        if !quant[role].is_null() && (!e8p || quant[role] != "e8p_q4") {
+            return Err(format!("Unsupported Qwen {role} precision"));
+        }
+    }
     let c = Configuration::parse(request.config)?;
     if c.signature != request.expected_signature {
         return Err("Qwen row architecture signature differs".into());
     }
     let t = c.text();
-    if (
-        t.hidden_size,
-        t.intermediate_size,
-        t.num_hidden_layers,
-        t.vocab_size,
-    ) != (5120, 17408, 64, 248320)
+    let geometry = matches!(
+        (
+            t.hidden_size,
+            t.intermediate_size,
+            t.num_hidden_layers,
+            t.num_attention_heads,
+            t.num_key_value_heads,
+            t.linear_num_value_heads,
+            t.tie_word_embeddings
+        ),
+        (5120, 17408, 64, 24, 4, 48, false) | (2048, 6144, 24, 8, 2, 16, true)
+    );
+    if !geometry
+        || (t.tie_word_embeddings && !embedding_q4)
+        || t.head_dim != 256
+        || t.linear_num_key_heads != 16
+        || t.linear_key_head_dim != 128
+        || t.linear_value_head_dim != 128
+        || t.linear_conv_kernel_dim != 4
+        || (t.vocab_size,) != (248320,)
         || request.prefill_profiles.len() != 1
         || request.prefill_profiles[0].tokens != CAPACITY
         || request.prefill_profiles[0].min_tokens != 1
         || request.prefill_profiles[0].kind != "qwen_q4_rows"
     {
-        return Err("Expected Qwen 27B compact 1..4096 row contract".into());
+        return Err("Expected dense Qwen compact 1..4096 row contract".into());
     }
     let m = &mut request.metadata;
-    validate_weights(m, &c, e8p)?;
+    validate_weights(m, &c, e8p, embedding_q4)?;
     m.programs.clear();
     let begin = if m.vision.is_some() {
         vec!["prepare", "embedding", "overlay"]
@@ -224,19 +305,19 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     let mut layer_ends = Vec::with_capacity(t.layer_types.len());
     let mut strides = BTreeMap::new();
     for (name, width, size) in [
-        ("Hidden", 5120, 2),
-        ("R0", 5120, 4),
-        ("R1", 5120, 4),
-        ("Norm", 5120, 2),
-        ("QKV", 10240, 2),
-        ("Zout", 6144, 2),
-        ("AB", 96, 2),
-        ("FullX", 14336, 2),
-        ("FullQ", 6144, 2),
-        ("FullGate", 6144, 2),
-        ("MixerIn", 6144, 2),
-        ("Mix", 5120, 2),
-        ("GateUp", 34816, 2),
+        ("Hidden", t.hidden_size, 2),
+        ("R0", t.hidden_size, 4),
+        ("R1", t.hidden_size, 4),
+        ("Norm", t.hidden_size, 2),
+        ("QKV", t.qkv(), 2),
+        ("Zout", t.mixer(), 2),
+        ("AB", 2 * t.linear_num_value_heads, 2),
+        ("FullX", t.full_x(), 2),
+        ("FullQ", t.mixer(), 2),
+        ("FullGate", t.mixer(), 2),
+        ("MixerIn", t.mixer(), 2),
+        ("Mix", t.hidden_size, 2),
+        ("GateUp", 2 * t.intermediate_size, 2),
     ] {
         strides.insert(name.into(), width * size);
     }
@@ -257,7 +338,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             private[2] = Operation::Copy {
                 source: "HistoryOut".into(),
                 destination: format!("L{layer}_History"),
-                bytes: 3 * 10240 * 2,
+                bytes: 3 * t.qkv() * 2,
             };
             m.programs
                 .insert(format!("{PREFIX}/layer{layer}/private"), private.clone());
@@ -336,7 +417,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         });
         for (layer, kind) in t.layer_types.iter().enumerate() {
             let names = if kind == "linear_attention" {
-                &["gates", "conv", "history", "recurrent", "gated_norm"][..]
+                &["gates", "conv", "recurrent", "gated_norm"][..]
             } else {
                 &["prepare", "attention", "attention_merge"][..]
             };
@@ -348,7 +429,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
     }
     mtp::register(m)?;
-    vision(m, c.vision_depth)?;
+    vision(m, c.vision_depth, t.hidden_size)?;
     let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
     m.row_execution = Some(RowExecution {
         capacity: m
@@ -459,6 +540,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     let metadata = request.metadata;
     Ok((
         Box::new(QwenRows {
+            private_roles: private_roles(&metadata),
             manifest: metadata.clone(),
         }),
         CreatedPlan {
@@ -534,25 +616,8 @@ impl Adapter for QwenRows {
 
 impl QwenRows {
     fn state_bindings(&self, segments: &[BatchSegment]) -> abi::StateBindings {
-        let layout = self.manifest.batch_layout.as_ref().unwrap();
         let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
-        let roles: Vec<_> = (0..layout.layers.len())
-            .flat_map(|layer| {
-                layout.state_columns.iter().map(move |column| {
-                    let per_layer = format!("L{layer}_{column}");
-                    if self.manifest.buffers.iter().any(|b| b.name == per_layer) {
-                        Some(per_layer)
-                    } else {
-                        self.manifest
-                            .buffers
-                            .iter()
-                            .any(|b| b.name == *column)
-                            .then(|| column.clone())
-                    }
-                })
-            })
-            .collect();
-        crate::packet::private_bindings(&decoders, decoders.len(), &roles)
+        crate::packet::private_bindings(&decoders, decoders.len(), &self.private_roles)
     }
     fn packet(
         &self,
@@ -729,7 +794,9 @@ impl QwenRows {
                 "HeadHidden".into(),
                 BufferView {
                     buffer: "HeadHidden".into(),
-                    offset: head_lane * 5120 * 2,
+                    offset: head_lane
+                        * m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden
+                        * 2,
                 },
             );
             append(
@@ -817,56 +884,99 @@ mod tests {
     use serde_json::json;
 
     fn request() -> CreateRequest {
-        let config = json!({"model_type":"qwen3_5","text_config":{"hidden_size":5120,
-            "intermediate_size":17408,"num_hidden_layers":64,"vocab_size":248320,
-            "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,
+        request_geometry(false)
+    }
+
+    fn request_geometry(small: bool) -> CreateRequest {
+        let (h, f, layers, hv, qh, kvh) = if small {
+            (2048, 6144, 24, 16, 8, 2)
+        } else {
+            (5120, 17408, 64, 48, 24, 4)
+        };
+        let mut config = json!({"model_type":"qwen3_5","text_config":{"hidden_size":h,
+            "intermediate_size":f,"num_hidden_layers":layers,"vocab_size":248320,
+            "linear_num_key_heads":16,"linear_num_value_heads":hv,"linear_key_head_dim":128,
             "linear_value_head_dim":128,"linear_conv_kernel_dim":4,
-            "layer_types":(0..64).map(|i|if i%4==3 {"full_attention"} else {"linear_attention"}).collect::<Vec<_>>()},
+            "num_attention_heads":qh,"num_key_value_heads":kvh,"head_dim":256,"tie_word_embeddings":small,
+            "layer_types":(0..layers).map(|i|if i%4==3 {"full_attention"} else {"linear_attention"}).collect::<Vec<_>>()},
             "quantization_config":{"quant_method":"orinfer_q4_int8","version":1,"rotation":"signed-block128",
             "scale":"fp16-output-row","compute_dtype":"int8_quality"}});
+        if small {
+            config["quantization_config"]["quant_method"] = json!("orinfer_e8p_q4_int8");
+            config["quantization_config"]["coefficients"] = json!([4, 1]);
+            config["quantization_config"]["basis_tensor"] = json!("orinfer.e8p_q4.basis");
+            config["quantization_config"]["layout"] = json!("u32-low-coarse-high-residual");
+            config["quantization_config"]["embedding"] = json!("e8p_q4");
+        }
         let signature = Configuration::parse(config.clone()).unwrap().signature;
         let mut buffers = vec![];
         let mut q4 = |name: String, n: usize, k: usize| {
-            for (suffix, dtype, shape) in
-                [("packed", "u8", vec![n, k / 2]), ("scale", "f16", vec![n])]
-            {
+            for (suffix, dtype, shape) in [
+                (
+                    "packed",
+                    if small { "u32" } else { "u8" },
+                    if small {
+                        vec![k / 128, n, 16]
+                    } else {
+                        vec![n, k / 2]
+                    },
+                ),
+                ("scale", "f16", vec![n]),
+            ] {
                 buffers.push(
                     json!({"name":format!("{name}.{suffix}"),"dtype":dtype,"shape":shape,
-                    "layout":"native_contiguous","alignment":256,"access":"read",
+                    "layout":if small && suffix=="packed" {"e8p-q4-k128-u32"} else {"native_contiguous"},"alignment":256,"access":"read",
                     "data":{"tensor":format!("{name}.{suffix}"),"sha256":"0".repeat(64)}}),
                 );
             }
         };
-        q4("lm_head.weight".into(), 248320, 5120);
-        for i in 0..64 {
+        q4(
+            if small {
+                "model.language_model.embed_tokens.weight"
+            } else {
+                "lm_head.weight"
+            }
+            .into(),
+            248320,
+            h,
+        );
+        for i in 0..layers {
             let p = format!("model.language_model.layers.{i}");
-            for (name, n, k) in [
-                ("gate_proj", 17408, 5120),
-                ("up_proj", 17408, 5120),
-                ("down_proj", 5120, 17408),
-            ] {
+            for (name, n, k) in [("gate_proj", f, h), ("up_proj", f, h), ("down_proj", h, f)] {
                 q4(format!("{p}.mlp.{name}.weight"), n, k);
             }
             let projections: &[(&str, usize)] = if i % 4 == 3 {
                 &[
-                    ("self_attn.q_proj", 12288),
-                    ("self_attn.k_proj", 1024),
-                    ("self_attn.v_proj", 1024),
+                    ("self_attn.q_proj", 2 * qh * 256),
+                    ("self_attn.k_proj", kvh * 256),
+                    ("self_attn.v_proj", kvh * 256),
                 ]
             } else {
                 &[
-                    ("linear_attn.in_proj_qkv", 10240),
-                    ("linear_attn.in_proj_z", 6144),
+                    ("linear_attn.in_proj_qkv", (32 + hv) * 128),
+                    ("linear_attn.in_proj_z", hv * 128),
                 ]
             };
             for (name, n) in projections {
-                q4(format!("{p}.{name}.weight"), *n, 5120);
+                q4(format!("{p}.{name}.weight"), *n, h);
+            }
+        }
+        if small {
+            for (name, dtype, shape) in [
+                ("basis", "i8", vec![256, 8]),
+                ("selectors", "u32", vec![256, 1]),
+            ] {
+                buffers.push(
+                    json!({"name":format!("orinfer.e8p_q4.{name}"),"dtype":dtype,"shape":shape,
+                    "layout":"native_contiguous","alignment":256,"access":"read",
+                    "data":{"tensor":format!("orinfer.e8p_q4.{name}"),"sha256":"0".repeat(64)}}),
+                );
             }
         }
         buffers.extend([
-            json!({"name":"Hidden","dtype":"f16","shape":[4096,5120],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
-            json!({"name":"R0","dtype":"f32","shape":[4096,5120],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
-            json!({"name":"QwenRowPointers","dtype":"u64","shape":[128*64*STATE_COLUMNS.len()],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"Hidden","dtype":"f16","shape":[4096,h],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"R0","dtype":"f32","shape":[4096,h],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
+            json!({"name":"QwenRowPointers","dtype":"u64","shape":[128*layers*STATE_COLUMNS.len()],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
             json!({"name":"QwenRowScratch","dtype":"u8","shape":[256],"layout":"native_contiguous","alignment":256,"access":"read_write"}),
         ]);
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
@@ -875,10 +985,70 @@ mod tests {
             "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
                 "status":"TokenStatus","logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
-                "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":5120,"state_columns":STATE_COLUMNS},
+                "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":h,"state_columns":STATE_COLUMNS},
                 "kv_cache":{"direct_prefill":true,"demand_mapping":true,"buffers":{},"prefill_workspace":{}},
                 "dynamic_batch_kernels":{"qwen_rows/layer0/pre/norm_rotate":{"name":"qwen_rows/layer0/pre/norm_rotate","capacity":4096,
                     "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],"arguments":[]}}}})).unwrap()
+    }
+
+    #[test]
+    fn small_dense_reuses_row_state_and_tied_head_without_duplicate_weight() {
+        let (adapter, plan) = create(request_geometry(true), Policy::Int8Quality).unwrap();
+        let m = &plan.metadata;
+        assert_eq!(m.prefill_plans[0].stages.len(), 24);
+        let layout = m.batch_layout.as_ref().unwrap();
+        assert_eq!(layout.hidden, 2048);
+        assert_eq!(layout.row_strides["QKV"], 6144 * 2);
+        assert!(!m.buffers.iter().any(|b| b.name.starts_with("lm_head.")));
+        let (calls, _) = adapter
+            .batch(
+                &[
+                    BatchSegment { slot: 3, tokens: 1 },
+                    BatchSegment { slot: 7, tokens: 2 },
+                ],
+                true,
+            )
+            .unwrap();
+        assert!(calls.iter().any(|c| c.sequence == Some(7)));
+        let mut wrong = request_geometry(true);
+        wrong
+            .metadata
+            .buffers
+            .retain(|b| b.name != "model.language_model.embed_tokens.weight.scale");
+        assert!(create(wrong, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn quantized_vision_inserts_shared_projection_stages_before_the_epilogue() {
+        let mut m = request_geometry(true).metadata;
+        m.vision = Some(serde_json::from_value(json!({
+            "hidden":2048,"patch_size":16,"temporal_patch_size":2,"merge_size":2,
+            "max_patches":32768,"max_features":8192,"pixels":"Pixels","grid":"Grid",
+            "length":"Length","output":"Output","features":"Features","feature_index":"Index",
+            "mrope_positions":"MRope","image_token_id":248056,"vision_start_token_id":248053,
+            "vision_end_token_id":248054,"plans":[{"patches":32768,"min_patches":4,"program":"vision"}]
+        })).unwrap());
+        let mut packed = m.buffers[0].clone();
+        packed.name = "model.visual.blocks.0.attn.qkv.weight.packed".into();
+        m.buffers.push(packed);
+        vision(&mut m, 24, 2048).unwrap();
+        let names: Vec<_> = m.programs["vision"]
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            &names[3..7],
+            &[
+                "qwen_rows/vision/layer0/qkv_rotate",
+                "qwen_rows/vision/layer0/qkv_project",
+                "qwen_rows/vision/layer0/qkv",
+                "qwen_rows/vision/layer0/rope",
+            ]
+        );
+        assert!(!names.contains(&"qwen_rows/vision/layer1/qkv_project"));
     }
 
     #[test]
@@ -1018,6 +1188,28 @@ mod tests {
 
     fn mtp_request() -> CreateRequest {
         let mut r = request();
+        for (name, width, dtype) in [
+            ("MtpEmbedding", 5120, "f16"),
+            ("MtpConcat", 10240, "f16"),
+            ("MtpHidden", 5120, "f16"),
+            ("MtpNorm", 5120, "f16"),
+            ("MtpR0", 5120, "f32"),
+            ("MtpR1", 5120, "f32"),
+            ("MtpFullX", 14336, "f16"),
+            ("MtpFullQ", 6144, "f16"),
+            ("MtpFullGate", 6144, "f16"),
+            ("MtpMixer", 6144, "f16"),
+            ("MtpMix", 5120, "f16"),
+            ("MtpGateUp", 34816, "f16"),
+        ] {
+            r.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":dtype,"shape":[512,width],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
         r.metadata.mtp=Some(serde_json::from_value(json!({
             "position":"MtpStep","input":"MtpInput","token":"MtpToken","status":"MtpStatus",
             "verification_tokens":"SequenceTokens","verification_status":"SequenceStatus",

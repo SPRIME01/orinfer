@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-module="${1:?usage: run.sh flash_next|qwen35 [converter arguments]}"
+module="${1:?usage: run.sh flash_next|qwen35|qwen_e8p [converter arguments]}"
 shift
 case "$module" in
-    flash_next|qwen35) ;;
+    flash_next|qwen35|qwen_e8p) ;;
     *) echo 'Unknown quantization entrypoint' >&2; exit 2 ;;
 esac
 cd "$repo_dir"

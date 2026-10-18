@@ -14,10 +14,36 @@ from tools.model.publication import (
     commit_package,
     load_model,
     link_or_copy,
+    seed_compile_cache,
 )
 
 
 class PublicationTests(unittest.TestCase):
+    def test_compile_cache_seeding_preserves_platform_and_live_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "source", root / "target"
+            target.mkdir()
+            for layout in ("v1/kernels", "v2/linux-aarch64/kernels"):
+                good = source / layout / "complete"
+                good.mkdir(parents=True)
+                (good / "kernel.cubin").write_bytes(b"compiled")
+                live = target / layout / "live"
+                live.mkdir(parents=True)
+                (live / "kernel.cubin").write_bytes(b"in progress")
+                other = source / layout / "live"
+                other.mkdir()
+                (other / "kernel.cubin").write_bytes(b"older")
+            seed_compile_cache(source, target)
+            for layout in ("v1/kernels", "v2/linux-aarch64/kernels"):
+                self.assertEqual(
+                    (target / layout / "complete/kernel.cubin").read_bytes(), b"compiled"
+                )
+                self.assertEqual(
+                    (target / layout / "live/kernel.cubin").read_bytes(), b"in progress"
+                )
+                self.assertEqual((source / layout / "live/kernel.cubin").read_bytes(), b"older")
+
     def test_replacing_a_cloned_asset_does_not_overwrite_the_source_inode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

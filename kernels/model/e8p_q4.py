@@ -1,5 +1,6 @@
 """Two-stage E8P projections with exact INT8 or direct INT4 schedules."""
 
+import tilelang
 import tilelang.language as T
 
 from kernels.model.integer_core import dp4a, prepare_e8p_book, tensor_core_tiles, tile_coordinates
@@ -66,6 +67,66 @@ __device__ __forceinline__ unsigned e8p_q4_decode_flags(unsigned b0, unsigned b1
 def validate_packed_k(K, packed_k):
     if type(packed_k) is not int or packed_k not in (0, 64, 128) or (packed_k and K % packed_k):
         raise ValueError("Invalid compressed K layout")
+
+
+@orin_jit
+def embedding(capacity, vocab, hidden):
+    """Gather and inverse-rotate selected rows of the shared K128 Q4 bank."""
+    from kernels.model.rotation_a8 import block_hadamard
+
+    validate_shape(capacity, vocab, hidden)
+    m = row_count(capacity, True)
+    source = decode_source((4, 1))
+    butterfly = block_hadamard(128)
+
+    @T.prim_func
+    def main(
+        IDs: T.Tensor((m,), T.int32),
+        Weight: T.Tensor((hidden // 128, vocab, 16), T.uint32),
+        Book: T.Tensor((256, 1), T.uint32),
+        Scale: T.Tensor((vocab,), T.float16),
+        Signs: T.Tensor((hidden,), T.int8),
+        Output: T.Tensor((m, hidden), T.float16),
+    ):
+        with T.Kernel(m, hidden // 128, threads=128) as (row, block):
+            T.import_source(source)
+            book = T.alloc_shared((512, 1), T.uint32)
+            current = T.alloc_shared((128,), T.float32)
+            values = T.alloc_fragment((128,), T.float32)
+            T.annotate_layout(
+                {
+                    values: tilelang.Fragment(
+                        (128,), forward_thread_fn=lambda k: k, forward_index_fn=lambda k: 0
+                    )
+                }
+            )
+            prepare_e8p_book(Book, book)
+            T.sync_threads()
+            for k in T.Parallel(128):
+                values[k] = 0
+                if 0 <= IDs[row] and IDs[row] < vocab:
+                    code = Weight[block, IDs[row], k // 8]
+                    word = T.call_pure_extern(
+                        "uint32",
+                        "e8p_q4_decode_flags",
+                        book[(code >> 8) & 255, 0],
+                        book[code >> 24, 0],
+                        book[256 + (code & 255), 0],
+                        book[256 + ((code >> 16) & 255), 0],
+                        (k // 4) % 2,
+                    )
+                    values[k] = T.cast(T.cast((word >> ((k % 4) * 8)) & 255, T.int8), T.float32)
+            butterfly(values, current)
+            for k in T.Parallel(128):
+                Output[row, block * 128 + k] = T.if_then_else(
+                    0 <= IDs[row] and IDs[row] < vocab,
+                    (values[k] * 0.08838834764831845)
+                    * T.cast(Scale[IDs[row]], T.float32)
+                    * T.cast(Signs[block * 128 + k], T.float32),
+                    0,
+                )
+
+    return main
 
 
 @orin_jit

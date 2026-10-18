@@ -886,6 +886,76 @@ fn capture_decode_projections() {
 }
 
 #[test]
+#[ignore = "Real vision encoder plan; requires images and exclusive GPU experiment lock"]
+fn profile_vision_stages() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let vision = model
+        .manifest
+        .vision
+        .clone()
+        .expect("Vision model required");
+    let mut seen = BTreeSet::new();
+    let mut rows = vec![];
+    for (case, source) in sources.into_iter().enumerate() {
+        for (index, image) in source.images.into_iter().enumerate() {
+            if !seen.insert((image.grid_height, image.grid_width)) {
+                continue;
+            }
+            let patches = image.grid_height * image.grid_width;
+            let tokens = std::iter::once(vision.vision_start_token_id)
+                .chain(std::iter::repeat_n(vision.image_token_id, patches / 4))
+                .chain([vision.vision_end_token_id])
+                .collect::<Vec<_>>();
+            // Materialize real pixels, grid, length and buffers before timing.
+            // Every replay starts at patch embedding and replaces its outputs.
+            model.prepare_visual(&tokens, &[image], &|| false).unwrap();
+            let program = vision
+                .plans
+                .iter()
+                .filter(|p| p.patches >= patches && p.min_patches <= patches)
+                .min_by_key(|p| p.patches)
+                .expect("Image must fit a native vision plan")
+                .program
+                .clone();
+            let plan = row_invocations(&model, &program, patches).unwrap();
+            if fixture["ncu"].as_bool() == Some(true) {
+                profile_native_ncu(&mut model, &plan);
+                rows.push(json!({"case":case,"image":index,"patches":patches,
+                    "program":program,"operations":plan}));
+            } else {
+                let hot = model.execution.profile_invocations_hot(&plan, 8).unwrap();
+                let trials = model.execution.profile_graph_operations(&plan).unwrap();
+                rows.push(json!({"case":case,"image":index,"patches":patches,
+                    "program":program,"operations":plan,
+                    "hot_graph_median_ms":median(&hot[1..].iter().map(|&v|f64::from(v)).collect::<Vec<_>>()),
+                    "instrumented_gpu_median_ms":median(&trials.iter().map(|t|t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<_>>()),
+                    "operation_median_ms":(0..plan.len()).map(|i|median(&trials.iter().map(|t|f64::from(t[i])).collect::<Vec<_>>())).collect::<Vec<_>>() }));
+            }
+            std::fs::write(&output, serde_json::to_vec_pretty(&json!({"rows":rows,
+                "fingerprint":model.stats.manifest_sha256,
+                "scope":"Real normalized image patches through the complete native vision encoder. Instrumented GPU graph, excluding image preprocessing, feature copies and text generation; not API latency or quality acceptance."})).unwrap()).unwrap();
+        }
+    }
+    assert!(!rows.is_empty(), "Fixture requires at least one image");
+}
+
+#[test]
 #[ignore = "Full native decode plan; requires real model and exclusive GPU experiment lock"]
 fn profile_decode_chain() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(

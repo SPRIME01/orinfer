@@ -1,0 +1,85 @@
+{
+  "seed": 20261002,
+  "cases": [
+    {
+      "id": "zh_en",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下中文文本翻译为英语，直接输出翻译结果，不要进行任何解释。\n\n第一轮请求需要预热，后续请求可以复用缓存。"
+        }
+      ],
+      "target_text": "The first request requires warm-up, while subsequent requests can reuse the cache."
+    },
+    {
+      "id": "en_zh",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下英文文本翻译为中文，直接输出翻译结果，不要进行任何解释。\n\nThe inference engine loads the model once and shares its weights across concurrent requests."
+        }
+      ],
+      "target_text": "推理引擎只加载一次模型，并在并发请求之间共享权重。"
+    },
+    {
+      "id": "ja_zh",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下日文文本翻译为中文，直接输出翻译结果，不要进行任何解释。\n\n本日の会議は午後三時から始まります。資料を事前にご確認ください。"
+        }
+      ],
+      "target_text": "今天的会议将于下午三点开始。请提前查看资料。"
+    },
+    {
+      "id": "de_zh",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下德文文本翻译为中文，直接输出翻译结果，不要进行任何解释。\n\nDie neue Software reduziert den Speicherverbrauch, ohne die Genauigkeit zu beeinträchtigen."
+        }
+      ],
+      "target_text": "新软件降低了内存占用，同时不影响精度。"
+    },
+    {
+      "id": "glossary",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下中文技术说明翻译成英语，并且严格遵循所有约束要求。\n\n〖源文〗\n前缀缓存保存可复用的状态，投机解码减少生成每个词元需要的计算。\n\n〖约束要求〗\n1. 〖硬性要求〗术语对照：前缀缓存→prefix cache；投机解码→speculative decoding；词元→token。\n2. 〖注意〗保持简洁、正式的技术文档风格。\n\n只输出译文，不要有任何额外说明。"
+        }
+      ],
+      "target_text": "The prefix cache stores reusable state, and speculative decoding reduces the computation required to generate each token."
+    },
+    {
+      "id": "json",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下英文内容翻译成中文，并且严格遵循所有约束要求。\n\n〖源文〗\n{\"message\":\"Your order has been shipped.\",\"count\":3,\"user\":\"{user_name}\"}\n\n〖约束要求〗\n1. 〖硬性要求〗保留 JSON 格式、所有键名、数字和 {user_name} 占位符，只翻译 message 的内容。\n\n只输出译文，不要有任何额外说明。"
+        }
+      ],
+      "target_text": "{\"message\":\"您的订单已发货。\",\"count\":3,\"user\":\"{user_name}\"}"
+    },
+    {
+      "id": "negation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下英文文本翻译为中文，直接输出翻译结果，不要进行任何解释。\n\nDo not restart the service until all active requests have finished. Queued requests should be preserved."
+        }
+      ],
+      "target_text": "在所有活跃请求完成之前，请勿重启服务。应保留排队中的请求。"
+    },
+    {
+      "id": "style",
+      "messages": [
+        {
+          "role": "user",
+          "content": "请将以下中文商务邮件翻译成英语，并且严格遵循所有约束要求。\n\n〖源文〗\n今天下午的会议临时取消了，我们会另行通知新的时间。给您带来不便，敬请谅解。\n\n〖约束要求〗\n1. 〖注意〗语气正式、礼貌，适合商务邮件。\n\n只输出译文，不要有任何额外说明。"
+        }
+      ],
+      "target_text": "This afternoon's meeting has been cancelled. We will notify you of the new time separately. We apologize for any inconvenience."
+    }
+  ]
+}

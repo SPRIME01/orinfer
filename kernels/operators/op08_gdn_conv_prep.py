@@ -26,6 +26,8 @@ def gdn_conv_prep(
     compact_decode: bool = False,
     inplace_history: bool = False,
     dynamic_tokens: bool = False,
+    key_heads: int = 16,
+    value_heads: int = 48,
 ):
     """Build (X,W,HI,lengths,positions,Q,K,V,HO,positions_out).
 
@@ -48,6 +50,10 @@ def gdn_conv_prep(
     inplace_history replaces HI/HO with one History argument for fixed B=1
     compact decode. Each head caches its raw tail before updating its own slice.
     """
+    KEY_HEADS, VALUE_HEADS, DIM = key_heads, value_heads, 128
+    CHANNELS = (2 * KEY_HEADS + VALUE_HEADS) * DIM
+    if min(KEY_HEADS, VALUE_HEADS) <= 0 or VALUE_HEADS % KEY_HEADS:
+        raise ValueError("Invalid GDN head geometry")
     assert tile_tokens in (1, 2, 4, 8, 16)
     assert qk_output_dtype in ("float16", "float32") and q_scale > 0
     assert weight_dtype in ("float16", "float32")
@@ -63,11 +69,15 @@ def gdn_conv_prep(
     if type(dynamic_tokens) is not bool or dynamic_tokens and (B != 1 or compact_decode):
         raise ValueError("Dynamic token strides require single-request prefill")
     time = T.dynamic("m") if dynamic_tokens else T.dynamic("tokens") if tokens is None else tokens
+    threads = min(128, tile_tokens * 16)
 
     @T.macro
     def body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out):
         with T.Kernel(
-            T.ceildiv(time, tile_tokens), 80, batch, threads=16 if compact_decode else 128
+            T.ceildiv(time, tile_tokens),
+            2 * KEY_HEADS + VALUE_HEADS,
+            batch,
+            threads=threads,
         ) as (bt, head, b):
             acc = T.alloc_fragment((tile_tokens, DIM), T.float32)
             raw = T.alloc_fragment((tile_tokens, DIM), T.float32)
@@ -77,25 +87,25 @@ def gdn_conv_prep(
             total = T.alloc_fragment((tile_tokens,), T.float32)
             normalized = T.alloc_fragment((tile_tokens, DIM), T.float16)
             product = T.alloc_fragment((tile_tokens, DIM), T.float16)
-            if compact_decode:
-                # The native 16-token tile reduces eight adjacent channels per
-                # thread, then a 16-lane group. Keep that FP32 order for decode.
-                layout = tilelang.Fragment(
-                    (tile_tokens, DIM),
-                    forward_thread_fn=lambda ti, d: ti * 16 + d // 8,
-                    forward_index_fn=lambda ti, d: d % 8,
-                )
-                T.annotate_layout(
-                    {
-                        acc: layout,
-                        raw: layout,
-                        activated: layout,
-                        value: layout,
-                        square: layout,
-                        normalized: layout,
-                        product: layout,
-                    }
-                )
+            # Every time tile retains the native eight adjacent K partials
+            # followed by a sixteen-lane reduction. Tile choice changes work
+            # distribution, never the normalization's FP32 reduction tree.
+            layout = tilelang.Fragment(
+                (tile_tokens, DIM),
+                forward_thread_fn=lambda ti, d: (ti % (threads // 16)) * 16 + d // 8,
+                forward_index_fn=lambda ti, d: (ti // (threads // 16)) * 8 + d % 8,
+            )
+            T.annotate_layout(
+                {
+                    acc: layout,
+                    raw: layout,
+                    activated: layout,
+                    value: layout,
+                    square: layout,
+                    normalized: layout,
+                    product: layout,
+                }
+            )
             if inplace_history:
                 tail = T.alloc_fragment((2, DIM), T.float16)
                 T.annotate_layout(
@@ -131,7 +141,7 @@ def gdn_conv_prep(
                 activated[ti, d] = acc[ti, d] / (1.0 + T.exp(-acc[ti, d]))
                 value[ti, d] = T.cast(activated[ti, d], T.float32)
                 square[ti, d] = value[ti, d] * value[ti, d]
-            if head < 32:
+            if head < 2 * KEY_HEADS:
                 T.reduce_sum(square, total, dim=1)
                 for ti, d in T.Parallel(tile_tokens, DIM):
                     if normalize_round_fp16:
@@ -140,14 +150,14 @@ def gdn_conv_prep(
                     else:
                         value[ti, d] *= T.rsqrt(total[ti] + 1e-6)
                     if bt * tile_tokens + ti < time:
-                        if head < 16:
+                        if head < KEY_HEADS:
                             Q[b, head, bt * tile_tokens + ti, d] = value[ti, d] * q_scale
                         else:
-                            K[b, head - 16, bt * tile_tokens + ti, d] = value[ti, d]
+                            K[b, head - KEY_HEADS, bt * tile_tokens + ti, d] = value[ti, d]
             else:
                 for ti, d in T.Parallel(tile_tokens, DIM):
                     if bt * tile_tokens + ti < time:
-                        V[b, head - 32, bt * tile_tokens + ti, d] = activated[ti, d]
+                        V[b, head - 2 * KEY_HEADS, bt * tile_tokens + ti, d] = activated[ti, d]
             # Only the first time-block writes each channel's final raw history.
             # Q/K are represented once, so shared value heads never race here.
             if bt == 0:

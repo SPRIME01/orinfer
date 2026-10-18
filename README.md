@@ -2,13 +2,13 @@
 
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）的文本、图片和多图，以及 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。
+面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）和 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。开发版新增 Index-Translate-2B 翻译适配；图片输入已接通，复杂图片的翻译质量仍需改进。
 
 ## 功能
 
 - OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
-- 27B 使用带旋转的自有码表 Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
-- 分块 prefill、独立请求状态及 prefix cache，两种模型都支持原生 MTP。两种模型均可通过对应算子包启用连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
+- 27B 与 Index-Translate-2B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
+- 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
 
@@ -57,6 +57,8 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包：512-token 输入的执行层 prefill 为 **1008.9 tokens/s**。通过 Rust CLI 的流式 Chat API，从零生成 Rust 代码，开启 `medium` thinking、总输出预算 16K，实际生成 6.2K–7.6K tokens 时，单流 decode 关闭 MTP 为 **29.49–29.72 tokens/s**，开启最多 3 个草稿后为 **44.99–45.82 tokens/s**，提升 **1.51–1.55 倍**。
 
 详细 prefill、API 首 token 时延、代码阶段吞吐、prefix cache 命中及 27B 测量结果见[性能参考](docs/performance.md)。数据对应重建后的执行包，测试配置、预热次数和计时口径均在该文档中说明。
+
+Index-Translate-2B 的量化权重约 **1.23 GB / 4.32 bit**。开发版 Rust CLI 固定长度基准中，512／2K／8K prefill 约 **7.6K／7.9K／6.5K tokens/s**，关闭 MTP 的 decode 约 **108／105／94 tokens/s**；普通请求路径约 **113／109／98 tokens/s**。关闭 MTP 的 150 TPS 目标尚未达到。测量口径、文本快速评测和图片质量限制见[同页记录](docs/performance.md#index-translate-2b2026-10-18)。
 
 目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
 

@@ -428,6 +428,49 @@ class DecodeTuner:
         kernel, record = self._tune(*args, **kwargs)
         return kernel, record["config"]
 
+    def compile_choices(self, *args, fixed=(), **kwargs):
+        """Bounded AOT row choices from the same dynamic projection body.
+
+        These specialize small packets without replacing the one prefill
+        fallback. Every emitted interval comes from measured, numerically
+        checked candidates, rather than a hand-written batch threshold.
+        """
+        import tilelang
+        from tools.model.row_selection import choices, ranges
+
+        if not kwargs.get("dynamic"):
+            raise ValueError("Bounded choices require runtime row arguments")
+        _, record = self._tune(*args, **kwargs)
+        spec = record["identity"]["spec"]
+        capacity = spec["rows"]
+        measurements = [
+            dict(
+                rows=p["rows"],
+                times={
+                    str(i): value
+                    for i, value in enumerate(p["times_ms"])
+                    if value is not None
+                    and all(q["times_ms"][i] is not None for q in record["profiles"])
+                },
+            )
+            for p in record["profiles"]
+        ]
+        selection = dict(ranges(measurements, capacity), configs=record["candidates"])
+        compiled = {}
+        for suffix, config in choices(selection, capacity, fixed, bounded=True):
+            key = json.dumps(config, sort_keys=True)
+            if key not in compiled:
+                kernel = tilelang.compile(
+                    make_prim(spec, config),
+                    out_idx=[],
+                    execution_backend="nvrtc",
+                    target=TARGET,
+                )
+                for live in record["checked_rows"]:
+                    self._validate(kernel, spec, config, live, kwargs.get("weights"))
+                compiled[key] = kernel
+            yield suffix, config, compiled[key]
+
     @staticmethod
     def _inputs(spec, live, weights=None):
         """Same mathematical inputs for all candidates; expert maps match tiles."""

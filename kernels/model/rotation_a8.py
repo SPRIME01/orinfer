@@ -29,8 +29,31 @@ def _rotation_code(value, scale, inv):
     return T.max(-127.0, T.min(127.0, T.round(adjusted)))
 
 
+def block_hadamard(width):
+    """Unscaled block128 butterflies, also used by inverse weight gathers."""
+
+    @T.macro
+    def transform(values, current):
+        for stage in T.unroll(5):
+            for k in T.Parallel(width):
+                other = T.call_pure_extern(
+                    "float32", "__shfl_xor_sync", T.uint32(0xFFFFFFFF), values[k], 1 << stage, 32
+                )
+                values[k] = other + values[k] * (1 - 2 * ((k >> stage) & 1))
+        for stage in T.unroll(5, 7):
+            T.copy(values, current)
+            T.sync_threads()
+            for k in T.Parallel(width):
+                values[k] = current[k ^ (1 << stage)] + values[k] * (1 - 2 * ((k >> stage) & 1))
+            T.sync_threads()
+
+    return transform
+
+
 def _block_rotation(width, inputs, swiglu, plane_rows=0):
     """Shared block128 butterflies; each warp owns consecutive coordinates."""
+
+    butterfly = block_hadamard(width)
 
     @T.macro
     def transform(X, Signs, row, offset, values, current):
@@ -59,18 +82,7 @@ def _block_rotation(width, inputs, swiglu, plane_rows=0):
                     values[k] = T.cast(X[row, offset + k], T.float32) * T.cast(
                         Signs[offset + k], T.float32
                     )
-        for stage in T.unroll(5):
-            for k in T.Parallel(width):
-                other = T.call_pure_extern(
-                    "float32", "__shfl_xor_sync", T.uint32(0xFFFFFFFF), values[k], 1 << stage, 32
-                )
-                values[k] = other + values[k] * (1 - 2 * ((k >> stage) & 1))
-        for stage in T.unroll(5, 7):
-            T.copy(values, current)
-            T.sync_threads()
-            for k in T.Parallel(width):
-                values[k] = current[k ^ (1 << stage)] + values[k] * (1 - 2 * ((k >> stage) & 1))
-            T.sync_threads()
+        butterfly(values, current)
         for k in T.Parallel(width):
             values[k] = T.cast(T.cast(values[k] * 0.08838834764831845, T.float16), T.float32)
 

@@ -1,6 +1,8 @@
-# Qwen 27B 原生 Q4A8 构建
+# Qwen3.5 Dense 原生 Q4A8 构建
 
 当前基线是官方 27B 的 beam8 重新编码、两级 E8P Q4A8 量化目录。它使用 signed-block128 旋转、两级固定整数码表和输出行 scale；Embedding、mixer 输出投影和 MTP 草稿矩阵保留 W8，敏感小权重及视觉保留浮点。本机量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`，完整模型为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`。
+
+同一构建入口也支持 Index-Translate-2B 的 24 层架构，使用 `tools/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用，不复制执行流程。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。
 
 两级 E8P-Q4 的数据契约为 `quant_method=orinfer_e8p_q4_int8`、`coefficients=[4,1]`、`basis_tensor=orinfer.e8p_q4.basis`、`layout=u32-low-coarse-high-residual`。输入压缩矩阵为 U32 `[N,K/8]`，构建时无损重排为 `[K/128,N,16]`，每个输出行一个 F16 scale。它复用原生执行计划、公共整数计算和离线 tile 调优。非零 basis 经验证后，直接 INT4 MMA 将完整 A8 拆成两个位平面，恢复相同的 INT32 点积；与 INT8 解码路径读取同一份压缩权重，由自动调优选择。
 
@@ -14,6 +16,8 @@ bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \
 构建只接受完整量化产物，按校验身份读取已有 safetensors 分片；两级 E8P 仅重排压缩码字，其余张量保持原始字节；不会持久保存展开 W8，也不再量化一次。必要的浮点布局转换与常量放在一个额外分片中。默认上下文 262144，可通过 `--context` 降低。
 
 发布目录结构与 Flash Next 相同：HF 配置/tokenizer、`cache/model.json`、标准权重分片，以及由 digest 固定的 schema-1 执行包。执行包包括 Rust 模型库和合并去重的 cubin/host ABI；层序、状态提交和 batching 逻辑由 Rust 注册，不写在模型数据中。
+
+构建时将 HF `tokenizer_config.json` 的 added-token 配置合并进部署用 `tokenizer.json`，验证每个 token 的 ID 不变。独立 Rust tokenizer 因此与 Transformers 识别相同的 thinking、工具及视觉标记，在线不需要加载 Transformers。
 
 直接 INT4 路径将每级 E8P 整数写成 `E=2n+1`，将 A8 写成 `A=lo+16hi`；分别累加两个位平面的整数乘积后，加回 `(a+b)·sum(A)`，再按原顺序乘权重 scale 和 token scale。它保留 A8 的全部信息。压缩权重以 K128 流水读取，CTA 内可用 1/2/4 组 warp 分摊 K 维，先在 shared memory 中合并 INT32 部分和，再执行一次原有 rescale；没有额外的全局归约 kernel。合法的 split-K 与 N tile 组合交给同一个离线调优器选择，不按单流、多流或矩阵名称指定实现。
 
@@ -31,11 +35,15 @@ E8P 的 INT8 Tensor Core 路径先将压缩 K128 slab 异步读入 CTA 共享内
 
 宽 FFN 的 SwiGLU、block128 旋转按列 tile 并行，再从局部最大值计算同一个输出行 A8 scale；旋转、舍入及 FP16 边界复用公共实现，不增加分组 scale。因果注意力使用公共行模板，离线选择 query-head 分组与 split 上限，支持动态拆分和编译期不拆分的特化。所有配置复用 INT8 KV 读取、FP32 softmax 和输出处理；真实行数与 KV 长度均在运行时传入。KV 读取使用紧凑的线程条带循环，避免 tile 完全展开产生过大的指令流；split merge 按输出列保留短向量，使用 FP32 树形归约后再执行原有 FP16 边界和 gate。调优包含非整 tile 的 KV 长度。Prefill、decode 与 MTP 复用同一计算体，Rust 分别绑定每个请求的 KV 和位置。
 
+整数投影保留一个大行数动态 fallback 与常用精确 AOT；128 行内非 AOT packet 的 tile 由离线测量选择，有界动态特化接收真实行数，不填充空请求。选择区间排除固定 AOT 点，复用同一投影计算体，未被选中的候选不进入部署包。
+
 上述流水线通过 `tools/model/row_tuning.py` 离线选择 tile，复用 Flash Next 的相邻选择区间合并规则；执行包只包含被选中的候选。运行时显式传入真实行数与 KV 长度，不按 batch 或上下文长度枚举 cubin。临时旋转区和有界注意力部分结果属于共享 workspace，不缓存展开权重。
 
 图片和多图使用共享 ViT 算子，一个动态 patch 模板覆盖 4–32768 patches，merger 按实际 patch 数除以 4。量化、执行和视觉均按真实 checkpoint 语义校验。
 
 两级 E8P 的整数、尾部和 Graph 检查可运行 `tools/quantization/check_e8p_q4.py` 与 `tools/quantization/check_e8p_direct.py`（通过同一个 GPU 包装器）。
+
+卷积的 1/2/4/8/16 时间 tile 由离线测量选择，共用八个 K 部分和、十六 lane 归约及原有 FP16 边界；MTP、prefill 短尾和大块使用同一计算体，不手写长度分界。普通 decode 的私有卷积在缓存旧尾部后原地提交历史；批量请求按地址表分别执行，不另发历史复制 kernel。E8P 的符号与 parity 合并为最终 XOR，保持全部码字和 INT32 点积不变。
 
 算子检查：
 
@@ -43,6 +51,7 @@ E8P 的 INT8 Tensor Core 路径先将压缩 K128 slab 异步读入 CTA 共享内
 bash tools/operators/run.sh tools/model/qwen35/check_kernels.py artifacts/qwen35-kernels \
   --gpu-lock-held
 bash tools/operators/run.sh tools/model/qwen35/check_rows.py artifacts/qwen35-rows
+bash tools/operators/run.sh tools/model/qwen35/check_decode.py artifacts/qwen35-decode
 ```
 
 构建缓存默认位于 `artifacts/build-cache/qwen35`。失败可用包装器 `--resume` 重跑，已校验编译对象会复用。新执行包必须另做真实模型加载、生成、prefix 恢复、并发和 MTP 验收；算子检查不代表整模型质量已通过。

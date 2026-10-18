@@ -11,6 +11,8 @@ python3 tools/eval/run_quality.py --help
 
 官方BF16或同模型FP8用作量化质量参考；同AWQ权重对照只用于实现诊断。场景检查、target NLL与长上下文任务需要分别评估。
 
+翻译模型可在 `offline_quality prepare` 时指定 `--fixtures fixtures/translation-quality-scenarios.json`，覆盖中英日德翻译、术语、JSON 占位符、否定和商务语气。参考译文用于固定概率评分历史；自由生成允许其他准确译法。这组快速检查不代表完整多语言 benchmark，图片和多图另做视觉概率及 API 任务验收。
+
 ## 离线 BF16 对照
 
 `reference_bf16.py`使用支持Qwen3_5的Transformers，从原始safetensors逐层加载权重，避免整份BF16权重常驻GPU。参考执行完整序列prefill；`score-model`执行正常prefill及逐token teacher-forced decode。报告明确标记两条路径，保留完整词表归一化的top-3、指定token概率与实际历史SHA256。
@@ -34,3 +36,5 @@ GPU任务通过`flock artifacts/gpu-experiment.lock`串行执行。参考与cand
 `prepare --long-context-tokens 512 2048 8192`追加确定性的中部资料检索场景。保留完整Chat模板，实际token长度接近且不超过给定预算；评分历史固定为正确资料答案。参考的`--batch-size`默认1，可合批以减少读取权重的次数；BF16舍入也会随GEMM形状变化，单流验收应使用单流参考。
 
 图片评分在每个case增加`images`数组，每项为`grid_height`、`grid_width`及归一化FP32 patch数组`pixels`，与在线`ImageInput`契约一致。`prompt_ids`须包含原生模板和展开后的图片占位token；参考和candidate共享相同patch输入。参考使用官方BF16视觉编码器、特征注入和MRoPE，不读取candidate视觉特征。输入指纹包含图片尺寸、FP32 little-endian像素SHA256和图片顺序，防止错误配对。该对照覆盖编码器至token概率；原始图片解码/resize应另用预处理参考验证，任务结果仍需独立自由生成。
+
+Transformers 的图像参考需要显式传入 `mm_token_type_ids`：展开的 image-pad 为 1，文本及界定符为 0；自由生成也必须保留该字段，确保使用 MRoPE。部署 tokenizer 应合并 `tokenizer_config.json` 的 added-token 配置，并与 Transformers 对照实际 token IDs；相同渲染字符串仍可能被切成不同 tokens。

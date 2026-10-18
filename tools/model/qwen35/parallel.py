@@ -20,7 +20,7 @@ def geometry(selection, row=1):
     return selection["configs"][int(key)]
 
 
-def factory(role, context, attention):
+def factory(role, context, attention, text=None):
     from kernels.model import kv_int8
     from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
     from kernels.model.gdn_sequence import _gdn_sequence
@@ -30,17 +30,41 @@ def factory(role, context, attention):
     from kernels.operators.op17_gdn_gated_norm import _compile_gated_norm
     from tools.model.row_tuning import ATTENTION_TARGET
 
+    text = text or {}
+    hk, hv = text.get("linear_num_key_heads", 16), text.get("linear_num_value_heads", 48)
+    qh, kvh = text.get("num_attention_heads", 24), text.get("num_key_value_heads", 4)
+
     def invoke(fn, *args, **kwargs):
         return inspect.unwrap(getattr(fn, "func", fn))(*args, **kwargs)
 
     if role == "gates":
-        fn = invoke(_compile_gates, packed_ab=True)
+        fn = invoke(_compile_gates, packed_ab=True, heads=hv)
     elif role == "conv":
-        fn = invoke(gdn_conv_prep, 1, 1)
+        # A request-owned decode CTA has exactly one time row. The compact
+        # layout preserves the prefill reduction tree and caches the old raw
+        # tail before updating this head's history in place.
+        fn = invoke(
+            gdn_conv_prep,
+            1,
+            1,
+            compact_decode=True,
+            inplace_history=True,
+            key_heads=hk,
+            value_heads=hv,
+        )
     elif role == "recurrent":
-        fn = invoke(_gdn_sequence, 1, in_place=True, value_tile=16, threads=32, prefetch_qk=True)
+        fn = invoke(
+            _gdn_sequence,
+            1,
+            in_place=True,
+            value_tile=16,
+            threads=32,
+            prefetch_qk=True,
+            key_heads=hk,
+            value_heads=hv,
+        )
     elif role == "gated_norm":
-        fn = invoke(_compile_gated_norm, 1)
+        fn = invoke(_compile_gated_norm, 1, heads=hv)
     elif role == "prepare":
         fn = invoke(
             kv_int8.full_prepare_mrope_int8,
@@ -48,10 +72,14 @@ def factory(role, context, attention):
             context,
             (11, 11, 10),
             max_position=context,
+            query_heads=qh,
+            kv_heads=kvh,
         )
     else:
         options = dict(
             block_m=attention["block_m"],
+            query_heads=qh,
+            kv_heads=kvh,
             target_tiles=ATTENTION_TARGET,
             max_splits=attention["max_splits"],
             head_group=attention["head_group"],
@@ -74,7 +102,7 @@ def factory(role, context, attention):
 def build(b, attention=None):
     """Add one dynamic 1..128-request kernel per private computation slot."""
     import tilelang
-    from kernels.model.independent_rows import independent_rows, history_commit
+    from kernels.model.independent_rows import independent_rows
     from tools.model.qwen35.build import gpu_lock
 
     if attention is None:
@@ -97,7 +125,9 @@ def build(b, attention=None):
         for role in names:
             old = kernels[f"qwen_rows/layer{layer}/private/{role}"]
             pointers = b.aot.compiler.pointers(old)
-            fn = factory(role, b.context, attention)
+            if role == "conv":
+                pointers["History"] = pointers["HI"]
+            fn = factory(role, b.context, attention, b.text)
             modes = {}
             normalized = dict(pointers)
             from tvm import tirx as tir
@@ -174,7 +204,7 @@ def build(b, attention=None):
             bindings["Pointers"] = dict(
                 kind="buffer_slice", name=TABLE, offset=layer * len(columns) * 8
             )
-            key = f"private-rows-{role}-{attention if role.startswith('attention') else ''}"
+            key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else ''}"
 
             def compile_wrapped(wrapped=wrapped, role=role):
                 return tilelang.compile(
@@ -191,22 +221,3 @@ def build(b, attention=None):
                 )
 
             b.emit(f"state/layer{layer}/{role}", key, compile_wrapped, bindings, LANES)
-            if role == "conv":
-                if offsets["HistoryOut"] != 0:
-                    raise ValueError("History must begin private scratch")
-                b.emit(
-                    f"state/layer{layer}/history",
-                    "private-history",
-                    lambda: history_commit(
-                        len(columns),
-                        column_map[SCRATCH],
-                        column_map["History"],
-                        row_stride=len(layers) * len(columns),
-                    ),
-                    dict(
-                        Pointers=dict(
-                            kind="buffer_slice", name=TABLE, offset=layer * len(columns) * 8
-                        )
-                    ),
-                    LANES,
-                )

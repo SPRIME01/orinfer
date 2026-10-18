@@ -33,6 +33,10 @@ def main():
         [rng.normal(0, scale, (32, 8)).astype(np.float32) for scale in [0.1, 1, 4, 20, 1e4]]
         + [np.full((1, 8), value, np.float32) for value in [0, 0.5, 1, -1, 2, 10]]
         + [grid[::4096].astype(np.float32)]
+        + [
+            rng.uniform(-1, 1, (32, 8)).astype(np.float32) * np.float32(2.0**exponent)
+            for exponent in (-126, -100, -70, -64, -63, -60, -54)
+        ]
     )
     raw = np.concatenate(
         [

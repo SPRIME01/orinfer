@@ -68,7 +68,7 @@ pub(crate) struct Executor {
     pub(super) kernels: RefCell<super::kernels::Catalog>,
     pub(super) cuda_graph: CudaGraphMode,
     pub(super) expert_cache: RefCell<Option<super::experts::Pager>>,
-    growth: BTreeMap<String, crate::model::KvGrowth>,
+    pub(super) growth: BTreeMap<String, crate::model::KvGrowth>,
     pub(crate) peak_kv_bytes: std::cell::Cell<usize>,
     pub(crate) peak_prefill_workspace_bytes: std::cell::Cell<usize>,
     pub(super) prefill_workspace: std::collections::BTreeSet<String>,
@@ -908,6 +908,29 @@ impl Executor {
                 .ok_or("Invalid logical KV write length")?,
             None => growth.tokens,
         };
+        self.ensure_kv_extent(program, position, count)
+    }
+    /// The request state machine knows the committed write interval. Batch
+    /// preparation can use it without downloading the same device position for
+    /// every owner; execution still validates the resulting device position.
+    pub(super) fn ensure_kv_extent(
+        &self,
+        program: &str,
+        position: usize,
+        count: usize,
+    ) -> Result<()> {
+        let Some(growth) = self.growth.get(program) else {
+            return Ok(());
+        };
+        if count == 0
+            || count > growth.tokens
+            || (growth.length.is_none() && count != growth.tokens)
+        {
+            return Err("Invalid logical KV write length".into());
+        }
+        if self.session.virtual_buffers.borrow().is_empty() {
+            return Ok(());
+        }
         let tokens = position.checked_add(count).ok_or("KV position overflow")?;
         let mut buffers = self.session.virtual_buffers.borrow_mut();
         let mut additional = 0usize;
@@ -923,6 +946,9 @@ impl Executor {
         if additional == 0 {
             return Ok(());
         }
+        // Physical mapping/COW changes require completed prior readers, even
+        // when the caller supplied host positions and retained the active arena.
+        self.sync()?;
         let (mut free, mut total) = (0, 0);
         // SAFETY: Live context; driver writes two scalar extents.
         unsafe {

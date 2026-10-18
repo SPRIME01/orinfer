@@ -173,13 +173,34 @@ impl ModelRuntime {
         };
         self.prepare_program_inputs(program, tokens, history)
     }
-    fn prepare_batch_target_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
+    fn prepare_batch_target_inputs(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> Result<()> {
         let program = if self.manifest.row_execution.is_some() {
             "batch_target"
         } else {
             "target"
         };
-        self.prepare_program_inputs(program, tokens, history)
+        let manifest = &self.manifest;
+        let execution = &mut self.execution;
+        self.model_package
+            .prepare_inputs(program, tokens, history, |name, bytes| {
+                let buffer = manifest
+                    .buffers
+                    .iter()
+                    .find(|b| b.name == name)
+                    .ok_or("Unknown model input upload")?;
+                if buffer.access == crate::artifact::Access::Read
+                    || buffer.data.is_some()
+                    || bytes.len() > buffer.bytes()?
+                {
+                    return Err("Invalid model input upload extent/access".into());
+                }
+                execution.upload_sequence_bytes(slot, name, bytes)
+            })
     }
     fn prepare_program_inputs(&self, program: &str, tokens: &[u32], history: &[u32]) -> Result<()> {
         self.model_package

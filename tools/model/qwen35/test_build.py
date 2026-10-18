@@ -54,6 +54,89 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_native_shard_layout_is_explicit_without_requantization(self):
+        from tools.model.publication import file_hash
+        from tools.model.safetensors_source import local_header
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            shard = source / "weights.safetensors"
+            values = {"W.int8": np.arange(-16, 16, dtype=np.int8).reshape(4, 8)}
+            save_file(values, shard)
+            original = file_hash(shard)
+            (source / "model.safetensors.index.json").write_text(
+                json.dumps(
+                    dict(
+                        metadata={"orinfer.sha256": {shard.name: original}},
+                        weight_map={"W.int8": shard.name},
+                    )
+                )
+            )
+            weights = Weights(source, root / "model")
+            weights.immutable("W.int8")
+            np.testing.assert_array_equal(weights.array("W.int8"), values["W.int8"])
+            _, header = local_header(root / "model/cache/weights" / shard.name)
+            self.assertEqual(header["__metadata__"]["orin.layout.W.int8"], "native_contiguous")
+            self.assertEqual(file_hash(shard), original)
+
+    def test_small_dense_geometry_and_tied_head(self):
+        candidate = config()
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            linear_num_value_heads=16,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            tie_word_embeddings=True,
+            layer_types=t["layer_types"][:24],
+        )
+        candidate["quantization_config"].update(
+            quant_method="orinfer_e8p_q4_int8",
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
+            embedding="e8p_q4",
+            vision="e8p_q4",
+        )
+        self.assertEqual(configuration(candidate, 262144)["hidden_size"], 2048)
+        t["tie_word_embeddings"] = False
+        with self.assertRaises(ValueError):
+            configuration(candidate, 262144)
+
+    def test_tied_head_binds_the_shared_compressed_weight(self):
+        builder = Builder.__new__(Builder)
+        builder.weights = SimpleNamespace(immutable=lambda n: n, packed_k=128)
+        builder.q4_codec, builder.book = "e8p_q4", "book"
+        launches = []
+        builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(bindings)
+        builder.projection(
+            "head/project",
+            "embedding",
+            248320,
+            2048,
+            "HeadLogits",
+            head=True,
+            rows=1,
+            dynamic=False,
+        )
+        self.assertEqual(
+            launches,
+            [
+                dict(
+                    A="HeadA8",
+                    W="embedding.packed",
+                    S="embedding.scale",
+                    AS="HeadAS",
+                    Out="HeadLogits",
+                    Book="book",
+                )
+            ],
+        )
+
     def test_prefetch_views_bind_the_owning_kv_and_exported_abi(self):
         first, merge = (lambda: None), (lambda: None)
         first.__name__, merge.__name__ = "attention", "merge"
@@ -66,6 +149,7 @@ class BuildTests(unittest.TestCase):
         )
         builder = Builder.__new__(Builder)
         builder.context, builder.lock = 262144, None
+        builder.qh, builder.kvh = 24, 4
         builder.row_tuner = SimpleNamespace(attention=lambda _: selection)
         launches = []
         builder.emit = lambda name, key, build, bindings, rows: launches.append(
@@ -105,14 +189,16 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn("stages", launches[1][0])
         self.assertNotIn("live_k", launches[1][1])
 
-    def test_projection_publishes_one_dynamic_fallback_and_exact_aot_only(self):
+    def test_projection_bounds_measured_choices_and_preserves_exact_aot(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
         builder.q4_codec = "e8p_q4"
         builder.book = "selectors"
+        builder.lock = None
+        builder.compile_projection = lambda *args, **kw: [("/rows/5-7", {"block_m": 8}, object())]
         launches = []
         builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(
-            (name, rows, options["dynamic"], bindings)
+            (name, rows, options.get("dynamic", True), bindings)
         )
         for kind in ("q4", "w8"):
             launches.clear()
@@ -122,13 +208,37 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(
                 [(name, rows, dynamic) for name, rows, dynamic, _ in launches],
                 [("projection", CAPACITY, True)]
-                + [(f"projection/rows/{r}-{r}", r, False) for r in (1, 2, 3, 4, 8, 16, 32)],
+                + [(f"projection/rows/{r}-{r}", r, False) for r in (1, 2, 3, 4, 8, 16, 32)]
+                + [("projection/rows/5-7", 128, True)],
             )
             output = "Out" if kind == "q4" else "Output"
             for _, _, _, bindings in launches:
                 self.assertEqual(
                     bindings[output], dict(kind="buffer_slice", name="output", offset=6)
                 )
+
+    def test_equivalent_projection_strides_share_the_compiled_identity(self):
+        builder = Builder.__new__(Builder)
+        builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
+        builder.q4_codec, builder.book = "e8p_q4", "selectors"
+        keys = []
+        builder.emit = lambda name, key, *args, **kwargs: keys.append(key)
+        for stride in (None, 64, 68):
+            builder.projection(
+                "projection", "weight", 64, 256, "output", stride=stride, rows=1, dynamic=False
+            )
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[0], keys[2])
+
+    def test_bounded_tuning_is_shared_across_layer_weights_but_not_strides(self):
+        builder = Builder.__new__(Builder)
+        builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
+        builder.q4_codec, builder.book, builder.lock = "e8p_q4", "selectors", None
+        builder.emit = lambda *args, **kwargs: None
+        with patch.object(builder, "compile_projection", return_value=[]) as compile:
+            for weight, stride in [("layer0", None), ("layer1", None), ("layer2", 68)]:
+                builder.projection("projection", weight, 64, 256, "output", stride=stride)
+            self.assertEqual(compile.call_count, 2)
 
     def test_two_stage_codec_has_an_explicit_contract(self):
         candidate = config()
@@ -226,6 +336,10 @@ class BuildTests(unittest.TestCase):
                 target = destination / "cache/weights/layer.safetensors"
                 self.assertNotEqual(target.stat().st_ino, shard.stat().st_ino)
                 begin, header = local_header(target)
+                for name in ("W.scale", "Sensitive"):
+                    self.assertEqual(
+                        header["__metadata__"][f"orin.layout.{name}"], "native_contiguous"
+                    )
                 self.assertEqual(
                     target.stat().st_size - begin, sum(v.nbytes for v in values.values())
                 )
