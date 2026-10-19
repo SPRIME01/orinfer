@@ -21,17 +21,14 @@
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "samplingParams": {
-            "temperature": 0,
-            "seed": 20261002
-          },
           "compat": {
-            "thinkingFormat": "qwen",
             "supportsReasoningEffort": true,
-            "thinkingTokenBudgetField": "thinking_token_budget",
             "supportsUsageInStreaming": true,
             "supportsStrictMode": true,
             "supportsLongCacheRetention": false
+          },
+          "thinkingLevelMap": {
+            "off": "none"
           }
         },
         {
@@ -50,17 +47,14 @@
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "samplingParams": {
-            "temperature": 0,
-            "seed": 20261002
-          },
           "compat": {
-            "thinkingFormat": "qwen",
             "supportsReasoningEffort": true,
-            "thinkingTokenBudgetField": "thinking_token_budget",
             "supportsUsageInStreaming": true,
             "supportsStrictMode": true,
             "supportsLongCacheRetention": false
+          },
+          "thinkingLevelMap": {
+            "off": "none"
           }
         }
       ]
