@@ -1,6 +1,7 @@
 use super::*;
 // Lifecycle scenarios adapted from Ollama; provenance and MIT notice are in fixtures/ollama.
 mod lifecycle;
+mod ollama;
 mod protocol;
 
 async fn eventually(mut condition: impl FnMut() -> bool) {

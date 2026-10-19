@@ -20,7 +20,7 @@ fn result(value: Result<Value>) -> Response {
         Err(e) => error(StatusCode::BAD_REQUEST, e),
     }
 }
-fn authorized(headers: &HeaderMap) -> bool {
+pub(super) fn authorized(headers: &HeaderMap) -> bool {
     std::env::var("ORINFER_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
@@ -42,6 +42,15 @@ async fn completions(
     State(manager): State<Arc<Manager>>,
     headers: HeaderMap,
     body: Body,
+) -> Response {
+    gateway(manager, headers, body, None).await
+}
+
+pub(super) async fn gateway(
+    manager: Arc<Manager>,
+    headers: HeaderMap,
+    body: Body,
+    protocol: Option<ollama::Kind>,
 ) -> Response {
     if !authorized(&headers) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
@@ -70,20 +79,66 @@ async fn completions(
         Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
     };
     drop(bytes);
-    let Some(name) = request
+    let native = if let Some(kind) = protocol {
+        match ollama::request::translate(&request, kind) {
+            Ok(mut native) => {
+                request = std::mem::take(&mut native.chat);
+                Some(native)
+            }
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
+    };
+    let Some(mut name) = request
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned)
     else {
         return error(StatusCode::BAD_REQUEST, "model is required");
     };
-    if !manager.records.lock().await.contains_key(&name) {
+    if protocol.is_some() {
+        name = ollama::resolve(&manager, &name).await;
+    }
+    let Some(record) = manager.records.lock().await.get(&name).cloned() else {
         return error(StatusCode::NOT_FOUND, format!("Unknown model: {name}"));
+    };
+    if let Some(native) = &native {
+        if let Err(e) = native.validate(&record) {
+            return error(StatusCode::BAD_REQUEST, e);
+        }
+        if native.empty && native.keep_alive == Some(0) {
+            return match manager.stop(&name, false).await {
+                Ok(()) => ollama::response::lifecycle(
+                    protocol.unwrap(),
+                    &native.model,
+                    "unload",
+                    native.stream,
+                ),
+                Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e),
+            };
+        }
     }
     let (mut lease, record) = match manager.acquire(&name).await {
         Ok(value) => value,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
     };
+    if let Some(native) = &native {
+        // An omitted keep_alive resets the TTL to the deployment default, just
+        // as a subsequent Ollama request supersedes a previous keep_alive:0.
+        lease.0.keep_alive_s.store(
+            native.keep_alive.unwrap_or(manager.config.keep_alive_s),
+            Ordering::Relaxed,
+        );
+        if native.empty {
+            return ollama::response::lifecycle(
+                protocol.unwrap(),
+                &native.model,
+                "load",
+                native.stream,
+            );
+        }
+    }
     if let Err(message) =
         crate::server::defaults::merge(&mut request, &record.options.default_request_params)
     {
@@ -140,6 +195,11 @@ async fn completions(
         if let Some(value) = response_headers.get(name) {
             output.headers_mut().insert(name, value.clone());
         }
+    }
+    if let Some(native) = native {
+        output.extensions_mut().insert(ollama::response::Context {
+            model: native.model,
+        });
     }
     output
 }
@@ -458,6 +518,7 @@ pub(super) fn public_router(manager: Arc<Manager>) -> Router {
         )
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
+        .merge(ollama::router())
         .with_state(manager)
 }
 

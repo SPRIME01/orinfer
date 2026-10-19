@@ -44,6 +44,26 @@
 
 `enable_thinking` 与 `reasoning_effort`、`max_tokens` 与 `max_completion_tokens` 分别按组覆盖：请求传入其中一项时，不再补入同组的部署默认值。因此，即使服务默认开启 thinking，请求仍可用 `enable_thinking=false` 或 `reasoning_effort=none` 关闭。请求自身的冲突仍返回 400。显式 `stream=false/null` 不继承默认 `stream_options`，显式 `logprobs=false/null` 不继承默认 `top_logprobs`。实际请求默认参数可在 `/health.default_request_params` 查看。
 
+## Ollama API
+
+无模型路径的 `orinfer serve` 同时提供 Ollama 原生接口，客户端地址为 `http://127.0.0.1:8088`：
+
+- `GET /api/version`、`GET /api/tags`、`POST /api/show`、`GET /api/ps`：版本、全部已注册模型、详情和已加载模型；发现接口只使用 CPU。
+- `POST /api/chat`、`POST /api/generate`：聊天与应用原生 chat template 的生成；默认 `stream=true`，输出 `application/x-ndjson`；`stream=false` 返回单个 JSON。
+- `POST /api/copy`、`DELETE /api/delete`：复制别名、移除注册。移除前等待活动请求结束；导入的权重文件由用户管理，保留原路径。
+
+```bash
+curl http://127.0.0.1:8088/api/chat -d '{"model":"index-translate-2b","messages":[{"role":"user","content":"Translate to English: 你好"}],"think":false,"options":{"num_predict":256},"keep_alive":"60s"}'
+```
+
+支持 `think` 布尔值/推理级别、消息中的 base64 PNG/JPEG/WebP 图片、工具及工具结果历史、`format="json"` 或 JSON Schema、`logprobs/top_logprobs`。`options` 支持 `temperature/top_p/top_k/seed/stop/presence_penalty/frequency_penalty/repeat_penalty` 与正数 `num_predict`。省略的参数继承部署默认值；显式 `think=false` 可以覆盖默认 thinking。工具参数返回 JSON 对象，流式时完整解析后发布；截断的无效参数返回错误。
+
+`keep_alive` 支持数字秒数、`"1h30m"` 等时长、负数永久保留和 `0` 请求结束后回收；空 messages/prompt 请求用于预加载，空请求加 `keep_alive=0` 用于卸载。未带 tag 的注册名也接受 `:latest`。两种协议共用准入、连续调度、prefix cache 和取消逻辑。
+
+返回真实 token/cache 计数和请求总时长（纳秒）；不推算未单独测量的各阶段耗时或实际 VRAM 字节数。`/api/ps.estimated_load_bytes` 是内存准入估算。`ORINFER_API_KEY` 同时保护 `/api` 与 `/v1`。
+
+当前模型由 CLI 导入原生 orinfer 包；Ollama registry 的 pull/push/create、embedding 接口、raw prompt、suffix、Go template 覆盖、旧 token context 和自动截断/滑窗明确返回错误。上下文由模型执行包确定，`options.num_ctx` 可省略或使用该值。
+
 ## Chat API
 
 提供 `GET /health`、`GET /v1/models` 和 `POST /v1/chat/completions`。设置 `ORINFER_API_KEY` 后，`/v1` 请求需携带 `Authorization: Bearer <key>`。

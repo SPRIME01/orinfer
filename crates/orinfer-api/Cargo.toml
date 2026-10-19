@@ -10,6 +10,7 @@ license.workspace = true
 axum = "=0.8.9"
 futures-util = "=0.3.34"
 libc = "=0.2.191"
+humantime = "=2.3.0"
 minijinja = { version = "=3.0.1", features = ["json", "serde"] }
 minijinja-contrib = { version = "=3.0.1", features = ["pycompat"] }
 jsonschema = { version = "=0.59.0", default-features = false }

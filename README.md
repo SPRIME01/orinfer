@@ -6,7 +6,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 ## 功能
 
-- OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
+- OpenAI Chat Completions 与 Ollama 原生聊天/生成 API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
 - [JSONL 离线推理](docs/batch.md)：连续批处理、逐条落盘和断点续跑，无需 HTTP 服务。
 - 27B、4B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。

@@ -1,5 +1,6 @@
 //! CPU-only model catalog and lifecycle supervision. CUDA stays in child workers.
 pub mod client;
+mod ollama;
 mod options;
 mod pull;
 mod registry;

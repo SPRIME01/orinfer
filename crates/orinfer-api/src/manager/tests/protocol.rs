@@ -1,9 +1,9 @@
 use super::*;
 use futures_util::StreamExt;
 
-struct Http {
-    url: String,
-    client: reqwest::Client,
+pub(super) struct Http {
+    pub(super) url: String,
+    pub(super) client: reqwest::Client,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Http {
@@ -12,7 +12,7 @@ impl Drop for Http {
     }
 }
 impl Http {
-    async fn new(manager: Arc<Manager>) -> Self {
+    pub(super) async fn new(manager: Arc<Manager>) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let router = routes::public_router(manager);
