@@ -25,6 +25,18 @@ pub(super) fn decode(
     mut body: Value,
     defaults: &Map<String, Value>,
 ) -> Result<ChatRequest, String> {
+    merge(&mut body, defaults)?;
+    serde_path_to_error::deserialize(body).map_err(|e| {
+        let path = e.path().to_string();
+        if path == "." {
+            e.inner().to_string()
+        } else {
+            format!("{path}: {}", e.inner())
+        }
+    })
+}
+
+pub(crate) fn merge(body: &mut Value, defaults: &Map<String, Value>) -> Result<(), String> {
     let request = body
         .as_object_mut()
         .ok_or("Expected a JSON request object")?;
@@ -51,14 +63,7 @@ pub(super) fn decode(
         }
         request.insert(name.clone(), value.clone());
     }
-    serde_path_to_error::deserialize(body).map_err(|e| {
-        let path = e.path().to_string();
-        if path == "." {
-            e.inner().to_string()
-        } else {
-            format!("{path}: {}", e.inner())
-        }
-    })
+    Ok(())
 }
 
 #[cfg(test)]

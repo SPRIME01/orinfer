@@ -46,7 +46,7 @@
         "off"
       ]
     },
-    "listen_default": "0.0.0.0:8088"
+    "listen_default": "[::]:8088"
   },
   "weight_accounting": {
     "average_bits_formula": "8 * resident_weight_bytes / included_parameter_count",

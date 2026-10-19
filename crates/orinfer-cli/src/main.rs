@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use orinfer_api::{BatchConfig, PreprocessingLimits, ServerConfig};
 use orinfer_engine::execution::{
     CudaGraphMode, LoadOptions, ResidentExperts, parse_cache_mib, parse_load_workers,
@@ -18,11 +18,66 @@ impl std::str::FromStr for MtpDrafts {
 #[derive(Parser)]
 #[command(name = "orinfer", version, about = "LLM inference on Jetson AGX Orin")]
 struct Cli {
+    #[arg(long, global = true, default_value_os_t = orinfer_api::manager::default_data_dir())]
+    data_dir: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Install a native hf://owner/model or ms://owner/model snapshot.
+    Pull {
+        source: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        revision: Option<String>,
+        /// Matching execution archive URL/path when it is not already installed.
+        #[arg(long)]
+        package: Option<String>,
+        #[arg(long)]
+        options: Option<String>,
+    },
+    /// Register an existing native model without copying its weights.
+    Import {
+        name: String,
+        path: PathBuf,
+        #[arg(long)]
+        options: Option<String>,
+    },
+    /// List registered models on disk.
+    List,
+    /// List loaded model workers.
+    Ps,
+    /// Show a registered model and its execution profile.
+    Show { name: String },
+    /// Load a model before the first request.
+    Load {
+        name: String,
+        #[arg(long, value_parser = parse_keep_alive)]
+        keep_alive: Option<u64>,
+    },
+    /// Drain and unload a model, keeping its files.
+    Stop {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a model registration, keeping externally owned files.
+    Rm { name: String },
+    /// Chat interactively or translate a prompt/stdin using a registered model.
+    Run {
+        name: String,
+        prompt: Option<String>,
+        #[arg(long, default_value = "{}")]
+        params: String,
+    },
+    /// Show recent worker log output.
+    Logs {
+        name: String,
+        #[arg(long, default_value_t = 100)]
+        tail: usize,
+    },
     /// Manage precompiled model execution packages without CUDA or Python.
     Package {
         #[command(subcommand)]
@@ -46,8 +101,10 @@ enum Command {
     RunModel(ModelArgs),
     /// Score frozen token histories through real prefill/decode kernels.
     ScoreModel(ModelArgs),
-    /// Serve the OpenAI Chat Completions API.
+    /// Start the model service; an optional directory serves one model directly.
     Serve(Box<ServeArgs>),
+    #[command(hide = true)]
+    Worker(Box<ServeArgs>),
     /// Process Chat requests from JSONL without an HTTP server.
     Batch(Box<BatchArgs>),
 }
@@ -61,7 +118,7 @@ enum PackageCommand {
         cache: Option<PathBuf>,
     },
 }
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct LoadArgs {
     /// Routed experts per layer equivalent, shared globally; full keeps all. MTP stays resident.
     #[arg(long, value_name = "full|N", default_value_t = ResidentExperts::default())]
@@ -86,10 +143,10 @@ struct ModelArgs {
     #[command(flatten)]
     load: LoadArgs,
 }
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct InferenceArgs {
-    /// Prepared model directory including tokenizer and execution package.
-    model_dir: PathBuf,
+    /// Model name for batch, or prepared model directory; omit for managed serving.
+    model_dir: Option<PathBuf>,
     #[arg(long, default_value_t = ServerConfig::default().model)]
     model: String,
     /// latency (serve default) or throughput (batch default).
@@ -139,9 +196,19 @@ struct ServeArgs {
     output_timeout_ms: u64,
     #[arg(long, default_value_t = PreprocessingLimits::default().drain_ms)]
     drain_timeout_ms: u64,
+    /// Idle model lifetime; accepts seconds, 5m, 1h or forever.
+    #[arg(long, default_value = "5m", value_parser = parse_keep_alive)]
+    keep_alive: u64,
+    /// Loaded-model limit; auto admits models by unified-memory availability.
+    #[arg(long, default_value = "auto")]
+    max_loaded_models: String,
+    #[arg(long, default_value_t = 120)]
+    load_timeout_s: u64,
 }
 #[derive(Args)]
 struct BatchArgs {
+    #[arg(skip)]
+    overrides: serde_json::Map<String, serde_json::Value>,
     #[command(flatten)]
     inference: InferenceArgs,
     #[arg(long)]
@@ -158,7 +225,7 @@ struct BatchArgs {
 impl From<InferenceArgs> for ServerConfig {
     fn from(args: InferenceArgs) -> Self {
         Self {
-            model_dir: args.model_dir,
+            model_dir: args.model_dir.unwrap_or_default(),
             model: args.model,
             default_request_params: args.default_request_params.unwrap_or_default(),
             listen: ServerConfig::default().listen,
@@ -239,8 +306,152 @@ fn print_json(value: impl serde::Serialize) -> Result<(), String> {
     );
     Ok(())
 }
-fn execute(command: Command) -> Result<(), String> {
+fn parse_keep_alive(value: &str) -> Result<u64, String> {
+    if value == "forever" {
+        return Ok(u64::MAX);
+    }
+    let (number, factor) = match value.as_bytes().last() {
+        Some(b's') => (&value[..value.len() - 1], 1),
+        Some(b'm') => (&value[..value.len() - 1], 60),
+        Some(b'h') => (&value[..value.len() - 1], 3600),
+        _ => (value, 1),
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .ok_or_else(|| "Expected seconds, 5m, 1h or forever".into())
+}
+
+fn run_chat(
+    data: &std::path::Path,
+    name: &str,
+    prompt: Option<String>,
+    params: &str,
+) -> Result<(), String> {
+    use std::io::{IsTerminal, Read, Write};
+    let parameters = parse_request_defaults(params)?;
+    if parameters.contains_key("model") || parameters.contains_key("messages") {
+        return Err("Use the model argument and prompt for model/messages".into());
+    }
+    let mut messages = Vec::new();
+    let mut send = |prompt: String| -> Result<(), String> {
+        messages.push(serde_json::json!({"role":"user","content":prompt}));
+        let mut body = serde_json::Value::Object(parameters.clone());
+        body["model"] = serde_json::json!(name);
+        body["messages"] = serde_json::json!(messages);
+        messages.push(orinfer_api::manager::client::chat(data, body)?);
+        Ok(())
+    };
+    if let Some(prompt) = prompt {
+        return send(prompt);
+    }
+    if !std::io::stdin().is_terminal() {
+        let mut text = String::new();
+        std::io::stdin()
+            .take((32 << 20) + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| e.to_string())?;
+        if text.len() > 32 << 20 {
+            return Err("Prompt exceeds 32 MiB".into());
+        }
+        return send(text);
+    }
+    loop {
+        print!(">>> ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        if std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?
+            == 0
+            || line.trim() == "/bye"
+        {
+            break;
+        }
+        send(line)?;
+    }
+    Ok(())
+}
+
+fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
+    use orinfer_api::manager::client;
+    use serde_json::json;
     match command {
+        Command::Pull {
+            source,
+            name,
+            revision,
+            package,
+            options,
+        } => {
+            let options = options
+                .map(|value| serde_json::from_str::<orinfer_api::manager::WorkerOptions>(&value))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            print_json(client::request(
+                data_dir,
+                "POST",
+                "/pull",
+                Some(
+                    &json!({"source":source,"name":name,"revision":revision,"package":package,"options":options}),
+                ),
+            )?)
+        }
+        Command::Import {
+            name,
+            path,
+            options,
+        } => {
+            let options = options
+                .map(|value| serde_json::from_str::<orinfer_api::manager::WorkerOptions>(&value))
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            print_json(client::request(
+                data_dir,
+                "POST",
+                "/import",
+                Some(
+                    &json!({"name":name,"path":path.canonicalize().map_err(|e| e.to_string())?,"options":options}),
+                ),
+            )?)
+        }
+        Command::List => print_json(client::request(data_dir, "GET", "/models", None)?),
+        Command::Ps => print_json(client::request(data_dir, "GET", "/ps", None)?),
+        Command::Show { name } => print_json(client::show(data_dir, &name)?),
+        Command::Load { name, keep_alive } => print_json(client::request(
+            data_dir,
+            "POST",
+            "/load",
+            Some(&json!({"name":name,"keep_alive_s":keep_alive})),
+        )?),
+        Command::Stop { name, force } => print_json(client::request(
+            data_dir,
+            "POST",
+            "/stop",
+            Some(&json!({"name":name,"force":force})),
+        )?),
+        Command::Rm { name } => print_json(client::request(
+            data_dir,
+            "POST",
+            "/remove",
+            Some(&json!({"name":name})),
+        )?),
+        Command::Run {
+            name,
+            prompt,
+            params,
+        } => run_chat(data_dir, &name, prompt, &params),
+        Command::Logs { name, tail } => {
+            let value = client::request(
+                data_dir,
+                "POST",
+                "/logs",
+                Some(&json!({"name":name,"tail":tail})),
+            )?;
+            print!("{}", value["text"].as_str().unwrap_or(""));
+            Ok(())
+        }
         Command::Package {
             command: PackageCommand::Install { archive, cache },
         } => print_json(orinfer_engine::operators::install::install(
@@ -263,8 +474,56 @@ fn execute(command: Command) -> Result<(), String> {
             println!("{}", orinfer_engine::BENCHMARK_PLAN);
             Ok(())
         }
-        Command::Serve(args) => orinfer_api::run((*args).into()),
+        Command::Serve(args) if args.inference.model_dir.is_none() => {
+            let max_loaded_models = if args.max_loaded_models == "auto" {
+                None
+            } else {
+                Some(
+                    args.max_loaded_models
+                        .parse::<usize>()
+                        .map_err(|e| e.to_string())?,
+                )
+            };
+            let settings: ServerConfig = args.inference.into();
+            orinfer_api::manager::run(orinfer_api::manager::ManagerConfig {
+                worker_options: orinfer_api::manager::WorkerOptions::from_settings(&settings),
+                data_dir: data_dir.into(),
+                listen: args.listen,
+                keep_alive_s: args.keep_alive,
+                max_loaded_models,
+                load_timeout_s: args.load_timeout_s,
+                gpu_lock: settings.gpu_lock,
+                memory_reserve_mib: settings.scheduler.memory_reserve_bytes >> 20,
+            })
+        }
+        Command::Serve(args) | Command::Worker(args) => orinfer_api::run((*args).into()),
         Command::Batch(args) => {
+            let model = args
+                .inference
+                .model_dir
+                .as_ref()
+                .ok_or("Model name or directory is required")?;
+            if !model.is_dir() {
+                let result = client::request(
+                    data_dir,
+                    "POST",
+                    "/batch",
+                    Some(
+                        &json!({"name":model.to_string_lossy(),"options":args.overrides,
+                    "scheduler_policy":args.inference.scheduler_policy.unwrap_or(orinfer_engine::scheduler::Policy::Throughput).to_string(),
+                    "input":std::path::absolute(&args.input).map_err(|e| e.to_string())?,
+                    "output":std::path::absolute(&args.output).map_err(|e| e.to_string())?,
+                    "resume":args.resume,"order":args.batch_order.to_string()}),
+                    ),
+                )?;
+                let success = result["success"] == true;
+                print_json(result["report"].clone())?;
+                return if success {
+                    Ok(())
+                } else {
+                    Err("Batch has errors, truncated responses or was interrupted; inspect the output JSONL".into())
+                };
+            }
             let report = orinfer_api::run_batch((*args).into())?;
             let failed = report.failed != 0 || report.truncated != 0 || report.interrupted;
             print_json(report)?;
@@ -315,8 +574,42 @@ fn execute(command: Command) -> Result<(), String> {
         )?),
     }
 }
+fn batch_overrides(
+    matches: &clap::ArgMatches,
+    inference: &InferenceArgs,
+) -> serde_json::Map<String, serde_json::Value> {
+    let settings: ServerConfig = inference.clone().into();
+    let mut values = serde_json::to_value(orinfer_api::manager::WorkerOptions::from_settings(
+        &settings,
+    ))
+    .unwrap()
+    .as_object()
+    .unwrap()
+    .clone();
+    let fields = [
+        ("prefix_cache_bytes", "prefix_cache_mib"),
+        ("memory_reserve_bytes", "memory_reserve_mib"),
+    ];
+    values.retain(|key, _| {
+        let id = fields
+            .iter()
+            .find(|(_, field)| *field == key)
+            .map(|(id, _)| *id)
+            .unwrap_or(key.as_str());
+        matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine)
+    });
+    values
+}
 fn main() -> ExitCode {
-    match execute(Cli::parse().command.unwrap_or(Command::Info)) {
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if let Some(Command::Batch(args)) = &mut cli.command {
+        args.overrides = batch_overrides(
+            matches.subcommand_matches("batch").unwrap(),
+            &args.inference,
+        );
+    }
+    match execute(cli.command.unwrap_or(Command::Info), &cli.data_dir) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -327,6 +620,41 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_batch_only_overrides_explicit_model_options() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "orinfer",
+                "batch",
+                "translator",
+                "--input",
+                "in.jsonl",
+                "--output",
+                "out.jsonl",
+                "--mtp-drafts",
+                "0",
+                "--cuda-graph",
+                "off",
+                "--scheduler-policy",
+                "latency",
+            ])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        let Some(Command::Batch(args)) = cli.command else {
+            panic!("batch command")
+        };
+        let options = batch_overrides(
+            matches.subcommand_matches("batch").unwrap(),
+            &args.inference,
+        );
+        assert_eq!(options.len(), 2);
+        assert_eq!(options["mtp_drafts"], "0");
+        assert_eq!(options["cuda_graph"], "off");
+        assert_eq!(
+            args.inference.scheduler_policy,
+            Some(orinfer_engine::scheduler::Policy::Latency)
+        );
+    }
     fn serve(options: &[&str]) -> Result<ServerConfig, clap::Error> {
         let mut args = vec!["orinfer", "serve", "/tmp"];
         args.extend_from_slice(options);
@@ -339,7 +667,7 @@ mod tests {
     fn defaults_and_server_options_are_preserved() {
         let config = serve(&[]).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.listen, "0.0.0.0:8088");
+        assert_eq!(config.listen, "[::]:8088");
         assert_eq!(config.cuda_graph, CudaGraphMode::DecodeOnly);
         assert_eq!(config.prefix_cache_bytes, 12usize << 30);
         assert_eq!(config.scheduler.max_active, 32);

@@ -339,13 +339,7 @@ impl<'a> Active<'a> {
                 return Ok(());
             }
         }
-        let reason = if exhausted || self.parser.incomplete_call {
-            "length"
-        } else if !self.parser.calls.is_empty() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
+        let reason = self.parser.finish_reason(exhausted);
         let job = &self.mailbox.job;
         let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":self.count,
             "total_tokens":job.prepared.input.len()+self.count,

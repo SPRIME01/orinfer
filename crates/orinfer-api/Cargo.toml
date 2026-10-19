@@ -20,11 +20,11 @@ sha2.workspace = true
 hex.workspace = true
 serde_path_to_error = "=0.1.20"
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
-tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "process"] }
 
 base64 = "=0.23.1"
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
-reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "rustls", "json", "query", "stream"] }
 llguidance = { version = "=1.9.1", default-features = false, features = ["lark"] }
 
 [lints]

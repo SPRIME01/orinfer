@@ -41,6 +41,92 @@ def check_scores(content, scores, count):
         assert probabilities == sorted(probabilities, reverse=True), score
 
 
+def check_ollama_vectors(base, common, record):
+    """Run the pinned upstream histories through the existing real-API harness.
+
+    See fixtures/ollama/LICENSE and cases.json for MIT attribution and adaptations.
+    Array and string content must encode the same history; compare semantic tool
+    calls while allowing independently generated response and call identifiers.
+    """
+    fixtures = Path(__file__).resolve().parents[2] / "fixtures/ollama/cases.json"
+    vectors = json.loads(fixtures.read_text())
+
+    def semantic(choice):
+        message = choice["message"]
+        return {
+            "content": message.get("content") or "",
+            "reasoning": message.get("reasoning_content") or "",
+            "calls": [
+                {
+                    "name": call["function"]["name"],
+                    "arguments": json.loads(call["function"]["arguments"]),
+                }
+                for call in message.get("tool_calls", [])
+            ],
+            "finish_reason": choice["finish_reason"],
+        }
+
+    for case in vectors["requests"]:
+        payload = dict(common, **case["request"])
+        payload.update(model=common["model"], seed=20261002, temperature=0, enable_thinking=False)
+        # One output-budget spelling avoids conflicting inherited controls.
+        payload.pop("max_tokens", None)
+        payload["max_completion_tokens"] = 256
+        response = complete(base, dict(payload, stream=False))
+        choice = semantic(response["choices"][0])
+        assert choice["finish_reason"] in ("stop", "tool_calls"), response
+        assert choice["content"] or choice["calls"], response
+        if "expected_calls" in case:
+            assert choice["calls"] == case["expected_calls"], response
+        baseline = json.loads(json.dumps(payload))
+        for message in baseline["messages"]:
+            if isinstance(message.get("content"), list):
+                message["content"] = "".join(part["text"] for part in message["content"])
+        normalized = complete(base, dict(baseline, stream=False))
+        assert semantic(normalized["choices"][0]) == choice, (response, normalized)
+        chunks = stream(base, payload)
+        for field in ("id", "created", "model", "object"):
+            assert all(chunk[field] == chunks[0][field] for chunk in chunks), field
+        deltas = [chunk["choices"][0]["delta"] for chunk in chunks if chunk["choices"]]
+        assert [delta["role"] for delta in deltas if "role" in delta] == ["assistant"]
+        assert deltas[-1] == {}, deltas[-1]
+        assert all(chunk["choices"][0]["finish_reason"] is None for chunk in chunks[:-2])
+        assert all(chunk.get("usage") is None for chunk in chunks[:-1])
+        for delta in deltas:
+            assert (
+                sum(
+                    bool(delta.get(field))
+                    for field in ("content", "reasoning_content", "tool_calls")
+                )
+                <= 1
+            )
+        streamed = {
+            "content": "".join(delta.get("content", "") or "" for delta in deltas),
+            "reasoning": "".join(delta.get("reasoning_content", "") or "" for delta in deltas),
+            "calls": [
+                {
+                    "name": call["function"]["name"],
+                    "arguments": json.loads(call["function"]["arguments"]),
+                }
+                for call in tool_calls(chunks)
+            ],
+            "finish_reason": chunks[-2]["choices"][0]["finish_reason"],
+        }
+        assert streamed == choice, (streamed, choice)
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            assert response["usage"][key] == normalized["usage"][key] == chunks[-1]["usage"][key]
+        usage = chunks[-1]["usage"]
+        assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        record(
+            "ollama_" + case["id"],
+            {
+                "upstream": vectors["upstream"]["revision"],
+                "source": case["source"],
+                "response": response,
+            },
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:8088/v1")
@@ -410,6 +496,7 @@ def main():
     )
     assert not auto["choices"][0]["message"].get("tool_calls"), auto
     record("strict_auto_plain_text", auto)
+    check_ollama_vectors(base, common, record)
     after = complete(base, common)
     assert after["choices"] == nullable["choices"], (after, nullable)
     record("request_state_isolation", after)

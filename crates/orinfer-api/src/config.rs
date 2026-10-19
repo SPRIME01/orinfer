@@ -91,7 +91,7 @@ impl Default for ServerConfig {
         Self {
             model_dir: PathBuf::new(),
             model: "qwen3.8-27b".into(),
-            listen: "0.0.0.0:8088".into(),
+            listen: "[::]:8088".into(),
             default_request_params: Default::default(),
             gpu_lock: "artifacts/gpu-experiment.lock".into(),
             cuda_graph: CudaGraphMode::default(),
