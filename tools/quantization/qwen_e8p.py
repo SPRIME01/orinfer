@@ -44,19 +44,30 @@ def policy(name, info):
     return "e8p-q4"
 
 
-def encode(args):
-    source_dir, out = args.source_dir.resolve(), args.output.resolve()
-    if source_dir == out:
-        raise ValueError("Source and encoded directories must differ")
-    config = json.loads((source_dir / "config.json").read_text())
+def text_configuration(config):
     if config.get("model_type") != "qwen3_5" or config.get("quantization_config"):
         raise ValueError("Expected original floating dense Qwen3.5 checkpoint")
     t = config["text_config"]
     if (t.get("hidden_size"), t.get("intermediate_size"), t.get("num_hidden_layers")) not in (
         (2048, 6144, 24),
+        (4096, 12288, 32),
         (5120, 17408, 64),
     ):
         raise ValueError("Unsupported dense Qwen geometry")
+    # HF composite configs may keep tying on the parent instead of text_config.
+    # Persist the effective value so construction and the native adapter agree.
+    tied = t.setdefault("tie_word_embeddings", config.get("tie_word_embeddings", False))
+    if type(tied) is not bool:
+        raise ValueError("Invalid embedding/head tying configuration")
+    return t
+
+
+def encode(args):
+    source_dir, out = args.source_dir.resolve(), args.output.resolve()
+    if source_dir == out:
+        raise ValueError("Source and encoded directories must differ")
+    config = json.loads((source_dir / "config.json").read_text())
+    t = text_configuration(config)
     origin = json.loads((source_dir / "source.json").read_text())
     source = Source(source_dir / "model.safetensors.index.json", directory=source_dir)
     out.mkdir(parents=True, exist_ok=True)

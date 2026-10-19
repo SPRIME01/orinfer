@@ -2,7 +2,7 @@
 
 当前基线是官方 27B 的 beam8 重新编码、两级 E8P Q4A8 量化目录。它使用 signed-block128 旋转、两级固定整数码表和输出行 scale；Embedding、mixer 输出投影和 MTP 草稿矩阵保留 W8，敏感小权重及视觉保留浮点。本机量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`，完整模型为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`。
 
-同一构建入口也支持 Index-Translate-2B 的 24 层架构，使用 `tools/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用，不复制执行流程。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。
+同一构建入口也支持 Index-Translate-2B 的 24 层和 Index-Translate-9B 的 32 层架构，使用 `tools/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用，不复制执行流程。9B 使用独立的 embedding 和输出头 E8P Q4 bank。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。
 
 两级 E8P-Q4 的数据契约为 `quant_method=orinfer_e8p_q4_int8`、`coefficients=[4,1]`、`basis_tensor=orinfer.e8p_q4.basis`、`layout=u32-low-coarse-high-residual`。输入压缩矩阵为 U32 `[N,K/8]`，构建时无损重排为 `[K/128,N,16]`，每个输出行一个 F16 scale。它复用原生执行计划、公共整数计算和离线 tile 调优。非零 basis 经验证后，直接 INT4 MMA 将完整 A8 拆成两个位平面，恢复相同的 INT32 点积；与 INT8 解码路径读取同一份压缩权重，由自动调优选择。
 
@@ -17,7 +17,7 @@ bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \
 
 发布目录结构与 Flash Next 相同：HF 配置/tokenizer、`cache/model.json`、标准权重分片，以及由 digest 固定的 schema-1 执行包。执行包包括 Rust 模型库和合并去重的 cubin/host ABI；层序、状态提交和 batching 逻辑由 Rust 注册，不写在模型数据中。
 
-构建时将 HF `tokenizer_config.json` 的 added-token 配置合并进部署用 `tokenizer.json`，验证每个 token 的 ID 不变。独立 Rust tokenizer 因此与 Transformers 识别相同的 thinking、工具及视觉标记，在线不需要加载 Transformers。
+构建时将 HF `tokenizer_config.json` 的 added-token 配置合并进部署用 `tokenizer.json`，验证每个 token 的 ID 不变。chat template 优先读取独立文件，否则从 `tokenizer_config.json` 提取文本模板，保持字节内容，在编译前校验并冻结。独立 Rust tokenizer 因此与 Transformers 识别相同的 thinking、工具及视觉标记，在线不需要加载 Transformers。
 
 直接 INT4 路径将每级 E8P 整数写成 `E=2n+1`，将 A8 写成 `A=lo+16hi`；分别累加两个位平面的整数乘积后，加回 `(a+b)·sum(A)`，再按原顺序乘权重 scale 和 token scale。它保留 A8 的全部信息。压缩权重以 K128 流水读取，CTA 内可用 1/2/4 组 warp 分摊 K 维，先在 shared memory 中合并 INT32 部分和，再执行一次原有 rescale；没有额外的全局归约 kernel。合法的 split-K 与 N tile 组合交给同一个离线调优器选择，不按单流、多流或矩阵名称指定实现。
 

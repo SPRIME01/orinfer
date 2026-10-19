@@ -59,6 +59,14 @@ def configuration(config, context):
             num_key_value_heads=2,
             tie_word_embeddings=True,
         )
+    elif t.get("hidden_size") == 4096:
+        expected.update(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+        )
     if any(t.get(k) != v or type(t.get(k)) is not type(v) for k, v in expected.items()) or t.get(
         "layer_types"
     ) != [
@@ -139,6 +147,7 @@ def gpu_lock(path):
 class Builder:
     def __init__(self, source, root, output, cache, context, lock):
         from tools.model.qwen35.compiler import Aot
+        from tools.model.frontend import prepare_chat_template
 
         self.source, self.root, self.output = source, root, output
         self.config = json.loads((source / "config.json").read_text())
@@ -169,6 +178,7 @@ class Builder:
         self.context = context
         self.lock = lock
         self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
+        prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
             root / "cache", output, cache, self.weights.buffers, compile_lock=lambda: gpu_lock(lock)
         )

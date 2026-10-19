@@ -7,10 +7,33 @@ import unittest
 
 from tokenizers import Tokenizer, models, pre_tokenizers
 
-from tools.model.frontend import prepare_tokenizer
+from tools.model.frontend import prepare_chat_template, prepare_tokenizer
 
 
 class FrontendTests(unittest.TestCase):
+    def test_embedded_chat_template_is_preserved_and_standalone_takes_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            embedded = "{{ messages[0].content }}\n{% if enable_thinking %}<think>{% endif %}"
+            (root / "tokenizer_config.json").write_text(json.dumps(dict(chat_template=embedded)))
+            target = root / "prepared.jinja"
+            prepare_chat_template(root, target)
+            self.assertEqual(target.read_text(), embedded)
+            standalone = b"{{ messages[-1].content }}\r\n"
+            (root / "chat_template.jinja").write_bytes(standalone)
+            prepare_chat_template(root, target)
+            self.assertEqual(target.read_bytes(), standalone)
+
+    def test_missing_empty_or_named_only_template_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for template in (None, " ", {"tool_use": "{{ messages }}"}):
+                (root / "tokenizer_config.json").write_text(
+                    json.dumps(dict(chat_template=template))
+                )
+                with self.subTest(template=template), self.assertRaises(ValueError):
+                    prepare_chat_template(root, root / "prepared.jinja")
+
     def test_configured_tokens_are_recognized_without_changing_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

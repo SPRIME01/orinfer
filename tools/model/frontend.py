@@ -4,6 +4,24 @@ import json
 from pathlib import Path
 
 
+def prepare_chat_template(source, destination):
+    """Freeze HF's standalone or embedded text template without rewriting it."""
+    source = Path(source)
+    template = source / "chat_template.jinja"
+    if template.is_file():
+        raw = template.read_bytes()
+        text = raw.decode("utf-8")
+    else:
+        config = json.loads((source / "tokenizer_config.json").read_text())
+        text = config.get("chat_template")
+        if not isinstance(text, str):
+            raise ValueError("Expected a standalone or embedded text chat template")
+        raw = text.encode("utf-8")
+    if not text.strip():
+        raise ValueError("Empty chat template")
+    Path(destination).write_bytes(raw)
+
+
 def prepare_tokenizer(source, destination):
     """Match HF token IDs without requiring tokenizer_config parsing online."""
     from tokenizers import AddedToken, Tokenizer

@@ -276,7 +276,9 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             t.linear_num_value_heads,
             t.tie_word_embeddings
         ),
-        (5120, 17408, 64, 24, 4, 48, false) | (2048, 6144, 24, 8, 2, 16, true)
+        (5120, 17408, 64, 24, 4, 48, false)
+            | (4096, 12288, 32, 16, 4, 32, false)
+            | (2048, 6144, 24, 8, 2, 16, true)
     );
     if !geometry
         || (t.tie_word_embeddings && !embedding_q4)
@@ -888,20 +890,27 @@ mod tests {
     }
 
     fn request_geometry(small: bool) -> CreateRequest {
-        let (h, f, layers, hv, qh, kvh) = if small {
-            (2048, 6144, 24, 16, 8, 2)
+        let dimensions = if small {
+            (2048, 6144, 24, 16, 8, 2, true)
         } else {
-            (5120, 17408, 64, 48, 24, 4)
+            (5120, 17408, 64, 48, 24, 4, false)
         };
+        dense_request(dimensions, small)
+    }
+
+    fn dense_request(
+        (h, f, layers, hv, qh, kvh, tied): (usize, usize, usize, usize, usize, usize, bool),
+        e8p: bool,
+    ) -> CreateRequest {
         let mut config = json!({"model_type":"qwen3_5","text_config":{"hidden_size":h,
             "intermediate_size":f,"num_hidden_layers":layers,"vocab_size":248320,
             "linear_num_key_heads":16,"linear_num_value_heads":hv,"linear_key_head_dim":128,
             "linear_value_head_dim":128,"linear_conv_kernel_dim":4,
-            "num_attention_heads":qh,"num_key_value_heads":kvh,"head_dim":256,"tie_word_embeddings":small,
+            "num_attention_heads":qh,"num_key_value_heads":kvh,"head_dim":256,"tie_word_embeddings":tied,
             "layer_types":(0..layers).map(|i|if i%4==3 {"full_attention"} else {"linear_attention"}).collect::<Vec<_>>()},
             "quantization_config":{"quant_method":"orinfer_q4_int8","version":1,"rotation":"signed-block128",
             "scale":"fp16-output-row","compute_dtype":"int8_quality"}});
-        if small {
+        if e8p {
             config["quantization_config"]["quant_method"] = json!("orinfer_e8p_q4_int8");
             config["quantization_config"]["coefficients"] = json!([4, 1]);
             config["quantization_config"]["basis_tensor"] = json!("orinfer.e8p_q4.basis");
@@ -914,8 +923,8 @@ mod tests {
             for (suffix, dtype, shape) in [
                 (
                     "packed",
-                    if small { "u32" } else { "u8" },
-                    if small {
+                    if e8p { "u32" } else { "u8" },
+                    if e8p {
                         vec![k / 128, n, 16]
                     } else {
                         vec![n, k / 2]
@@ -925,13 +934,13 @@ mod tests {
             ] {
                 buffers.push(
                     json!({"name":format!("{name}.{suffix}"),"dtype":dtype,"shape":shape,
-                    "layout":if small && suffix=="packed" {"e8p-q4-k128-u32"} else {"native_contiguous"},"alignment":256,"access":"read",
+                    "layout":if e8p && suffix=="packed" {"e8p-q4-k128-u32"} else {"native_contiguous"},"alignment":256,"access":"read",
                     "data":{"tensor":format!("{name}.{suffix}"),"sha256":"0".repeat(64)}}),
                 );
             }
         };
         q4(
-            if small {
+            if tied {
                 "model.language_model.embed_tokens.weight"
             } else {
                 "lm_head.weight"
@@ -940,6 +949,9 @@ mod tests {
             248320,
             h,
         );
+        if e8p && !tied {
+            q4("model.language_model.embed_tokens.weight".into(), 248320, h);
+        }
         for i in 0..layers {
             let p = format!("model.language_model.layers.{i}");
             for (name, n, k) in [("gate_proj", f, h), ("up_proj", f, h), ("down_proj", h, f)] {
@@ -961,7 +973,7 @@ mod tests {
                 q4(format!("{p}.{name}.weight"), *n, h);
             }
         }
-        if small {
+        if e8p {
             for (name, dtype, shape) in [
                 ("basis", "i8", vec![256, 8]),
                 ("selectors", "u32", vec![256, 1]),
@@ -989,6 +1001,37 @@ mod tests {
                 "kv_cache":{"direct_prefill":true,"demand_mapping":true,"buffers":{},"prefill_workspace":{}},
                 "dynamic_batch_kernels":{"qwen_rows/layer0/pre/norm_rotate":{"name":"qwen_rows/layer0/pre/norm_rotate","capacity":4096,
                     "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],"arguments":[]}}}})).unwrap()
+    }
+
+    #[test]
+    fn medium_dense_reuses_rows_with_separate_embedding_and_head_banks() {
+        let request = dense_request((4096, 12288, 32, 32, 16, 4, false), true);
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let m = &plan.metadata;
+        assert_eq!(m.prefill_plans[0].stages.len(), 32);
+        let layout = m.batch_layout.as_ref().unwrap();
+        assert_eq!(layout.hidden, 4096);
+        assert_eq!(layout.row_strides["QKV"], 8192 * 2);
+        assert_eq!(layout.row_strides["FullX"], 10240 * 2);
+        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
+            assert!(m.buffers.iter().any(|b| b.name == format!("{name}.packed")));
+        }
+        let (calls, _) = adapter
+            .batch(
+                &[
+                    BatchSegment { slot: 2, tokens: 1 },
+                    BatchSegment { slot: 5, tokens: 3 },
+                ],
+                true,
+            )
+            .unwrap();
+        assert!(calls.iter().any(|c| c.sequence == Some(5)));
+        let mut wrong = dense_request((4096, 12288, 32, 32, 16, 4, false), true);
+        wrong
+            .metadata
+            .buffers
+            .retain(|b| b.name != "lm_head.weight.scale");
+        assert!(create(wrong, Policy::Int8Quality).is_err());
     }
 
     #[test]

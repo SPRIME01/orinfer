@@ -8,7 +8,7 @@ CPU 工具使用项目 uv 环境，GPU 编码使用固定编译镜像。编码�
 | --- | --- | --- |
 | Flash Next 专家及 PLE | 整数 E8P Q2，U16 描述 8 个权重 | 输出行 FP16 scale，解码到 INT8 |
 | 27B 主干与输出头 | 两级整数 E8P Q4，U32 描述 8 个权重 | 固定系数 `[4,1]`，输出行 FP16 scale，A8 计算 |
-| Index-Translate-2B 主干 | 两级整数 E8P Q4 | 固定系数 `[4,1]`，输出行 FP16 scale，A8 计算 |
+| Index-Translate-2B/9B 主干 | 两级整数 E8P Q4 | 固定系数 `[4,1]`，输出行 FP16 scale，A8 计算 |
 | Flash Next 部分非专家投影 | 旋转标量码表 Q4 | signed-block128，输出行 FP16 scale，A8 计算 |
 
 敏感部分保留 W8、FP16、BF16 或 FP32。scale、basis、旋转符号、padding 和例外权重均计入实际空间，不保存常驻展开 W8 副本。
@@ -37,7 +37,7 @@ Flash Next 的固定来源转换、PLE、非专家权重准备和原始 BF16 tea
 
 源信息需包含固定的 repository/revision、配置和 safetensors 索引。远端权重可按字节范围读取；已下载分片通过 `--source-dir` 复用。准备工具核对来源、编码实现、seed 和已完成分块，不混用不同来源或不完整产物。
 
-`qwen_e8p.py` 从官方 BF16 分片直接执行两级拟合和 beam8 搜索。输入目录包含原始 HF 文件以及记录固定 `repo`、40 位 `revision` 的 `source.json`；`--shard FILE` 可逐片编码。已完成块保存校验和，完整分片写入后才清理其临时块；调用方可释放已编码源分片。embedding、共享输出头和视觉大矩阵也量化为 E8P Q4；敏感输出投影和 MTP 矩阵保留 W8，patch、位置表、norm 等较小敏感参数保留原始数据。tied 输出头读取同一份压缩 embedding，不保存展开副本。
+`qwen_e8p.py` 支持 Index-Translate-2B/9B 和 27B，从官方 BF16 分片直接执行两级拟合和 beam8 搜索。输入目录包含原始 HF 文件以及记录固定 `repo`、40 位 `revision` 的 `source.json`；`--shard FILE` 可逐片编码。已完成块保存校验和，完整分片写入后才清理其临时块；调用方可释放已编码源分片。embedding、共享输出头和视觉大矩阵也量化为 E8P Q4；敏感输出投影和 MTP 矩阵保留 W8，patch、位置表、norm 等较小敏感参数保留原始数据。2B 的 tied 输出头读取同一份压缩 embedding，不保存展开副本；9B 按官方配置分别编码 embedding 和输出头，不改变权重共享语义。
 
 ```bash
 bash tools/quantization/run.sh qwen_e8p --source-dir /path/to/original \

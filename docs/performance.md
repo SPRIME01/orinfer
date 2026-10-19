@@ -2,6 +2,28 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## Index-Translate-9B（2026-10-18）
+
+来源为官方 [IndexTeam/Index-Translate-9B](https://huggingface.co/IndexTeam/Index-Translate-9B)，固定 revision `4e06279e62352dab96bbeb6fa0579bca5e822d75`。复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求状态组件，按配置使用 32 层、4096 hidden 和独立 embedding/输出头，不复制执行流程。
+
+主干、embedding、输出头及视觉大矩阵采用 signed-block128 旋转、两级 E8P Q4A8，系数 `[4,1]`、beam8；敏感输出投影与 MTP 保留 W8，小矩阵及 norm 等保留浮点。未做激活校准。包含 scale、码表及混合精度例外的量化 payload 为 **5,440,207,936 bytes，平均 4.509 bit**；部署只读数据另含 RoPE 等常量，共 5,473,766,976 bytes。使用 INT8 KV、FP32 GDN 状态；上下文配置 256K，本节实际测到 8K。
+
+Rust release CLI `run-model`，关闭 MTP、`decode_only`，每个输入连续测两次、每次固定生成 65 tokens，取第二次。Prefill 不含输出头，decode 为后续 64 tokens 的完整执行时间；这是执行层固定长度测量，不能代替自然完成的 HTTP 吞吐。
+
+| 输入 tokens | Prefill TPS | Decode TPS | 首 token 时延（s） |
+| --- | ---: | ---: | ---: |
+| 512 | 2152.6 | 33.42 | 0.241 |
+| 2048 | 2219.6 | 32.62 | 0.926 |
+| 8192 | 1956.4 | 29.82 | 4.190 |
+
+同次 release 进程加载到就绪 **4.65 s**，未清文件缓存，不能视为磁盘冷启动结论。完整 `validate-model` 权重校验另测 6.93 s，不包含在默认加载时间内。
+
+固定 seed `20261002`，对照同源原始 BF16，使用相同 teacher-forced 历史。8 个文本翻译场景共 130 位置，目标 NLL 增加 **0.02370 nats/token**，首选 token 与 BF16 一致率 **96.15%**、全部位于 BF16 top3，110 个高置信位置无首选变化。2K/8K 共 26 位置的 NLL 差为 **−0.07549**，首选一致率 96.15%，全部位于 BF16 top3；8K 的一处变化为“加载压缩模型”与“加载一个压缩模型”。通知图片与红/蓝双图的 17 个位置，NLL 增加 **0.08327**，首选一致率 94.12%，全部位于 BF16 top3。上述小样本不替代完整翻译 benchmark、复杂图文或 256K 质量评测。
+
+真实 Chat API 覆盖无 MTP／最多 3 草稿、SSE、完整 prefix 命中、8 并发、术语约束、JSON 保留、图片和双图。请求均关闭 thinking、greedy、总输出预算 256 tokens，并自然结束。MTP 的英译中在单流与并发时分别使用“只需加载模型一次”与“会加载模型一次”，均保留原意；单流冷请求与连续三次缓存命中的措辞相同。对应同历史位置的“会／只需”都在 BF16 top3，不能把措辞差异直接判作翻译失败，也不保证不同调度下逐 token 相同。简单图片翻译正确，双图红/蓝顺序正确但出现“红色：红色”式冗余标签，复杂图文尚未验收。
+
+普通 2/3/4/5/8/32 路请求，以及验证宽度 2/4/8 × 请求数 1/2/4/8 × verification/mixed 的 24 组同历史检查，KL 与所选 token NLL 差均为 0。取消复用、32/512-token 部分前缀恢复的 target/draft KV、GDN、卷积及位置一致；这是状态与执行一致性检查，不代表 256K 压测。JSONL 的 16 条翻译全部自然结束，断点续跑未重复写入。完整模型校验、`make check` 和 `make check-offline` 通过。
+
 ## Index-Translate-2B（2026-10-18）
 
 来源为官方 [IndexTeam/Index-Translate-2B](https://huggingface.co/IndexTeam/Index-Translate-2B)，固定 revision `9bc08445315723eb9b77d1b93505915eb03c3f01`。主干、共享 embedding/输出头和视觉大矩阵采用未使用激活校准的两级 E8P Q4A8；敏感输出/MTP 矩阵保留 W8。量化 payload 含 scale 等共 **1,228,931,712 bytes，平均 4.323 bit**；部署的只读数据另含 RoPE 等派生常量，共 1,262,497,024 bytes。文本使用 INT8 KV、FP32 GDN 状态，最长上下文配置为 256K；本节实际测到 8K。

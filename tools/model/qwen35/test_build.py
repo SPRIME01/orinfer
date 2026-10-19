@@ -54,6 +54,23 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_medium_dense_geometry_requires_matching_gdn_and_gqa(self):
+        candidate = config()
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            layer_types=t["layer_types"][:32],
+        )
+        self.assertEqual(configuration(candidate, 262144)["hidden_size"], 4096)
+        for key, value in (("linear_num_value_heads", 48), ("num_key_value_heads", 2)):
+            with self.subTest(key=key), patch.dict(t, {key: value}):
+                with self.assertRaises(ValueError):
+                    configuration(candidate, 262144)
+
     def test_native_shard_layout_is_explicit_without_requantization(self):
         from tools.model.publication import file_hash
         from tools.model.safetensors_source import local_header

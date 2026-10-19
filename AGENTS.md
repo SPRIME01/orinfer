@@ -5,7 +5,7 @@
 ## 范围
 
 - 硬件固定本机Jetson AGX Orin 64GB，aarch64/CUDA SM87。
-- 支持Qwen3.8-27B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和Index-Translate-2B（Qwen3_5）的文本、图片和多图输入；不包含视频。
+- 支持Qwen3.8-27B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和Index-Translate-2B/9B（Qwen3_5）的文本、图片和多图输入；不包含视频。
 - 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
 - 模型实现、公共执行组件、TileLang kernel和离线构建工具在统一workspace维护；不按模型×精度强制拆仓。orinfer-models分别注册模型适配器与计算策略，部署包内Rust cdylib通过版本化C ABI生成执行程序、动态batch和状态绑定，匹配的TileLang cubin与库同包发布。公共CUDA执行器不硬编码模型族、层数、维度或层序；新增架构不增加核心分派枚举。
 - 第一阶段包含prefix cache与多请求batching；缓存恢复和batch调度必须保持完整KV/GDN/卷积/MTP状态及请求隔离。
@@ -15,7 +15,7 @@
 
 - 按真实checkpoint配置核对GDN、GQA、RoPE、zero-centered RMSNorm、embedding和head语义。
 - GDN持续状态为FP32；KV、卷积、GDN和位置状态均属于请求私有状态。
-- Index-Translate-2B复用27B的动态GDN/GQA、FFN、视觉、MTP和请求状态组件，按配置传递头数与维度，不复制模型执行流程。主干、embedding/共享输出头和视觉大矩阵使用两级E8P Q4A8，敏感输出/MTP投影保留W8；tied embedding与输出头共享同一份K128压缩bank，embedding按需解码并逆旋转选中行，输出头使用旋转A8输入，不重复存储或常驻展开大权重。
+- Index-Translate-2B/9B复用27B的动态GDN/GQA、FFN、视觉、MTP和请求状态组件，按配置传递头数与维度，不复制模型执行流程。主干、embedding/共享输出头和视觉大矩阵使用两级E8P Q4A8，敏感输出/MTP投影保留W8；2B的tied embedding与输出头共享同一份K128压缩bank；9B按官方配置分别保留embedding与输出头bank，embedding按需解码并逆旋转选中行，输出头使用旋转A8输入，不重复存储或常驻展开大权重。
 - 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
 - KV增长契约可以同时引用请求私有KV和按上下文增长的共享workspace；私有映射按owner查找，共享映射从会话查找，不能假定增长列表全部属于请求arena。
 - 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
