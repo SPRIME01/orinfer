@@ -32,6 +32,8 @@ Flash Next 的 HC 无损缓存指数和 QSA radix shift 通过已有 ABI 的整�
 
 在线创建只导出最终程序、全部局部特化候选和专家常驻契约引用的绑定；融合前的构建输入不注册为可执行 launch。`plan-model` 和 `validate-model` 通过内部创建参数 `build_bindings` 保留完整构建契约，供离线重建、完整资产校验和诊断。它不改变 schema 1 或 C ABI 1；运行时的实际逐层执行节点仍需实例化，CUDA Graph replay 不查询或解释模板。
 
+动态 launch 的全行数验证只在离线构建使用的 `plan-model` 和 `validate-model` 执行，相同容量和表达式只验证一次。正常加载检查每个绑定的参数类型和容量 ABI；实际 launch 继续检查真实行数、算术溢出、除零和非零 grid，不在启动时穷举所有行数。此行为由引擎实现，无需重建执行包。
+
 创建时用 JSON 传递配置、数据契约与小型编译目录。独立入口 `orinfer_model_plans_v1` 用 C 数组导出生成的 kernel 参数绑定和 kernel/copy/zero 程序；主 `orinfer_model_v1` 表保持 ABI 1。导出接口显式声明表及记录大小，数组、字符串和嵌套参数由同一个 owner 管理并释放。逐层绑定和完整程序不经过 JSON 序列化往返。动态 batch 热路径继续使用 C 数组，一次返回指令、buffer views、动态 launch 参数和请求状态绑定。原生内存由分配方释放，库保持加载直到模型及 CUDA 资源释放完成。模型实例与 GPU 执行线程绑定。
 
 有限专家常驻模式通过创建请求的 `expert_contracts` 选择更完整的原生绑定契约。模型库返回 `expert_banks`：专家数、按专家连续存储的张量，以及消费 kernel 的 I32 路由计数参数位置。核心按实际绑定读取计数，管理全局 SLRU 和 CUDA VMM 页，不识别模型专属名称或维度。默认全量常驻只构建模型计划所需的验证契约；不从执行包 JSON 读取逐层 `kernel_contracts`。

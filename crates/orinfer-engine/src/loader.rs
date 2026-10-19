@@ -132,7 +132,7 @@ fn load_impl(
     validate_scopes(&model.metadata, &model.buffer_scopes)?;
     let decode_programs = built.decode_programs;
     let expert_banks = built.expert_banks;
-    validate_dynamic_contracts(&model.metadata)?;
+    validate_dynamic_contracts(&model.metadata, build_bindings)?;
     model.metadata.validate()?;
     // The descriptor pins the package; configuration also affects generated plans.
     let fingerprint = sha256(&[raw, package_raw, config_raw].concat());
@@ -220,17 +220,25 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
     Ok(())
 }
 
-fn validate_dynamic_contracts(model: &Manifest) -> Result<()> {
+fn validate_dynamic_contracts(model: &Manifest, exhaustive_rows: bool) -> Result<()> {
     let kernels: BTreeMap<_, _> = model.kernels.iter().map(|k| (k.name.as_str(), k)).collect();
+    let mut row_contracts = std::collections::BTreeSet::new();
     for (name, template) in &model.dynamic_batch_kernels {
         if name != &template.name {
             return Err("Dynamic launch name differs from binding".into());
         }
-        template.validate(
+        template.validate_binding(
             kernels
                 .get(name.as_str())
                 .ok_or("Missing dynamic batch kernel")?,
         )?;
+        // Plans used by the offline builder and validate-model check the entire
+        // domain once per expression contract, rather than once per model layer.
+        if exhaustive_rows
+            && row_contracts.insert((template.capacity, &template.grid, &template.arguments))
+        {
+            template.validate_rows()?;
+        }
     }
     if !model.dynamic_batch_kernels.is_empty()
         && (!model.batch_profiles.contains(&128)
@@ -250,6 +258,59 @@ fn validate_dynamic_contracts(model: &Manifest) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn dynamic_fixture() -> Manifest {
+        let identity = serde_json::json!({"file":"kernel.cubin", "sha256":"0".repeat(64)});
+        serde_json::from_value(serde_json::json!({
+            "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":2,
+            "max_context":128,"vocab":4,"toolchain":{},"buffers":[],"reset_buffers":[],
+            "input":"Input","token":"Token","status":"Status","position":"Step",
+            "logits":"Logits","weight_bytes":0,"weight_parameters":1,"weight_scope":"test",
+            "batch_profiles":[128],
+            "kernels":[{"name":"rows","module":identity,"source":identity,"host_abi":identity,
+                "symbol":"test","grid":[128,1,1],"block":[32,1,1],"shared_memory_bytes":0,
+                "cooperative":false,"args":[{"kind":"i32","value":128}]}],
+            "dynamic_batch_kernels":{"rows":{"name":"rows","capacity":128,
+                "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],
+                "arguments":[{"index":0,"value":{"op":"rows"}}]}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dynamic_row_domain_is_checked_offline_and_at_each_real_launch() {
+        let mut manifest = dynamic_fixture();
+        let template = manifest.dynamic_batch_kernels.get_mut("rows").unwrap();
+        template.arguments[0].value = serde_json::from_value(serde_json::json!({
+            "op":"divide","lhs":{"op":"rows"},"rhs":{"op":"remainder",
+                "lhs":{"op":"rows"},"rhs":{"op":"constant","value":3}}
+        }))
+        .unwrap();
+        manifest.kernels[0].args[0] = crate::artifact::Argument::I32 { value: 64 };
+        validate_dynamic_contracts(&manifest, false).unwrap();
+        assert!(validate_dynamic_contracts(&manifest, true).is_err());
+        let template = &manifest.dynamic_batch_kernels["rows"];
+        assert!(template.launch(2).is_ok());
+        assert!(template.launch(3).is_err());
+    }
+
+    #[test]
+    fn every_binding_keeps_its_abi_check_when_expressions_are_shared() {
+        let mut manifest = dynamic_fixture();
+        let mut template = manifest.dynamic_batch_kernels["rows"].clone();
+        let mut binding = manifest.kernels[0].clone();
+        binding.name = "rows_second_layer".into();
+        template.name.clone_from(&binding.name);
+        manifest
+            .dynamic_batch_kernels
+            .insert(template.name.clone(), template);
+        manifest.kernels.push(binding);
+        validate_dynamic_contracts(&manifest, true).unwrap();
+        manifest.kernels[1].args[0] = crate::artifact::Argument::I32 { value: 127 };
+        for exhaustive in [false, true] {
+            assert!(validate_dynamic_contracts(&manifest, exhaustive).is_err());
+        }
+    }
 
     #[test]
     #[ignore = "Requires a prepared native model; CPU only, no GPU allocation"]

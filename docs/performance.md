@@ -2,6 +2,19 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## 部署启动（2026-10-19）
+
+通过 [startup 基准](../tools/bench/README.md) 启动真实 Rust release CLI，等待 HTTP 就绪后发送首个流式翻译请求。相同模型、权重和执行包，比较前端串行准备、逐张量分配的实现，与前端并行准备、只读权重 arena、分片读取和 DMA 流水线的实现；两者均已将动态行数穷举检查移至离线验证。每项取三个新进程的中位数，保留文件缓存，计时排除共享 GPU 锁等待和进程退出。
+
+| 模型 | API 就绪：修改前 → 后（s） | 首输出：修改前 → 后（s） | 首请求完成：修改前 → 后（s） |
+| --- | ---: | ---: | ---: |
+| Index-Translate-2B | 2.041 → 0.931 | 2.127 → 1.009 | 2.233 → 1.113 |
+| Index-Translate-9B | 3.348 → 2.261 | 3.461 → 2.380 | 3.794 → 2.714 |
+
+配置为 `decode_only`、关闭 MTP 和 prefix cache，固定 seed `20261002`、greedy、关闭 thinking；请求为 34 个输入 tokens、12 个自然结束的输出 tokens，修改前后正文、usage 与停止原因一致。首输出按首个非空 SSE 正文计时，片段可能包含多个 tokens。这是新进程部署到首个完整请求的测量，文件缓存未清理；重启设备或完全冷盘加载需另测。
+
+CUDA 分配数在 2B 上由 1063 降为 209，9B 由 1272 降为 245；arena 分别增加 6912／11456 bytes 的对齐开销。512／2K／8K 输入、每项 65 个输出 tokens 的固定长度完整执行回归，两个模型的输出 token 均与修改前相同，prefill/decode TPS 差异在约 2% 以内。开启最多 3 个 MTP 草稿时，2B 单图和双图请求的正文、usage 与停止原因同样保持一致。
+
 ## Qwen3.5-4B（2026-10-19）
 
 来源为官方 [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)，固定 revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`。32 层、2560 hidden、9216 FFN，复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求私有状态；tied embedding/输出头共享同一份压缩 bank。

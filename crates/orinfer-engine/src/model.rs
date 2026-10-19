@@ -33,6 +33,19 @@ pub struct RequestReport {
     pub diagnostic: bool,
 }
 #[derive(Debug, Serialize)]
+pub struct LoadStages {
+    pub cuda_init_s: f64,
+    pub buffer_alloc_s: f64,
+    pub kernel_assets_s: f64,
+    pub weight_read_wait_s: f64,
+    pub weight_dma_wait_s: f64,
+    pub weight_upload_chunks: usize,
+    pub final_sync_s: f64,
+    pub cuda_allocations: usize,
+    pub weight_arena_padding_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub resident_experts: crate::execution::ResidentExperts,
     pub expert_cache: Option<crate::execution::ExpertCacheStatistics>,
@@ -40,6 +53,7 @@ pub struct Report {
     pub model: String,
     pub device: crate::cuda::DeviceInfo,
     pub load_to_ready_s: f64,
+    pub load_stages: LoadStages,
     pub verify_weights: bool,
     pub load_workers: usize,
     pub preloaded_modules: usize,

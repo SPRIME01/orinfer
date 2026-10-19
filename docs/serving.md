@@ -232,6 +232,10 @@ prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少
 
 启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。默认模式无法发现仅修改数值、但不改变结构的损坏。
 
+HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对前端 hash 与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中，不能重复相加。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
+
+已加载的只读权重共享一次 CUDA arena 分配，保留各张量的对齐和布局，padding 计入权重与显存统计；请求私有状态、KV 和按需加载的专家保持独立管理。读取线程复用分片文件描述符，按文件偏移调度读取，并与多块异步上传重叠；缓冲区在对应 DMA 完成后复用。启动失败时先完成 CUDA 清理，再释放 GPU 锁。
+
 ## 诊断 CLI
 
 `plan-model` 在 CPU 加载模型包原生库并输出其生成的计划，`validate-model` 校验模型、执行库、kernel 和张量 hash；两者不初始化 GPU。执行包接口与旧数据迁移见[模型执行包](model-packages.md)。

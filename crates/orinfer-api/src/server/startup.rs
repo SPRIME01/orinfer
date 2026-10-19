@@ -21,34 +21,18 @@ impl Worker {
 }
 
 pub(super) async fn start(settings: &Settings) -> Result<Worker> {
+    let started = Instant::now();
     let settings = settings.clone();
-    let codec = Arc::new(ChatCodec::load(&settings.model_dir)?);
-    if !settings.default_request_params.is_empty() {
-        codec
-            .prepare(
-                defaults::validation_request(&settings.default_request_params)?,
-                "defaults-validation",
-                usize::MAX,
-                None,
-                &mut preparation::Context::new(
-                    Arc::new(AtomicBool::new(false)),
-                    settings.limits.memory_mib * 1024 * 1024,
-                ),
-            )
-            .map_err(|e| format!("default_request_params: {e}"))?;
-    }
     let default_request_params = Arc::new(settings.default_request_params.clone());
     let (sender, receiver) = mpsc::channel(128);
     let (ready_sender, ready_receiver) = oneshot::channel();
     let model_id: Arc<str> = settings.model.clone().into();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_codec = Arc::clone(&codec);
     let worker_model = Arc::clone(&model_id);
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
     let resident_experts = settings.resident_experts;
-    let load_workers = settings.load_workers;
     let prompt_lookup = settings.prompt_lookup;
     let activity = Arc::new(continuous::Activity::default());
     let lifecycle = Arc::clone(&activity.lifecycle);
@@ -60,39 +44,14 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         .spawn(move || {
             let _ = worker_lifecycle.supervise(|| {
                 let initialize = || -> Result<_> {
-                    use std::os::fd::AsRawFd;
-                    if let Some(parent) = settings
-                        .gpu_lock
-                        .parent()
-                        .filter(|p| !p.as_os_str().is_empty())
-                    {
-                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                    }
-                    let lock = std::fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .read(true)
-                        .write(true)
-                        .open(&settings.gpu_lock)
-                        .map_err(|e| e.to_string())?;
-                    // SAFETY: flock borrows this live file descriptor. The file remains
-                    // owned by this worker for the complete CUDA model lifetime.
-                    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-                    {
-                        return Err("GPU experiment lock is busy".into());
-                    }
-                    let model = Model::load_with_options(
-                        &settings.model_dir,
-                        LoadOptions {
-                            cuda_graph: settings.cuda_graph,
-                            verify_weights,
-                            load_workers,
-                            resident_experts: settings.resident_experts,
-                            prefix_cache_bytes: settings.prefix_cache_bytes,
-                            mtp_drafts: settings.mtp_drafts,
-                            prompt_lookup: settings.prompt_lookup,
+                    let ((worker_codec, frontend_s), loaded) = load_parallel(
+                        || {
+                            let at = Instant::now();
+                            load_frontend(&settings).map(|codec| (codec, at.elapsed().as_secs_f64()))
                         },
+                        || load_model(&settings),
                     )?;
+                    let model = &loaded.model;
                     if &worker_codec.asset_hashes != model.frontend_assets() {
                         return Err("Frontend assets changed while loading model".into());
                     }
@@ -104,15 +63,20 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                     if !model.batching_supported() && scheduler.max_active != 1 {
                         return Err("This execution package schedules one active request; set --max-active-requests 1 (additional requests queue)".into());
                     }
-                    Ok((lock, model, context, vision))
+                    eprintln!(
+                        "WORKER READY after {:.3}s; frontend={frontend_s:.3}s; model={:.3}s; parallel_load=true",
+                        started.elapsed().as_secs_f64(), loaded.seconds
+                    );
+                    Ok((loaded, context, vision, worker_codec))
                 };
                 match initialize() {
-                    Ok((_lock, mut model, context, vision)) => {
+                    Ok((mut loaded, context, vision, worker_codec)) => {
                         worker_lifecycle.ready();
-                        let mtp_drafts = model.mtp_drafts();
-                        if ready_sender.send(Ok((context, vision, mtp_drafts))).is_ok() {
+                        let mtp_drafts = loaded.model.mtp_drafts();
+                        let ready = (context, vision, mtp_drafts, Arc::clone(&worker_codec));
+                        if ready_sender.send(Ok(ready)).is_ok() {
                             continuous::worker(
-                                &mut model,
+                                &mut loaded.model,
                                 receiver,
                                 &worker_codec,
                                 &worker_model,
@@ -141,7 +105,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
-    let (context, vision, mtp_drafts) = match ready {
+    let (context, vision, mtp_drafts, codec) = match ready {
         Ok(ready) => ready,
         Err(error) => {
             shutdown.store(true, Ordering::Relaxed);
@@ -179,4 +143,225 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         shutdown,
         handle: worker,
     })
+}
+
+// Fields drop in declaration order, including when frontend preparation fails:
+// finish model teardown before releasing GPU ownership.
+struct LoadedModel<T = Model> {
+    model: T,
+    _lock: std::fs::File,
+    seconds: f64,
+}
+
+fn load_model(settings: &Settings) -> Result<LoadedModel> {
+    use std::os::fd::AsRawFd;
+    let at = Instant::now();
+    if let Some(parent) = settings
+        .gpu_lock
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&settings.gpu_lock)
+        .map_err(|e| e.to_string())?;
+    // SAFETY: The descriptor remains owned by this GPU worker through model teardown.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("GPU experiment lock is busy".into());
+    }
+    let model = Model::load_with_options(
+        &settings.model_dir,
+        LoadOptions {
+            cuda_graph: settings.cuda_graph,
+            verify_weights: settings.verify_weights,
+            load_workers: settings.load_workers,
+            resident_experts: settings.resident_experts,
+            prefix_cache_bytes: settings.prefix_cache_bytes,
+            mtp_drafts: settings.mtp_drafts,
+            prompt_lookup: settings.prompt_lookup,
+        },
+    )?;
+    Ok(LoadedModel {
+        model,
+        _lock: lock,
+        seconds: at.elapsed().as_secs_f64(),
+    })
+}
+
+fn load_frontend(settings: &Settings) -> Result<Arc<ChatCodec>> {
+    let codec = Arc::new(ChatCodec::load(&settings.model_dir)?);
+    if !settings.default_request_params.is_empty() {
+        codec
+            .prepare(
+                defaults::validation_request(&settings.default_request_params)?,
+                "defaults-validation",
+                usize::MAX,
+                None,
+                &mut preparation::Context::new(
+                    Arc::new(AtomicBool::new(false)),
+                    settings.limits.memory_mib * 1024 * 1024,
+                ),
+            )
+            .map_err(|e| format!("default_request_params: {e}"))?;
+    }
+    Ok(codec)
+}
+
+/// Only the frontend crosses threads; model construction and destruction stay
+/// on the caller's CUDA owner, including frontend errors and panics.
+fn load_parallel<T: Send, U>(
+    frontend: impl FnOnce() -> Result<T> + Send,
+    model: impl FnOnce() -> Result<U>,
+) -> Result<(T, U)> {
+    std::thread::scope(|scope| {
+        let frontend = std::thread::Builder::new()
+            .name("orinfer-frontend".into())
+            .spawn_scoped(scope, frontend)
+            .map_err(|e| e.to_string())?;
+        let model = model();
+        let frontend = frontend
+            .join()
+            .map_err(|_| "Frontend loader panicked".to_owned())
+            .and_then(|r| r);
+        Ok((frontend?, model?))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontend_overlaps_model_load_and_model_stays_on_owner() {
+        let owner = std::thread::current().id();
+        let (front_tx, front_rx) = std::sync::mpsc::channel();
+        let (model_tx, model_rx) = std::sync::mpsc::channel();
+        let (frontend, model) = load_parallel(
+            move || {
+                front_tx.send(std::thread::current().id()).unwrap();
+                model_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(7)
+            },
+            || {
+                assert_ne!(
+                    front_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap(),
+                    owner
+                );
+                model_tx.send(()).unwrap();
+                // Rc cannot cross threads, just like the CUDA model.
+                Ok(std::rc::Rc::new(std::thread::current().id()))
+            },
+        )
+        .unwrap();
+        assert_eq!(frontend, 7);
+        assert_eq!(*model, owner);
+    }
+
+    #[test]
+    fn frontend_error_or_panic_drops_model_on_owner() {
+        struct Owned(std::rc::Rc<std::cell::Cell<bool>>, std::thread::ThreadId);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                assert_eq!(std::thread::current().id(), self.1);
+                self.0.set(true);
+            }
+        }
+        for panic in [false, true] {
+            let dropped = std::rc::Rc::new(std::cell::Cell::new(false));
+            let result = load_parallel(
+                || -> Result<()> {
+                    if panic {
+                        panic!("frontend failure");
+                    }
+                    Err("frontend failure".into())
+                },
+                || Ok(Owned(dropped.clone(), std::thread::current().id())),
+            );
+            assert!(result.is_err());
+            assert!(dropped.get());
+        }
+    }
+
+    #[test]
+    fn frontend_failure_keeps_gpu_lock_through_model_teardown() {
+        use std::os::fd::AsRawFd;
+        struct AssertLocked<'a>(&'a std::fs::File);
+        impl Drop for AssertLocked<'_> {
+            fn drop(&mut self) {
+                // SAFETY: Independent live descriptor to the same test lock.
+                let code =
+                    unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                assert_eq!(code, -1);
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EWOULDBLOCK)
+                );
+            }
+        }
+        let path =
+            std::env::temp_dir().join(format!("orinfer-startup-lock-{}", std::process::id()));
+        let probe = std::fs::File::create_new(&path).unwrap();
+        for panic in [false, true] {
+            let lock = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                // SAFETY: Both descriptors are live; operations are nonblocking.
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let result = load_parallel(
+                || -> Result<()> {
+                    if panic {
+                        panic!("frontend failure");
+                    }
+                    Err("frontend failure".into())
+                },
+                || {
+                    Ok(LoadedModel {
+                        model: AssertLocked(&probe),
+                        _lock: lock,
+                        seconds: 0.,
+                    })
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                // SAFETY: Teardown completed; this live descriptor can acquire ownership.
+                unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            // SAFETY: Release the lock acquired above before the next iteration.
+            assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
+        drop(probe);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn model_error_waits_for_frontend_cleanup() {
+        let finished = AtomicBool::new(false);
+        let completed = &finished;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = load_parallel(
+            move || {
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                completed.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            || -> Result<()> {
+                tx.send(()).unwrap();
+                Err("model failure".into())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "model failure");
+        assert!(finished.load(Ordering::Relaxed));
+    }
 }

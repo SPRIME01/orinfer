@@ -101,6 +101,7 @@ pub fn run(settings: Settings) -> Result<()> {
     result
 }
 async fn serve(settings: Settings) -> Result<()> {
+    let started = Instant::now();
     let worker = startup::start(&settings).await?;
     let state = worker.state.clone();
     let shutdown = Arc::clone(&worker.shutdown);
@@ -132,8 +133,10 @@ async fn serve(settings: Settings) -> Result<()> {
         .await
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128",
-        settings.listen, scheduler.max_active
+        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
+        settings.listen,
+        scheduler.max_active,
+        started.elapsed().as_secs_f64()
     );
     let shutdown_at = Arc::new(std::sync::Mutex::new(None));
     let signal_shutdown_at = Arc::clone(&shutdown_at);

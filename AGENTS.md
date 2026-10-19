@@ -29,6 +29,7 @@
 - E8P可使用无损K64/K128压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。
 - 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，默认在线校验dtype、shape、物理layout和容器边界；权重payload hash由`--verify-weights`显式开启，`validate-model`始终完整校验。配置签名仍校验，前端资源、CPU资产元数据、原生执行库和kernel身份仍固定并校验hash。模型数据通过execution_package digest固定独立模型执行包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，在线模型数据描述与执行包均保留schema 1，只支持当前原生模型包结构；不提供旧结构或schema 2兼容分支。算子夹具格式独立。
 - 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
+- HTTP与离线入口并行准备前端和模型；CUDA模型在所属worker创建、使用及销毁，前端失败或panic也需等待并正确回收，模型销毁完成后再释放GPU锁。只读权重arena保持每张量对齐且仅释放单一owner，padding计入权重与显存预算；请求状态、KV和按需专家单独管理。权重读取和DMA有界流水化，缓冲区复用及失败清理等待对应传输完成；启动验收同时测进程到API就绪、首输出及首请求完成。
 - JSONL离线入口与HTTP复用Chat前端、模型加载和连续worker，不复制推理或状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
 - `serve`默认latency、`batch`默认throughput调度。吞吐策略复用动态packet和原生prefill，不沿用在线准入时间门限、两个长prefill限制或decode时间配额；物理内存、状态隔离和输出预算保持共同约束，联合路径按实测成本选择。排序使用一次性冻结的时间，不能在比较函数内反复读取elapsed导致顺序变化。
 - JSONL全局规划复用Chat前端提取实际token前缀，索引与工作区受预处理预算的四分之一约束，每条最多保留4096个前缀token，预算不足或不适合规划的内容保留流式处理。重排保持物理行号、custom_id、输入身份和续跑语义；缓存提示只影响快照选择，不能截断输入或输出。长度估计只观察自然完成的请求，不能把输出预算当成真实长度。异步结果队列保留内存计费，返回成功或中断结果前须排空并确认写入/同步；错误必须传播。
@@ -36,6 +37,7 @@
 - 离线构建将HF tokenizer_config的added_tokens_decoder合并到部署tokenizer.json，逐项验证ID不变。验收按Transformers实际生成的token ID比较，不只比较渲染字符串；缺失的thinking/工具标记不能当作普通文本切分。
 - 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进Rust模型库；禁止在生成模块逐层复制整份特化绑定，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model保留构建契约以支持离线重建；在线只导出最终程序、局部特化和专家常驻契约引用的绑定，不将融合前的构建输入注册为可执行launch。
 - Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
+- 动态launch全行数验证放在离线构建使用的plan-model和validate-model，同容量及表达式去重；在线加载保留逐绑定ABI校验，实际launch保留真实行数与算术检查，不在启动时穷举行数。
 - Flash Next普通decode（1–128请求）、混合batch和MTP验证共享1–1024 token行的target执行模板；单／多流草稿和warm共享1–512行draft模板，输出头复用相同实现。因果段、接受前缀因子、捕获、提交和请求隔离独立处理，不复制投影／HC／FFN／专家计算流程。整数投影和专家按1/2/3/4/8/16/32离线特化，其余行数使用动态参数cubin；TileLang自动调优只选择不改变scale、dtype与归约边界的合法tile，路由与专家tile必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子不保留8/16分界。不得恢复旧的逐容量在线batch planner、空行补齐或混合decode子组回退；离线中间绑定只用于构建最终模板，MTP短尾也走一行packet，单请求target程序仅保留状态准备／参考用途。Graph分支按模板槽位注册，全部特化验证读写依赖后复用；不手写batch档位，不在线调优；缓存按源码、编译器和设备身份失效。
 - CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
 - 共享片段与完整packet复用同一套Graph分支捕获；片段只启用完整且无歧义的fork/join区间。动态槽位展开的连续辅助kernel属于同一边界，重复的私有状态槽位不得关闭无关共享分支；优先级按实际launch grid判断。模型声明支持batch验证时，单请求MTP也复用Verification packet，不另走逐算子验证链。

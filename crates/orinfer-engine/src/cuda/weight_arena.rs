@@ -1,0 +1,104 @@
+//! Immutable weight slices share one owner allocation; request state stays private.
+use crate::{
+    artifact::{Buffer, Result},
+    weights::TensorIdentity,
+};
+use std::{alloc::Layout, collections::BTreeMap};
+
+pub(super) struct WeightsLayout {
+    pub offsets: BTreeMap<String, usize>,
+    pub allocation_bytes: usize,
+    pub padding_bytes: usize,
+    alignment: usize,
+}
+impl WeightsLayout {
+    pub fn new<'a>(buffers: impl Iterator<Item = &'a Buffer<TensorIdentity>>) -> Result<Self> {
+        let mut layout = Layout::from_size_align(0, 1).map_err(|e| e.to_string())?;
+        let mut offsets = BTreeMap::new();
+        let mut payload = 0usize;
+        for buffer in buffers {
+            let bytes = buffer.bytes()?;
+            let alignment = usize::try_from(buffer.alignment).map_err(|e| e.to_string())?;
+            let next = Layout::from_size_align(bytes, alignment).map_err(|e| e.to_string())?;
+            let (extended, offset) = layout.extend(next).map_err(|e| e.to_string())?;
+            if offsets.insert(buffer.name.clone(), offset).is_some() {
+                return Err("Duplicate immutable weight buffer".into());
+            }
+            payload = payload.checked_add(bytes).ok_or("Weight arena overflow")?;
+            layout = extended;
+        }
+        // CUDA allocations guarantee 256-byte alignment. Larger contracts get
+        // headroom for aligning the bank base within the owned allocation.
+        let extra = if layout.align() > 256 {
+            layout.align() - 1
+        } else {
+            0
+        };
+        let allocation_bytes = layout
+            .size()
+            .checked_add(extra)
+            .ok_or("Weight arena overflow")?;
+        Ok(Self {
+            offsets,
+            allocation_bytes,
+            padding_bytes: allocation_bytes - payload,
+            alignment: layout.align(),
+        })
+    }
+
+    pub fn base(&self, allocation: u64) -> Result<u64> {
+        let mask = self.alignment as u64 - 1;
+        allocation
+            .checked_add(mask)
+            .map(|p| p & !mask)
+            .ok_or_else(|| "Weight arena address overflow".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::{Access, Dtype};
+
+    fn buffer(name: &str, bytes: usize, alignment: u64) -> Buffer<TensorIdentity> {
+        Buffer {
+            name: name.into(),
+            dtype: Dtype::U8,
+            shape: vec![bytes],
+            layout: "contiguous".into(),
+            alignment,
+            access: Access::Read,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn aligned_slices_do_not_overlap_or_escape_the_owner_allocation() {
+        let buffers = [buffer("a", 3, 256), buffer("b", 37, 512), buffer("c", 9, 1)];
+        let arena = WeightsLayout::new(buffers.iter()).unwrap();
+        let base = arena.base(256).unwrap();
+        let mut previous_end = 256;
+        for buffer in &buffers {
+            let address = base + arena.offsets[&buffer.name] as u64;
+            assert_eq!(address % buffer.alignment, 0);
+            assert!(address >= previous_end);
+            previous_end = address + buffer.bytes().unwrap() as u64;
+            assert!(previous_end <= 256 + arena.allocation_bytes as u64);
+        }
+        assert_eq!(arena.padding_bytes, arena.allocation_bytes - 49);
+        assert!(arena.base(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn empty_invalid_and_duplicate_layouts_are_checked_without_cuda() {
+        let arena = WeightsLayout::new(std::iter::empty()).unwrap();
+        assert_eq!(arena.allocation_bytes, 0);
+        for buffers in [
+            vec![buffer("a", 3, 3)],
+            vec![buffer("a", usize::MAX, 256)],
+            vec![buffer("a", 3, 256), buffer("a", 3, 256)],
+        ] {
+            assert!(WeightsLayout::new(buffers.iter()).is_err());
+        }
+    }
+}

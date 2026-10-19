@@ -16,6 +16,7 @@ mod sequence;
 pub(crate) mod snapshot;
 mod transfers;
 mod virtual_memory;
+mod weight_arena;
 mod weight_upload;
 pub(crate) use cudarc::driver::sys;
 pub(crate) type Handle = sys::CUgraphExec;
@@ -43,6 +44,7 @@ impl Driver {
             b"cuCtxSynchronize\0".as_slice(),
             b"cuStreamCreate\0".as_slice(),
             b"cuStreamSynchronize\0".as_slice(),
+            b"cuEventQuery\0".as_slice(),
             b"cuStreamDestroy_v2\0".as_slice(),
             b"cuMemGetInfo_v2\0".as_slice(),
             b"cuMemAlloc_v2\0".as_slice(),

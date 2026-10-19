@@ -313,7 +313,7 @@ impl ModelPackage {
                         .get(k.dynamic)
                         .ok_or("Unknown dynamic launch definition")?
                         .bind(&name);
-                    template.validate(&binding)?;
+                    template.validate_binding(&binding)?;
                     metadata.dynamic_batch_kernels.insert(name, template);
                 }
                 metadata.kernels.push(binding);
