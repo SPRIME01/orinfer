@@ -131,6 +131,7 @@ pub(super) async fn ps(State(manager): State<Arc<Manager>>, headers: HeaderMap) 
     let runners: Vec<_> = manager.runners.lock().await.values().cloned().collect();
     let records = manager.records.lock().await;
     let models: Vec<_> = runners.iter().filter_map(|runner| {
+        if runner.loading.load(Ordering::Acquire) { return None; }
         let record = records.values().find(|r| runner_key(r) == runner.key)?;
         let keep_alive = runner.keep_alive_s.load(Ordering::Relaxed);
         let idle = runner.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs();

@@ -97,7 +97,7 @@ impl Fixture {
             transition: Semaphore::new(1),
             requests: Arc::new(Semaphore::new(128)),
             body_memory: Arc::new(Semaphore::new(512)),
-            request_budget: Arc::new(SyncMutex::new(0)),
+            budgets: Arc::new(SyncMutex::new(BudgetTotals::default())),
             gpu_owner: SyncMutex::new(None),
             stopping: AtomicBool::new(false),
         });
@@ -180,6 +180,7 @@ async fn dead_worker_is_restarted_and_failed_startup_does_not_hold_gpu_lock() {
     fixture.manager.stop("fixture:2b", false).await.unwrap();
     fs::write(&fixture.manager.executable, "#!/bin/sh\nexit 2\n").unwrap();
     assert!(fixture.manager.acquire("fixture:2b").await.is_err());
+    assert_eq!(fixture.manager.budgets.lock().unwrap().loading, 0);
     fixture.assert_gpu_released().await;
 }
 
@@ -229,11 +230,11 @@ fn request_budgets_are_global_and_released_on_cancellation() {
         .reserve_request(&record, &json!({"max_tokens":64}), 32)
         .unwrap();
     assert_eq!(
-        *fixture.manager.request_budget.lock().unwrap(),
+        fixture.manager.budgets.lock().unwrap().requests,
         1024 + 96 * 128
     );
     drop(budget);
-    assert_eq!(*fixture.manager.request_budget.lock().unwrap(), 0);
+    assert_eq!(fixture.manager.budgets.lock().unwrap().requests, 0);
     record.sequence_bytes = usize::MAX;
     assert!(
         fixture

@@ -60,6 +60,8 @@ curl http://127.0.0.1:8088/api/chat -d '{"model":"index-translate-2b","messages"
 
 `keep_alive` 支持数字秒数、`"1h30m"` 等时长、负数永久保留和 `0` 请求结束后回收；空 messages/prompt 请求用于预加载，空请求加 `keep_alive=0` 用于卸载。未带 tag 的注册名也接受 `:latest`。两种协议共用准入、连续调度、prefix cache 和取消逻辑。
 
+模型内存预算充足时直接并发处理，不同模型也可并行冷启动，同一模型只启动一个 worker。加载或请求状态预算不足时，优先立即驱逐最近最少使用的空闲模型，`keep_alive=-1` 也不阻止内存压力回收；空间仍被活动请求或在途加载占用时才等待。不打断正在生成的请求。加载中的模型单独预留内存，避免重复承诺相同余量，预留在就绪或失败后释放。
+
 返回真实 token/cache 计数和请求总时长（纳秒）；不推算未单独测量的各阶段耗时或实际 VRAM 字节数。`/api/ps.estimated_load_bytes` 是内存准入估算。`ORINFER_API_KEY` 同时保护 `/api` 与 `/v1`。
 
 当前模型由 CLI 导入原生 orinfer 包；Ollama registry 的 pull/push/create、embedding 接口、raw prompt、suffix、Go template 覆盖、旧 token context 和自动截断/滑窗明确返回错误。上下文由模型执行包确定，`options.num_ctx` 可省略或使用该值。

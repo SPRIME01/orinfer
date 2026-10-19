@@ -34,7 +34,7 @@ impl Http {
             task,
         }
     }
-    async fn post(&self, request: &Value) -> reqwest::Response {
+    pub(super) async fn post(&self, request: &Value) -> reqwest::Response {
         self.client
             .post(format!("{}/v1/chat/completions", self.url))
             .header("x-request-id", "ollama-fixture")
@@ -124,7 +124,7 @@ async fn streamed_response_owns_lease_and_budgets_until_disconnect() {
     let second = http.post(&request).await;
     assert_eq!(second.status(), 200);
     assert_eq!(fixture.manager.requests.available_permits(), 0);
-    assert_eq!(*fixture.manager.request_budget.lock().unwrap(), 2048);
+    assert_eq!(fixture.manager.budgets.lock().unwrap().requests, 2048);
     let third = http.post(&request).await;
     assert_eq!(third.status(), 429);
     assert_eq!(
@@ -147,12 +147,12 @@ async fn streamed_response_owns_lease_and_budgets_until_disconnect() {
     drop(first);
     eventually(|| fixture.manager.requests.available_permits() == 1).await;
     assert_eq!(runner.active.load(Ordering::Acquire), 1);
-    assert_eq!(*fixture.manager.request_budget.lock().unwrap(), 1024);
+    assert_eq!(fixture.manager.budgets.lock().unwrap().requests, 1024);
     eventually(|| fixture.root.join("disconnected").exists()).await;
     drop(second);
     eventually(|| fixture.manager.requests.available_permits() == 2).await;
     assert_eq!(fixture.manager.body_memory.available_permits(), 512);
-    assert_eq!(*fixture.manager.request_budget.lock().unwrap(), 0);
+    assert_eq!(fixture.manager.budgets.lock().unwrap().requests, 0);
     fixture.manager.sweep().await;
     assert!(fixture.manager.runners.lock().await.is_empty());
     fixture.assert_gpu_released().await;

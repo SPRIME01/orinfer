@@ -236,3 +236,141 @@ async fn graceful_stop_drains_active_requests_before_unloading() {
     assert!(fixture.manager.runners.lock().await.is_empty());
     fixture.assert_gpu_released().await;
 }
+
+#[tokio::test]
+async fn enough_memory_allows_parallel_cold_loads_and_unblocked_ready_models() {
+    let fixture = Fixture::new();
+    fixture
+        .alias("second", |r| r.options.mtp_drafts = "0".into())
+        .await;
+    fixture
+        .alias("third", |r| r.options.cuda_graph = "off".into())
+        .await;
+    let first = fixture.manager.acquire("fixture:2b").await.unwrap().0;
+    fs::write(fixture.root.join("hold_start"), "").unwrap();
+    let manager = Arc::clone(&fixture.manager);
+    let second = tokio::spawn(async move { manager.acquire("second").await });
+    eventually(|| fixture.starts() == 2).await;
+    let manager = Arc::clone(&fixture.manager);
+    let third = tokio::spawn(async move { manager.acquire("third").await });
+    eventually(|| fixture.starts() == 3).await;
+    assert!(!second.is_finished() && !third.is_finished());
+    assert_eq!(fixture.manager.budgets.lock().unwrap().loading, 2);
+    let ready = tokio::time::timeout(
+        Duration::from_millis(250),
+        fixture.manager.acquire("fixture:2b"),
+    )
+    .await
+    .expect("A ready model waited for another model's cold load")
+    .unwrap()
+    .0;
+    assert_eq!(first.0.pid, ready.0.pid);
+    fs::remove_file(fixture.root.join("hold_start")).unwrap();
+    let second = second.await.unwrap().unwrap().0;
+    let third = third.await.unwrap().unwrap().0;
+    assert_eq!(fixture.manager.budgets.lock().unwrap().loading, 0);
+    drop((first, ready, second, third));
+    fixture.unload().await;
+    fixture.assert_gpu_released().await;
+}
+
+#[tokio::test]
+async fn fitting_http_requests_bypass_an_unrelated_lifecycle_transition() {
+    let fixture = Fixture::new();
+    drop(fixture.manager.acquire("fixture:2b").await.unwrap().0);
+    let http = super::protocol::Http::new(Arc::clone(&fixture.manager)).await;
+    let transition = fixture.manager.transition.acquire().await.unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        http.post(&json!({
+            "model":"fixture:2b", "messages":[{"role":"user","content":"hello"}], "max_tokens":8
+        })),
+    )
+    .await
+    .expect("A fitting request waited for the lifecycle permit");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["model"],
+        "fixture:2b"
+    );
+    drop(transition);
+    fixture.unload().await;
+}
+
+#[tokio::test]
+async fn request_memory_pressure_evicts_idle_workers_even_with_forever_keep_alive() {
+    let fixture = Fixture::new();
+    fixture
+        .alias("idle", |r| r.options.mtp_drafts = "0".into())
+        .await;
+    let (active, mut record) = fixture.manager.acquire("fixture:2b").await.unwrap();
+    let idle = fixture.manager.acquire("idle").await.unwrap().0;
+    let victim = Arc::clone(&idle.0);
+    victim.keep_alive_s.store(u64::MAX, Ordering::Release);
+    drop(idle);
+    // Impossible to satisfy without allocating physical RAM: exercise eviction
+    // and the remaining active-work wait boundary deterministically on CPU.
+    record.sequence_bytes = usize::MAX / 2;
+    let result = fixture
+        .manager
+        .reserve_request_with_eviction(&record, &json!({}), 32)
+        .await;
+    assert!(
+        result
+            .err()
+            .unwrap()
+            .starts_with("Insufficient unified memory")
+    );
+    assert!(victim.child.lock().await.try_wait().unwrap().is_some());
+    assert!(active.0.child.lock().await.try_wait().unwrap().is_none());
+    assert_eq!(fixture.manager.runners.lock().await.len(), 1);
+    assert_eq!(fixture.manager.budgets.lock().unwrap().requests, 0);
+    drop(active);
+    fixture.unload().await;
+}
+
+#[tokio::test]
+async fn pending_load_reservations_prevent_double_promising_memory_and_release_on_drop() {
+    let fixture = Fixture::new();
+    let (_, mut record) = fixture.manager.acquire("fixture:2b").await.unwrap();
+    record.sequence_bytes = 1024;
+    let reserved = usize::MAX / 2;
+    fixture.manager.budgets.lock().unwrap().loading = reserved;
+    let budget = MemoryBudget {
+        bytes: reserved,
+        kind: BudgetKind::Loading,
+        total: Arc::clone(&fixture.manager.budgets),
+    };
+    assert!(
+        fixture
+            .manager
+            .reserve_request(&record, &json!({}), 32)
+            .is_err()
+    );
+    drop(budget);
+    let request = fixture
+        .manager
+        .reserve_request(&record, &json!({}), 32)
+        .unwrap();
+    drop(request);
+    fixture.unload().await;
+}
+
+#[tokio::test]
+async fn claimed_idle_victim_cannot_accept_a_racing_request() {
+    let fixture = Fixture::new();
+    drop(fixture.manager.acquire("fixture:2b").await.unwrap().0);
+    let transition = fixture.manager.transition.acquire().await.unwrap();
+    let victim = fixture.manager.claim_idle().await.unwrap();
+    let manager = Arc::clone(&fixture.manager);
+    let arriving = tokio::spawn(async move { manager.acquire("fixture:2b").await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!arriving.is_finished());
+    assert_eq!(victim.active.load(Ordering::Acquire), 0);
+    fixture.manager.remove_runner(&victim).await.unwrap();
+    drop(transition);
+    let replacement = arriving.await.unwrap().unwrap().0;
+    assert_ne!(victim.pid, replacement.0.pid);
+    drop(replacement);
+    fixture.unload().await;
+}

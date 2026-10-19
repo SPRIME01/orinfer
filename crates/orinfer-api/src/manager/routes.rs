@@ -147,13 +147,17 @@ pub(super) async fn gateway(
     request["model"] = json!(lease.0.model);
     let started = Instant::now();
     loop {
-        match manager.reserve_request(&record, &request, input_bytes) {
+        match manager
+            .reserve_request_with_eviction(&record, &request, input_bytes)
+            .await
+        {
             Ok(budget) => {
                 lease.1 = Some(budget);
                 break;
             }
             Err(message) => {
-                if manager.stopping.load(Ordering::Acquire)
+                if !message.starts_with("Insufficient unified memory")
+                    || manager.stopping.load(Ordering::Acquire)
                     || started.elapsed() >= Duration::from_secs(manager.config.load_timeout_s)
                 {
                     return error(StatusCode::SERVICE_UNAVAILABLE, message);
@@ -468,6 +472,7 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             last_used: SyncMutex::new(Instant::now()),
             keep_alive_s: AtomicU64::new(0),
             draining: AtomicBool::new(false),
+            loading: AtomicBool::new(false),
             directory,
             pid,
             batch: true,

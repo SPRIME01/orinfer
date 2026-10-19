@@ -38,26 +38,46 @@ struct Runner {
     last_used: SyncMutex<Instant>,
     keep_alive_s: AtomicU64,
     draining: AtomicBool,
+    loading: AtomicBool,
     directory: PathBuf,
     pid: u32,
     batch: bool,
 }
-struct RequestBudget {
-    bytes: usize,
-    total: Arc<SyncMutex<usize>>,
+#[derive(Default)]
+struct BudgetTotals {
+    requests: usize,
+    loading: usize,
 }
-impl Drop for RequestBudget {
+#[derive(Clone, Copy)]
+enum BudgetKind {
+    Request,
+    Loading,
+}
+struct MemoryBudget {
+    bytes: usize,
+    kind: BudgetKind,
+    total: Arc<SyncMutex<BudgetTotals>>,
+}
+impl Drop for MemoryBudget {
     fn drop(&mut self) {
         let mut total = self.total.lock().unwrap_or_else(|e| e.into_inner());
-        *total = total.saturating_sub(self.bytes);
+        let used = match self.kind {
+            BudgetKind::Request => &mut total.requests,
+            BudgetKind::Loading => &mut total.loading,
+        };
+        *used = used.saturating_sub(self.bytes);
     }
 }
-struct Lease(Arc<Runner>, Option<RequestBudget>);
+struct Lease(Arc<Runner>, Option<MemoryBudget>);
 impl Drop for Lease {
     fn drop(&mut self) {
         *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.0.active.fetch_sub(1, Ordering::AcqRel);
     }
+}
+enum Acquisition {
+    Ready(Lease, ModelRecord),
+    Loading(Lease, ModelRecord, MemoryBudget),
 }
 struct Manager {
     config: ManagerConfig,
@@ -69,7 +89,7 @@ struct Manager {
     transition: Semaphore,
     requests: Arc<Semaphore>,
     body_memory: Arc<Semaphore>,
-    request_budget: Arc<SyncMutex<usize>>,
+    budgets: Arc<SyncMutex<BudgetTotals>>,
     gpu_owner: SyncMutex<Option<File>>,
     stopping: AtomicBool,
 }
@@ -137,18 +157,44 @@ impl Manager {
         tokio::spawn(async move {
             let started = Instant::now();
             loop {
-                let transition = tokio::select! {
-                    biased;
-                    _ = reply.closed() => return,
-                    permit = manager.transition.acquire() => permit,
+                if reply.is_closed() {
+                    return;
+                }
+                // Ready models can accept work while another model starts or
+                // unloads. Only lifecycle changes need the transition permit.
+                let result = match manager.ready(&name).await {
+                    Ok(Some((lease, record))) => Ok(Acquisition::Ready(lease, record)),
+                    Err(error) => Err(error),
+                    Ok(None) => {
+                        let transition = tokio::select! {
+                            biased;
+                            _ = reply.closed() => return,
+                            permit = manager.transition.acquire() => permit,
+                        };
+                        match transition {
+                            Ok(_permit) if !reply.is_closed() => manager.acquire_inner(&name).await,
+                            Ok(_) => return,
+                            Err(_) => Err("Service is stopping".into()),
+                        }
+                    }
                 };
-                let result = match transition {
-                    Ok(_permit) if !reply.is_closed() => manager.acquire_inner(&name).await,
-                    Ok(_) => return,
-                    Err(_) => Err("Service is stopping".into()),
+                // The lifecycle permit has been released: different models
+                // may load concurrently against separately reserved budgets.
+                let result = match result {
+                    Ok(Acquisition::Ready(lease, record)) => Ok((lease, record)),
+                    Ok(Acquisition::Loading(lease, record, budget)) => {
+                        let result = manager.finish_start(&lease.0).await;
+                        drop(budget);
+                        if result.is_ok() {
+                            lease.0.loading.store(false, Ordering::Release);
+                        }
+                        result.map(|()| (lease, record))
+                    }
+                    Err(error) => Err(error),
                 };
                 let wait = result.as_ref().err().is_some_and(|e| {
                     e.starts_with("Insufficient unified memory")
+                        || e == "Model is loading"
                         || e == "Model is draining"
                         || e == "Model is executing an offline batch job"
                 });
@@ -167,8 +213,7 @@ impl Manager {
         });
         receive.await.map_err(|e| e.to_string())?
     }
-    // The caller holds transition across identity lookup, eviction and startup.
-    async fn acquire_inner(&self, name: &str) -> Result<(Lease, ModelRecord)> {
+    async fn ready(&self, name: &str) -> Result<Option<(Lease, ModelRecord)>> {
         if self.stopping.load(Ordering::Acquire) {
             return Err("Service is stopping".into());
         }
@@ -179,28 +224,55 @@ impl Manager {
             .get(name)
             .cloned()
             .ok_or_else(|| format!("Unknown model: {name}"))?;
-        let key = runner_key(&record);
-        let existing = self.runners.lock().await.get(&key).cloned();
-        if let Some(runner) = existing {
-            if runner
-                .child
-                .lock()
-                .await
-                .try_wait()
-                .map_err(|e| e.to_string())?
-                .is_none()
-            {
-                if runner.batch {
-                    return Err("Model is executing an offline batch job".into());
-                }
-                if runner.draining.load(Ordering::Acquire) {
-                    return Err("Model is draining".into());
-                }
-                runner.active.fetch_add(1, Ordering::AcqRel);
-                return Ok((Lease(runner, None), record));
+        let lease = {
+            let runners = self.runners.lock().await;
+            let Some(runner) = runners.get(&runner_key(&record)) else {
+                return Ok(None);
+            };
+            if runner.loading.load(Ordering::Acquire) {
+                return Err("Model is loading".into());
             }
-            self.runners.lock().await.remove(&key);
+            if runner.batch {
+                return Err("Model is executing an offline batch job".into());
+            }
+            if runner.draining.load(Ordering::Acquire) {
+                return Err("Model is draining".into());
+            }
+            // Claiming a lease and marking a worker for eviction share this
+            // lock, so an idle eviction cannot race a newly active request.
+            runner.active.fetch_add(1, Ordering::AcqRel);
+            Lease(Arc::clone(runner), None)
+        };
+        let exited = lease
+            .0
+            .child
+            .lock()
+            .await
+            .try_wait()
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if exited {
+            return Ok(None);
         }
+        Ok(Some((lease, record)))
+    }
+    // The caller holds transition until the memory reservation and child are
+    // published. Waiting for CUDA readiness happens outside this critical section.
+    async fn acquire_inner(&self, name: &str) -> Result<Acquisition> {
+        if let Some((lease, record)) = self.ready(name).await? {
+            return Ok(Acquisition::Ready(lease, record));
+        }
+        let record = self
+            .records
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("Unknown model: {name}"))?;
+        let key = runner_key(&record);
+        // Only an exited worker can remain after the ready check. Startup and
+        // sweep also hold transition, so no replacement can be removed here.
+        self.runners.lock().await.remove(&key);
         if let Some((at, message)) = self.failures.lock().await.get(&key)
             && at.elapsed() < Duration::from_secs(10)
         {
@@ -208,14 +280,14 @@ impl Manager {
         }
         let result = self.start(&record, &key).await;
         match result {
-            Ok(runner) => {
+            Ok((runner, budget)) => {
                 runner.active.store(1, Ordering::Release);
                 self.runners
                     .lock()
                     .await
                     .insert(key.clone(), Arc::clone(&runner));
                 self.failures.lock().await.remove(&key);
-                Ok((Lease(runner, None), record))
+                Ok(Acquisition::Loading(Lease(runner, None), record, budget))
             }
             Err(error) => {
                 if !error.starts_with("Insufficient unified memory") {
@@ -230,7 +302,7 @@ impl Manager {
         }
     }
 
-    async fn start(&self, record: &ModelRecord, key: &str) -> Result<Arc<Runner>> {
+    async fn start(&self, record: &ModelRecord, key: &str) -> Result<(Arc<Runner>, MemoryBudget)> {
         let actual = orinfer_engine::artifact::sha256(
             &fs::read(record.path.join("cache/model.json")).map_err(|e| e.to_string())?,
         );
@@ -238,6 +310,7 @@ impl Manager {
             return Err("Model identity changed; import the new version before loading".into());
         }
         self.reserve_space(record).await?;
+        let budget = self.reserve_budget(record.load_bytes, BudgetKind::Loading)?;
         let directory = self.directory.join(&key[..16]);
         private_directory(&directory)?;
         let socket = directory.join("worker.sock");
@@ -272,80 +345,135 @@ impl Manager {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .map_err(|e| e.to_string())?;
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id().ok_or("Worker did not start")?;
+        Ok((
+            Arc::new(Runner {
+                key: key.into(),
+                model: record.name.clone(),
+                child: Mutex::new(child),
+                client,
+                active: AtomicUsize::new(0),
+                last_used: SyncMutex::new(Instant::now()),
+                batch: false,
+                keep_alive_s: AtomicU64::new(self.config.keep_alive_s),
+                draining: AtomicBool::new(false),
+                loading: AtomicBool::new(true),
+                directory,
+                pid,
+            }),
+            budget,
+        ))
+    }
+    async fn finish_start(&self, runner: &Arc<Runner>) -> Result<()> {
+        let result = self.wait_ready(runner).await;
+        if let Err(error) = &result {
+            let _transition = self
+                .transition
+                .acquire()
+                .await
+                .map_err(|_| "Service is stopping")?;
+            self.failures
+                .lock()
+                .await
+                .insert(runner.key.clone(), (Instant::now(), error.clone()));
+            self.remove_runner(runner).await?;
+        }
+        result
+    }
+    async fn wait_ready(&self, runner: &Runner) -> Result<()> {
         let at = Instant::now();
         loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            if let Some(status) = runner
+                .child
+                .lock()
+                .await
+                .try_wait()
+                .map_err(|e| e.to_string())?
+            {
                 return Err(format!(
                     "Worker exited with {status}; see {}",
-                    directory.join("worker.log").display()
+                    runner.directory.join("worker.log").display()
                 ));
             }
             if at.elapsed() >= Duration::from_secs(self.config.load_timeout_s)
                 || self.stopping.load(Ordering::Acquire)
             {
-                let _ = child.kill().await;
                 return Err("Model loading timed out or service stopped".into());
             }
-            if let Ok(response) = client
+            if let Ok(response) = runner
+                .client
                 .get("http://localhost/health")
                 .timeout(Duration::from_secs(1))
                 .send()
                 .await
                 && let Ok(health) = response.json::<Value>().await
                 && health["status"] == "ready"
-                && health["model"] == record.name
+                && health["model"] == runner.model
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         eprintln!(
-            "MODEL LOADED {} pid={pid} after {:.3}s",
-            record.name,
+            "MODEL LOADED {} pid={} after {:.3}s",
+            runner.model,
+            runner.pid,
             at.elapsed().as_secs_f64()
         );
-        Ok(Arc::new(Runner {
-            key: key.into(),
-            model: record.name.clone(),
-            child: Mutex::new(child),
-            client,
-            active: AtomicUsize::new(0),
-            last_used: SyncMutex::new(Instant::now()),
-            batch: false,
-            keep_alive_s: AtomicU64::new(self.config.keep_alive_s),
-            draining: AtomicBool::new(false),
-            directory,
-            pid,
-        }))
+        Ok(())
     }
-
-    async fn reserve_space(&self, record: &ModelRecord) -> Result<()> {
+    fn memory_headroom(&self) -> Result<usize> {
         let reserve = self
             .config
             .memory_reserve_mib
             .checked_mul(1 << 20)
-            .ok_or("Memory budget overflow")?;
+            .ok_or("Memory reserve overflow")?;
+        Ok(available_bytes()?.saturating_sub(reserve))
+    }
+    fn reserve_budget(&self, bytes: usize, kind: BudgetKind) -> Result<MemoryBudget> {
+        let mut total = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
+        // Keep pending loads fully reserved until ready, even while their
+        // partial allocations already appear in MemAvailable. This errs on
+        // the conservative side during overlapping CUDA startup.
+        let proposed = total
+            .requests
+            .checked_add(total.loading)
+            .and_then(|n| n.checked_add(bytes))
+            .ok_or("Global memory budget overflow")?;
+        if self.memory_headroom()? < proposed {
+            return Err("Insufficient unified memory for allocation budget".into());
+        }
+        match kind {
+            BudgetKind::Request => total.requests += bytes,
+            BudgetKind::Loading => total.loading += bytes,
+        }
+        Ok(MemoryBudget {
+            bytes,
+            kind,
+            total: Arc::clone(&self.budgets),
+        })
+    }
+    async fn reserve_space(&self, record: &ModelRecord) -> Result<()> {
         loop {
             let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
             let count_full = self
                 .config
                 .max_loaded_models
                 .is_some_and(|n| runners.len() >= n);
-            if !count_full && available_bytes()?.saturating_sub(reserve) >= record.load_bytes {
+            let fits = {
+                // Both request state and overlapping loads reserve against one
+                // ledger. A final atomic reservation in start() rechecks races.
+                let total = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
+                self.memory_headroom()?
+                    .saturating_sub(total.requests)
+                    .saturating_sub(total.loading)
+                    >= record.load_bytes
+            };
+            if !count_full && fits {
                 break;
             }
-            let victim = runners
-                .into_iter()
-                .filter(|r| r.active.load(Ordering::Acquire) == 0)
-                .max_by_key(|r| {
-                    r.last_used
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .elapsed()
-                });
-            let Some(victim) = victim else {
+            let Some(victim) = self.claim_idle().await else {
                 return Err("Insufficient unified memory or loaded-model capacity; active models are retained".into());
             };
             self.remove_runner(&victim).await?;
@@ -358,12 +486,59 @@ impl Manager {
         }
         Ok(())
     }
+    // Caller holds transition. Claim under the same lock as ready(), before
+    // waiting for process teardown; keep_alive never prevents pressure eviction.
+    async fn claim_idle(&self) -> Option<Arc<Runner>> {
+        let runners = self.runners.lock().await;
+        let victim = runners
+            .values()
+            .filter(|r| {
+                r.active.load(Ordering::Acquire) == 0
+                    && !r.draining.load(Ordering::Acquire)
+                    && !r.loading.load(Ordering::Acquire)
+            })
+            .min_by_key(|r| *r.last_used.lock().unwrap_or_else(|e| e.into_inner()))
+            .cloned()?;
+        victim.draining.store(true, Ordering::Release);
+        Some(victim)
+    }
+    async fn reserve_request_with_eviction(
+        &self,
+        record: &ModelRecord,
+        request: &Value,
+        input_bytes: usize,
+    ) -> Result<MemoryBudget> {
+        match self.reserve_request(record, request, input_bytes) {
+            Ok(budget) => return Ok(budget),
+            Err(error) if !error.starts_with("Insufficient unified memory") => return Err(error),
+            Err(_) => {}
+        }
+        let _transition = self
+            .transition
+            .acquire()
+            .await
+            .map_err(|_| "Service is stopping")?;
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err("Service is stopping".into());
+            }
+            let error = match self.reserve_request(record, request, input_bytes) {
+                Ok(budget) => return Ok(budget),
+                Err(error) if error.starts_with("Insufficient unified memory") => error,
+                Err(error) => return Err(error),
+            };
+            let Some(victim) = self.claim_idle().await else {
+                return Err(error);
+            };
+            self.remove_runner(&victim).await?;
+        }
+    }
     fn reserve_request(
         &self,
         record: &ModelRecord,
         request: &Value,
         input_bytes: usize,
-    ) -> Result<RequestBudget> {
+    ) -> Result<MemoryBudget> {
         let output = request
             .get("max_completion_tokens")
             .or_else(|| request.get("max_tokens"))
@@ -377,26 +552,7 @@ impl Manager {
             .checked_mul(tokens)
             .and_then(|n| n.checked_add(record.sequence_bytes))
             .ok_or("Request memory estimate overflow")?;
-        let mut total = self
-            .request_budget
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let proposed = total
-            .checked_add(bytes)
-            .ok_or("Global request memory overflow")?;
-        let reserve = self
-            .config
-            .memory_reserve_mib
-            .checked_mul(1 << 20)
-            .ok_or("Memory reserve overflow")?;
-        if available_bytes()?.saturating_sub(reserve) < proposed {
-            return Err("Insufficient unified memory for this request budget".into());
-        }
-        *total = proposed;
-        Ok(RequestBudget {
-            bytes,
-            total: Arc::clone(&self.request_budget),
-        })
+        self.reserve_budget(bytes, BudgetKind::Request)
     }
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
@@ -421,7 +577,10 @@ impl Manager {
     }
 
     async fn remove_runner(&self, runner: &Arc<Runner>) -> Result<()> {
-        runner.draining.store(true, Ordering::Release);
+        {
+            let _runners = self.runners.lock().await;
+            runner.draining.store(true, Ordering::Release);
+        }
         let mut child = runner.child.lock().await;
         if child.try_wait().map_err(|e| e.to_string())?.is_none() {
             // SAFETY: This still-running child is retained and cannot have its PID reused.
@@ -470,16 +629,30 @@ impl Manager {
             .acquire()
             .await
             .map_err(|_| "Service is stopping")?;
-        let runner = self.runners.lock().await.get(&runner_key(&record)).cloned();
-        let Some(runner) = runner else {
-            return Ok(());
+        let runner = {
+            let runners = self.runners.lock().await;
+            let Some(runner) = runners.get(&runner_key(&record)).cloned() else {
+                return Ok(());
+            };
+            runner.draining.store(true, Ordering::Release);
+            runner
         };
-        runner.draining.store(true, Ordering::Release);
         drop(transition);
         let at = Instant::now();
         while !force && runner.active.load(Ordering::Acquire) != 0 {
             if at.elapsed() > Duration::from_secs(30) {
-                runner.draining.store(false, Ordering::Release);
+                let _transition = self
+                    .transition
+                    .acquire()
+                    .await
+                    .map_err(|_| "Service is stopping")?;
+                let runners = self.runners.lock().await;
+                if runners
+                    .get(&runner.key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &runner))
+                {
+                    runner.draining.store(false, Ordering::Release);
+                }
                 return Err(
                     "Model still has active requests; stop again after completion or use --force"
                         .into(),
@@ -500,13 +673,6 @@ impl Manager {
         };
         let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
         for runner in runners {
-            let expired = runner.active.load(Ordering::Acquire) == 0
-                && runner
-                    .last_used
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .elapsed()
-                    >= Duration::from_secs(runner.keep_alive_s.load(Ordering::Relaxed));
             let exited = runner
                 .child
                 .lock()
@@ -515,6 +681,29 @@ impl Manager {
                 .ok()
                 .flatten()
                 .is_some();
+            let expired = {
+                if runner.loading.load(Ordering::Acquire) {
+                    continue;
+                }
+                let runners = self.runners.lock().await;
+                if !runners
+                    .get(&runner.key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &runner))
+                {
+                    continue;
+                }
+                let expired = runner.active.load(Ordering::Acquire) == 0
+                    && runner
+                        .last_used
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .elapsed()
+                        >= Duration::from_secs(runner.keep_alive_s.load(Ordering::Relaxed));
+                if expired || exited {
+                    runner.draining.store(true, Ordering::Release);
+                }
+                expired
+            };
             if (expired || exited)
                 && let Err(e) = self.remove_runner(&runner).await
             {
@@ -526,7 +715,7 @@ impl Manager {
         let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
         let records = self.records.lock().await;
         json!(runners.iter().map(|r| json!({"model":r.model,"pid":r.pid,"active_requests":r.active.load(Ordering::Acquire),
-            "state":if r.draining.load(Ordering::Acquire) {"draining"} else if r.batch {"batch"} else {"ready"},
+            "state":if r.draining.load(Ordering::Acquire) {"draining"} else if r.loading.load(Ordering::Acquire) {"loading"} else if r.batch {"batch"} else {"ready"},
             "estimated_load_bytes":records.values().find(|record| runner_key(record)==r.key).map(|record| record.load_bytes),
             "idle_s":r.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs_f64(),
             "keep_alive_s":r.keep_alive_s.load(Ordering::Relaxed),"log":r.directory.join("worker.log")})).collect::<Vec<_>>())
@@ -557,7 +746,7 @@ pub fn run(mut config: ManagerConfig) -> Result<()> {
         transition: Semaphore::new(1),
         requests: Arc::new(Semaphore::new(128)),
         body_memory: Arc::new(Semaphore::new(512)),
-        request_budget: Arc::new(SyncMutex::new(0)),
+        budgets: Arc::new(SyncMutex::new(BudgetTotals::default())),
         gpu_owner: SyncMutex::new(None),
         stopping: AtomicBool::new(false),
     });
