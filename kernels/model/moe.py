@@ -12,6 +12,113 @@ from kernels.model.rows import row_count
 
 
 @orin_jit
+def router_projection(M, H, E, dynamic_rows=False):
+    """One floating projection for the router and the shared expert's gate."""
+    from kernels.model.floating_core import mma_loop
+
+    if min(M, H, E) <= 0 or H % 128:
+        raise ValueError("Invalid floating router geometry")
+    m = row_count(M, dynamic_rows)
+    product = mma_loop(m, H, 16, 32, 128, dtype="float16", stages=2)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((m, H), T.float16),
+        W: T.Tensor((E + 1, H), T.float16),
+        Logits: T.Tensor((m, E), T.float32),
+        SharedGate: T.Tensor((m,), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(m, 16), T.ceildiv(E + 1, 32), threads=128) as (by, bx):
+            acc = T.alloc_fragment((16, 32), T.float32)
+            product(X, W, acc, by, bx, 0)
+            for i, j in T.Parallel(16, 32):
+                if by * 16 + i < m:
+                    if bx * 32 + j < E:
+                        Logits[by * 16 + i, bx * 32 + j] = acc[i, j]
+                    elif bx * 32 + j == E:
+                        SharedGate[by * 16 + i] = acc[i, j]
+
+    return main
+
+
+@orin_jit
+def integer_experts(
+    M,
+    N,
+    K,
+    E,
+    top_k,
+    *,
+    codec="e8p_q4",
+    block_m=16,
+    block_n=64,
+    block_k=128,
+    stages=2,
+    dynamic_rows=False,
+):
+    """Routed bank/row views around the shared dense integer MMA computation."""
+    from kernels.model.integer_core import tensor_core
+    from kernels.model.e8p_q4 import decode_source
+
+    if (
+        min(M, N, K, E, top_k) <= 0
+        or top_k > E
+        or K % 128
+        or block_m not in (8, 16, 32)
+        or block_n not in (32, 64, 128)
+        or codec not in ("w8", "e8p_q4")
+        or (codec == "w8" and (block_m == 8 or block_n == 32))
+        or block_k not in (128, 256)
+        or K % block_k
+        or stages not in (1, 2)
+    ):
+        raise ValueError("Invalid grouped integer projection geometry")
+    tiles = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
+    m = row_count(M, dynamic_rows)
+    rows = m * top_k
+    packed = codec == "e8p_q4"
+    threads = 64 if packed and block_n == 32 else 128
+    product = tensor_core(
+        rows,
+        N,
+        K,
+        block_m,
+        block_n,
+        block_k,
+        stages=stages,
+        codec=codec,
+        source=decode_source((4, 1)) if packed else "",
+        packed_k=128 if packed else 0,
+        grouped=True,
+    )
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, K), T.int8),
+        W: T.Tensor((E, K // 128, N, 16) if packed else (E, N, K), T.uint32 if packed else T.int8),
+        Book: T.Tensor((256, 1), T.uint32),
+        WS: T.Tensor((E, N), T.float16),
+        AS: T.Tensor((rows,), T.float16),
+        Counts: T.Tensor((E,), T.int32),
+        Offsets: T.Tensor((E,), T.int32),
+        TileExpert: T.Tensor((tiles,), T.int32),
+        TileRow: T.Tensor((tiles,), T.int32),
+        TileCount: T.Tensor((1,), T.int32),
+        Out: T.Tensor((rows, N), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(rows, block_m) + T.min(E, rows), T.ceildiv(N, block_n), threads=threads
+        ) as (tile, bx):
+            if tile < TileCount[0]:
+                expert = TileExpert[tile]
+                first = Offsets[expert] + TileRow[tile]
+                count = T.min(block_m, Counts[expert] - TileRow[tile])
+                product(A, W, Book, WS, WS, AS, Out, 0, bx, expert, first, count)
+
+    return main
+
+
+@orin_jit
 def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool = False):
     """Build (IDs, Counts[E], RelativeSlot[M,top_k]), all INT32.
 

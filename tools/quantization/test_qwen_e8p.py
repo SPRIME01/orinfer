@@ -1,10 +1,52 @@
 """Precision policy for shared dense Qwen encoders and tied embeddings."""
 
 import unittest
-from tools.quantization.qwen_e8p import policy, text_configuration
+from tools.quantization.qwen_e8p import canonical_name, policy, text_configuration
 
 
 class DensePolicyTests(unittest.TestCase):
+    def test_four_billion_preserves_tied_embedding_semantics(self):
+        config = dict(
+            model_type="qwen3_5",
+            tie_word_embeddings=True,
+            text_config=dict(hidden_size=2560, intermediate_size=9216, num_hidden_layers=32),
+        )
+        self.assertTrue(text_configuration(config)["tie_word_embeddings"])
+        config["text_config"]["intermediate_size"] = 8192
+        with self.assertRaises(ValueError):
+            text_configuration(config)
+
+    def test_root_vision_names_use_the_same_sensitive_tensor_policy(self):
+        position = canonical_name("visual.pos_embed.weight")
+        self.assertEqual(position, "model.visual.pos_embed.weight")
+        self.assertEqual(policy(position, dict(dtype="BF16", shape=[2304, 1152])), "original")
+        self.assertEqual(canonical_name(position), position)
+        self.assertEqual(
+            canonical_name("mtp.layers.0.mlp.gate.weight"), "mtp.layers.0.mlp.gate.weight"
+        )
+
+    def test_moe_banks_use_q4_without_quantizing_router_or_draft_exceptions(self):
+        text = dict(
+            hidden_size=2048,
+            num_hidden_layers=40,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+        config = dict(model_type="qwen3_5_moe", text_config=text, tie_word_embeddings=False)
+        self.assertEqual(text_configuration(config)["intermediate_size"], 512)
+        for name, shape, expected in (
+            ("model.language_model.layers.0.mlp.experts.gate_up_proj", [256, 1024, 2048], "e8p-q4"),
+            ("model.language_model.layers.0.mlp.experts.down_proj", [256, 2048, 512], "e8p-q4"),
+            ("model.language_model.layers.0.mlp.gate.weight", [256, 2048], "original"),
+            ("mtp.layers.0.mlp.experts.0.up_proj.weight", [512, 2048], "w8"),
+        ):
+            self.assertEqual(policy(name, dict(dtype="BF16", shape=shape)), expected)
+        text["num_experts_per_tok"] = 10
+        with self.assertRaises(ValueError):
+            text_configuration(config)
+
     def test_medium_dense_preserves_untied_output_head(self):
         config = dict(
             model_type="qwen3_5",

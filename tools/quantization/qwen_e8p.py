@@ -28,13 +28,17 @@ from tools.quantization.qwen35 import gpu_lock
 
 def policy(name, info):
     shape = info["shape"]
+    expert_bank = len(shape) == 3 and name.endswith(
+        (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+    )
     if (
         info["dtype"] != "BF16"
-        or len(shape) != 2
-        or shape[1] % 128
+        or (len(shape) != 2 and not expert_bank)
+        or shape[-1] % 128
         or min(shape) < 128
         or name == "model.visual.pos_embed.weight"
         or "norm" in name
+        or name.endswith(".mlp.gate.weight")
     ):
         return "original"
     if name.startswith("mtp.") or name.endswith(
@@ -45,11 +49,27 @@ def policy(name, info):
 
 
 def text_configuration(config):
-    if config.get("model_type") != "qwen3_5" or config.get("quantization_config"):
-        raise ValueError("Expected original floating dense Qwen3.5 checkpoint")
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe") or config.get(
+        "quantization_config"
+    ):
+        raise ValueError("Expected original floating Qwen3.5 checkpoint")
     t = config["text_config"]
-    if (t.get("hidden_size"), t.get("intermediate_size"), t.get("num_hidden_layers")) not in (
+    if config["model_type"] == "qwen3_5_moe":
+        expected = dict(
+            hidden_size=2048,
+            num_hidden_layers=40,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+        if any(t.get(k) != v or type(t.get(k)) is not int for k, v in expected.items()):
+            raise ValueError("Unsupported Qwen MoE geometry")
+        # Canonical workspace width; the expert/shared widths remain explicit.
+        t["intermediate_size"] = t["shared_expert_intermediate_size"]
+    elif (t.get("hidden_size"), t.get("intermediate_size"), t.get("num_hidden_layers")) not in (
         (2048, 6144, 24),
+        (2560, 9216, 32),
         (4096, 12288, 32),
         (5120, 17408, 64),
     ):
@@ -60,6 +80,11 @@ def text_configuration(config):
     if type(tied) is not bool:
         raise ValueError("Invalid embedding/head tying configuration")
     return t
+
+
+def canonical_name(name):
+    # Official MoE checkpoints may place the same vision encoder at the root.
+    return "model." + name if name.startswith("visual.") else name
 
 
 def encode(args):
@@ -154,6 +179,7 @@ def encode(args):
         for name, info in sorted(header.items()):
             if name == "__metadata__":
                 continue
+            name = canonical_name(name)
             shape = info["shape"]
             parameters += math.prod(shape)
             kind = policy(name, info)

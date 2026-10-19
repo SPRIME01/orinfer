@@ -47,7 +47,24 @@ class Aot:
             target="sm_87",
         )
 
-    def emit(self, name, key, build, bindings, rows=4096, *, dynamic=True, row_divisor=1):
+    def emit(
+        self,
+        name,
+        key,
+        build,
+        bindings,
+        rows=4096,
+        *,
+        dynamic=True,
+        row_divisor=1,
+        row_multiplier=1,
+    ):
+        if (
+            row_multiplier < 1
+            or rows % row_multiplier
+            or (row_multiplier != 1 and row_divisor != 1)
+        ):
+            raise ValueError("Invalid dynamic assignment row multiplier")
         if key not in self.objects:
 
             def construct(folder):
@@ -66,7 +83,8 @@ class Aot:
                 k: (dict(kind="buffer", name=v) if isinstance(v, str) else v)
                 for k, v in bindings.items()
             },
-            rows,
+            rows // row_multiplier,
+            multiplier=row_multiplier,
             key=key,
             artifact=artifact,
         )

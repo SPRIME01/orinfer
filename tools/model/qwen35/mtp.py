@@ -211,18 +211,23 @@ def build(b):
         ),
     )
     quant("post_quant", b.h, "MtpNorm")
-    for role, offset in [("gate", 0), ("up", b.f)]:
-        project(
-            role,
-            "mtp.layers.0.mlp." + role + "_proj.weight",
-            b.f,
-            b.h,
-            "MtpGateUp",
-            stride=2 * b.f,
-            offset=offset,
-        )
-    quant("down_quant", b.f, "MtpGateUp", True)
-    project("down", "mtp.layers.0.mlp.down_proj.weight", b.h, b.f, "MtpHidden")
+    if b.moe:
+        from tools.model.qwen35.moe import build as moe_ffn
+
+        moe_ffn(b, "mtp", "mtp.layers.0.mlp", rows=WARM, draft=True)
+    else:
+        for role, offset in [("gate", 0), ("up", b.f)]:
+            project(
+                role,
+                "mtp.layers.0.mlp." + role + "_proj.weight",
+                b.f,
+                b.h,
+                "MtpGateUp",
+                stride=2 * b.f,
+                offset=offset,
+            )
+        quant("down_quant", b.f, "MtpGateUp", True)
+        project("down", "mtp.layers.0.mlp.down_proj.weight", b.h, b.f, "MtpHidden")
     emit(
         "advance",
         "advance",

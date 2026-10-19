@@ -1,7 +1,7 @@
 //! The target's row arithmetic is shared; speculation changes causal commit only.
 use super::*;
 
-pub(super) fn register(m: &mut Manifest) -> Result<()> {
+pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
     let Some(spec) = m.mtp.as_ref() else {
         return Ok(());
     };
@@ -22,7 +22,7 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         return Err("Unsupported Qwen compact MTP contract".into());
     }
     let hidden = m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden;
-    let warm = kernels(
+    let mut warm = kernels(
         "qwen_rows/mtp",
         &[
             "gather",
@@ -44,13 +44,11 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             "out",
             "post_norm",
             "post_quant",
-            "gate",
-            "up",
-            "down_quant",
-            "down",
-            "advance",
         ],
     );
+    let ffn = ffn_names(moe, true);
+    warm.extend(kernels("qwen_rows/mtp", &ffn));
+    warm.extend(kernels("qwen_rows/mtp", &["advance"]));
     let mut head = kernels(
         "qwen_rows/mtp",
         &[
@@ -148,19 +146,6 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
             "mtp_private",
             &["kv_prepare", "attention", "attention_merge"][..],
         ),
-        (
-            "mtp_post",
-            &[
-                "out_quant",
-                "out",
-                "post_norm",
-                "post_quant",
-                "gate",
-                "up",
-                "down_quant",
-                "down",
-            ][..],
-        ),
         ("mtp_advance", &["advance"][..]),
         ("mtp_gather", &["final_norm"][..]),
         ("mtp_select", &["selection"][..]),
@@ -168,6 +153,12 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
         m.programs
             .insert(name.into(), kernels("qwen_rows/mtp", names));
     }
+    let mut post = kernels(
+        "qwen_rows/mtp",
+        &["out_quant", "out", "post_norm", "post_quant"],
+    );
+    post.extend(kernels("qwen_rows/mtp", &ffn));
+    m.programs.insert("mtp_post".into(), post);
     let batch_programs = m
         .programs
         .keys()

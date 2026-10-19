@@ -41,16 +41,32 @@ const PRE_GDN: &[&str] = &["norm_rotate", "qkv", "z", "ab"];
 const PRE_ATTN: &[&str] = &["norm_rotate", "q", "k", "v"];
 const PRIVATE_GDN: &[&str] = &["gates", "conv", "history", "recurrent", "gated_norm"];
 const PRIVATE_ATTN: &[&str] = &["prepare", "attention", "attention_merge"];
-const POST: &[&str] = &[
-    "quantize",
-    "out",
-    "norm_rotate",
-    "gate",
-    "up",
-    "swiglu_rotate",
-    "swiglu_quantize",
-    "down",
-];
+fn ffn_names(moe: bool, draft: bool) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if moe {
+        names.extend([
+            "router",
+            "topk",
+            "histogram_local",
+            "histogram_offsets",
+            "histogram_finish",
+            "offsets",
+            "tiles",
+            "dispatch",
+        ]);
+    }
+    names.extend(["gate", "up"]);
+    names.extend(if draft {
+        &["down_quant"][..]
+    } else {
+        &["swiglu_rotate", "swiglu_quantize"][..]
+    });
+    names.push("down");
+    if moe {
+        names.extend(["expert_up", "expert_rotate", "expert_down", "combine"]);
+    }
+    names
+}
 const HEAD: &[&str] = &["rotate", "project", "partials", "merge"];
 
 struct QwenRows {
@@ -138,7 +154,30 @@ fn validate_weights(
             ("up_proj", t.intermediate_size, t.hidden_size),
             ("down_proj", t.hidden_size, t.intermediate_size),
         ] {
-            q4(format!("{p}.mlp.{name}.weight"), n, k)?;
+            let branch = if t.num_experts > 0 {
+                "shared_expert."
+            } else {
+                ""
+            };
+            q4(format!("{p}.mlp.{branch}{name}.weight"), n, k)?;
+        }
+        if t.num_experts > 0 {
+            for (name, n, k) in [
+                ("gate_up_proj", 2 * t.moe_intermediate_size, t.hidden_size),
+                ("down_proj", t.hidden_size, t.moe_intermediate_size),
+            ] {
+                let name = format!("{p}.mlp.experts.{name}");
+                let packed = format!("{name}.packed");
+                check(
+                    packed.clone(),
+                    Dtype::U32,
+                    vec![t.num_experts, k / 128, n, 16],
+                )?;
+                if map[packed.as_str()].layout != "e8p-q4-k128-u32" {
+                    return Err("Invalid Qwen MoE E8P bank layout".into());
+                }
+                check(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
+            }
         }
         let shapes: &[(&str, usize)] = if kind == "linear_attention" {
             &[
@@ -279,8 +318,23 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         (5120, 17408, 64, 24, 4, 48, false)
             | (4096, 12288, 32, 16, 4, 32, false)
             | (2048, 6144, 24, 8, 2, 16, true)
+            | (2560, 9216, 32, 16, 4, 32, true)
+            | (2048, 512, 40, 16, 2, 32, false)
     );
+    let moe_geometry = if t.num_experts > 0 {
+        e8p && t.hidden_size == 2048
+            && t.num_hidden_layers == 40
+            && t.num_experts == 256
+            && t.num_experts_per_tok == 8
+            && t.moe_intermediate_size == 512
+            && t.shared_expert_intermediate_size == 512
+            && t.intermediate_size == 512
+            && t.mlp_only_layers.is_empty()
+    } else {
+        t.intermediate_size != 512 && t.num_experts_per_tok == 0
+    };
     if !geometry
+        || !moe_geometry
         || (t.tie_word_embeddings && !embedding_q4)
         || t.head_dim != 256
         || t.linear_num_key_heads != 16
@@ -346,7 +400,9 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 .insert(format!("{PREFIX}/layer{layer}/private"), private.clone());
         }
         forward.extend(private);
-        forward.extend(section(m, &format!("layer{layer}/post"), POST));
+        let mut post = vec!["quantize", "out", "norm_rotate"];
+        post.extend(ffn_names(t.num_experts > 0, false));
+        forward.extend(section(m, &format!("layer{layer}/post"), &post));
         layer_ends.push(forward.len());
     }
     forward.extend(section(m, "end", &["advance"]));
@@ -430,7 +486,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             );
         }
     }
-    mtp::register(m)?;
+    mtp::register(m, t.num_experts > 0)?;
     vision(m, c.vision_depth, t.hidden_size)?;
     let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
     m.row_execution = Some(RowExecution {
@@ -898,6 +954,26 @@ mod tests {
         dense_request(dimensions, small)
     }
 
+    #[test]
+    fn four_billion_reuses_tied_dense_row_and_mtp_programs() {
+        let request = with_mtp(dense_request((2560, 9216, 32, 32, 16, 4, true), true));
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let layout = plan.metadata.batch_layout.as_ref().unwrap();
+        assert_eq!(layout.hidden, 2560);
+        assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 32);
+        assert!(plan.metadata.programs.contains_key("mtp_warm"));
+        let (calls, _) = adapter
+            .batch(
+                &[
+                    BatchSegment { slot: 2, tokens: 1 },
+                    BatchSegment { slot: 5, tokens: 3 },
+                ],
+                true,
+            )
+            .unwrap();
+        assert!(calls.iter().any(|c| c.sequence == Some(5)));
+    }
+
     fn dense_request(
         (h, f, layers, hv, qh, kvh, tied): (usize, usize, usize, usize, usize, usize, bool),
         e8p: bool,
@@ -1001,6 +1077,102 @@ mod tests {
                 "kv_cache":{"direct_prefill":true,"demand_mapping":true,"buffers":{},"prefill_workspace":{}},
                 "dynamic_batch_kernels":{"qwen_rows/layer0/pre/norm_rotate":{"name":"qwen_rows/layer0/pre/norm_rotate","capacity":4096,
                     "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],"arguments":[]}}}})).unwrap()
+    }
+
+    #[test]
+    fn moe_reuses_dense_causal_rows_with_compressed_expert_banks() {
+        let mut request = dense_request((2048, 512, 40, 32, 16, 2, false), true);
+        request.config["model_type"] = json!("qwen3_5_moe");
+        for (key, value) in [
+            ("num_experts", 256),
+            ("num_experts_per_tok", 8),
+            ("moe_intermediate_size", 512),
+            ("shared_expert_intermediate_size", 512),
+        ] {
+            request.config["text_config"][key] = json!(value);
+        }
+        request.expected_signature = Configuration::parse(request.config.clone())
+            .unwrap()
+            .signature;
+        for b in &mut request.metadata.buffers {
+            if b.name.contains(".mlp.") {
+                b.name = b.name.replace(".mlp.", ".mlp.shared_expert.");
+                b.data.as_mut().unwrap().tensor = b.name.clone();
+            }
+        }
+        for layer in 0..40 {
+            for (role, n, k) in [("gate_up_proj", 1024, 2048), ("down_proj", 2048, 512)] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{role}");
+                for (suffix, dtype, shape, layout) in [
+                    (
+                        "packed",
+                        "u32",
+                        vec![256, k / 128, n, 16],
+                        "e8p-q4-k128-u32",
+                    ),
+                    ("scale", "f16", vec![256, n], "native_contiguous"),
+                ] {
+                    request.metadata.buffers.push(
+                        serde_json::from_value(json!({"name":format!("{name}.{suffix}"),
+                        "dtype":dtype,"shape":shape,"layout":layout,"alignment":256,"access":"read",
+                        "data":{"tensor":format!("{name}.{suffix}"),"sha256":"0".repeat(64)}}))
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        request.metadata.buffers.push(
+            serde_json::from_value(json!({
+                "name":"MoeLogits","dtype":"f32","shape":[4096,256],
+                "layout":"native_contiguous","alignment":256,"access":"read_write"
+            }))
+            .unwrap(),
+        );
+        let copied = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        let (adapter, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 40);
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        assert!(
+            post.iter()
+                .any(|op| matches!(op,Operation::Kernel{name} if name.ends_with("/expert_down")))
+        );
+        assert!(
+            post.iter()
+                .any(|op| matches!(op,Operation::Kernel{name} if name.ends_with("/combine")))
+        );
+        let (calls, _) = adapter
+            .batch_operation(
+                &[
+                    BatchSegment { slot: 7, tokens: 3 },
+                    BatchSegment { slot: 2, tokens: 2 },
+                ],
+                abi::BatchOperation::Warm,
+                true,
+            )
+            .unwrap();
+        let experts: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                matches!(&c.operation,Operation::Kernel{name}
+            if name=="qwen_rows/mtp/expert_up")
+            })
+            .collect();
+        assert_eq!(experts.len(), 1);
+        assert_eq!(experts[0].sequence, None);
+        let conditions: Vec<_> = calls
+            .iter()
+            .filter_map(|c| {
+                matches!(&c.operation,
+            Operation::Copy{destination,..} if destination=="MtpCondition")
+                .then_some(c.sequence)
+            })
+            .collect();
+        assert_eq!(conditions, [Some(7), Some(2)]);
+        request
+            .metadata
+            .buffers
+            .retain(|b| !b.name.ends_with("layers.0.mlp.experts.down_proj.scale"));
+        assert!(create(request, Policy::Int8Quality).is_err());
     }
 
     #[test]
@@ -1230,20 +1402,25 @@ mod tests {
     }
 
     fn mtp_request() -> CreateRequest {
-        let mut r = request();
+        with_mtp(request())
+    }
+
+    fn with_mtp(mut r: CreateRequest) -> CreateRequest {
+        let configuration = Configuration::parse(r.config.clone()).unwrap();
+        let t = configuration.text();
         for (name, width, dtype) in [
-            ("MtpEmbedding", 5120, "f16"),
-            ("MtpConcat", 10240, "f16"),
-            ("MtpHidden", 5120, "f16"),
-            ("MtpNorm", 5120, "f16"),
-            ("MtpR0", 5120, "f32"),
-            ("MtpR1", 5120, "f32"),
-            ("MtpFullX", 14336, "f16"),
-            ("MtpFullQ", 6144, "f16"),
-            ("MtpFullGate", 6144, "f16"),
-            ("MtpMixer", 6144, "f16"),
-            ("MtpMix", 5120, "f16"),
-            ("MtpGateUp", 34816, "f16"),
+            ("MtpEmbedding", t.hidden_size, "f16"),
+            ("MtpConcat", 2 * t.hidden_size, "f16"),
+            ("MtpHidden", t.hidden_size, "f16"),
+            ("MtpNorm", t.hidden_size, "f16"),
+            ("MtpR0", t.hidden_size, "f32"),
+            ("MtpR1", t.hidden_size, "f32"),
+            ("MtpFullX", t.full_x(), "f16"),
+            ("MtpFullQ", t.mixer(), "f16"),
+            ("MtpFullGate", t.mixer(), "f16"),
+            ("MtpMixer", t.mixer(), "f16"),
+            ("MtpMix", t.hidden_size, "f16"),
+            ("MtpGateUp", 2 * t.intermediate_size, "f16"),
         ] {
             r.metadata.buffers.push(
                 serde_json::from_value(json!({

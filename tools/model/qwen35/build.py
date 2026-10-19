@@ -1,4 +1,4 @@
-"""Build native dense Qwen3.5 data and a schema-1 Rust/TileLang package.
+"""Build native dense/MoE Qwen3.5 data and a schema-1 Rust/TileLang package.
 
 Consumes completed scalar or two-stage E8P Q4A8 checkpoints.
 Weight shards are linked or losslessly K-repacked; transforms, scales and the
@@ -29,8 +29,8 @@ LANES = 128
 
 
 def configuration(config, context):
-    if config.get("model_type") != "qwen3_5":
-        raise ValueError("Expected dense Qwen3_5 checkpoint")
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe"):
+        raise ValueError("Expected Qwen3_5 checkpoint")
     t = config["text_config"]
     expected = dict(
         hidden_size=5120,
@@ -49,7 +49,21 @@ def configuration(config, context):
         hidden_act="silu",
         tie_word_embeddings=False,
     )
-    if t.get("hidden_size") == 2048:
+    if config["model_type"] == "qwen3_5_moe":
+        expected.update(
+            hidden_size=2048,
+            intermediate_size=512,
+            num_hidden_layers=40,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+            mlp_only_layers=[],
+        )
+    elif t.get("hidden_size") == 2048:
         expected.update(
             hidden_size=2048,
             intermediate_size=6144,
@@ -57,6 +71,15 @@ def configuration(config, context):
             linear_num_value_heads=16,
             num_attention_heads=8,
             num_key_value_heads=2,
+            tie_word_embeddings=True,
+        )
+    elif t.get("hidden_size") == 2560:
+        expected.update(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
             tie_word_embeddings=True,
         )
     elif t.get("hidden_size") == 4096:
@@ -73,7 +96,7 @@ def configuration(config, context):
         "full_attention" if i % 4 == 3 else "linear_attention"
         for i in range(expected["num_hidden_layers"])
     ]:
-        raise ValueError("Unsupported dense Qwen arithmetic geometry")
+        raise ValueError("Unsupported Qwen arithmetic geometry")
     rope = t["rope_parameters"]
     if any(
         rope.get(k) != v
@@ -156,6 +179,7 @@ class Builder:
         self.tied = t.get("tie_word_embeddings", False)
         self.h, self.v = t["hidden_size"], t["vocab_size"]
         self.f = t["intermediate_size"]
+        self.moe = self.config["model_type"] == "qwen3_5_moe"
         self.hk, self.hv = t["linear_num_key_heads"], t["linear_num_value_heads"]
         self.qh, self.kvh = t["num_attention_heads"], t["num_key_value_heads"]
         self.qkv, self.mixdim = (2 * self.hk + self.hv) * 128, self.hv * 128
@@ -320,7 +344,18 @@ class Builder:
                 raise ValueError("Q4 integer table differs from compiled decoder")
             w.constant("orinfer.q4.table", table)
 
-    def emit(self, name, key, build, bindings, rows=CAPACITY, *, dynamic=True, row_divisor=1):
+    def emit(
+        self,
+        name,
+        key,
+        build,
+        bindings,
+        rows=CAPACITY,
+        *,
+        dynamic=True,
+        row_divisor=1,
+        row_multiplier=1,
+    ):
         return self.aot.emit(
             "qwen_rows/" + name,
             key,
@@ -329,6 +364,7 @@ class Builder:
             rows,
             dynamic=dynamic,
             row_divisor=row_divisor,
+            row_multiplier=row_multiplier,
         )
 
     def embedding(self, name, input, output, rows=CAPACITY):
@@ -835,20 +871,27 @@ class Builder:
                 kind="w8",
             )
             self.norm_rotation(post, "Mix", "R1", p + ".post_attention_layernorm.weight", "R0")
-            for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
-                self.projection(
-                    post + "/" + role,
-                    p + f".mlp.{role}_proj.weight",
-                    self.f,
-                    self.h,
-                    "GateUp",
-                    stride=self.f,
-                    offset=offset,
+            if self.moe:
+                from tools.model.qwen35.moe import build as moe_ffn
+
+                moe_ffn(self, post, p + ".mlp")
+            else:
+                for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
+                    self.projection(
+                        post + "/" + role,
+                        p + f".mlp.{role}_proj.weight",
+                        self.f,
+                        self.h,
+                        "GateUp",
+                        stride=self.f,
+                        offset=offset,
+                    )
+                self.rotation(
+                    post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
                 )
-            self.rotation(
-                post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
-            )
-            self.projection(post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden")
+                self.projection(
+                    post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden"
+                )
             print("BOUND layer", i, flush=True)
         self.emit(
             "end/advance",
@@ -925,7 +968,7 @@ class Builder:
         )
 
     def publish(self, engine):
-        from tools.model.frontend import prepare_tokenizer
+        from tools.model.frontend import prepare_generation_config, prepare_tokenizer
 
         w = self.weights
         total = w.finish()
@@ -935,13 +978,13 @@ class Builder:
             "tokenizer.json",
             "tokenizer_config.json",
             "chat_template.jinja",
-            "generation_config.json",
             "merges.txt",
             "vocab.json",
         ]:
             if (self.source / name).is_file():
                 shutil.copyfile(self.source / name, self.root / name)
         prepare_tokenizer(self.source, self.root / "tokenizer.json")
+        prepare_generation_config(self.source, self.root / "generation_config.json")
         metadata = dict(
             schema_version=2,
             target="sm_87",

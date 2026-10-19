@@ -2,13 +2,13 @@
 
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）和 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。开发版新增 Index-Translate-2B/9B 翻译适配；图片输入已接通，复杂图片的翻译质量仍需改进。
+面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）和 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。开发版新增 Qwen3.5-4B 和 Index-Translate-2B/9B 翻译适配；图片输入已接通，复杂图片的翻译质量仍需改进。
 
 ## 功能
 
 - OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
 - [JSONL 离线推理](docs/batch.md)：连续批处理、逐条落盘和断点续跑，无需 HTTP 服务。
-- 27B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
+- 27B、4B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
@@ -62,6 +62,8 @@ Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包
 Index-Translate-2B 的量化权重约 **1.23 GB / 4.32 bit**。开发版 Rust CLI 固定长度基准中，512／2K／8K prefill 约 **7.6K／7.9K／6.5K tokens/s**，关闭 MTP 的 decode 约 **108／105／94 tokens/s**；普通请求路径约 **113／109／98 tokens/s**。关闭 MTP 的 150 TPS 目标尚未达到。测量口径、文本快速评测和图片质量限制见[同页记录](docs/performance.md#index-translate-2b2026-10-18)。
 
 Index-Translate-9B 的量化权重约 **5.44 GB / 4.51 bit**，复用相同执行组件并保留独立 embedding/输出头。Rust CLI 固定长度基准中，512／2K／8K prefill 约 **2153／2220／1956 tokens/s**，关闭 MTP 的 decode 约 **33.4／32.6／29.8 tokens/s**。测试范围与 BF16 快速质量对照见[9B 测量](docs/performance.md#index-translate-9b2026-10-18)。
+
+Qwen3.5-4B 的量化权重约 **2.58 GB / 4.42 bit**，复用相同动态执行组件和共享 embedding/输出头。Rust CLI 固定长度基准中，512／2K／8K prefill 约 **3279／3401／2798 tokens/s**，关闭 MTP 的 decode 约 **54.45／52.34／45.68 tokens/s**。测量口径与小样本 BF16 对照见[4B 测量](docs/performance.md#qwen35-4b2026-10-19)。
 
 目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
 

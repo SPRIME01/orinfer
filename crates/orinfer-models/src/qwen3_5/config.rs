@@ -25,6 +25,16 @@ pub(crate) struct TextConfig {
     pub num_key_value_heads: usize,
     #[serde(default = "head_dim")]
     pub head_dim: usize,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
+    #[serde(default)]
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
+    #[serde(default)]
+    pub mlp_only_layers: Vec<usize>,
 }
 
 fn query_heads() -> usize {
@@ -91,12 +101,15 @@ impl Configuration {
     pub fn parse(config: Value) -> Result<Self> {
         if !matches!(
             config["model_type"].as_str(),
-            Some("qwen3_5" | "qwen3_5_text")
+            Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe")
         ) {
             return Err("Unsupported Qwen model configuration".into());
         }
         let text_value = config.get("text_config").unwrap_or(&config);
         let text = parse_text(text_value)?;
+        if (config["model_type"] == "qwen3_5_moe") != (text.num_experts > 0) {
+            return Err("Qwen dense/MoE configuration mismatch".into());
+        }
         // These values affect compiled arithmetic, weight contracts or state.
         // Checkpoint identity, naming, dtype labels and quantization provenance
         // deliberately do not determine architecture/operator compatibility.

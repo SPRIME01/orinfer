@@ -2,6 +2,38 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## Qwen3.5-4B（2026-10-19）
+
+来源为官方 [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)，固定 revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`。32 层、2560 hidden、9216 FFN，复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求私有状态；tied embedding/输出头共享同一份压缩 bank。
+
+主干、embedding/输出头和视觉大矩阵使用 signed-block128 旋转、两级 E8P Q4A8，系数 `[4,1]`、beam8；敏感输出/MTP 投影保留 W8，小张量保留浮点。量化 payload 共 **2,575,068,160 bytes，平均 4.421 bit**；部署只读数据另含派生常量，共 2,608,622,592 bytes。使用 INT8 KV、FP32 GDN 状态，上下文配置为 256K，实际输入测到 8K。
+
+Rust release CLI `run-model`，关闭 MTP、`decode_only`，每个输入连续测两次，每次固定生成 65 tokens，取第二次。Prefill 计时到输出头之前，decode 计时覆盖后续 64 步：
+
+| 输入 tokens | Prefill TPS | Decode TPS | 首 token 时延（s） |
+| --- | ---: | ---: | ---: |
+| 512 | 3278.9 | 54.45 | 0.158 |
+| 2048 | 3401.2 | 52.34 | 0.604 |
+| 8192 | 2797.7 | 45.68 | 2.930 |
+
+同次 release 进程加载到就绪 **3.18 s**，保留已有文件缓存；完整 `validate-model` 权重校验另测 4.54 s。此处为执行层固定长度基准，HTTP 自然完成吞吐应按具体请求另测。
+
+固定 seed `20261002`，与原始 BF16 使用相同 teacher-forced 历史：
+
+| 场景 | 位置数 | 目标 NLL 差（nats/token） | 首选一致率 | 所选 token 位于 BF16 top3 |
+| --- | ---: | ---: | ---: | ---: |
+| 文本 | 118 | −0.01596 | 86.44% | 96.61% |
+| 2K/8K 长输入 | 26 | +0.16662 | 88.46% | 100% |
+| 简单图片/双图 | 17 | −0.02180 | 94.12% | 100% |
+
+三组分别有 77/16/10 个高置信位置，首选均与 BF16 一致。目标答案为固定有效续写，NLL 差允许为负；这些小样本用于量化诊断，任务正确性另看自由生成。开放问答中，原始 BF16 和量化模型均会对无领域提示的 prefix caching 问题给出内存地址位解释，因此这类知识性回答应与量化误差分开评估。
+
+普通 2/3/4/5/8/32 路请求，以及验证宽度 2/4/8 × 请求数 1/2/4/8 × verification/mixed 的 24 组同历史检查通过，KL 与所选 token NLL 差均为 0。32/512-token 部分前缀恢复覆盖 target/draft KV、GDN、卷积和位置状态；JSONL 16 条请求自然结束，续跑保持完整结果及唯一 custom_id。
+
+Chat API 在关闭 MTP 和最多 3 草稿下均完成单流、SSE、完整 prefix 命中、8 并发、图片和双图检查。普通请求使用 greedy、固定 seed `20261002`，关闭 MTP 时，重复 prefix/SSE 及并发正文在本组场景一致；最多 3 草稿时存在措辞差异，状态与同历史概率检查仍通过。Thinking 算术使用官方通用任务建议：temperature=1.0、top_p=0.95、top_k=20、presence_penalty=1.5、repetition_penalty=1.0，思考预算 512、总输出预算 4096；关闭/开启 MTP 分别生成 1010/740 tokens，并自然结束，结果均为 391。该采样配置仅用于验收请求，服务默认值保持原配置。
+
+Greedy 的同一算术在 1024/2048 总预算下出现截断；原始 BF16 在思考预算 512 下也生成了 2272 tokens 才结束。强制闭合思考标记后，原始 BF16 和量化模型都可能继续在正文中推导，因此标签内思考预算与完整回答预算应分别评估。
+
 ## Index-Translate-9B（2026-10-18）
 
 来源为官方 [IndexTeam/Index-Translate-9B](https://huggingface.co/IndexTeam/Index-Translate-9B)，固定 revision `4e06279e62352dab96bbeb6fa0579bca5e822d75`。复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求状态组件，按配置使用 32 层、4096 hidden 和独立 embedding/输出头，不复制执行流程。

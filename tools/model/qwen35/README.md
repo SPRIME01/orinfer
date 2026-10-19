@@ -6,6 +6,8 @@
 
 两级 E8P-Q4 的数据契约为 `quant_method=orinfer_e8p_q4_int8`、`coefficients=[4,1]`、`basis_tensor=orinfer.e8p_q4.basis`、`layout=u32-low-coarse-high-residual`。输入压缩矩阵为 U32 `[N,K/8]`，构建时无损重排为 `[K/128,N,16]`，每个输出行一个 F16 scale。它复用原生执行计划、公共整数计算和离线 tile 调优。非零 basis 经验证后，直接 INT4 MMA 将完整 A8 拆成两个位平面，恢复相同的 INT32 点积；与 INT8 解码路径读取同一份压缩权重，由自动调优选择。
 
+Qwen3.5-4B 同样复用此入口，按官方配置使用 2560 hidden、9216 FFN、32 层和共享 embedding/输出头。原始 checkpoint 缺少 `generation_config.json` 时，构建器从本模型配置和 tokenizer 固定 EOS 与 padding，覆盖模型结束和 chat 结束标记；显式提供的生成配置保留原始字节。
+
 ```bash
 make build
 bash tools/operators/run.sh tools/model/qwen35/build.py artifacts/qwen35-build \

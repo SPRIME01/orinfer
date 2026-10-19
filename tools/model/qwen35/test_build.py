@@ -54,6 +54,91 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_four_billion_requires_tied_head_and_matching_attention(self):
+        candidate = config()
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            tie_word_embeddings=True,
+            layer_types=t["layer_types"][:32],
+        )
+        candidate["quantization_config"].update(
+            quant_method="orinfer_e8p_q4_int8",
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
+            embedding="e8p_q4",
+        )
+        self.assertEqual(configuration(candidate, 262144)["hidden_size"], 2560)
+        for key, value in (("tie_word_embeddings", False), ("num_key_value_heads", 2)):
+            with self.subTest(key=key), patch.dict(t, {key: value}):
+                with self.assertRaises(ValueError):
+                    configuration(candidate, 262144)
+
+    def test_expert_repack_and_assembled_banks_do_not_duplicate_unbound_weights(self):
+        from tools.model.safetensors_source import local_header
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            codes = np.arange(2 * 3 * 32, dtype=np.uint32).reshape(2, 3, 32)
+            shard = source / "experts.safetensors"
+            save_file(
+                {"Experts.packed": codes, "Unbound": np.ones((4, 4), np.float16)},
+                str(shard),
+                metadata={"orin.layout.Experts.packed": "e8p-q4-row-u32"},
+            )
+            before = hashlib.sha256(shard.read_bytes()).hexdigest()
+            index = dict(
+                metadata={"orinfer.sha256": {shard.name: before}},
+                weight_map={"Experts.packed": shard.name, "Unbound": shard.name},
+            )
+            (source / "model.safetensors.index.json").write_text(json.dumps(index))
+            weights = Weights(source, root / "model", packed_k=128)
+            weights.immutable("Experts.packed")
+            bank = weights.array("Experts.packed")
+            self.assertEqual(bank.shape, (2, 2, 3, 16))
+            np.testing.assert_array_equal(bank.transpose(0, 2, 1, 3).reshape(codes.shape), codes)
+            weights.constant("Assembled", np.ones((2, 4, 4), np.int8))
+            weights.finish()
+            _, header = local_header(root / "model/cache/weights" / shard.name)
+            self.assertEqual(set(header) - {"__metadata__"}, {"Experts.packed"})
+            self.assertEqual(hashlib.sha256(shard.read_bytes()).hexdigest(), before)
+
+    def test_moe_geometry_keeps_shared_experts_and_router_explicit(self):
+        candidate = config()
+        candidate["model_type"] = "qwen3_5_moe"
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=2048,
+            intermediate_size=512,
+            num_hidden_layers=40,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+            mlp_only_layers=[],
+            layer_types=t["layer_types"][:40],
+        )
+        self.assertEqual(configuration(candidate, 262144)["num_experts"], 256)
+        for key, value in (
+            ("num_experts_per_tok", 10),
+            ("shared_expert_intermediate_size", 640),
+            ("tie_word_embeddings", True),
+            ("mlp_only_layers", [0]),
+        ):
+            with self.subTest(key=key), patch.dict(t, {key: value}):
+                with self.assertRaises(ValueError):
+                    configuration(candidate, 262144)
+
     def test_medium_dense_geometry_requires_matching_gdn_and_gqa(self):
         candidate = config()
         t = candidate["text_config"]
@@ -373,7 +458,7 @@ class BuildTests(unittest.TestCase):
             (np.uint8, (3, 16), "e8p-q4-row-u32"),
             (np.uint32, (3, 15), "e8p-q4-row-u32"),
             (np.uint32, (3, 16), "q4-row-packed-little-nibbles"),
-            (np.uint32, (1, 3, 16), "e8p-q4-row-u32"),
+            (np.uint32, (1, 2, 3, 16), "e8p-q4-row-u32"),
         ]:
             with (
                 self.subTest(dtype=dtype, shape=shape, layout=layout),
