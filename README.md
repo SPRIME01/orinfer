@@ -1,5 +1,7 @@
 # Orinfer
 
+[简体中文](README.md) | [English](docs/en/README.md)
+
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
 面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）和 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。开发版新增 Qwen3.5-4B 和 Index-Translate-2B/9B 翻译适配；图片输入已接通，复杂图片的翻译质量仍需改进。
