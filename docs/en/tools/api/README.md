@@ -1,5 +1,7 @@
 # API validation
 
+[简体中文](../../../../tools/api/README.md) | **English**
+
 `smoke.py` acts only as a client of a running real-model server. It covers arbitrary input lengths, EOS, SSE and usage accounting, fixed seeds, stop sequences, queuing, isolation after disconnects, error formats, integer-argument tool calls, and tool-result follow-ups. The output path must not exist. If the server requires authentication, the client reads `ORINFER_API_KEY` from the environment.
 
 ```bash
@@ -27,7 +29,7 @@ ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 
-The [OpenCode configuration](../../examples/opencode.json) and [Pi configuration](../../examples/pi-models.json) can be used for coding workflows; see [OpenCode and Pi](../../docs/serving.md#opencode-and-pi). Clients execute tools and return their results to the Chat API. Test in an isolated directory: verify file reads/edits, running tests, tool-error responses, thinking, compaction, and session continuation. Do not commit the test directory, generated files, session databases, or logs.
+The [OpenCode configuration](../../../../examples/opencode.json) and [Pi configuration](../../../../examples/pi-models.json) can be used for coding workflows; see [OpenCode and Pi](../../serving.md#opencode-and-pi). Clients execute tools and return their results to the Chat API. Test in an isolated directory: verify file reads/edits, running tests, tool-error responses, thinking, compaction, and session continuation. Do not commit the test directory, generated files, session databases, or logs.
 
 To validate single-image, multi-image, image-history, and thinking templates, use a built vision manifest and a local PNG:
 

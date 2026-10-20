@@ -1,5 +1,7 @@
 # 构建、检查与发布
 
+**简体中文** | [English](../../docs/en/tools/build/README.md)
+
 在线服务只依赖 Rust 二进制、CUDA 驱动、准备好的模型目录和算子包。Python、PyTorch、TileLang 均属于离线环境。
 
 ## 编译环境

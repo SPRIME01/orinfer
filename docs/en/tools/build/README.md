@@ -1,5 +1,7 @@
 # Build, checks, and release
 
+[简体中文](../../../../tools/build/README.md) | **English**
+
 The online service needs only a Rust binary, CUDA driver, prepared model directory, and execution package. Python, PyTorch, and TileLang belong to the **offline** build environment.
 
 ## Compiler environment
@@ -61,8 +63,8 @@ python3 tools/release/package.py --version v0.1.4 \
 
 By default this builds and verifies artifacts without publishing. The tool requires a clean working tree, builds from `Cargo.lock`, verifies aarch64 and version identity, and packages the complete sources, license, dependency notices, model packaging tools, and architecture contract. Each native execution package and library identity is verified. Engine, execution, and bundled source archives use XZ compression (`.tar.xz`, preset 6). Legacy `.tar.gz` execution-package inputs are verified and *repacked* to XZ, not merely renamed. Asset names derive from architecture, compute policy, and GPU target; `RELEASE.json` lists each package digest. Full offline tools and Flash Next documentation accompany the release. Weights are excluded.
 
-Install an execution package with `orinfer package install`; Python is not required. See [Installing execution packages](../../docs/model-packages.md#installing-execution-packages).
+Install an execution package with `orinfer package install`; Python is not required. See [Installing execution packages](../../model-packages.md#installing-execution-packages).
 
-Release 0.1.2 accepts only current schema-1 native execution packages containing `.so` and cubins; old operator assets from v0.1.1 are incompatible. Models in the old format must be rebuilt or reassembled with current tools. Current native models can use the [execution-library update workflow](../../docs/model-packages.md), preserving compatible weights and kernel assets.
+Release 0.1.2 accepts only current schema-1 native execution packages containing `.so` and cubins; old operator assets from v0.1.1 are incompatible. Models in the old format must be rebuilt or reassembled with current tools. Current native models can use the [execution-library update workflow](../../model-packages.md), preserving compatible weights and kernel assets.
 
 To publish, add `--publish --notes /path/to/release-notes.md`. The tool checks that the tag points to the source revision, pushes it, creates a GitHub Release, then downloads and SHA256-verifies all uploaded assets. Existing releases are never overwritten.

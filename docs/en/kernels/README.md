@@ -1,5 +1,7 @@
 # TileLang kernels
 
+[简体中文](../../../kernels/README.md) | **English**
+
 Target: **CUDA SM87**. `operators/` contains primitive operators; `model/` contains model projections, fusions, GDN, and attention.
 
 Kernels compile offline into cubins with a real host ABI; Rust executes them online through the CUDA Driver API. See [Model tools](../tools/model/README.md) for export and assembly. Every implementation must validate numerical results, unaligned tails, state semantics, and CUDA Graph replay **after changing the inputs**.
@@ -27,3 +29,10 @@ BF16 vision epilogues use explicit PTX round-to-nearest-even writes, preserving 
 QSA uses group-four compressed indexing, exact radix top-k, and group-64 INT8 KV in `model/qsa.py`. `model/qsa_attention.py` computes attention with shared-KV-tile FP16 Tensor Cores while softmax and accumulation remain FP32. Maximum context is 262,144 tokens. Compressed index, pending ring, and KV scales are request state. See `tools/operators/qsa*.py` for kernel checks and `tools/model/flash_next/long_context.py` for actual long-context runs. [Quantization](../tools/quantization/README.md) documents conversion and independent BF16 references.
 
 `model/flash_mtp.py` provides complete HC input normalization, embedding/branch fusion, and per-position MTP history. `model/greedy.py` handles multirow verification output. Target verification saves convolution, PLE, and QSA pending histories. GDN stores keys, decay, and FP32 updates, and `model/gdn_sequence.py` replays accepted prefixes into FP32 state rather than cloning full matrices at each position. Commits follow accepted length; live cursors isolate rejected KV and compressed-index suffixes. `tools/model/flash_next/mtp.py` supplies offline greedy acceptance, draft refresh, and full-session restoration. MTP shares base-model embeddings/output head while using separate INT8 KV. Verify operators with `tools/operators/flash_mtp.py`, actual requests with `tools/model/flash_next/checks/mtp.py`, and fused/GDN/direct-expert variants with `tools/operators/flash_mtp_optimization.py`.
+
+
+## GPU sampling
+
+`model/sampling.py` implements the shared GPU stochastic sampler: FP64 processing of penalties and bias, top-k followed by nucleus truncation, and stable sorting by score/token ID. Probability mass is bounded U64 fixed-point with maximum unnormalized truncation error `vocab / scale`. The scale is chosen based on vocabulary size to prevent sum overflow. Integer radix accumulation is independent of batch composition; Rust supplies the same seed and committed-position counters for randomness.
+
+Counts, masks, and histograms are reconstructible workspace, not prefix snapshots. Ordinary stochastic/grammar sampling without logprob reporting uses GPU; top-logprobs and MTP p/q probabilities and rejection correction retain the CPU reference path. `tools/operators/sampling.py` validates numerics, tails, exceptional inputs, and CUDA Graph replay with changed inputs.

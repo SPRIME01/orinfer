@@ -1,5 +1,7 @@
 # orinfer-models
 
+[简体中文](../../../../crates/orinfer-models/README.md) | **English**
+
 Native model implementations live in the unified workspace. Model adapters and precision policies register independently and share execution components, TileLang sources, build tools, and tests. Deployment produces a `.so + cubin` execution package.
 
 The current `int8_quality` paths cover Qwen3.8-27B (`Qwen3_5`) and Flash Next, including mixed precision, fusion, batching, MTP, and visual position semantics. The model library links only to `orinfer-model-sdk`, not `orinfer-engine`; cross-library communication uses C ABI v1 exclusively.
@@ -11,4 +13,4 @@ cargo build --release --locked --offline -p orinfer-models
 cargo test --locked --offline -p orinfer-models
 ```
 
-See [Model execution packages](../../docs/model-packages.md) for build steps, package contracts, and validation.
+See [Model execution packages](../../model-packages.md) for build steps, package contracts, and validation.

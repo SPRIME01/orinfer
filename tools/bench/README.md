@@ -1,5 +1,7 @@
 # 性能工具
 
+**简体中文** | [English](../../docs/en/tools/bench/README.md)
+
 当前 Flash Next 的 Rust CLI / Chat API 实测与 27B 历史参考见[性能参考](../../docs/performance.md)。该文档分别列出执行层 prefill、输入 tokens / API TTFT、排除 TTFT 的 decode，以及完整 prefix 命中时延；本目录各工具的整请求吞吐不能直接替代这些指标。
 
 `reference_bench.py`测量兼容OpenAI SSE接口的prefill/TTFT与decode时间；`test_reference_bench.py`检查token chunk和计时间隔。

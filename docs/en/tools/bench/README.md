@@ -1,6 +1,8 @@
 # Benchmark tools
 
-See [Performance reference](../../docs/performance.md) for measured Flash Next Rust CLI/Chat API results and historical 27B results. That reference distinguishes execution-layer prefill, input tokens versus API TTFT, decode excluding TTFT, and full-prefix-hit latency. **Whole-request throughput measured here must not be substituted for those metrics.**
+[简体中文](../../../../tools/bench/README.md) | **English**
+
+See [Performance reference](../../performance.md) for measured Flash Next Rust CLI/Chat API results and historical 27B results. That reference distinguishes execution-layer prefill, input tokens versus API TTFT, decode excluding TTFT, and full-prefix-hit latency. **Whole-request throughput measured here must not be substituted for those metrics.**
 
 `reference_bench.py` measures prefill/TTFT and decode against an OpenAI-compatible SSE endpoint; `test_reference_bench.py` tests token chunks and timing intervals. Record reference server configuration and identity in `reference-lock.json` in the output directory. Supply explicit input tokens via `--seed-tokens /path/to/input-tokens.json`. This workload requires token-ID input/output, fixed-length generation, and optionally separate timing diagnostics; ordinary Chat requests are not interchangeable.
 
