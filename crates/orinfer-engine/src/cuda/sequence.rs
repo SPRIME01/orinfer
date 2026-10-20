@@ -176,19 +176,43 @@ impl Executor {
         slots: &[usize],
         names: [&str; N],
     ) -> Result<Vec<[i32; N]>> {
-        let bytes = N.checked_mul(4).ok_or("Control size overflow")?;
+        let values = self.read_sequence_vectors(slots, &names, 1)?;
+        Ok(values
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .map(|chunk| std::array::from_fn(|j| chunk[j] as i32))
+            .collect())
+    }
+    /// Read equally sized control vectors for all owners with one synchronization
+    /// per bounded staging slab, preserving owner/name/vector order.
+    pub(crate) fn read_sequence_vectors(
+        &self,
+        slots: &[usize],
+        names: &[&str],
+        count: usize,
+    ) -> Result<Vec<u32>> {
+        let words = names
+            .len()
+            .checked_mul(count)
+            .ok_or("Control size overflow")?;
+        let bytes = words.checked_mul(4).ok_or("Control size overflow")?;
         if bytes == 0 || bytes > super::transfers::READBACK_BYTES {
             return Err("Invalid sequence control extent".into());
         }
-        let mut regions = Vec::with_capacity(slots.len() * N);
+        let total = slots
+            .len()
+            .checked_mul(words)
+            .ok_or("Control vector overflow")?;
+        let mut regions = Vec::with_capacity(slots.len() * names.len());
         for &slot in slots {
             let arena = self
                 .sequences
                 .get(slot)
                 .filter(|s| s.leased && !s.quarantined)
                 .ok_or("Controls require a live leased arena")?;
-            for name in names {
-                if arena.sizes.get(name).is_none_or(|&size| size < 4) {
+            for &name in names {
+                if arena.sizes.get(name).is_none_or(|&n| n < count * 4) {
                     return Err("Sequence control exceeds allocation".into());
                 }
                 regions.push((
@@ -196,22 +220,23 @@ impl Executor {
                         .addresses
                         .get(name)
                         .ok_or("Missing sequence control")?,
-                    4,
+                    count * 4,
                 ));
             }
         }
-        let mut values = vec![[0i32; N]; slots.len()];
+        let mut values = vec![0u32; total];
         let capacity = super::transfers::READBACK_BYTES / bytes;
-        for (i, chunk) in values.chunks_mut(capacity).enumerate() {
-            let start = i * capacity * N;
-            // SAFETY: Each initialized array contains exactly N i32 controls.
-            // The retained arenas remain leased until readback has completed.
+        for (i, chunk) in values.chunks_mut(capacity * words).enumerate() {
+            let start = i * capacity * names.len();
+            let owners = chunk.len() / words;
+            // SAFETY: Initialized u32 storage covers every checked source region;
+            // readback waits for DMA completion before this storage is inspected.
             let raw = unsafe {
-                std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast(), chunk.len() * bytes)
+                std::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast(), chunk.len() * 4)
             };
             self.session.transfers.borrow_mut().readback(
                 self.session.stream,
-                &regions[start..start + chunk.len() * N],
+                &regions[start..start + owners * names.len()],
                 raw,
             )?;
         }

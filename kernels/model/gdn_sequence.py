@@ -278,3 +278,46 @@ def gdn_commit(
                 State[h, i, bv * value_tile + j] = state[i, j]
 
     return main
+
+
+@orin_jit
+def gdn_commit_controlled(tokens=8, value_tile=16, key_heads=16, value_heads=48):
+    """Same FP32 commit with a device-owned compact key stride per request.
+
+    The fixed tensor extent is allocation capacity. Length supplies the actual
+    saved key stride, allowing the independent-owner wrapper to join different
+    verification widths without specializing their computation.
+    """
+    HK, HV = key_heads, value_heads
+    if not 1 <= tokens <= 8 or HK <= 0 or HV % HK:
+        raise ValueError("Invalid controlled GDN commit geometry")
+    replay = rank_one(value_tile, staged=True)
+
+    @T.prim_func
+    def main(
+        K: T.Tensor((HK * tokens * DK,), T.float16),
+        G: T.Tensor((tokens, HV), T.float32),
+        Update: T.Tensor((tokens, HV, DV), T.float32),
+        Accepted: T.Tensor((1,), T.int32),
+        Length: T.Tensor((1,), T.int32),
+        State: T.Tensor((HV, DK, DV), T.float32),
+    ):
+        with T.Kernel(DV // value_tile, HV, threads=128) as (bv, h):
+            keys = T.alloc_shared((tokens, DK), T.float16)
+            for t, i in T.Parallel(tokens, DK):
+                if t < Length[0]:
+                    keys[t, i] = K[(h // (HV // HK) * Length[0] + t) * DK + i]
+            T.sync_threads()
+            state = T.alloc_fragment((DK, value_tile), T.float32)
+            delta = T.alloc_fragment((value_tile,), T.float32)
+            for i, j in T.Parallel(DK, value_tile):
+                state[i, j] = State[h, i, bv * value_tile + j]
+            for t in T.serial(tokens):
+                if t < Accepted[0]:
+                    for j in T.Parallel(value_tile):
+                        delta[j] = Update[t, h, bv * value_tile + j]
+                    replay(state, keys, delta, T.exp(G[t, h]), 0, t, h, bv)
+            for i, j in T.Parallel(DK, value_tile):
+                State[h, i, bv * value_tile + j] = state[i, j]
+
+    return main

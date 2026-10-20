@@ -26,6 +26,7 @@ from tools.model.compile import primitive
 ROOT = Path(__file__).resolve().parents[3]
 CAPACITY = 4096
 LANES = 128
+HEAD_ROWS = 512
 
 
 def configuration(config, context):
@@ -223,6 +224,9 @@ class Builder:
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
+        from tools.model.qwen35 import commit
+
+        commit.build(self)
 
     def workspace(self):
         w = self.weights
@@ -259,14 +263,14 @@ class Builder:
             ("A8", "i8", [c * max(f, h, self.mixdim, 2 * h)]),
             ("AS", "f16", [c]),
             ("UnusedA8Mask", "u8", [max(f, h, self.mixdim, 2 * h)]),
-            ("HeadHidden", "f16", [LANES, h]),
-            ("HeadA8", "i8", [LANES, h]),
-            ("HeadAS", "f16", [LANES]),
-            ("HeadLogits", "f32", [LANES, v]),
-            ("GreedyValues", "f32", [LANES * math.ceil(v / 1024)]),
-            ("GreedyIndices", "i32", [LANES * math.ceil(v / 1024)]),
-            ("GreedyInvalid", "i32", [LANES * math.ceil(v / 1024)]),
-            ("Pairs", "i32", [LANES, 2]),
+            ("HeadHidden", "f16", [HEAD_ROWS, h]),
+            ("HeadA8", "i8", [HEAD_ROWS, h]),
+            ("HeadAS", "f16", [HEAD_ROWS]),
+            ("HeadLogits", "f32", [HEAD_ROWS, v]),
+            ("GreedyValues", "f32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("GreedyIndices", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("GreedyInvalid", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("Pairs", "i32", [HEAD_ROWS, 2]),
         ]:
             w.fixed(name, dtype, shape)
         for name, dtype, shape in [
@@ -918,7 +922,7 @@ class Builder:
                 Y="HeadHidden",
             ),
         )
-        for name, rows, dynamic in [("head", LANES, True), ("head_last", 1, False)]:
+        for name, rows, dynamic in [("head", HEAD_ROWS, True), ("head_last", 1, False)]:
             self.rotation(
                 name + "/rotate", self.h, "HeadHidden", rows=rows, dynamic=dynamic, head=True
             )

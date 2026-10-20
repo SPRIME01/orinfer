@@ -1,104 +1,25 @@
 //! Speculation advances one bounded verification round. Catch-up is lazy while
 //! batched target decode is profitable; stale ring entries are never consumed.
 use super::*;
+pub(in crate::runtime) mod control;
 
 #[derive(Default)]
 pub(in crate::runtime) struct Profile {
     time: scheduler::Estimate,
-    tokens: f64,
     trials: usize,
-    last_progress: usize,
 }
 impl Profile {
     pub fn upper(&self) -> f64 {
         self.time.upper()
     }
-    pub fn observe(&mut self, seconds: f64, tokens: usize, progress: usize) {
+    pub fn observe(&mut self, seconds: f64) {
         if self.trials == 1 {
             // The first use may capture a graph or load a lazy CUDA module.
-            // Keep it as a trial, but estimate steady execution from later uses.
             self.time = Default::default();
-            self.tokens = 0.;
         }
         self.time.observe(seconds);
-        self.tokens = if self.time.samples == 1 {
-            tokens as f64
-        } else {
-            self.tokens * 0.8 + tokens as f64 * 0.2
-        };
         self.trials += 1;
-        self.last_progress = progress;
     }
-    pub fn observe_steady(&mut self, seconds: f64, tokens: usize, progress: usize) {
-        if !seconds.is_finite() || seconds <= 0. || tokens == 0 {
-            return;
-        }
-        // Batched callers subtract module/capture time themselves. Retaining
-        // the first measured steady iteration bounds expensive exploration.
-        self.time.observe(seconds);
-        self.tokens = if self.time.samples == 1 {
-            tokens as f64
-        } else {
-            self.tokens * 0.8 + tokens as f64 * 0.2
-        };
-        self.trials += 1;
-        self.last_progress = progress;
-    }
-    fn batch_score(&self) -> Option<f64> {
-        (self.trials >= 1).then_some(self.time.upper() / self.tokens.max(1.))
-    }
-    pub fn score(&self) -> Option<f64> {
-        (self.trials >= 3).then_some(self.time.mean / self.tokens.max(1.))
-    }
-    pub fn trials(&self) -> usize {
-        self.trials
-    }
-}
-
-pub(super) fn select_profile(
-    plans: &[usize],
-    costs: &BTreeMap<usize, Profile>,
-    progress: usize,
-    last_probe: usize,
-    slack: f64,
-    fallback_per_token: f64,
-) -> Option<(usize, bool)> {
-    let valid: Vec<_> = plans
-        .iter()
-        .copied()
-        .filter(|n| {
-            costs
-                .get(n)
-                .map_or(fallback_per_token * *n as f64, |p| p.time.upper())
-                <= slack
-        })
-        .collect();
-    if let Some(rows) = valid
-        .iter()
-        .copied()
-        .filter(|n| costs.get(n).is_none_or(|p| p.score().is_none()))
-        .max()
-    {
-        return Some((rows, true));
-    }
-    // Count committed tokens, including ordinary decode: otherwise switching
-    // away from speculation freezes the clock and can prevent recovery when
-    // reasoning turns into code. Peer deadlines still bound every probe.
-    if progress.saturating_sub(last_probe) >= 64 {
-        return valid
-            .into_iter()
-            .min_by_key(|n| costs[n].last_progress)
-            .map(|n| (n, true));
-    }
-    valid
-        .into_iter()
-        .min_by(|a, b| {
-            costs[a]
-                .score()
-                .unwrap()
-                .total_cmp(&costs[b].score().unwrap())
-        })
-        .map(|n| (n, false))
 }
 
 pub(super) enum Preparation {
@@ -138,84 +59,270 @@ struct DraftRound {
 }
 pub(super) struct BatchChoice {
     pub(super) selected: Vec<(usize, usize)>,
-    pub(super) exploring: bool,
+}
+
+pub(super) struct Feedback {
+    pub(super) key: control::Key,
+    pub(super) width: usize,
+    pub(super) lookups: usize,
+    pub(super) generated: usize,
+    pub(super) indices: Vec<usize>,
 }
 
 impl ModelRuntime {
-    pub(super) fn select_mixed_speculation(
+    pub(super) fn maintain_lazy_drafts(
+        &mut self,
+        requests: &mut [&mut RequestState],
+    ) -> Result<()> {
+        let Some(spec) = self.manifest.mtp.clone() else {
+            return Ok(());
+        };
+        let Some(ring) = spec
+            .hidden_ring
+            .as_ref()
+            .and_then(|name| self.manifest.buffers.iter().find(|b| b.name == *name))
+            .map(|b| b.shape[0])
+        else {
+            return Ok(());
+        };
+        let width = spec.verification_widths().into_iter().max().unwrap_or(1);
+        let margin = requests.len().saturating_mul(width).max(ring / 4).min(ring);
+        let threshold = ring.saturating_sub(margin);
+        let mut due: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                if r.prefilling || r.is_finished() || r.mtp_blocked {
+                    return None;
+                }
+                let lag = r
+                    .history
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_sub(r.warm.tokens);
+                (lag >= threshold && lag > 0).then_some((i, lag))
+            })
+            .collect();
+        due.sort_unstable_by_key(|&(i, lag)| (std::cmp::Reverse(lag), requests[i].slot));
+        let mut ordinary_maintenance = false;
+        for (i, lag) in due {
+            let urgent = lag.saturating_add(width) > ring;
+            if !urgent && ordinary_maintenance {
+                continue;
+            }
+            if lag > ring {
+                requests[i].mtp_blocked = true;
+                continue;
+            }
+            let tokens = spec.warm_plan(lag)?.1;
+            let began = Instant::now();
+            self.with_request(requests[i], |model, req| {
+                let end = req.warm.tokens + tokens;
+                model.mtp_warm_state(
+                    &spec,
+                    &req.history[req.warm.tokens + 1..end + 1],
+                    &|| false,
+                    ExecutionPhase::Decode,
+                    true,
+                )?;
+                req.warm.tokens = end;
+                req.mtp.refresh_s += began.elapsed().as_secs_f64();
+                Ok(())
+            })?;
+            self.scheduler_statistics.mtp_catchup_tokens += tokens;
+            self.scheduler_statistics.mtp_catchup_s += began.elapsed().as_secs_f64();
+            ordinary_maintenance = true;
+        }
+        Ok(())
+    }
+    fn speculation_key(
+        requests: &[&mut RequestState],
+        selected: &[(usize, usize)],
+    ) -> control::Key {
+        let decode: Vec<_> = selected
+            .iter()
+            .filter(|(i, _)| !requests[*i].prefilling)
+            .collect();
+        control::Key {
+            batch: decode.len(),
+            context: decode
+                .iter()
+                .map(|(i, _)| requests[*i].history.len())
+                .max()
+                .unwrap_or(1)
+                .max(1)
+                .ilog2(),
+            sampling: decode.iter().any(|(i, _)| {
+                !requests[*i].sampling.is_greedy() || requests[*i].sampling.top_logprobs.is_some()
+            }),
+            prefill: selected
+                .iter()
+                .filter(|(i, _)| requests[*i].prefilling)
+                .map(|(_, n)| n)
+                .sum(),
+        }
+    }
+    pub(super) fn speculation_feedback(
         &self,
+        requests: &[&mut RequestState],
+        work: &Work,
+    ) -> Option<Feedback> {
+        self.manifest.mtp.as_ref()?;
+        let selected = match work {
+            Work::Batch(rows) | Work::MixedSpeculative(rows) => rows.clone(),
+            Work::SpeculativeBatch(choice) => choice.selected.clone(),
+            Work::Speculative(i, width) => vec![(*i, *width)],
+            _ => return None,
+        };
+        let key = Self::speculation_key(requests, &selected);
+        if key.batch == 0 {
+            return None;
+        }
+        let mut widths = selected
+            .iter()
+            .filter(|(i, _)| !requests[*i].prefilling)
+            .map(|(_, n)| *n);
+        let width = widths.next()?;
+        if widths.any(|n| n != width) {
+            return None;
+        }
+        Some(Feedback {
+            key,
+            width,
+            lookups: requests.iter().map(|r| r.mtp.lookup_rounds).sum(),
+            indices: selected
+                .iter()
+                .filter(|(i, _)| !requests[*i].prefilling)
+                .map(|(i, _)| *i)
+                .collect(),
+            generated: selected
+                .iter()
+                .filter(|(i, _)| !requests[*i].prefilling)
+                .map(|(i, _)| requests[*i].generated)
+                .sum(),
+        })
+    }
+    pub(super) fn select_auto_speculation(
+        &mut self,
         requests: &[&mut RequestState],
         joint: &[(usize, usize)],
         options: &scheduler::Options,
         slack: f64,
-    ) -> Option<Vec<(usize, usize)>> {
-        let spec = self
-            .manifest
-            .mtp
-            .as_ref()
-            .filter(|s| !s.mixed_verification_tokens.is_empty())?;
-        let decoders = joint
-            .iter()
-            .filter(|(i, _)| !requests[*i].prefilling)
-            .count();
-        if !(1..=8).contains(&decoders) || !joint.iter().any(|(i, _)| requests[*i].prefilling) {
+    ) -> Option<BatchChoice> {
+        let spec = self.manifest.mtp.as_ref()?;
+        let key = Self::speculation_key(requests, joint);
+        if key.batch == 0 {
             return None;
         }
-        let cap = self
-            .manifest
-            .prefill_batch_profiles
+        let mixed = key.prefill > 0;
+        let plans = if mixed {
+            spec.mixed_verification_tokens.clone()
+        } else if key.batch > 1 {
+            spec.batch_verification_tokens.clone()
+        } else {
+            spec.verification_widths()
+        };
+        let limit = joint
             .iter()
-            .map(|p| p.tokens)
-            .max()?;
-        let baseline = self.predict_iteration(requests, joint) / decoders as f64;
-        for width in spec
-            .mixed_verification_tokens
-            .iter()
-            .copied()
-            .rev()
-            .filter(|&n| {
-                n <= spec.default_verification_tokens && n * decoders <= options.max_batch_tokens
+            .filter(|(i, _)| !requests[*i].prefilling)
+            .map(|(i, _)| {
+                (requests[*i].limit - requests[*i].generated).min(
+                    self.manifest
+                        .max_context
+                        .saturating_sub(requests[*i].history.len().saturating_sub(1)),
+                )
             })
+            .min()?
+            .min(spec.default_verification_tokens);
+        if joint
+            .iter()
+            .any(|(i, _)| !requests[*i].prefilling && requests[*i].mtp_blocked)
+        {
+            return None;
+        }
+        let baseline = self.predict_iteration(requests, joint);
+        let row_budget = if options.max_speculative_tokens == 0 {
+            4096
+        } else {
+            options.max_speculative_tokens
+        };
+        let mut candidates = vec![];
+        for width in plans
+            .into_iter()
+            .filter(|&n| n >= 2 && n <= limit && n * key.batch <= row_budget)
         {
             let selected: Vec<_> = joint
                 .iter()
                 .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
                 .collect();
-            if selected.iter().map(|(_, n)| n).sum::<usize>() > cap
-                || selected
-                    .iter()
-                    .map(|&(i, n)| if requests[i].prefilling { 1 } else { n })
-                    .sum::<usize>()
-                    > *self.manifest.batch_profiles.iter().max().unwrap_or(&1)
-                || selected.iter().any(|&(i, n)| {
-                    !requests[i].prefilling && n > requests[i].limit - requests[i].generated
+            let mut segments: Vec<_> = selected
+                .iter()
+                .map(|&(i, tokens)| BatchSegment {
+                    slot: requests[i].slot,
+                    tokens,
                 })
-            {
+                .collect();
+            if mixed {
+                segments.sort_by_key(|s| {
+                    !requests[joint
+                        .iter()
+                        .find(|(i, _)| requests[*i].slot == s.slot)
+                        .unwrap()
+                        .0]
+                        .prefilling
+                });
+            }
+            let packet = mixed || key.batch > 1 || spec.batch_verification_tokens.contains(&width);
+            let operation = if mixed {
+                orinfer_model_sdk::abi::BatchOperation::MixedRows {
+                    prefills: (joint.len() - key.batch) as u8,
+                }
+            } else {
+                orinfer_model_sdk::abi::BatchOperation::Verification
+            };
+            if packet && !self.model_package.supports_batch(&segments, operation) {
                 continue;
             }
-            let key = Self::iteration_key(requests, &selected);
-            let measured = self.mixed_speculation_costs.get(&key);
-            // A cold trial includes an explicit drafter allowance; measured
-            // full rounds include proposal, verification, commit and warm.
-            let upper = measured.map_or_else(
-                || {
-                    self.predict_iteration(requests, &selected)
-                        + self.mtp_seconds_per_token * (width - 1) as f64 * decoders as f64
-                },
-                Profile::upper,
-            );
-            if upper > slack
-                || measured
-                    .and_then(Profile::batch_score)
-                    .is_some_and(|s| s >= baseline)
-            {
-                continue;
-            }
-            return Some(selected);
+            let expected_tokens = joint
+                .iter()
+                .filter(|(i, _)| !requests[*i].prefilling)
+                .map(|(i, _)| requests[*i].draft_acceptance.expected(width - 1))
+                .sum();
+            candidates.push(control::Candidate {
+                width,
+                expected_tokens,
+                prior_seconds: self.predict_iteration(requests, &selected)
+                    + self.mtp_seconds_per_token * (width - 1) as f64,
+            });
         }
-        None
+        candidates.sort_by_key(|c| c.width);
+        let decision = self
+            .dynamic_speculation
+            .choose(key, &candidates, baseline, slack);
+        *self
+            .scheduler_statistics
+            .mtp_depth_histogram
+            .entry(decision.map_or(0, |(w, _)| w - 1))
+            .or_default() += 1;
+        let (width, exploring) = decision?;
+        self.scheduler_statistics.mtp_probe_iterations += usize::from(exploring);
+        Some(BatchChoice {
+            selected: joint
+                .iter()
+                .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
+                .collect(),
+        })
     }
-
+    pub(super) fn select_mixed_speculation(
+        &mut self,
+        requests: &[&mut RequestState],
+        joint: &[(usize, usize)],
+        options: &scheduler::Options,
+        slack: f64,
+    ) -> Option<Vec<(usize, usize)>> {
+        self.select_auto_speculation(requests, joint, options, slack)
+            .map(|choice| choice.selected)
+    }
     pub(super) fn speculative_mixed_step(
         &mut self,
         requests: &mut [&mut RequestState],
@@ -237,108 +344,6 @@ impl ModelRuntime {
         self.speculative_packet_step(requests, &decoders, &prefills, output)
     }
 
-    pub(super) fn select_speculative_batch(
-        &self,
-        requests: &[&mut RequestState],
-        decode: &[usize],
-        options: &scheduler::Options,
-        normal: f64,
-        normal_mean: f64,
-    ) -> Option<BatchChoice> {
-        let spec = self.manifest.mtp.as_ref()?;
-        let limit = (options.max_batch_tokens / decode.len()).min(spec.default_verification_tokens);
-        let slack = if options.policy == scheduler::Policy::Throughput {
-            f64::INFINITY
-        } else {
-            decode
-                .iter()
-                .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
-                .fold(f64::INFINITY, f64::min)
-        };
-        let progress: usize = decode.iter().map(|&i| requests[i].generated).sum();
-        let last_probe: usize = decode
-            .iter()
-            .map(|&i| requests[i].speculation_probe_token)
-            .sum();
-        let probe_due = progress.saturating_sub(last_probe) >= 64 * decode.len();
-        let mut best = None;
-        let mut probe = None;
-        let mut seen = BTreeSet::new();
-        for width in spec
-            .batch_verification_tokens
-            .iter()
-            .copied()
-            .filter(|&n| n <= limit)
-            .rev()
-        {
-            let selected: Vec<_> = decode
-                .iter()
-                .map(|&i| {
-                    spec.batch_verification_tokens
-                        .iter()
-                        .copied()
-                        .filter(|&n| {
-                            !requests[i].mtp_blocked
-                                && n <= width
-                                && n <= requests[i].limit - requests[i].generated
-                                && n <= self.manifest.max_context
-                                    - requests[i].history.len().saturating_sub(1)
-                        })
-                        .max()
-                        .map(|n| (i, n))
-                })
-                .collect::<Option<_>>()?;
-            let key = Self::batch_speculation_key(requests, &selected);
-            if !seen.insert(key) {
-                continue;
-            }
-            let profile = self.batch_speculation_costs.get(&key);
-            // Crossing a context bucket does not erase a measured rejection.
-            // Revisit it on the shared probe clock, rather than restarting all
-            // lengths at every power-of-two boundary.
-            if profile.is_none()
-                && !probe_due
-                && self
-                    .batch_speculation_costs
-                    .range((key.0, key.1, 0, 0)..=(key.0, key.1, key.2, usize::MAX))
-                    .any(|(k, p)| {
-                        k.3 == key.3
-                            && p.batch_score().is_some_and(|score| {
-                                score >= normal_mean / decode.len() as f64 * 0.95
-                            })
-                    })
-            {
-                continue;
-            }
-            let prediction = profile.map_or(normal * 1.5 + key.1 as f64 * 0.005, Profile::upper);
-            if prediction > slack {
-                continue;
-            }
-            if profile.is_none_or(|p| p.trials() < 1) {
-                if probe.is_none() {
-                    probe = Some(selected);
-                }
-            } else if probe_due && probe.is_none() {
-                probe = Some(selected);
-            } else if let Some(score) = profile.and_then(Profile::batch_score)
-                && score < normal_mean / decode.len() as f64 * 0.95
-                && best.as_ref().is_none_or(|(cost, _)| score < *cost)
-            {
-                best = Some((score, selected));
-            }
-        }
-        probe
-            .map(|selected| BatchChoice {
-                selected,
-                exploring: true,
-            })
-            .or_else(|| {
-                best.map(|(_, selected)| BatchChoice {
-                    selected,
-                    exploring: false,
-                })
-            })
-    }
     pub(super) fn speculative_batch_step(
         &mut self,
         requests: &mut [&mut RequestState],
@@ -362,10 +367,16 @@ impl ModelRuntime {
             .mtp
             .as_ref()
             .is_some_and(|s| !s.batch_draft_profiles.is_empty());
-        for &(i, width) in selected {
+        let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
+        let slots: Vec<_> = selected.iter().map(|(i, _)| requests[*i].slot).collect();
+        let cursors = self.execution.read_sequence_controls(
+            &slots,
+            [self.manifest.position.as_str(), spec.position.as_str()],
+        )?;
+        for (&(i, width), cursor) in selected.iter().zip(cursors) {
             if grouped_draft {
                 match self.with_request(requests[i], |model, req| {
-                    model.start_speculative_round(req, width)
+                    model.start_speculative_round(req, width, Some(cursor))
                 }) {
                     Ok(DraftPreparation::Finished(tokens)) => {
                         self.scheduler_statistics.decode_tokens += tokens.len();
@@ -489,12 +500,31 @@ impl ModelRuntime {
         let total_rows: usize = segments.iter().map(|s| s.tokens).sum();
         let grouped_commit = self.manifest.mtp.as_ref().is_some_and(|s| s.batch_commit);
         let mut committed = vec![];
-        for (i, round) in rounds {
+        let control_width = rounds.iter().map(|(_, r)| r.plan.tokens).max().unwrap();
+        let slots: Vec<_> = rounds.iter().map(|(i, _)| requests[*i].slot).collect();
+        let spec = self.manifest.mtp.as_ref().unwrap();
+        let control_values = self.execution.read_sequence_vectors(
+            &slots,
+            &[&spec.verification_tokens, &spec.verification_status],
+            control_width,
+        )?;
+        for ((i, round), values) in rounds
+            .into_iter()
+            .zip(control_values.chunks_exact(2 * control_width))
+        {
+            let width = round.plan.tokens;
             requests[i].mtp.verification_s +=
                 seconds * round.plan.tokens as f64 / total_rows as f64;
             if grouped_commit {
                 let result = self.with_request(requests[i], |model, req| {
-                    model.sample_verified_round(req, round)
+                    model.sample_verified_round(
+                        req,
+                        round,
+                        Some((
+                            &values[..width],
+                            &values[control_width..control_width + width],
+                        )),
+                    )
                 });
                 match result {
                     Ok(round) => committed.push((i, round)),
@@ -534,7 +564,14 @@ impl ModelRuntime {
                     .model_package
                     .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Commit)?;
                 if !bindings.is_empty() {
-                    return Err("Unexpected commit state table".into());
+                    let table = self
+                        .manifest
+                        .mtp
+                        .as_ref()
+                        .and_then(|s| s.commit_state_table.as_ref())
+                        .ok_or("Missing commit pointer table contract")?;
+                    self.execution
+                        .upload_sequence_addresses(table, std::rc::Rc::clone(&bindings))?;
                 }
                 self.execution.execute_batch_operation(
                     orinfer_model_sdk::abi::BatchOperation::Commit,
@@ -562,10 +599,20 @@ impl ModelRuntime {
                 }
                 self.warm_committed_batch(requests, &committed)?;
             }
-            for (i, round) in committed {
+            let positions = if grouped_warm {
+                let slots: Vec<_> = committed.iter().map(|(i, _)| requests[*i].slot).collect();
+                self.execution
+                    .read_sequence_controls(&slots, [self.manifest.position.as_str()])?
+                    .into_iter()
+                    .map(|v| Some(v[0] as usize))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![None; committed.len()]
+            };
+            for ((i, round), position) in committed.into_iter().zip(positions) {
                 let tokens = if grouped_warm {
                     self.with_request(requests[i], |model, req| {
-                        model.finish_warmed_commit(req, round)
+                        model.finish_warmed_commit(req, round, position)
                     })?
                 } else {
                     requests[i].mtp.restore_s += restore_s;
@@ -705,10 +752,15 @@ impl ModelRuntime {
                 self.execution.activate_sequence(segment.slot)?;
                 self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
             }
-            for j in active {
+            let slots: Vec<_> = active.iter().map(|&j| requests[drafts[j].0].slot).collect();
+            let controls = self
+                .execution
+                .read_sequence_controls(&slots, [spec.token.as_str(), spec.status.as_str()])?;
+            for (j, control) in active.into_iter().zip(controls) {
                 let (i, draft) = &mut drafts[j];
-                match self.with_request(requests[*i], |model, req| model.consume_draft(req, draft))
-                {
+                match self.with_request(requests[*i], |model, req| {
+                    model.consume_draft(req, draft, Some(control))
+                }) {
                     Ok(()) => {}
                     Err(_) if requests[*i].failure().is_some() => {
                         draft.done = true;
@@ -721,11 +773,27 @@ impl ModelRuntime {
         Ok(())
     }
     pub(super) fn refresh_request_mtp(&self, req: &mut RequestState, head: bool) -> Result<bool> {
+        self.refresh_request_mtp_at(req, head, None)
+    }
+    fn refresh_request_mtp_at(
+        &self,
+        req: &mut RequestState,
+        head: bool,
+        cursors: Option<[i32; 2]>,
+    ) -> Result<bool> {
         let Some(spec) = &self.manifest.mtp else {
             return Ok(true);
         };
-        let position = self.read_control(&self.manifest.position)? as usize;
-        let draft_position = self.read_control(&spec.position)? as usize;
+        let [position, draft_position] = match cursors {
+            Some(values) => values,
+            None => self
+                .execution
+                .read_control_group([&self.manifest.position, &spec.position])?,
+        };
+        if position < 0 || draft_position < 0 {
+            return Err("Invalid private MTP cursor".into());
+        }
+        let (position, draft_position) = (position as usize, draft_position as usize);
         if req.warm.tokens > position || draft_position != req.warm.tokens {
             return Err(format!(
                 "Private MTP cursor mismatch: slot {}, target {position}, draft {draft_position}, warm {}",
@@ -773,13 +841,17 @@ impl ModelRuntime {
         &mut self,
         req: &mut RequestState,
         max_rows: usize,
+        cursors: Option<[i32; 2]>,
     ) -> Result<DraftPreparation> {
         if req.failure().is_some() {
             return Ok(DraftPreparation::Finished(vec![]));
         }
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
-        let valid = self.refresh_request_mtp(req, true)?;
-        let position = self.read_control(&self.manifest.position)? as usize;
+        let valid = self.refresh_request_mtp_at(req, true, cursors)?;
+        let position = match cursors {
+            Some(values) => values[0],
+            None => self.read_control(&self.manifest.position)?,
+        } as usize;
         let remaining = req.limit - req.generated;
         let plan = valid
             .then(|| {
@@ -860,7 +932,12 @@ impl ModelRuntime {
             Ok(())
         }
     }
-    fn consume_draft(&self, req: &mut RequestState, build: &mut DraftRound) -> Result<()> {
+    fn consume_draft(
+        &self,
+        req: &mut RequestState,
+        build: &mut DraftRound,
+        controls: Option<[i32; 2]>,
+    ) -> Result<()> {
         let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
         let round = &mut build.round;
         let vocab = round.vocab;
@@ -874,9 +951,12 @@ impl ModelRuntime {
             ..req.sampling.clone()
         };
         let i = drafts.len();
-        let [selected, status] = self
-            .execution
-            .read_control_group([&spec.token, &spec.status])?;
+        let [selected, status] = match controls {
+            Some(values) => values,
+            None => self
+                .execution
+                .read_control_group([&spec.token, &spec.status])?,
+        };
         if status != 0 || selected < 0 || selected as usize >= vocab {
             return Err("Invalid request draft token".into());
         }
@@ -968,7 +1048,7 @@ impl ModelRuntime {
         req: &mut RequestState,
         max_rows: usize,
     ) -> Result<Preparation> {
-        let mut build = match self.start_speculative_round(req, max_rows)? {
+        let mut build = match self.start_speculative_round(req, max_rows, None)? {
             DraftPreparation::Finished(tokens) => return Ok(Preparation::Finished(tokens)),
             DraftPreparation::Draft(build) => *build,
         };
@@ -982,7 +1062,7 @@ impl ModelRuntime {
                 )?;
                 self.launch_rows(&spec.draft_program, 1, ExecutionPhase::Decode)?;
             }
-            self.consume_draft(req, &mut build)?;
+            self.consume_draft(req, &mut build, None)?;
         }
         Ok(Preparation::Round(Self::finish_drafts(req, build)?))
     }
@@ -1029,6 +1109,7 @@ impl ModelRuntime {
         &mut self,
         req: &mut RequestState,
         round: PreparedRound,
+        controls: Option<(&[u32], &[u32])>,
     ) -> Result<CommittedRound> {
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
         let PreparedRound {
@@ -1042,8 +1123,19 @@ impl ModelRuntime {
             proposals,
             verification: _,
         } = round;
-        let target = self.read_controls(&spec.verification_tokens, plan.tokens)?;
-        let status = self.read_controls(&spec.verification_status, plan.tokens)?;
+        let owned;
+        let (target, status) = if let Some(values) = controls {
+            values
+        } else {
+            owned = (
+                self.read_controls(&spec.verification_tokens, plan.tokens)?,
+                self.read_controls(&spec.verification_status, plan.tokens)?,
+            );
+            (owned.0.as_slice(), owned.1.as_slice())
+        };
+        if target.len() != plan.tokens || status.len() != plan.tokens {
+            return Err("Verification control extent mismatch".into());
+        }
         if target.iter().any(|&id| id as usize >= vocab) || status.iter().any(|&s| s != 0) {
             return Err("Invalid request verification output".into());
         }
@@ -1114,6 +1206,9 @@ impl ModelRuntime {
                 .count()
         };
         req.mtp.accepted_draft_tokens += accepted;
+        if !is_lookup {
+            req.draft_acceptance.observe(drafts.len(), accepted);
+        }
         if is_lookup {
             req.mtp.lookup_accepted_draft_tokens += accepted;
             req.prompt_lookup
@@ -1166,6 +1261,7 @@ impl ModelRuntime {
         &self,
         req: &mut RequestState,
         round: CommittedRound,
+        position: Option<usize>,
     ) -> Result<Vec<u32>> {
         let committed = round.tokens;
         req.warm.tokens = round.position + committed.len();
@@ -1173,8 +1269,10 @@ impl ModelRuntime {
             &self.manifest.token,
             &[*committed.last().expect("nonempty commit")],
         )?;
-        if self.read_control(&self.manifest.position)? as usize
-            != req.input.len() + req.generated - 1
+        if match position {
+            Some(p) => p,
+            None => self.read_control(&self.manifest.position)? as usize,
+        } != req.input.len() + req.generated - 1
         {
             return Err("Private speculative position mismatch".into());
         }
@@ -1192,14 +1290,14 @@ impl ModelRuntime {
         let at = Instant::now();
         self.mtp_warm(&spec, &round.tokens, &|| false, ExecutionPhase::Decode)?;
         req.mtp.refresh_s += at.elapsed().as_secs_f64();
-        self.finish_warmed_commit(req, round)
+        self.finish_warmed_commit(req, round, None)
     }
     pub(super) fn commit_verified_round(
         &mut self,
         req: &mut RequestState,
         round: PreparedRound,
     ) -> Result<Vec<u32>> {
-        let committed = self.sample_verified_round(req, round)?;
+        let committed = self.sample_verified_round(req, round, None)?;
         self.finish_verified_round(req, committed, false)
     }
 }
@@ -1253,7 +1351,7 @@ mod policy_tests {
                         return Err("Expected a live speculative round".into());
                     };
                     m.verify_single_round(r, &round)?;
-                    let committed = m.sample_verified_round(r, round)?;
+                    let committed = m.sample_verified_round(r, round, None)?;
                     m.restore_verified_cursor(r, &committed, false)?;
                     Ok(committed)
                 })
@@ -1294,20 +1392,6 @@ mod policy_tests {
         for req in &mut requests {
             model.finish_request(req, false).unwrap();
         }
-    }
-    #[test]
-    fn batch_cost_uses_measured_upper_margin_and_rejects_invalid_samples() {
-        let mut p = Profile::default();
-        p.observe_steady(0.2, 8, 8);
-        assert!((p.batch_score().unwrap() - 0.025).abs() < 1e-12);
-        p.observe_steady(0.4, 4, 16);
-        assert!(p.batch_score().unwrap() > p.time.mean / p.tokens);
-        // Ordinary 8-row decode taking 60 ms is faster than this MTP round.
-        assert!(p.batch_score().unwrap() > 0.06 / 8.);
-        p.observe_steady(f64::NAN, 8, 24);
-        p.observe_steady(0.01, 0, 24);
-        assert_eq!(p.trials(), 2);
-        assert_eq!(p.last_progress, 16);
     }
     #[test]
     #[ignore = "Requires real MTP model and exclusive GPU experiment lock"]
@@ -1554,56 +1638,5 @@ mod policy_tests {
         for req in &mut peers {
             model.finish_request(req, false).unwrap();
         }
-    }
-    #[test]
-    fn profiles_warm_before_comparison_and_revisit_old_lengths() {
-        let mut costs = BTreeMap::<usize, Profile>::new();
-        let plans = [2, 4];
-        for round in 0..3 {
-            assert_eq!(
-                select_profile(&plans, &costs, round, 0, f64::INFINITY, 0.1),
-                Some((4, true))
-            );
-            costs
-                .entry(4)
-                .or_default()
-                .observe(if round == 0 { 1.0 } else { 0.08 }, 3, round + 1);
-        }
-        assert!((costs[&4].score().unwrap() - 0.08 / 3.0).abs() < 1e-12);
-        for round in 3..6 {
-            assert_eq!(
-                select_profile(&plans, &costs, round, 0, f64::INFINITY, 0.1),
-                Some((2, true))
-            );
-            costs.entry(2).or_default().observe(0.06, 1, round + 1);
-        }
-        assert_eq!(
-            select_profile(&plans, &costs, 7, 0, f64::INFINITY, 0.1),
-            Some((4, false))
-        );
-        assert_eq!(
-            select_profile(&plans, &costs, 64, 0, f64::INFINITY, 0.1),
-            Some((4, true))
-        );
-        costs.get_mut(&4).unwrap().observe(0.08, 3, 64);
-        // Ordinary decode advances progress without observing any profile.
-        // Crossing the probe interval must recover exploration anyway.
-        assert_eq!(
-            select_profile(&plans, &costs, 128, 64, f64::INFINITY, 0.1),
-            Some((2, true))
-        );
-        assert_eq!(
-            select_profile(&plans, &costs, 127, 64, f64::INFINITY, 0.1),
-            Some((4, false))
-        );
-        assert_eq!(
-            select_profile(&plans, &costs, 7, 0, 0.07, 0.1),
-            Some((2, false))
-        );
-        assert_eq!(select_profile(&plans, &costs, 128, 64, 0.01, 0.1), None);
-        assert_eq!(
-            select_profile(&[4], &costs, 7, 0, f64::INFINITY, 0.1),
-            Some((4, false))
-        );
     }
 }

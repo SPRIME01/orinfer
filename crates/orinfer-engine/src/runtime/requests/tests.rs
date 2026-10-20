@@ -1,3 +1,4 @@
+mod auto_speculation;
 mod decode_quality;
 mod decode_template;
 mod flash_batch;

@@ -171,13 +171,38 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         .filter(|name| name.starts_with("mtp_") || name.starts_with("qwen_rows/verify/"))
         .cloned()
         .collect();
+    if let Some(table) = m.buffers.iter().find(|b| b.name == "QwenCommitPointers") {
+        if table.dtype != Dtype::U64
+            || table.shape != [LANES * m.batch_layout.as_ref().unwrap().layers.len() * 8]
+        {
+            return Err("Invalid Qwen commit address table".into());
+        }
+        let mut operations = vec![];
+        for (layer, kind) in m.batch_layout.as_ref().unwrap().layers.iter().enumerate() {
+            if kind == "linear_attention" {
+                operations.extend(kernels(
+                    &format!("qwen_rows/commit/layer{layer}"),
+                    &["state", "history"],
+                ));
+            }
+        }
+        m.programs.insert("qwen_rows/commit".into(), operations);
+    }
     let spec = m.mtp.as_mut().unwrap();
     spec.batch_verification_tokens = (2..=8).collect();
     spec.mixed_verification_tokens = spec.batch_verification_tokens.clone();
     spec.batch_draft_profiles = vec![LANES];
     spec.batch_commit = true;
+    spec.commit_state_table = m
+        .buffers
+        .iter()
+        .find(|b| b.name == "QwenCommitPointers")
+        .map(|b| b.name.clone());
     spec.batch_warm = true;
     spec.batch_programs = batch_programs;
+    if spec.commit_state_table.is_some() {
+        spec.batch_programs.push("qwen_rows/commit".into());
+    }
     let kv = m.kv_cache.as_mut().ok_or("Missing MTP KV storage")?;
     for (name, position, tokens, length) in [
         ("mtp_warm", "MtpStep", 512, Some("MtpSegmentLength")),
@@ -217,6 +242,44 @@ pub(super) fn commit(
         return Err("Invalid Qwen MTP commit packet".into());
     }
     let mut out = vec![];
+    if spec.commit_state_table.is_some() {
+        const COLUMNS: &[&str] = &[
+            "VerifyK",
+            "VerifyG",
+            "VerifyUpdate",
+            "AcceptedInputs",
+            "SegmentLength",
+            "State",
+            "HistoryPrefixes",
+            "History",
+        ];
+        let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
+        let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
+            .flat_map(|layer| {
+                let buffers = &buffers;
+                COLUMNS.iter().map(move |&role| {
+                    let name = format!("L{layer}_{role}");
+                    if buffers.contains(name.as_str()) {
+                        Some(name)
+                    } else {
+                        buffers.contains(role).then(|| role.into())
+                    }
+                })
+            })
+            .collect();
+        let bindings = crate::packet::private_bindings(segments, segments.len(), &roles);
+        if include {
+            append(
+                m,
+                &mut out,
+                "qwen_rows/commit",
+                segments.len(),
+                None,
+                &BTreeMap::new(),
+            )?;
+        }
+        return Ok((out, bindings));
+    }
     if include {
         for s in segments {
             append(

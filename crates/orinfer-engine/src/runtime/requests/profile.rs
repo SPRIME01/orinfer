@@ -271,7 +271,10 @@ fn profile_cached_generation() {
                 // Equal proposal widths isolate kernel arithmetic from the
                 // normal latency-adaptive profile selection during validation.
                 if fixture["fixed_speculation"].as_bool() == Some(true) {
-                    request.speculation_costs.clear();
+                    model.dynamic_speculation.fixed_width = Some(
+                        (fixture["mtp_drafts"].as_u64().unwrap() as usize + 1)
+                            .min(request.limit - request.generated),
+                    );
                 }
                 let steps = model
                     .advance_requests(&mut [&mut request], &scheduler::Options::default())
@@ -1411,6 +1414,8 @@ fn profile_adaptive_mtp_decode() {
         iterations: usize,
         repetitions: usize,
         mtp_drafts: usize,
+        #[serde(default)]
+        force_mtp: bool,
     }
     let fixture: Fixture = crate::model::read(&std::path::PathBuf::from(
         std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
@@ -1454,7 +1459,10 @@ fn profile_adaptive_mtp_decode() {
                 [true, false]
             } {
                 model.manifest.mtp = enabled.then(|| mtp.clone());
-                model.batch_speculation_costs.clear();
+                model.dynamic_speculation = Default::default();
+                if enabled && fixture.force_mtp {
+                    model.dynamic_speculation.fixed_width = Some(fixture.mtp_drafts + 1);
+                }
                 let mut requests: Vec<_> = (0..count)
                     .map(|i| {
                         let source = &fixture.cases[i % fixture.cases.len()];
@@ -1486,6 +1494,7 @@ fn profile_adaptive_mtp_decode() {
                         .unwrap();
                 }
                 let before = totals(&requests);
+                let before_depths = model.scheduler_statistics.mtp_depth_histogram.clone();
                 let mut emitted = 0;
                 let began = Instant::now();
                 for _ in 0..fixture.iterations {
@@ -1503,10 +1512,25 @@ fn profile_adaptive_mtp_decode() {
                     assert_eq!(after, [0; 3]);
                     assert_eq!(emitted, count * fixture.iterations);
                 }
+                let depth_histogram: BTreeMap<_, _> = model
+                    .scheduler_statistics
+                    .mtp_depth_histogram
+                    .iter()
+                    .map(|(&depth, &count)| {
+                        (
+                            depth,
+                            count - before_depths.get(&depth).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                if enabled && fixture.force_mtp {
+                    assert!(proposed > 0, "Forced MTP never executed");
+                }
                 let row = json!({"batch":count,"repetition":repetition,"mtp_enabled":enabled,
                     "iterations":fixture.iterations,"committed_tokens":emitted,"wall_s":seconds,
                     "decode_tps":emitted as f64/seconds,"mtp_rounds":after[0]-before[0],
                     "proposed_tokens":proposed,"accepted_draft_tokens":accepted,
+                    "depth_histogram":depth_histogram,"forced":fixture.force_mtp,
                     "acceptance":(proposed>0).then(||accepted as f64/proposed as f64)});
                 eprintln!("adaptive MTP decode {row}");
                 rows.push(row);

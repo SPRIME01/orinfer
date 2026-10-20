@@ -9,7 +9,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 - OpenAI Chat Completions 与 Ollama 原生聊天/生成 API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
 - [JSONL 离线推理](docs/batch.md)：连续批处理、逐条落盘和断点续跑，无需 HTTP 服务。
 - 27B、4B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
-- 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
+- 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。MTP 根据并发、上下文、执行耗时和逐深度接受情况自动选择投机深度，也可回退普通 decode。`--mtp-drafts 1..7` 设置草稿上限，`0` 关闭，`auto` 使用执行包的上限。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
 - CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
 
@@ -48,7 +48,8 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | `--resident-experts` | `full` | 专家全量常驻；Flash Next 可指定每层等效容量，按需从 SSD 加载 |
 | `--prefix-cache-mib` | `12288` | GPU 前缀缓存预算；0 关闭 |
 | `--max-active-requests` | `32` | 活跃请求上限，支持 1–128 |
-| `--max-batch-tokens` | `128` | decode/验证行预算；混合 prefill 可使用执行包容量 |
+| `--max-batch-tokens` | `128` | 普通 decode 行预算；混合 prefill 可使用执行包容量 |
+| `--max-speculative-tokens` | `0` | MTP 总验证行预算；`0` 使用执行包允许的容量 |
 | `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
 
 实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer serve --help`。

@@ -44,6 +44,9 @@ pub struct Spec {
     pub batch_draft_profiles: Vec<usize>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub batch_commit: bool,
+    /// Optional private pointer table consumed by an owner-parallel commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_state_table: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub batch_warm: bool,
     /// Target row counts validated for joint prefill/speculative execution.

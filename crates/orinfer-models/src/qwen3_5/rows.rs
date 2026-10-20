@@ -17,6 +17,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CAPACITY: usize = 4096;
 const LANES: usize = 128;
+fn head_capacity(m: &Manifest) -> usize {
+    m.buffers
+        .iter()
+        .find(|b| b.name == "HeadHidden")
+        .and_then(|b| b.shape.first())
+        .copied()
+        .unwrap_or(LANES)
+}
 const PREFIX: &str = "qwen_rows";
 // This order is the address-table contract compiled into the private kernels.
 const STATE_COLUMNS: &[&str] = &[
@@ -619,7 +627,8 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         "verify" | "restore" => 8,
                         name if name.starts_with("qwen_rows/state/") => LANES,
                         name if name.starts_with("qwen_rows/verify/") => 8,
-                        "qwen_rows/head" => LANES,
+                        "qwen_rows/head" => head_capacity(m),
+                        "qwen_rows/commit" => LANES,
                         _ => CAPACITY,
                     },
                 )
@@ -821,7 +830,7 @@ impl QwenRows {
             .enumerate()
             .map(|(lane, s)| if verified(lane) { s.tokens } else { 1 })
             .sum();
-        if head_rows > LANES
+        if head_rows > head_capacity(m)
             || segments.iter().enumerate().any(|(lane, s)| {
                 verified(lane)
                     && !m
@@ -1685,6 +1694,50 @@ mod tests {
             "verification_plans":[{"tokens":8,"min_tokens":2,"program":"verify","restore_program":"restore","capture_program":"capture"}]
         })).unwrap());
         r
+    }
+
+    #[test]
+    fn owner_parallel_commit_keeps_acceptance_and_compact_stride_private() {
+        let mut r = mtp_request();
+        let layers = r.config["text_config"]["num_hidden_layers"]
+            .as_u64()
+            .unwrap() as usize;
+        for name in ["AcceptedInputs", "SegmentLength"] {
+            if !r.metadata.buffers.iter().any(|b| b.name == name) {
+                r.metadata.buffers.push(serde_json::from_value(json!({"name":name,"dtype":"i32","shape":[1],"layout":"native_contiguous","alignment":256,"access":"read_write"})).unwrap());
+            }
+        }
+        r.metadata.buffers.push(serde_json::from_value(json!({"name":"QwenCommitPointers","dtype":"u64","shape":[128*layers*8],"layout":"native_contiguous","alignment":256,"access":"read_write"})).unwrap());
+        let (a, plan) = create(r, Policy::Int8Quality).unwrap();
+        assert_eq!(
+            plan.metadata
+                .mtp
+                .as_ref()
+                .unwrap()
+                .commit_state_table
+                .as_deref(),
+            Some("QwenCommitPointers")
+        );
+        let segments = [
+            BatchSegment { slot: 7, tokens: 3 },
+            BatchSegment {
+                slot: 31,
+                tokens: 8,
+            },
+        ];
+        let (calls, bindings) = a
+            .batch_operation(&segments, abi::BatchOperation::Commit, true)
+            .unwrap();
+        assert!(calls.iter().all(|c| c.sequence.is_none()));
+        assert!(calls.iter().any(|c|matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/commit/layer0/state")));
+        assert_eq!(bindings.len(), 2 * layers * 8);
+        assert_eq!(bindings[3], Some((7, "AcceptedInputs".into())));
+        assert_eq!(bindings[4], Some((7, "SegmentLength".into())));
+        assert_eq!(
+            bindings[layers * 8 + 3],
+            Some((31, "AcceptedInputs".into()))
+        );
+        assert_eq!(bindings[layers * 8 + 4], Some((31, "SegmentLength".into())));
     }
 
     #[test]

@@ -159,7 +159,7 @@ struct InferenceArgs {
     gpu_lock: PathBuf,
     #[command(flatten)]
     load: LoadArgs,
-    /// auto uses the package default; 0 disables MTP; 1..7 sets draft count.
+    /// auto adapts up to the package default; 0 disables MTP; 1..7 caps drafts.
     #[arg(long, value_name = "N", default_value = "auto")]
     mtp_drafts: MtpDrafts,
     /// Snapshot cache budget in MiB; 0 disables reuse.
@@ -167,9 +167,12 @@ struct InferenceArgs {
     prefix_cache_bytes: usize,
     #[arg(long, default_value_t = ServerConfig::default().scheduler.max_active)]
     max_active_requests: usize,
-    /// Decode/verification row budget; mixed prefill may use the package capacity.
+    /// Ordinary decode row budget; mixed prefill may use the package capacity.
     #[arg(long, default_value_t = ServerConfig::default().scheduler.max_batch_tokens)]
     max_batch_tokens: usize,
+    /// Total MTP verification row budget; 0 uses the package's legal capacity.
+    #[arg(long, default_value_t = 0)]
+    max_speculative_tokens: usize,
     /// Predicted mixed prefill budget in milliseconds (latency policy).
     #[arg(long, default_value_t = ServerConfig::default().scheduler.prefill_budget_ms)]
     prefill_budget_ms: f64,
@@ -241,6 +244,7 @@ impl From<InferenceArgs> for ServerConfig {
                 policy: args.scheduler_policy.unwrap_or_default(),
                 max_active: args.max_active_requests,
                 max_batch_tokens: args.max_batch_tokens,
+                max_speculative_tokens: args.max_speculative_tokens,
                 prefill_budget_ms: args.prefill_budget_ms,
                 target_tpot_ms: args.target_tpot_ms,
                 memory_reserve_bytes: args.memory_reserve_bytes,

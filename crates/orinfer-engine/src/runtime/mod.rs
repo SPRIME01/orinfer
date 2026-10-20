@@ -46,10 +46,7 @@ pub(crate) struct ModelRuntime {
     iteration_costs:
         std::collections::BTreeMap<(usize, usize, usize, usize), crate::scheduler::Estimate>,
     mtp_seconds_per_token: f64,
-    batch_speculation_costs:
-        std::collections::BTreeMap<(usize, usize, usize, usize), requests::SpeculationProfile>,
-    mixed_speculation_costs:
-        std::collections::BTreeMap<(usize, usize, usize, usize), requests::SpeculationProfile>,
+    dynamic_speculation: requests::speculation::control::Controller,
     prompt_lookup: bool,
     startup_costs: std::collections::BTreeMap<(usize, usize, bool), crate::scheduler::Estimate>,
     model_package: crate::model_package::ModelPackage,
@@ -132,8 +129,7 @@ impl ModelRuntime {
             decode_until: None,
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
-            batch_speculation_costs: Default::default(),
-            mixed_speculation_costs: Default::default(),
+            dynamic_speculation: Default::default(),
             prompt_lookup: options.prompt_lookup,
             startup_costs: Default::default(),
             model_package: prepared.execution_model,
