@@ -1,5 +1,7 @@
 # Model execution packages
 
+[简体中文](../model-packages.md) | **English**
+
 The online engine loads model-specific execution logic through a **versioned C ABI**. Model adapters, compute policies, shared runtime components, kernels, and build tools remain in one source workspace. Deployment packages contain a native `.so`, matching cubins, and configuration/layout contracts; the model's weights stay in its model directory. An execution package does not require a separate source repository.
 
 Labels such as A8/A4 describe compute policies, **not uniform precision across every operator**. Packages must declare their actual mixed-precision behavior.
@@ -24,7 +26,7 @@ Schema-1 `cache/model.json` pins the entire `execution_package` by digest. The s
 
 ## Native ABI and execution bindings
 
-The `.so` depends on `orinfer-model-sdk`, not `orinfer-engine`. Its `orinfer_model_v1` export returns a C function table for describe/create/batch/visual operations and corresponding resource release functions. See [orinfer_model.h](../crates/orinfer-model-sdk/include/orinfer_model.h). Rust structs and traits never cross the dynamic-library boundary.
+The `.so` depends on `orinfer-model-sdk`, not `orinfer-engine`. Its `orinfer_model_v1` export returns a C function table for describe/create/batch/visual operations and corresponding resource release functions. See [orinfer_model.h](../../crates/orinfer-model-sdk/include/orinfer_model.h). Rust structs and traits never cross the dynamic-library boundary.
 
 The package `catalog` stores shared assets, compiled implementation definitions, and dynamic-row launch templates. Definitions reference cubin/source/host ABI indices, symbols, blocks, shared memory, cooperative flags, ordered argument types, and read-only contracts. They do **not** store layer numbers, weight names, per-layer arguments, grids, or full execution programs. One cubin may expose distinct ABI/launch contracts; do not deduplicate definitions by binary hash alone.
 
@@ -158,4 +160,4 @@ bash tools/operators/run.sh tools/model/validate_model_package_gpu.py artifacts/
 
 It covers all three Graph modes, changed inputs, and complete logits, but does not establish production-model quality or throughput.
 
-Current native Flash Next packages can be rebuilt with `tools/model/flash_next/build.py`, retuning integer projections against real matrices with content checks and resume support. The rebuild preserves verified state, floating-point reductions, and joint expert combinations from the input package. It requires an existing compatible execution package; intermediate quantized weights are not deployable models. See [Flash Next builds](../tools/model/flash_next/README.md).
+Current native Flash Next packages can be rebuilt with `tools/model/flash_next/build.py`, retuning integer projections against real matrices with content checks and resume support. The rebuild preserves verified state, floating-point reductions, and joint expert combinations from the input package. It requires an existing compatible execution package; intermediate quantized weights are not deployable models. See [Flash Next builds](tools/model/flash_next/README.md).

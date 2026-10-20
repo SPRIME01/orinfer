@@ -1,8 +1,97 @@
 # Performance reference
 
+[简体中文](../performance.md) | **English**
+
 Measured results on **Jetson AGX Orin 64GB / CUDA SM87**, with dates given below. On October 12, 2026, the device ran in MAXN at a GPU frequency of 1300.5 MHz; tests did not alter global power or frequency settings. Measurements use the Rust release CLI and matching optimized execution packages. Changes to native libraries, kernels, or ABI require rebuilding the execution package; CPU-only scheduler changes may reuse it.
 
 **Read the measurement boundary before comparing numbers.** Execution-layer prefill, fixed-length decode, HTTP end-to-end TPS, TTFT, total JSONL job TPS, and GPU-only kernel times are different metrics. Token rates use actual token counts. Full-prefix-hit results are warm-cache upper bounds, not cold-request performance.
+
+## GPU stochastic sampling (2026-10-20)
+
+A shared TileLang GPU sampling program handles penalties, bias, grammar masks, top-k, and top-p while preserving the original counter-based seed. Ordinary stochastic requests read back only selected tokens and state; greedy, probability-reporting, and MTP p/q correction use their established paths. Production model builders publish the same sampler.
+
+Index-Translate-2B Rust release JSONL: eight independent translation requests, temperature 0.8/top-p 0.9/top-k 0/seed 20261002, MTP and prefix disabled. **618 output tokens** completed naturally, with identical content/usage/finish reasons under CPU and GPU sampling. These are full-invocation TPS including loading and persistence:
+
+| Concurrent requests | CPU sampling TPS | GPU sampling TPS |
+| ---: | ---: | ---: |
+| 1 | 41.80 | **77.25** |
+| 4 | 55.08 | **140.68** |
+
+Earlier alternated runs found **39.64–40.19 → 71.85–71.95** TPS at one request and **51.81–52.19 → 122.75–123.09** at four; absolute rates vary with conditions.
+
+One Flash Next 125-input/95-output-token translation with MTP/prefix off improved generation excluding loading from **5.038 → 4.592 s** (**18.86 → 20.69 TPS**), with identical output/usage/finish reasons and GPU-path first output at 0.515 s. Separate load times of 43.099/18.209 s included a 34.023-s weight I/O wait in the former; they do not measure a sampling gain. In the final release, one warmup and three requests gave median **4.861 → 3.777 s** (**19.54 → 25.15 TPS, ~1.29×**). These are stochastic translation results, not greedy-code/MTP measurements.
+
+For each of 27B, Flash Next and 2B, three 64-token seeded sampling and full committed-state checks passed; MTP verification/mixed, partial prefix restoration, unaligned vocabulary sizes, masks, penalties, bias and changed-input Graph replay passed. Compute Sanitizer found no errors.
+
+### Flash Next complete code generation retest
+
+The final release reused the historical 512-token code-generation prompt, greedy seed 20261002, medium thinking, 16,384 total/reasoning budgets, up to three MTP drafts, `decode_only`, fully resident experts, 1,024 MiB prefix cache, one request. Both cold and full-prefix-hit runs naturally produced **8,265 tokens**, including **3,574 reasoning tokens**, with identical output and reasoning.
+
+| Request | Full HTTP time (s) | TTFT (s) | Complete decode TPS |
+| --- | ---: | ---: | ---: |
+| Cold | 189.909 | 1.443 | 43.85 |
+| Full-prefix hit | 165.741 | 0.0164 | **49.87** |
+
+Decode remains `(completion_tokens-1)/(HTTP time-TTFT)`, including reasoning/code and SSE. The warm result exceeds historical 44.99 TPS, but that historical request generated only 6,276 tokens, so one cannot attribute the difference to a specific change. Generated code compiled and **16/17 generated tests passed**; the failing generated test incorrectly assumed a full frame had not arrived after its final payload byte. Do not label this a complete task-test pass.
+
+## Index-Translate-35B shared-path cleanup (2026-10-20)
+
+Index-Translate-35B-A3B-preview reuses Qwen3_5. Attention tuning jointly measures INT8 reads, temporary FP16 KV staging, attention and merge over 1–4,096 rows, odd tails and two context sizes. An old hardcoded 128-row cutoff was removed. 21–64 and 129–193 rows selected the same staging tile; all selections are published from measurements rather than source thresholds.
+
+GDN explicitly declares chunked prefill and four-row deferred decode; native adapters validate declaration, state geometry and MTP contract. Generic compiler/cache/projection tuning/row convergence moved under `tools/model/`, and an unused single-row expert kernel was removed. **1,888 buffer contracts**, weight identities and **8,997 non-attention bindings** stayed identical.
+
+Same weights, Rust release, `decode_only`, two full 65-token runs per length (second measured), with identical output token IDs:
+
+| Input tokens | Prefill TPS (before → after) | Decode TPS (before → after) |
+| ---: | ---: | ---: |
+| 512 | 2362.97 → 2361.93 | 53.90 → 53.78 |
+| 2048 | 3529.98 → 3533.67 | 52.53 → 52.57 |
+| 8192 | 3502.99 → 3499.41 | 48.07 → 48.02 |
+
+Four independent paragraph JSONL translations, naturally completed, greedy seed 20261002, thinking/prefix off. Complete *post-ready* throughput includes queuing, generation, writing and shutdown, and is distinct from process-load TPS.
+
+| Configuration | Post-ready whole-job TPS (before → after) |
+| --- | ---: |
+| 1 request, MTP off | 44.57 → 44.70 |
+| 4 requests, MTP off | 76.43 → 76.87 |
+| 1 request, at most 3 drafts | 43.96 → 44.15 |
+
+The last case performed 38 verification rounds. Responses had minor phrasing differences without losing timing, identifiers or state isolation. Weight-loading waits varied ~3.36–33 seconds in both versions; whole-process 1-request MTP median TPS happened to be **20.03 → 12.17**, not evidence of a compute slowdown. Across 173 teacher-forced positions, short-text (130) target NLL difference from original BF16 changed **-0.01124 → -0.00570 nats/token** and top-1 agreement **97.69 → 98.46%**; 26 long-context/17 vision position probabilities remained unchanged. These are small-sample regressions. Dynamic tails, 2/8-way decode, mixed MTP, vision owner order, cancellation, full weight validation, `make check` and `make check-offline` passed. 32/512-token branch restore was byte-identical for target/draft KV, GDN/convolution, positions and 120 deferred log buffers, Graph on/off.
+
+## Deployment startup (2026-10-19)
+
+The [startup benchmark](tools/bench/README.md) measured real Rust release processes to HTTP readiness and first completed streaming translation. Identical models/weights/packages compared serialized frontend prep and per-tensor CUDA allocation against parallel frontend prep, readonly weight arenas, sharded reads and pipelined DMA. Exhaustive row-shape checks were moved offline for both versions. Each result is a three-process median retaining filesystem cache, excluding GPU lock and exit.
+
+| Model | Ready time (before → after, s) | First output (s) | First request complete (s) |
+| --- | ---: | ---: | ---: |
+| Index-Translate-2B | 2.041 → **0.931** | 2.127 → 1.009 | 2.233 → 1.113 |
+| Index-Translate-9B | 3.348 → **2.261** | 3.461 → 2.380 | 3.794 → 2.714 |
+
+Used `decode_only`, MTP/prefix off, greedy seed 20261002 and thinking off; prompts had 34 input tokens/12 naturally completed output tokens, with matching text/usage/finish reasons. First output is the first nonempty SSE content, potentially multiple tokens. These are warm-filesystem new-process metrics, **not** cold disk or power-cycle timings. CUDA allocations fell **1063 → 209** (2B) and **1272 → 245** (9B), with arena alignment overhead of 6,912/11,456 bytes. Fixed 512/2K/8K, 65-token request outputs matched, prefill/decode rates differed ~2% or less; 2B with up to three MTP drafts preserved image/two-image responses.
+
+## Qwen3.5-4B (2026-10-19)
+
+Official [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), pinned revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Its 32 layers, 2,560 hidden and 9,216 FFN reuse shared Qwen3_5 dynamic row, GDN/GQA, FFN, vision, MTP and state. Embedding/head are tied to the same compressed bank. Backbone, embedding/head and vision matrices use signed-block128 rotated two-stage E8P Q4A8 (`[4,1]`, beam8); sensitive output/MTP use W8 and small tensors stay floating point.
+
+Quantized payload including scales/exceptions: **2,575,068,160 bytes / 4.421 bits per weight**; read-only deployed data with derived constants: **2,608,622,592 bytes**. INT8 KV, FP32 GDN; configured 256K context, measured to 8K. Rust release `run-model`, MTP off, `decode_only`, fixed 65 output tokens, second of two runs:
+
+| Input tokens | Prefill TPS | Decode TPS | First-token time (s) |
+| ---: | ---: | ---: | ---: |
+| 512 | 3278.9 | 54.45 | 0.158 |
+| 2048 | 3401.2 | 52.34 | 0.604 |
+| 8192 | 2797.7 | 45.68 | 2.930 |
+
+Load-to-ready was 3.18 s with filesystem cache retained, versus 4.54 s for separate full weight validation. For same original BF16 teacher-forced histories, fixed seed 20261002:
+
+| Scenario | Positions | Target NLL difference | Top-1 agreement | In BF16 top-3 |
+| --- | ---: | ---: | ---: | ---: |
+| Text | 118 | -0.01596 | 86.44% | 96.61% |
+| 2K/8K long input | 26 | +0.16662 | 88.46% | 100% |
+| Simple/ordered two images | 17 | -0.02180 | 94.12% | 100% |
+
+All 77/16/10 high-confidence positions respectively matched BF16 top-1. These are small quantization probes, not task-quality proof. Both original BF16 and quantized models answered an open-ended prefix-caching question as if about memory-address bits; distinguish knowledge/task weakness from quantization error.
+
+Ordinary 2/3/4/5/8/32 request batches and 24 matched-history verification/mixed cases (width 2/4/8 × request counts 1/2/4/8) had zero KL and selected-token NLL differences. 32/512-token partial prefixes retained target/draft KV, GDN, convolution and positions. A 16-record JSONL job ended normally and resumed without duplicates. Real SSE/Chat with MTP off/up to three drafts covered single, full-prefix hit, eight-way, image and two-image input. Greedy MTP-off outputs matched across repeats; MTP wording sometimes varied without numerical/state regression. A thinking arithmetic task using temperature 1.0/top-p .95/top-k 20/presence 1.5/repetition 1.0, 512 reasoning cap and 4,096 total output returned 391 both MTP off/on (1,010/740 tokens). Greedy 1,024/2,048 caps truncated. Original BF16 also required 2,272 tokens before ending thinking despite a 512 cap. Validate reasoning-tag and total-answer budgets separately.
 
 ## Index-Translate-9B (2026-10-18)
 
@@ -90,7 +179,7 @@ Peak active counts and real batches matched configured levels. For full-cache-hi
 
 Matched-history owner-by-owner checks across 5/8/12/16/24/32/33/64/128 requests with 512/2K inputs yielded 1,288 positions with zero maximum KL and target NLL difference; all selections were within reference top-3. Cancellation, reuse, and reclamation passed. These compare the **same quantized model**, not original BF16.
 
-Earlier single-stream SSE acceptance used [fixed translation prompts](../fixtures/translation-benchmark.json), thinking off, greedy, seed 20261002, 512 output budget, and 512 MiB prefix cache. With one warmup and three identical full-prefix-hit runs per setting, complete-HTTP median output rates were **112.97 TPS without MTP (183 tokens)** and **152.46/153.33/148.77 TPS** with up to 1/2/3 drafts. Time, identifiers, and three paragraphs were preserved despite wording changes. MTP figures do **not** meet the separate 150-TPS-without-MTP goal.
+Earlier single-stream SSE acceptance used [fixed translation prompts](../../fixtures/translation-benchmark.json), thinking off, greedy, seed 20261002, 512 output budget, and 512 MiB prefix cache. With one warmup and three identical full-prefix-hit runs per setting, complete-HTTP median output rates were **112.97 TPS without MTP (183 tokens)** and **152.46/153.33/148.77 TPS** with up to 1/2/3 drafts. Time, identifiers, and three paragraphs were preserved despite wording changes. MTP figures do **not** meet the separate 150-TPS-without-MTP goal.
 
 Against original same-source BF16: eight text cases / 130 teacher-forced positions had **+0.03385 nats/token** target NLL, **96.92%** top-1 agreement, all choices within BF16 top-3, and 96 unchanged high-confidence positions. A 2K/8K terminology subset / 30 positions had +0.13515 NLL and correctly completed the target translations. Convolution/E8P decode optimization preserved probabilities/top choices at 177 text, context, and vision positions; 24 MTP verification/mixed scenarios had zero KL/NLL differences. Partial 32/512-token prefix state and 78 attention cases, all 65,536 E8P codewords, convolution tails, and changed-input Graph replay passed.
 

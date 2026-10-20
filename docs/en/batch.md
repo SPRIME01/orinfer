@@ -1,5 +1,7 @@
 # Offline JSONL inference
 
+[简体中文](../batch.md) | **English**
+
 `orinfer batch` loads a model and processes local files directly, without an HTTP server or Python. It shares the Chat template, tokenizer, sampling, stop handling, continuous batching, prefix cache, and model execution packages with `serve`.
 
 ```bash
@@ -47,7 +49,7 @@ If `model` is omitted, it defaults to the CLI's `--model`; an explicit model mus
 - Offline requests return complete responses. Explicit `stream=true` or `stream_options` is invalid. Streaming settings supplied by deployment defaults are disabled for batch; other defaults merge according to the usual explicit-request precedence.
 - Keep input files, referenced images, and model artifacts unchanged throughout a job and its resumption. The program checks for input file changes but does not persist immutable snapshots of remote images.
 
-The [translation batch fixture](../fixtures/translation-batch.jsonl) can be used as input. Set sufficient output budgets so truncated translations are not mistaken for complete results.
+The [translation batch fixture](../../fixtures/translation-batch.jsonl) can be used as input. Set sufficient output budgets so truncated translations are not mistaken for complete results.
 
 ## Output and resuming
 

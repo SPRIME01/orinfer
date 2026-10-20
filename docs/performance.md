@@ -1,5 +1,7 @@
 # 性能参考
 
+**简体中文** | [English](en/performance.md)
+
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
 ## GPU随机采样（2026-10-20）

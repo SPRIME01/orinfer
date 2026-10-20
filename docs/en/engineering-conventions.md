@@ -1,11 +1,13 @@
 # Engineering conventions
 
+[简体中文](../../AGENTS.md) | **English**
+
 These instructions apply to the entire repository. Explicit user instructions take precedence.
 
 ## Scope
 
 - Target hardware is the local **Jetson AGX Orin 64GB, aarch64 / CUDA SM87**.
-- Supported model families: Qwen3.8-27B (`Qwen3_5`), Qwen3.8-Flash-Next (`qwen4_exp`), and Index-Translate-2B/9B (`Qwen3_5`). Text, single-image, and ordered multi-image inputs are in scope; video is not.
+- Supported model families: Qwen3.8-27B and Qwen3.5-4B (`Qwen3_5`), Qwen3.8-Flash-Next (`qwen4_exp`), and Index-Translate-2B/9B (`Qwen3_5`). Text, single-image, and ordered multi-image inputs are in scope; video is not.
 - Use Rust for online runtime and serving. Production GPU kernels originate in TileLang; Python is for offline conversion, compilation, references, and validation only.
 - Keep model implementations, shared execution components, TileLang kernels, and offline tools in one workspace. Do not split repositories by model × precision. `orinfer-models` independently registers model adapters and compute policies. Deployment Rust `cdylib` packages use a versioned C ABI to generate programs, dynamic batches, and state bindings, shipping matching TileLang cubins. The generic CUDA executor must not hard-code model families, layers, dimensions, or layer order; new architectures must not add core dispatch enums.
 - Prefix caching and multi-request batching are first-class features. Every cache restoration or scheduling change must preserve **all** KV/GDN/convolution/MTP state and request isolation.
@@ -18,6 +20,7 @@ These instructions apply to the entire repository. Explicit user instructions ta
 - Verify GDN, GQA, RoPE, zero-centered RMSNorm, embedding, and output-head semantics against real checkpoint configuration.
 - Recurrent GDN state is FP32. KV, convolution, GDN, positions, and other causal state belong to each request.
 - Index-Translate-2B/9B reuse 27B dynamic GDN/GQA, FFN, vision, MTP, and request-state components with configuration-derived dimensions/head counts; do not clone their execution flow. Backbone, embedding/output head, and large vision matrices use two-stage E8P Q4A8; sensitive output/MTP projections use W8. The 2B tied embedding/head use one K128 compressed bank; 9B keeps separate banks according to the official configuration. Decode and inverse-rotate selected embedding rows on demand, rotate A8 input for the output head, and do not duplicate or permanently expand large weights.
+- Qwen3.5-4B uses 2,560 hidden, 9,216 FFN, 32 layers, 32 GDN value heads, and 16/4 GQA heads. Tied embedding/output head shares one E8P Q4 bank. When the original checkpoint omits `generation_config.json`, pin EOS/padding from model configuration and tokenizer while preserving explicitly supplied generation-config bytes.
 - When changing prefill/decode, restore, or branching, validate **every** state component, not merely KV.
 - KV-growth lists can include both request-private KV and context-growing shared workspaces. Resolve private mappings by owner, shared mappings by session; never assume everything in a growth list belongs to the request arena.
 - Keep one resident compressed W4 representation; count scales, zeros, LUTs, padding, and persistent duplicate representations in average bits per weight. Temporary W8 is not a permanent weight cache.

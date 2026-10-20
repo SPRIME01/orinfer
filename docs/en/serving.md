@@ -1,5 +1,7 @@
 # Serving guide
 
+[简体中文](../serving.md) | **English**
+
 ## Startup and model loading
 
 ```bash
@@ -43,6 +45,29 @@ Limited mode performs CPU scheduling and SSD reads after routing and automatical
 Without this option, ordinary API defaults apply. Explicit request values—including `false`, empty arrays, and `null`—override deployment defaults. An explicit `null` clears the deployment default and then follows that field's normal null handling. Objects replace objects; there is no recursive merge. Clients must still supply `model` and `messages`, which cannot be deployment defaults. Default fields and combinations are validated before the GPU model loads.
 
 The pairs `enable_thinking`/`reasoning_effort` and `max_tokens`/`max_completion_tokens` override as groups: supplying either request field suppresses the group's deployment default. Therefore `enable_thinking=false` or `reasoning_effort=none` disables an enabled deployment default. Conflicts *within* the request return 400. Explicit `stream=false/null` suppresses default `stream_options`; explicit `logprobs=false/null` suppresses default `top_logprobs`. Inspect `/health.default_request_params`.
+
+## Ollama API
+
+Running `orinfer serve` without a single model path also exposes native Ollama APIs at `http://127.0.0.1:8088`:
+
+- `GET /api/version`, `GET /api/tags`, `POST /api/show`, `GET /api/ps`: version, registered models, model details, and loaded models; discovery is CPU-only.
+- `POST /api/chat` and `POST /api/generate`: Chat and generation using native chat templates, streaming NDJSON (`application/x-ndjson`) by default; `stream=false` returns one JSON object.
+- `POST /api/copy` and `DELETE /api/delete`: alias copying and deregistration after active requests finish. Imported weight files remain at their user-owned paths.
+
+```bash
+curl http://127.0.0.1:8088/api/chat \
+  -d '{"model":"index-translate-2b","messages":[{"role":"user","content":"Translate to English: 你好"}],"think":false,"options":{"num_predict":256},"keep_alive":"60s"}'
+```
+
+Supports Boolean or named-level `think`, base64 PNG/JPEG/WebP image messages, tools and tool-result histories, `format="json"` or JSON Schema, and `logprobs/top_logprobs`. `options` supports temperature, top-p, top-k, seed, stop, presence/frequency/repetition penalties and positive `num_predict`. Omitted fields inherit deployment defaults; explicit `think=false` overrides default reasoning. Tool arguments are complete JSON objects, emitted only after full parse when streaming; incomplete invalid arguments return errors.
+
+`keep_alive` accepts numeric seconds, durations such as `"1h30m"`, negative indefinite retention, or `0` to unload after completion. Empty messages/prompts preload; an empty request with `keep_alive=0` unloads. Names without tags accept `:latest`. Both APIs share admission, continuous scheduling, prefix caching and cancellation.
+
+Different models may run simultaneously when memory permits, including simultaneous cold starts; each model has only one worker. Under memory pressure, the manager evicts least-recently-used idle models, including models requested with `keep_alive=-1`. It waits only if active requests/in-flight loads still hold necessary memory, and does not interrupt active generation. Each in-flight load reserves memory until ready or failed.
+
+Responses report actual tokens, cache counts and total duration in nanoseconds, without manufacturing unsupported stage timings or physical VRAM figures. `/api/ps.estimated_load_bytes` is an admission estimate. `ORINFER_API_KEY` protects both `/api` and `/v1`.
+
+Import models through the CLI as native Orinfer packages. Ollama registry pull/push/create, embedding, raw prompt, suffix, Go-template overrides, legacy token context, and automatic truncation/sliding windows are unsupported and return explicit errors. Context is fixed by the execution package; `options.num_ctx` may be absent or equal that size.
 
 ## Chat API
 
@@ -107,7 +132,7 @@ The 27B model and Flash Next packages with vision encoders support images. User 
 
 `detail=low` uses roughly a 256×256 pixel budget; `auto/high` use the smaller of the checkpoint budget and package vision capacity. Preprocessing preserves aspect ratio and aligns dimensions to 32 pixels; each 32×32 region occupies one prompt token. Compressed images are capped at 24 MiB apiece; URL reads time out after 20 seconds. Patch, feature, or total-context overflow returns 400. Sending images to a text-only model also returns 400.
 
-Each image runs separate bidirectional vision attention; merger output is injected at its image tokens. Text uses interleaved MRoPE. Vision encoding executes each time, even when the corresponding processed text prefix is cached. Video and audio are unsupported. See [Vision tools](../tools/vision/README.md).
+Each image runs separate bidirectional vision attention; merger output is injected at its image tokens. Text uses interleaved MRoPE. Vision encoding executes each time, even when the corresponding processed text prefix is cached. Video and audio are unsupported. See [Vision tools](tools/vision/README.md).
 
 ### Tool calling
 
@@ -119,7 +144,7 @@ Unconstrained `auto` calls retain the native XML protocol. Unknown functions or 
 
 ### OpenCode and Pi
 
-The [OpenCode example](../examples/opencode.json) uses `@ai-sdk/openai-compatible`, a default coding agent, automatic compaction, image/tool/thinking support, and `reasoning_content` history passthrough without an agent-step limit. Copy to project `opencode.json` and use the model ID configured with `--model`:
+The [OpenCode example](../../examples/opencode.json) uses `@ai-sdk/openai-compatible`, a default coding agent, automatic compaction, image/tool/thinking support, and `reasoning_content` history passthrough without an agent-step limit. Copy to project `opencode.json` and use the model ID configured with `--model`:
 
 ```bash
 opencode run --model orinfer/qwen-flash-next 'Inspect and fix failing tests in this project'
@@ -128,7 +153,7 @@ opencode run --model orinfer/qwen-flash-next --variant low 'Inspect and fix fail
 
 Thinking defaults off; low/medium/high impose 512/1024/2048 reasoning-token caps within an 8,192-token total output cap. Tool permissions retain OpenCode defaults.
 
-The [Pi example](../examples/pi-models.json) targets `earendil-works/pi`. Merge the provider into Pi's `models.json` (default `~/.pi/agent`). It uses `openai-completions` and allows model/thinking selection with `/model` and `/thinking`:
+The [Pi example](../../examples/pi-models.json) targets `earendil-works/pi`. Merge the provider into Pi's `models.json` (default `~/.pi/agent`). It uses `openai-completions` and allows model/thinking selection with `/model` and `/thinking`:
 
 ```bash
 pi --provider orinfer --model qwen-flash-next --thinking low
@@ -166,7 +191,7 @@ On rejection, per-request GDN, convolution, positions, and live KV state are res
 
 Batch-capable Flash packages let 2–8 decoders share draft projection, target verification, accepted-state commit, and grouped warmup of shifted tokens over real causal segments. Each request drafts again only at its own endpoint; convolution, GDN, QSA, positions, sampling, and constraint parsers remain private. Other concurrency, mixed prefill, and output tails use ordinary target batching. Packages without batch MTP continue per-request selection.
 
-Draft width is selected within the CLI limit using measured whole-iteration cost and committed tokens, including draft, verify, commit, and warmup. Multi-request scheduling first measures ordinary target-batch cost. Low-benefit conclusions carry across context ranges and are periodically re-probed; warmup/capture/module-load costs are excluded from stable estimates. Exploration is bounded by other requests' decode budgets. Benefits depend on acceptance and concurrency; short requests may finish before tuning stabilizes. See [Model tools](../tools/model/README.md).
+Draft width is selected within the CLI limit using measured whole-iteration cost and committed tokens, including draft, verify, commit, and warmup. Multi-request scheduling first measures ordinary target-batch cost. Low-benefit conclusions carry across context ranges and are periodically re-probed; warmup/capture/module-load costs are excluded from stable estimates. Exploration is bounded by other requests' decode budgets. Benefits depend on acceptance and concurrency; short requests may finish before tuning stabilizes. See [Model tools](tools/model/README.md).
 
 ### Prefix cache
 
@@ -215,6 +240,7 @@ Context capacity is set by the package, up to 262,144 tokens. Long prompts prefi
 | `--verify-weights` | off | Full loaded-weight/CPU-table content checks at startup |
 | `--prefix-cache-mib` | `12288` | GPU prefix-cache budget in MiB; 0 disables |
 | `--max-active-requests` | `32` | 1–128 active requests |
+| `--max-speculative-tokens` | `0` | Total MTP verification-row budget; 0 follows package capacity |
 | `--max-batch-tokens` | `128` | 1–128 decode/verification rows; mixed prefill may use package capacity |
 | `--prefill-budget-ms` | `200` | Soft predicted-cost bound on latency-policy mixed chunks |
 | `--target-tpot-ms` | `400` | Soft time-between-engine-token-commits target in latency mode |
@@ -228,7 +254,7 @@ Context capacity is set by the package, up to 262,144 tokens. Long prompts prefi
 
 The default `latency` policy chooses combined or independent prefill by measured whole-iteration cost. Multiple cold requests do not automatically force long inputs into small blocks; unknown combined shapes do not supersede valid native large blocks. Mixed batches and independent prefill share a decode time budget; prompt work is followed by bounded decode bursts (including MTP) while long-waiting prefills still progress. `throughput` removes time quotas and cold-prefill count restrictions and can probe unknown combined shapes, retaining memory admission and isolation; see [Offline batch jobs](batch.md). Compare `/health` counters `independent_prefill_choices`, `joint_prefill_choices`, and `decode_burst_iterations`. Logs report queue time, engine-side TTFT since model-queue admission, generation time, and reasoning tokens. Engine token commit can precede complete client-visible text.
 
-`/health` reports starting/ready/draining/failed plus scheduling, admission, cache restore, and Graph counters. GPU worker failures yield 503; CUDA or internal state faults require restart. See [Benchmark tools](../tools/bench/README.md) for measurements.
+`/health` reports starting/ready/draining/failed plus scheduling, admission, cache restore, and Graph counters. GPU worker failures yield 503; CUDA or internal state faults require restart. See [Benchmark tools](tools/bench/README.md) for measurements.
 
 Startup always checks configuration, execution-library and kernel identity, and the structure/dtype/shape/layout/offsets of weights and CPU-table safetensors, but normally skips SHA256 scans of large weights. Add `--verify-weights` to `serve`, `run-model`, or `score-model` for full content verification. `validate-model` always checks all weight contents. Default structural verification cannot detect corruption that changes only tensor values.
 
@@ -238,4 +264,4 @@ Startup always checks configuration, execution-library and kernel identity, and 
 
 `run-model MODEL_DIR REQUESTS.json` takes token-ID requests for fixed-block, ordinary-decode diagnostic benchmarking and resets per-request state. Input length must be divisible by a declared prefill plan; this is **not** a benchmark for arbitrary-length Chat, MTP, or caching. For those, use the Chat API or Rust `Model::generate`.
 
-`score-model` scores frozen token histories. See [API validation](../tools/api/README.md) for fixed scenario tests and [Quality evaluation](../tools/eval/README.md) for BF16/FP8 references.
+`score-model` scores frozen token histories. See [API validation](tools/api/README.md) for fixed scenario tests and [Quality evaluation](tools/eval/README.md) for BF16/FP8 references.

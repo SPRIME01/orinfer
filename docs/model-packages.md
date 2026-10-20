@@ -1,5 +1,7 @@
 # 模型执行包
 
+**简体中文** | [English](en/model-packages.md)
+
 在线引擎通过版本化 C ABI 加载模型执行逻辑。模型适配器、计算策略、共享执行组件、kernel和构建工具在同一源码workspace维护。部署包包含原生 `.so`、匹配的 cubin 和配置/布局契约；权重仍在模型目录中。部署包不要求对应独立源码仓库。A8/A4 是计算策略，包应声明实际混合精度，不代表所有算子精度相同。
 
 核心负责 API、调度、CUDA context/stream、内存、graph 和 prefix 索引；包负责配置校验、模型执行顺序、融合、动态 batch、状态绑定和视觉位置。增加模型族不需要在核心添加枚举或分派分支。当前原生库为 `orinfer-models`，注册 Qwen3.5 和 Flash Next 的 `int8_quality` 路径。
