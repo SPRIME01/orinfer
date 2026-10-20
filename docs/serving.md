@@ -1,5 +1,7 @@
 # 服务使用指南
 
+**简体中文** | [English](en/serving.md)
+
 ## 启动与模型加载
 
 ```bash

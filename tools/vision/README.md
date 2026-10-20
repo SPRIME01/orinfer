@@ -1,5 +1,7 @@
 # 图片与多图
 
+**简体中文** | [English](../../docs/en/tools/vision/README.md)
+
 27B 与 Flash Next 使用 `kernels/vision/encoder.py` 的共享 ViT 实现，文本模型分别声明 merger 输出维度、特征注入和 MRoPE 状态。27B 通过 [原生构建器](../model/qwen35/README.md)生成包含视觉功能的模型；Flash Next [原生重建](../model/flash_next/README.md)保留输入模型的视觉契约。
 
 在线由 Rust 处理图片预处理、位置生成、请求私有特征表及模型执行。视觉使用一个动态 patch 模板，支持图片和有序多图，不支持视频。默认最大 32768 patches，即 8192 个视觉 tokens；实际输入还受上下文与请求内存预算限制。使用方式见[服务说明](../../docs/serving.md)。

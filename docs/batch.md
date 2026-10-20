@@ -1,5 +1,7 @@
 # JSONL 离线推理
 
+**简体中文** | [English](en/batch.md)
+
 `orinfer batch` 直接加载模型处理本地文件，无需 HTTP 服务或 Python。它与 `serve` 共用 Chat 模板、tokenizer、采样、停止判断、连续批处理、prefix cache 和模型执行包。
 
 ```bash

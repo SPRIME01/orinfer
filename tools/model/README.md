@@ -1,5 +1,7 @@
 # 离线模型构建
 
+**简体中文** | [English](../../docs/en/tools/model/README.md)
+
 Python 用于权重准备、TileLang 编译、调优和验证；在线加载、执行与服务由 Rust 完成。
 
 ## 支持的构建入口

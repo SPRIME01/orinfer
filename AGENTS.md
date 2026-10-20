@@ -1,5 +1,7 @@
 # 工程约定
 
+**简体中文** | [English](docs/en/engineering-conventions.md)
+
 本文件适用于整个仓库；用户明确指令优先。
 
 ## 范围

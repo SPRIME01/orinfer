@@ -1,5 +1,7 @@
 # API验证
 
+**简体中文** | [English](../../docs/en/tools/api/README.md)
+
 `smoke.py`只作为客户端连接运行中的真实模型服务，覆盖任意输入长度、EOS、SSE/usage、固定seed、stop、排队和断开后的状态隔离、错误格式，以及带整数参数的工具调用和结果回传。输出路径必须不存在；启用服务鉴权时从环境变量`ORINFER_API_KEY`读取凭据。
 
 ```bash
