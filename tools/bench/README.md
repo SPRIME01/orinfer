@@ -1,42 +1,44 @@
-# 性能工具
+# Benchmark tools
 
-当前 Flash Next 的 Rust CLI / Chat API 实测与 27B 历史参考见[性能参考](../../docs/performance.md)。该文档分别列出执行层 prefill、输入 tokens / API TTFT、排除 TTFT 的 decode，以及完整 prefix 命中时延；本目录各工具的整请求吞吐不能直接替代这些指标。
+See [Performance reference](../../docs/performance.md) for measured Flash Next Rust CLI/Chat API results and historical 27B results. That reference distinguishes execution-layer prefill, input tokens versus API TTFT, decode excluding TTFT, and full-prefix-hit latency. **Whole-request throughput measured here must not be substituted for those metrics.**
 
-`reference_bench.py`测量兼容OpenAI SSE接口的prefill/TTFT与decode时间；`test_reference_bench.py`检查token chunk和计时间隔。
+`reference_bench.py` measures prefill/TTFT and decode against an OpenAI-compatible SSE endpoint; `test_reference_bench.py` tests token chunks and timing intervals. Record reference server configuration and identity in `reference-lock.json` in the output directory. Supply explicit input tokens via `--seed-tokens /path/to/input-tokens.json`. This workload requires token-ID input/output, fixed-length generation, and optionally separate timing diagnostics; ordinary Chat requests are not interchangeable.
 
-参考服务的配置及身份须记录在输出目录的`reference-lock.json`中，输入token由`--seed-tokens /path/to/input-tokens.json`显式提供。请求要求服务支持token-ID输入/输出、固定长度生成和可选的独立计时诊断；不能直接用普通Chat请求代替。
+`run_aot_artifact.sh MANIFEST NEW_OUTPUT` builds the Rust CLI and runs an AOT fixture while recording process and machine identity. Use `tools/model/run.sh` for full-model inference. `sample_machine.py` and `sample_continuous.py` read temperatures, clock speeds, memory, and power without changing global settings. GPU jobs share `artifacts/gpu-experiment.lock`. `validate_plan.py` validates benchmark/quick-quality configurations on CPU; it does not measure performance.
 
-`run_aot_artifact.sh MANIFEST NEW_OUTPUT`构建Rust CLI并执行AOT fixture，保留实际运行身份和机器状态。模型完整推理使用`tools/model/run.sh`。
+## Code generation, MTP, and translation
 
-`sample_machine.py`和`sample_continuous.py`只读记录机器温度、频率、内存和功耗；不会改动全局设置。GPU运行入口共享`artifacts/gpu-experiment.lock`。
-
-`validate_plan.py`校验benchmark与快速评测配置，属于CPU检查，不产生性能测量。
-
-`code_generation.py` 用相同 Chat 请求测量 thinking、MTP 和 prefix cache 的组合，输入采用下方 `concurrency.py` 的 cases 格式：
+`code_generation.py` measures combinations of thinking, MTP, and prefix caching through the same Chat requests. Input uses the `concurrency.py` case format described below:
 
 ```bash
 python3 -m tools.bench.code_generation --requests code-requests.json \
   --repetitions 3 --output artifacts/code-generation.json
 ```
 
-每个 case 先执行一次预热，再重复请求；输出保留全部正文、思考文本、usage、首 token、首正文时间、实际缓存 token 命中率和 scheduler 差值。吞吐按已提交的 completion tokens 除以完整 HTTP 耗时计算，包含 thinking、prefill 和传输，不将 MTP 草稿或 SSE chunk 当作 token。报告单独列出空正文及预算截断，不能用提前结束的响应替代完整代码性能或质量验收。测冷请求需先重启自己的服务或使用新前缀；服务配置和输入保持一致，测量期间应独占接口。
+Each case gets one warmup followed by repeated requests. Reports retain full answer and reasoning text, usage, first-token/first-content timing, actual cached-token hit rate, and scheduler counter deltas. TPS is **committed completion tokens divided by complete HTTP time**, including reasoning, prefill, and transport. MTP drafts and SSE chunks are not token counts. Empty answers and budget truncation are reported separately; an early-ended response is not valid evidence of complete coding performance or quality. For cold measurements, restart your own server or change the prefix. Keep service and inputs fixed, with exclusive API access during measurement.
 
-该工具也适用于翻译任务：以 `--requests fixtures/translation-benchmark.json` 测量完整译文，核对三个段落、时间和标识符。固定 batch 的 `benchmark_flash_decode_template` 诊断由引擎输出预算控制长度，不额外添加 EOS logit bias，避免将普通 greedy 测成需要整词表回读的 CPU 采样路径；它不包含 HTTP 或排队时间。
+Translation workloads can use `--requests fixtures/translation-benchmark.json`; check all three paragraphs, timing information, and identifiers. The fixed-batch `benchmark_flash_decode_template` diagnostic controls length through engine output budget without artificial EOS logit bias, so ordinary greedy decode is not accidentally converted into CPU full-vocabulary sampling. It excludes HTTP and queuing time.
 
-`concurrency.py`以真实SSE请求测量1..128并发，输入为`{ "cases": [{ "id": "case", "request": { ...Chat API body... } }] }`：
+## Concurrency and health statistics
+
+`concurrency.py` measures 1–128 concurrent real SSE requests. Input has the shape `{"cases":[{"id":"case","request":{... Chat API body ...}}]}`:
 
 ```bash
 python3 tools/bench/concurrency.py --requests requests.json \
   --concurrency 1 2 4 8 16 32 128 --repetitions 3 --output artifacts/concurrency.json
 ```
 
-报告包括真实usage输出token数、整轮吞吐、TTFT分位数、缓存tokens及每请求结果。吞吐包含排队、prefill、HTTP和输出，不能直接当作GPU纯decode TPS；流式chunk间隔也不能当作token ITL。重复请求会命中prefix cache；测冷请求时需构造不同输入或关闭cache。`/health.scheduler_statistics`提供prefill实际计算tokens、引擎提交的decode tokens、batch直方图、混合迭代及峰值活跃数。
+Reports include true usage-based output-token counts, whole-round throughput, TTFT percentiles, cached tokens, and per-request results. Throughput includes queuing, prefill, HTTP, and output; it is **not GPU-only decode TPS**. SSE chunk gaps are not necessarily token ITL. Repeated prompts may hit prefix cache, so vary input or disable caching for cold comparisons. `/health.scheduler_statistics` exposes actual prefill compute tokens, engine-committed decode tokens, batch histograms, mixed iterations, and peak active requests.
 
-健康接口还提供准入、request startup、prefix恢复、prefill完成、batch输入准备/计划/提交及Graph统计。`batch_execution`记录batch Graph命中、未命中、捕获的kernel/copy/memset操作数、淘汰、地址变化失效和分项耗时；单请求/MTP程序运行期间的新捕获另记`sequence_captures/sequence_capture_s`。这些是累计主机计时，replay包含同步等待，不能视为CUDA event的GPU时间。`request_start_s`包含`prefix_restore_s`，batch Graph分项包含在`compute_s`中；单程序捕获可能发生在startup或计算阶段，不能把这些重叠计时重复相加。
+Health data also covers admission, request startup, prefix restore, prefill completion, batch input preparation/planning/commit, and CUDA Graphs. `batch_execution` reports batch Graph hits/misses, captured kernel/copy/memset node counts, eviction, address-change invalidation, and component timing. Single-request/MTP captures are separately counted under `sequence_captures/sequence_capture_s`.
 
-工具在发送请求前、整轮完成后取得健康快照，并输出`scheduler_delta`和`admission_delta`；累计峰值不作差值。测量期间应独占服务，重启导致计数器回退时会报错。`admission_statistics`记录各轮处理的请求数、完整缓存命中的文本请求数、准入直方图及墙钟时间；它包含策略、显存准入检查和request startup。
+These counters accumulate **host time**; replay can include synchronization waits, so they are not CUDA-event GPU durations. `request_start_s` includes `prefix_restore_s`, and batch Graph components are already part of `compute_s`. Single-program capture may occur during startup or compute; do not sum overlapping counters as independent time.
 
-`benchmark_prefill_scheduling`是默认跳过的真实GPU基准，比较同一模型的联合prefill与逐请求大块prefill。夹具包含`model`、新的`output`路径、`cuda_graph`、`batches`（2..8）、`repetitions`、`output_tokens`及`cases`；case使用`GenerationInput`字段`input_tokens`、`max_new_tokens`、`sampling`，只接受文本输入。采样应设置`temperature: 0`、`seed: 20261002`。关闭本项目GPU服务后，在独占实验锁下运行：
+The tools take health snapshots before sending requests and after completion, then report `scheduler_delta` and `admission_delta`. Cumulative peaks are not subtracted. Use exclusive server access; counter resets after restart are treated as errors. `admission_statistics` records counts per round, full-cache-hit text requests, admission histograms, and wall time, including policy, memory checks, and startup.
+
+## Joint versus independent prefill
+
+`benchmark_prefill_scheduling` is an ignored real-GPU test comparing joint prefill against large, per-request prefill for the *same model*. Its fixture provides `model`, a new `output` path, `cuda_graph`, `batches` (2–8), `repetitions`, `output_tokens`, and text-only `cases` with `GenerationInput` fields `input_tokens`, `max_new_tokens`, and `sampling`. Use `temperature: 0` and `seed: 20261002`. Stop your own GPU service and hold the experiment lock:
 
 ```bash
 ORINFER_BATCH_FIXTURE=artifacts/prefill-scheduling-fixture.json \
@@ -44,25 +46,47 @@ ORINFER_BATCH_FIXTURE=artifacts/prefill-scheduling-fixture.json \
   cargo test --release --offline -p orinfer-engine benchmark_prefill_scheduling -- --ignored --nocapture
 ```
 
-基准关闭MTP和prefix复用，交换两条路径的测试顺序，分别记录准入、所有请求完成prefill的吞吐、每请求TTFT和后续batch decode。Prefill计时包含head和首token选择，TTFT另含准入；整个cohort完成prefill后才开始decode，未测量在线混合调度的ITL。联合路径使用算子包声明的分块，逐请求路径使用其最大可用单请求块；不同块可能采用不同量化码本。输出token差异用于诊断，不能替代独立BF16/FP8质量验收。每个请求另校验最终位置及KV回收。
+The test disables MTP and prefix reuse, alternates path order, and separately records admission, aggregate time to prefill completion, per-request TTFT, and subsequent batch decode. Prefill timing includes head and first-token selection; TTFT also includes admission. Decode begins after the cohort has finished prefill, so this does not measure online mixed-scheduling ITL.
 
-`mixed.py`先预热一个文本`anchor`，启动指定数量的缓存命中请求，在每条流收到若干有效输出片段后注入一个冷请求。输入为`{ "anchor": { ...Chat API body... }, "cold_cases": [{ "id": "cold", "anchor_count": 2, "request": { ... }, "expected_prompt_tokens": 8192, "target_text": "CODE-641" }] }`。所有请求使用`temperature: 0`、`seed: 20261002`；anchor须足够长以保持生成。每个并发档位的冷请求应在输入开头使用不同标识，避免跨轮缓存；`anchor_count`限定case适用的档位，省略时适用于所有档位。提示token数和任务答案字段可省略。
+Joint paths use package-declared chunks; independent paths use their largest valid per-request chunk. Different blocks may choose different quantization codebooks. Token differences are diagnostic, not an independent BF16/FP8 quality result. Each request also checks final positions and KV reclamation.
+
+## Mixed warm/cold requests
+
+`mixed.py` warms one text `anchor`, launches a specified number of prefix-hit anchors, and injects a cold request after each stream has delivered a set number of valid output chunks.
+
+Input shape:
+
+```json
+{
+  "anchor": {"model":"MODEL_ID","messages":[{"role":"user","content":"..."}]},
+  "cold_cases": [{"id":"cold","anchor_count":2,"request":{},
+    "expected_prompt_tokens":8192,"target_text":"CODE-641"}]
+}
+```
+
+Set `temperature: 0` and `seed: 20261002` on all requests. Anchors must generate long enough to remain active. Use a distinct identifier at the beginning of each cold prompt to prevent cross-round cache hits. `anchor_count` restricts which concurrency counts a case runs under (omitted means all). Expected prompt tokens and target text are optional.
 
 ```bash
 python3 -m tools.bench.mixed --requests mixed-requests.json \
   --anchor-counts 1 2 4 8 --trigger-chunks 4 --output artifacts/mixed.json
 ```
 
-报告包含无注入对照、长请求TTFT、anchor输出吞吐、长请求prefill期间重叠的SSE片段间隔及引擎计数器差值。跨越注入边界的停顿也计入；片段间隔不是token ITL。要求anchor完整命中prefix，冷请求命中不超过5%，通过准入计数检查无其他流量。测试采用服务当前配置，包括自适应MTP；纯decode吞吐与关闭MTP的基准应另测。
+Reports include no-injection controls, cold-request TTFT, anchor output throughput, overlapping SSE chunk intervals during long prefill, and engine-counter deltas. The boundary-crossing stall is included; chunks are not token ITL. Tests require full prefix hits for anchors and no more than 5% cold-prompt cache hits, verified through admission counters, with no other traffic. The server's actual adaptive MTP settings apply; run separate pure-decode/disabled-MTP baselines.
 
-`acceptance.py`执行带延迟到达的异构任务验收，覆盖长短文本、图片、多图和多轮分支。JSON含`cases: [{id, request, expected_words}]`、可选`warmup: [id]`与`rounds: [{id, jobs: [{case, delay_s}]}]`；每轮最多128个提交请求。答案检查仅用于明确的标签/简短答案任务，忽略大小写和分隔符；并发吞吐从真实usage计算。输出保存每轮scheduler/admission差值、活跃/排队峰值及每请求结果，拒绝不完整SSE或任务答案错误。
+## Heterogeneous delayed-arrival acceptance
+
+`acceptance.py` validates delayed arrival of short/long text, images, multiple images, and multiround branching. JSON supports `cases: [{id, request, expected_words}]`, optional `warmup: [id]`, and `rounds: [{id, jobs: [{case, delay_s}]}]` with at most 128 requests submitted per round.
+
+Answer checks are limited to unambiguous labels/short answers and ignore case/separators. Concurrent throughput comes from actual usage. Results retain scheduler/admission deltas, active/queued peaks, and per-request outcomes. Incomplete SSE and incorrect expected answers fail the run.
 
 ```bash
 python3 -m tools.bench.acceptance --requests acceptance-requests.json \
   --output artifacts/acceptance.json
 ```
 
-`validate_flash_decode_batches` 使用同一 `ORINFER_BATCH_FIXTURE` 格式，检查 2/3/4/8/16/32 请求的同历史 logits/top3/NLL、图片与多图、取消/槽位复用，以及 target batch 后继续 MTP。需 native Flash batch 包和独占 GPU 锁：
+## Flash Next GPU packet tests
+
+`validate_flash_decode_batches` accepts the same `ORINFER_BATCH_FIXTURE` shape and checks 2/3/4/8/16/32 requests against matched-history logits/top-3/NLL, images, ordered multi-image inputs, cancellation/slot reuse, and continued MTP after target batching. It requires a native Flash batch package and exclusive GPU lock:
 
 ```bash
 ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
@@ -70,12 +94,28 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
   cargo test --release --offline -p orinfer-engine validate_flash_decode_batches -- --ignored --nocapture
 ```
 
-该检查关闭 prefix cache，对照同权重、相同冷 prefill 和 teacher-forced 历史的单序列执行，验证 batch 迁移的算术与隔离；不替代原始 BF16/FP8 量化质量验收。性能与缓存命中的功能验收另用真实 Chat/SSE 的 `concurrency.py`、`acceptance.py` 测量。
+This disables prefix cache and compares identical weights, cold prefill, and teacher-forced histories against single-sequence execution. It establishes arithmetic/state isolation in the batch path, not original BF16/FP8 quantization quality. Use real Chat/SSE `concurrency.py` and `acceptance.py` for functional throughput/cache acceptance.
 
-`validate_flash_heterogeneous_scheduling` 使用相同夹具格式，第一条 case 的输入须至少 4096 tokens，第二条为短请求。它分别检查两条 cold prefill 和已开始 decode 的短请求与长 prefill 混跑，确认长请求保留原生大块、活跃 decoder 期间块长受限、连续 decode 有推进，以及相同分块和 teacher-forced 历史下的 KL/NLL/top3；同样需要独占 GPU 锁。独立最大块与中断分块的首 token 分布差异另行记录，不当作状态隔离或 BF16 量化质量验收。`validate_flash_bounded_prefill` 接受按成本选择的联合或独立路径，不要求每轮都混合。
+`validate_flash_heterogeneous_scheduling` uses the same fixture. The first case must contain at least 4,096 input tokens; the second must be short. It tests two cold prefills and mixing an already decoding short request with a long prefill. It verifies large native chunks for standalone long requests, bounded chunk sizes with active decoders, continued decode progress, and KL/NLL/top-3 under identical chunking and teacher-forced history. Independent large-chunk versus interrupted-chunk first-token differences are reported separately and are not state-isolation or BF16-quality verdicts. `validate_flash_bounded_prefill` accepts either cost-selected joint or independent execution instead of requiring every iteration to be mixed. Run under the GPU lock.
 
-`validate_flash_long_generation_reuse` 使用相同夹具格式，前两条 case 为压力提示和后续验证提示；后者须包含原生 4096-token prefill。它先记录后续提示的冷请求 logits 与完整已提交状态，再强制执行 16384 个 decode tokens（含 MTP）、保存生成缓存并复用槽位，检查冷请求和完整 prefix 命中与参考的分块、logits、KV/GDN/卷积/PLE/MTP 状态一致。引擎测试刻意继续处理 EOS 来保证压力长度，任务输出正确性另用真实 Chat API 验证；同样需要独占 GPU 锁。
+`validate_flash_long_generation_reuse` uses the same fixture with a stress prompt and a follow-up prompt; the latter must include a native 4,096-token prefill. The test first captures cold follow-up logits and full committed state, then forces 16,384 decode tokens (including MTP), caches generated prefixes, reuses slots, and compares cold/fully cached follow-ups against reference chunking, logits, and KV/GDN/convolution/PLE/MTP state. Engine tests intentionally continue beyond EOS to reach stress length; separately check task correctness via real Chat. Requires the GPU lock.
 
-固定到达时间的混合请求验收使用 `python -m tools.bench.scheduling --requests TRACE.json --output RESULT.json`。输入为 `{"requests":[{"id":"short-1","at_s":0.1,"request":{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}}]}`，最多 128 条；同一时刻可提交多条请求。到达时间不依赖前一请求是否完成，报告客户端到达误差、TTFT、整请求耗时和最大流式 chunk 间隔的 P50/P95/P99，以及失败数、有效输出吞吐、成功请求的 prefix 请求/token 命中率和调度统计。chunk 间隔不能当成 token ITL。比较调度版本时使用相同 trace、模型包、缓存/MTP/Graph 配置，分别测试冷缓存与预热后的缓存。
+## Scheduled mixed-arrival trace
 
-`profile_vision_stages` 是默认跳过的真实模型诊断，使用 `ORINFER_BATCH_FIXTURE` 中的 `model`、新 `output` 路径和带 `images` 的 `GenerationInput` cases。它按实际图片网格绑定视觉程序，记录整段热 Graph 与逐算子 GPU 时延；`ncu: true` 对实际 launch 添加 NVTX 区间。图片解码、resize、特征复制和文本生成不在该计时内，完整图片翻译性能须另测 Chat API。通过同一个 GPU 锁运行 `cargo test --release -p orinfer-engine profile_vision_stages -- --ignored --nocapture --test-threads=1`。
+Use `python -m tools.bench.scheduling --requests TRACE.json --output RESULT.json` to replay a fixed arrival schedule (up to 128 requests). Input example:
+
+```json
+{"requests":[{"id":"short-1","at_s":0.1,"request":{"model":"MODEL_ID","messages":[{"role":"user","content":"Hello"}],"max_tokens":16}}]}
+```
+
+Arrivals are scheduled independently of prior request completion; multiple jobs may arrive together. Reports include arrival-time error, TTFT, whole-request time, and largest SSE chunk gap at P50/P95/P99, failure count, valid output TPS, successful-request prefix hit ratios (requests and tokens), and scheduler statistics. Chunk gaps must not be treated as token ITL. Compare scheduler versions using the same trace, package, cache/MTP/Graph settings, and both cold and warmed caches.
+
+## Vision-stage profiling
+
+`profile_vision_stages` is an ignored real-model diagnostic using a fixture with `model`, a new `output` path, and image-bearing `GenerationInput` cases. It binds actual image grids, measures end-to-end warm vision Graphs and per-operator GPU latency, and optionally adds NVTX ranges to launches with `ncu: true`. Image decoding, resizing, feature copying, and text generation are **excluded**. Measure complete image translation separately via Chat API.
+
+```bash
+ORINFER_BATCH_FIXTURE=/absolute/path/to/vision-fixture.json \
+  flock artifacts/gpu-experiment.lock \
+  cargo test --release -p orinfer-engine profile_vision_stages -- --ignored --nocapture --test-threads=1
+```
