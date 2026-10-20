@@ -28,6 +28,7 @@ def _gdn_sequence(
     key_heads: int = 16,
     value_heads: int = 48,
     shared_state: bool = False,
+    initial_state=None,
 ):
     HK, HV = key_heads, value_heads
     if min(HK, HV) <= 0 or HV % HK:
@@ -83,7 +84,9 @@ def _gdn_sequence(
             predicted = T.alloc_fragment((value_tile,), T.float32)
             result = T.alloc_fragment((value_tile,), T.float32)
             update = T.alloc_fragment((value_tile,), T.float32)
-            if shared_state:
+            if initial_state is not None:
+                initial_state(state, State, h, bv)
+            elif shared_state:
                 T.copy(State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile], state_tile)
                 T.copy(state_tile, state)
             else:

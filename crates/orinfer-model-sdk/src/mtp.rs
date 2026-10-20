@@ -47,6 +47,11 @@ pub struct Spec {
     /// Optional private pointer table consumed by an owner-parallel commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_state_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_table: Option<CausalTable>,
+    /// Joined token rows for warm; independent request/head capacity is separate.
+    #[serde(default, skip_serializing_if = "crate::model::is_zero")]
+    pub batch_warm_capacity: usize,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub batch_warm: bool,
     /// Target row counts validated for joint prefill/speculative execution.
@@ -58,6 +63,27 @@ pub struct Spec {
     /// Prefix/factor capacity is shared between widths within each owner arena.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shared_verification_state: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalTable {
+    pub buffer: String,
+    pub columns: Vec<String>,
+    pub row_offset: String,
+    /// Verification and accepted-prefix commit retain exact pending GDN updates.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<CausalAttention>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CausalAttention {
+    pub min_tokens: usize,
+    pub max_tokens: usize,
+    pub program: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

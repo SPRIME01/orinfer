@@ -180,6 +180,15 @@ impl ModelRuntime {
         } else {
             "target"
         };
+        self.prepare_sequence_program_inputs(slot, program, tokens, history)
+    }
+    fn prepare_sequence_program_inputs(
+        &mut self,
+        slot: usize,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> Result<()> {
         let manifest = &self.manifest;
         let execution = &mut self.execution;
         self.model_package

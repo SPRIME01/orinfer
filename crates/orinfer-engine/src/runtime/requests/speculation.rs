@@ -375,9 +375,7 @@ impl ModelRuntime {
         )?;
         for (&(i, width), cursor) in selected.iter().zip(cursors) {
             if grouped_draft {
-                match self.with_request(requests[i], |model, req| {
-                    model.start_speculative_round(req, width, Some(cursor))
-                }) {
+                match self.start_speculative_round(requests[i], width, Some(cursor)) {
                     Ok(DraftPreparation::Finished(tokens)) => {
                         self.scheduler_statistics.decode_tokens += tokens.len();
                         output.push(StepOutput { request: i, tokens });
@@ -419,7 +417,7 @@ impl ModelRuntime {
                 rounds.push((i, Self::finish_drafts(requests[i], build)?));
             }
         }
-        if rounds.len() == 1 && prefills.is_empty() {
+        if rounds.len() == 1 && prefills.is_empty() && !self.deferred_verification() {
             let (i, round) = rounds.pop().unwrap();
             let result = self.with_request(requests[i], |model, req| {
                 model.verify_single_round(req, &round)?;
@@ -448,23 +446,44 @@ impl ModelRuntime {
         };
         for (i, round) in &rounds {
             let req = &mut requests[*i];
-            self.execution.activate_sequence(req.slot)?;
-            // Shared verification entries map KV using the live width, not
-            // the capacity or the preceding prefill's workspace control.
-            self.upload_segment_controls(round.plan.tokens)?;
-            self.execution
-                .ensure_sequence_program(req.slot, &round.plan.program)?;
-            self.upload_ids(&self.manifest.input, &round.verification)?;
-            self.prepare_verification_inputs(
+            self.execution.ensure_sequence_program_at(
+                req.slot,
+                &round.plan.program,
+                round.position,
+                round.plan.tokens,
+            )?;
+            self.execution.upload_sequence_ids(
+                req.slot,
+                &self.manifest.input,
+                &round.verification,
+            )?;
+            self.prepare_sequence_program_inputs(
+                req.slot,
                 &round.plan.program,
                 &round.verification,
                 &req.history[..req.history.len() - 1],
             )?;
-            self.upload_segment_controls(round.plan.tokens)?;
+            self.upload_sequence_segment_controls(req.slot, round.plan.tokens)?;
             segments.push(BatchSegment {
                 slot: req.slot,
                 tokens: round.plan.tokens,
             });
+        }
+        if let Some(table) = self
+            .manifest
+            .mtp
+            .as_ref()
+            .and_then(|s| s.verification_table.as_ref())
+        {
+            let mut offset = 0;
+            for segment in &segments {
+                self.execution.upload_sequence_bytes(
+                    segment.slot,
+                    &table.row_offset,
+                    &(offset as u32).to_le_bytes(),
+                )?;
+                offset += segment.tokens;
+            }
         }
         let operation = if prefills.is_empty() {
             orinfer_model_sdk::abi::BatchOperation::Verification
@@ -475,7 +494,14 @@ impl ModelRuntime {
         };
         let (plan, bindings) = self.model_package.cached_batch(&segments, operation)?;
         if !bindings.is_empty() {
-            return Err("Unexpected verification state table".into());
+            let table = self
+                .manifest
+                .mtp
+                .as_ref()
+                .and_then(|s| s.verification_table.as_ref())
+                .ok_or("Missing verification pointer table")?;
+            self.execution
+                .upload_sequence_addresses(&table.buffer, std::rc::Rc::clone(&bindings))?;
         }
         self.execution.execute_batch_operation(
             operation,
@@ -516,16 +542,14 @@ impl ModelRuntime {
             requests[i].mtp.verification_s +=
                 seconds * round.plan.tokens as f64 / total_rows as f64;
             if grouped_commit {
-                let result = self.with_request(requests[i], |model, req| {
-                    model.sample_verified_round(
-                        req,
-                        round,
-                        Some((
-                            &values[..width],
-                            &values[control_width..control_width + width],
-                        )),
-                    )
-                });
+                let result = self.sample_verified_round(
+                    requests[i],
+                    round,
+                    Some((
+                        &values[..width],
+                        &values[control_width..control_width + width],
+                    )),
+                );
                 match result {
                     Ok(round) => committed.push((i, round)),
                     Err(_) if requests[i].failure().is_some() => output.push(StepOutput {
@@ -552,36 +576,21 @@ impl ModelRuntime {
             let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
             let mut segments = vec![];
             for (i, round) in &committed {
-                self.execution.activate_sequence(requests[*i].slot)?;
-                self.upload_ids(&spec.accepted_inputs, &[round.tokens.len() as u32])?;
+                self.execution.upload_sequence_ids(
+                    requests[*i].slot,
+                    &spec.accepted_inputs,
+                    &[round.tokens.len() as u32],
+                )?;
                 segments.push(BatchSegment {
                     slot: requests[*i].slot,
                     tokens: round.plan.tokens,
                 });
             }
-            if segments.len() >= 2 {
-                let (plan, bindings) = self
-                    .model_package
-                    .cached_batch(&segments, orinfer_model_sdk::abi::BatchOperation::Commit)?;
-                if !bindings.is_empty() {
-                    let table = self
-                        .manifest
-                        .mtp
-                        .as_ref()
-                        .and_then(|s| s.commit_state_table.as_ref())
-                        .ok_or("Missing commit pointer table contract")?;
-                    self.execution
-                        .upload_sequence_addresses(table, std::rc::Rc::clone(&bindings))?;
-                }
-                self.execution.execute_batch_operation(
-                    orinfer_model_sdk::abi::BatchOperation::Commit,
-                    segments.iter().map(|s| (s.slot, s.tokens)).collect(),
-                    &plan,
-                    true,
-                    true,
-                )?;
+            if segments.len() >= 2 || self.deferred_verification() {
+                self.commit_spec_packet(&segments)?;
             } else {
                 let round = &committed[0].1;
+                self.execution.activate_sequence(segments[0].slot)?;
                 self.launch_rows(
                     &round.plan.restore_program,
                     round.plan.tokens,
@@ -593,9 +602,7 @@ impl ModelRuntime {
             if grouped_warm {
                 for (i, round) in &committed {
                     requests[*i].mtp.restore_s += restore_s;
-                    self.with_request(requests[*i], |model, req| {
-                        model.restore_verified_cursor(req, round, true)
-                    })?;
+                    self.restore_verified_cursor(requests[*i], round, true)?;
                 }
                 self.warm_committed_batch(requests, &committed)?;
             }
@@ -611,9 +618,7 @@ impl ModelRuntime {
             };
             for ((i, round), position) in committed.into_iter().zip(positions) {
                 let tokens = if grouped_warm {
-                    self.with_request(requests[i], |model, req| {
-                        model.finish_warmed_commit(req, round, position)
-                    })?
+                    self.finish_warmed_commit(requests[i], round, position)?
                 } else {
                     requests[i].mtp.restore_s += restore_s;
                     self.with_request(requests[i], |model, req| {
@@ -626,6 +631,36 @@ impl ModelRuntime {
         }
         Ok(())
     }
+    fn deferred_verification(&self) -> bool {
+        self.manifest
+            .mtp
+            .as_ref()
+            .and_then(|s| s.verification_table.as_ref())
+            .is_some_and(|t| t.deferred)
+    }
+    fn commit_spec_packet(&mut self, segments: &[BatchSegment]) -> Result<()> {
+        use orinfer_model_sdk::abi::BatchOperation;
+        let (plan, bindings) = self
+            .model_package
+            .cached_batch(segments, BatchOperation::Commit)?;
+        if !bindings.is_empty() {
+            let table = self
+                .manifest
+                .mtp
+                .as_ref()
+                .and_then(|s| s.commit_state_table.as_ref())
+                .ok_or("Missing commit pointer table contract")?;
+            self.execution
+                .upload_sequence_addresses(table, std::rc::Rc::clone(&bindings))?;
+        }
+        self.execution.execute_batch_operation(
+            BatchOperation::Commit,
+            segments.iter().map(|s| (s.slot, s.tokens)).collect(),
+            &plan,
+            true,
+            true,
+        )
+    }
     fn execute_spec_packet(
         &mut self,
         segments: &[BatchSegment],
@@ -633,7 +668,30 @@ impl ModelRuntime {
     ) -> Result<()> {
         let (plan, bindings) = self.model_package.cached_batch(segments, phase)?;
         if !bindings.is_empty() {
-            return Err("Unexpected MTP packet state table".into());
+            let table = self
+                .manifest
+                .mtp
+                .as_ref()
+                .and_then(|s| s.verification_table.as_ref())
+                .filter(|_| {
+                    matches!(
+                        phase,
+                        orinfer_model_sdk::abi::BatchOperation::Verification
+                            | orinfer_model_sdk::abi::BatchOperation::MixedRows { .. }
+                    )
+                })
+                .ok_or("Missing speculative pointer table")?;
+            let mut offset = 0;
+            for segment in segments {
+                self.execution.upload_sequence_ids(
+                    segment.slot,
+                    &table.row_offset,
+                    &[offset as u32],
+                )?;
+                offset += segment.tokens;
+            }
+            self.execution
+                .upload_sequence_addresses(&table.buffer, std::rc::Rc::clone(&bindings))?;
         }
         self.execution.execute_batch_operation(
             phase,
@@ -650,10 +708,12 @@ impl ModelRuntime {
     ) -> Result<()> {
         use orinfer_model_sdk::abi::BatchOperation;
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
-        let capacity = *spec
-            .batch_draft_profiles
-            .last()
-            .ok_or("Missing warm batch capacity")?;
+        let capacity = spec.batch_warm_capacity.max(
+            *spec
+                .batch_draft_profiles
+                .last()
+                .ok_or("Missing warm batch capacity")?,
+        );
         let at = Instant::now();
         let mut cursor = 0;
         while cursor < committed.len() {
@@ -670,11 +730,16 @@ impl ModelRuntime {
                 if live != tokens {
                     return Err("Accepted warm chain exceeds native capacity".into());
                 }
-                self.execution.activate_sequence(requests[*i].slot)?;
-                self.upload_ids(&spec.input, &round.tokens)?;
-                self.prepare_program_inputs(&warm.program, &round.tokens, &[])?;
+                let slot = requests[*i].slot;
                 self.execution
-                    .ensure_sequence_program(requests[*i].slot, &warm.program)?;
+                    .upload_sequence_ids(slot, &spec.input, &round.tokens)?;
+                self.prepare_sequence_program_inputs(slot, &warm.program, &round.tokens, &[])?;
+                self.execution.ensure_sequence_program_at(
+                    slot,
+                    &warm.program,
+                    round.position,
+                    tokens,
+                )?;
                 segments.push(BatchSegment {
                     slot: requests[*i].slot,
                     tokens,
@@ -722,12 +787,18 @@ impl ModelRuntime {
             let mut segments = vec![];
             for &j in &advancing {
                 let (i, draft) = &drafts[j];
-                self.execution
-                    .ensure_sequence_program(requests[*i].slot, &spec.draft_program)?;
-                self.prepare_program_inputs(
+                let slot = requests[*i].slot;
+                self.prepare_sequence_program_inputs(
+                    slot,
                     &spec.draft_program,
                     &[*draft.round.drafts.last().unwrap()],
                     &[],
+                )?;
+                self.execution.ensure_sequence_program_at(
+                    slot,
+                    &spec.draft_program,
+                    draft.round.position + draft.round.drafts.len() - 1,
+                    1,
                 )?;
                 segments.push(BatchSegment {
                     slot: requests[*i].slot,
@@ -758,9 +829,7 @@ impl ModelRuntime {
                 .read_sequence_controls(&slots, [spec.token.as_str(), spec.status.as_str()])?;
             for (j, control) in active.into_iter().zip(controls) {
                 let (i, draft) = &mut drafts[j];
-                match self.with_request(requests[*i], |model, req| {
-                    model.consume_draft(req, draft, Some(control))
-                }) {
+                match self.consume_draft(requests[*i], draft, Some(control)) {
                     Ok(()) => {}
                     Err(_) if requests[*i].failure().is_some() => {
                         draft.done = true;
@@ -847,6 +916,12 @@ impl ModelRuntime {
             return Ok(DraftPreparation::Finished(vec![]));
         }
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
+        if cursors.is_none()
+            || cursors.is_some_and(|v| v[0] != v[1])
+            || spec.draft_snapshot_program.is_some()
+        {
+            self.execution.activate_sequence(req.slot)?;
+        }
         let valid = self.refresh_request_mtp_at(req, true, cursors)?;
         let position = match cursors {
             Some(values) => values[0],
@@ -865,6 +940,7 @@ impl ModelRuntime {
             .flatten();
         let pending = *req.history.last().ok_or("Missing pending token")?;
         let Some(plan) = plan else {
+            self.execution.activate_sequence(req.slot)?;
             self.execute_target_tail(req)?;
             let out = self.commit_ordinary_token(req)?;
             if valid {
@@ -933,7 +1009,7 @@ impl ModelRuntime {
         }
     }
     fn consume_draft(
-        &self,
+        &mut self,
         req: &mut RequestState,
         build: &mut DraftRound,
         controls: Option<[i32; 2]>,
@@ -970,6 +1046,7 @@ impl ModelRuntime {
                 })? {
                 Some(token) => token,
                 None => {
+                    self.execution.activate_sequence(req.slot)?;
                     let raw = self
                         .execution
                         .download_bytes(&spec.draft_logits, vocab * 4)?;
@@ -989,13 +1066,15 @@ impl ModelRuntime {
                 }
             };
             if token != selected as u32 {
-                self.upload_ids(&spec.token, &[token])?;
+                self.execution
+                    .upload_sequence_ids(req.slot, &spec.token, &[token])?;
             }
             draft_decoder.consume(token).inspect_err(|error| {
                 req.decoder.fail(error.clone());
             })?;
             token
         } else {
+            self.execution.activate_sequence(req.slot)?;
             let raw = self
                 .execution
                 .download_bytes(&spec.draft_logits, vocab * 4)?;
@@ -1020,7 +1099,8 @@ impl ModelRuntime {
                 token,
                 distribution,
             });
-            self.upload_ids(&spec.token, &[token])?;
+            self.execution
+                .upload_sequence_ids(req.slot, &spec.token, &[token])?;
             draft_decoder.consume(token).inspect_err(|error| {
                 req.decoder.fail(error.clone());
             })?;
@@ -1150,6 +1230,7 @@ impl ModelRuntime {
                     Some(token) => token,
                     None => {
                         if logits.is_none() {
+                            self.execution.activate_sequence(req.slot)?;
                             let raw = self.execution.download_bytes(
                                 &spec.verification_logits,
                                 plan.tokens * vocab * 4,
@@ -1175,6 +1256,7 @@ impl ModelRuntime {
             }
             committed
         } else {
+            self.execution.activate_sequence(req.slot)?;
             let raw = self
                 .execution
                 .download_bytes(&spec.verification_logits, plan.tokens * vocab * 4)?;
@@ -1235,16 +1317,24 @@ impl ModelRuntime {
             is_lookup,
         } = round;
         let at = Instant::now();
+        if !restored || spec.draft_restore_program.is_some() {
+            self.execution.activate_sequence(req.slot)?;
+        }
         if !restored && (spec.commit_always || committed.len() < plan.tokens) {
             self.upload_ids(&spec.accepted_inputs, &[committed.len() as u32])?;
             self.launch_rows(&plan.restore_program, plan.tokens, ExecutionPhase::Decode)?;
         }
         if restored || spec.commit_always || committed.len() < plan.tokens {
-            self.upload_ids(
+            self.execution.upload_sequence_ids(
+                req.slot,
                 &self.manifest.position,
                 &[(*position + committed.len()) as u32],
             )?;
-            self.upload_ids(&spec.target_length, &[(*position + committed.len()) as u32])?;
+            self.execution.upload_sequence_ids(
+                req.slot,
+                &spec.target_length,
+                &[(*position + committed.len()) as u32],
+            )?;
         }
         req.mtp.restore_s += at.elapsed().as_secs_f64();
         req.history.extend_from_slice(committed);
@@ -1253,19 +1343,21 @@ impl ModelRuntime {
         if !*is_lookup && let Some(restore) = &spec.draft_restore_program {
             self.launch_program(restore, ExecutionPhase::Decode)?;
         }
-        self.upload_ids(&spec.position, &[*position as u32])?;
+        self.execution
+            .upload_sequence_ids(req.slot, &spec.position, &[*position as u32])?;
         req.mtp.refresh_s += at.elapsed().as_secs_f64();
         Ok(())
     }
     fn finish_warmed_commit(
-        &self,
+        &mut self,
         req: &mut RequestState,
         round: CommittedRound,
         position: Option<usize>,
     ) -> Result<Vec<u32>> {
         let committed = round.tokens;
         req.warm.tokens = round.position + committed.len();
-        self.upload_ids(
+        self.execution.upload_sequence_ids(
+            req.slot,
             &self.manifest.token,
             &[*committed.last().expect("nonempty commit")],
         )?;
@@ -1298,7 +1390,20 @@ impl ModelRuntime {
         round: PreparedRound,
     ) -> Result<Vec<u32>> {
         let committed = self.sample_verified_round(req, round, None)?;
-        self.finish_verified_round(req, committed, false)
+        let deferred = self.deferred_verification();
+        if deferred {
+            let spec = self.manifest.mtp.as_ref().ok_or("Missing MTP adapter")?;
+            self.execution.upload_sequence_ids(
+                req.slot,
+                &spec.accepted_inputs,
+                &[committed.tokens.len() as u32],
+            )?;
+            self.commit_spec_packet(&[BatchSegment {
+                slot: req.slot,
+                tokens: committed.plan.tokens,
+            }])?;
+        }
+        self.finish_verified_round(req, committed, deferred)
     }
 }
 

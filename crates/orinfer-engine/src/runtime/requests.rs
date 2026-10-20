@@ -1744,6 +1744,23 @@ impl ModelRuntime {
         }
         Ok(())
     }
+    pub(super) fn upload_sequence_segment_controls(
+        &mut self,
+        slot: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        if let Some(controls) = &self.manifest.segment_controls {
+            let tokens = u32::try_from(tokens).map_err(|_| "Segment length exceeds u32")?;
+            self.execution
+                .upload_sequence_ids(slot, &controls.length, &[tokens])?;
+            self.execution.upload_sequence_ids(
+                slot,
+                &controls.last_index,
+                &[tokens.checked_sub(1).ok_or("Empty segment")?],
+            )?;
+        }
+        Ok(())
+    }
     fn prepare_batch_inputs(
         &mut self,
         requests: &mut [&mut RequestState],

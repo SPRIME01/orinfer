@@ -1,7 +1,10 @@
 //! Resolve immutable model bindings once per stable decode cohort.
 use super::{Result, sequence::Sequence};
 use orinfer_model_sdk::abi::StateBindings;
-use std::{collections::BTreeSet, rc::Rc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    rc::Rc,
+};
 
 struct Resolved {
     bindings: Rc<StateBindings>,
@@ -11,12 +14,12 @@ struct Resolved {
 
 #[derive(Default)]
 pub(super) struct StateTable {
-    current: Option<Resolved>,
+    recent: VecDeque<Resolved>,
 }
 
 impl StateTable {
     pub(super) fn invalidate(&mut self) {
-        self.current = None;
+        self.recent.clear();
     }
 
     pub(super) fn resolve(
@@ -24,15 +27,21 @@ impl StateTable {
         bindings: Rc<StateBindings>,
         sequences: &[Sequence],
     ) -> Result<Rc<[u8]>> {
-        if let Some(cached) = &self.current
-            && Rc::ptr_eq(&cached.bindings, &bindings)
+        if let Some(index) = self
+            .recent
+            .iter()
+            .position(|entry| Rc::ptr_eq(&entry.bindings, &bindings))
         {
+            let cached = &self.recent[index];
             // The retained Rc prevents identity reuse or in-place mutation.
             // Lease validity can change without replacing any allocation.
             for &slot in &cached.owners {
                 Self::owner(sequences, slot)?;
             }
-            return Ok(Rc::clone(&cached.bytes));
+            let cached = self.recent.remove(index).unwrap();
+            let bytes = Rc::clone(&cached.bytes);
+            self.recent.push_back(cached);
+            return Ok(bytes);
         }
         let capacity = bindings
             .len()
@@ -54,7 +63,11 @@ impl StateTable {
             bytes.extend_from_slice(&address.to_le_bytes());
         }
         let bytes: Rc<[u8]> = bytes.into();
-        self.current = Some(Resolved {
+        const CAPACITY: usize = 8;
+        if self.recent.len() == CAPACITY {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(Resolved {
             bindings,
             owners: owners.into_iter().collect(),
             bytes: Rc::clone(&bytes),
@@ -116,5 +129,21 @@ mod tests {
         let changed = Rc::new(vec![None, Some((1, "state".into()))]);
         let new = table.resolve(changed, &arenas).unwrap();
         assert_eq!(&*new, [0u64.to_le_bytes(), 73u64.to_le_bytes()].concat());
+    }
+
+    #[test]
+    fn alternating_program_tables_reuse_resolved_bytes() {
+        let mut arenas = [arena(42), arena(73)];
+        let verify = Rc::new(vec![Some((0, "state".into()))]);
+        let commit = Rc::new(vec![Some((1, "state".into()))]);
+        let mut table = StateTable::default();
+        let first = table.resolve(Rc::clone(&verify), &arenas).unwrap();
+        table.resolve(commit, &arenas).unwrap();
+        assert!(Rc::ptr_eq(
+            &first,
+            &table.resolve(Rc::clone(&verify), &arenas).unwrap()
+        ));
+        arenas[0].leased = false;
+        assert!(table.resolve(verify, &arenas).is_err());
     }
 }

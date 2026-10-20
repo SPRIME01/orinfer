@@ -224,6 +224,9 @@ class Builder:
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
+        from tools.model.qwen35 import causal_parallel
+
+        causal_parallel.build(self)
         from tools.model.qwen35 import commit
 
         commit.build(self)

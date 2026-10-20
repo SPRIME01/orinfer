@@ -171,9 +171,13 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         .filter(|name| name.starts_with("mtp_") || name.starts_with("qwen_rows/verify/"))
         .cloned()
         .collect();
-    if let Some(table) = m.buffers.iter().find(|b| b.name == "QwenCommitPointers") {
+    let commit_table = m.mtp.as_ref().and_then(|s| s.verification_table.as_ref());
+    let table_name = commit_table
+        .map_or("QwenCommitPointers", |t| t.buffer.as_str())
+        .to_owned();
+    if let Some(table) = m.buffers.iter().find(|b| b.name == table_name) {
         if table.dtype != Dtype::U64
-            || table.shape != [LANES * m.batch_layout.as_ref().unwrap().layers.len() * 8]
+            || table.shape != [LANES * layers.len() * commit_table.map_or(8, |t| t.columns.len())]
         {
             return Err("Invalid Qwen commit address table".into());
         }
@@ -196,12 +200,80 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
     spec.commit_state_table = m
         .buffers
         .iter()
-        .find(|b| b.name == "QwenCommitPointers")
+        .find(|b| b.name == table_name)
         .map(|b| b.name.clone());
     spec.batch_warm = true;
+    spec.batch_warm_capacity = m
+        .buffers
+        .iter()
+        .find(|b| b.name == "MtpHidden")
+        .and_then(|b| b.shape.first())
+        .copied()
+        .unwrap_or(LANES);
     spec.batch_programs = batch_programs;
     if spec.commit_state_table.is_some() {
         spec.batch_programs.push("qwen_rows/commit".into());
+    }
+    if let Some(table) = &spec.verification_table {
+        if table.columns.is_empty()
+            || (!table.attention.is_empty()
+                && ((2..=8).any(|width| {
+                    table
+                        .attention
+                        .iter()
+                        .filter(|choice| (choice.min_tokens..=choice.max_tokens).contains(&width))
+                        .count()
+                        != 1
+                }) || table.attention.iter().any(|choice| {
+                    choice.min_tokens < 2
+                        || choice.max_tokens > 8
+                        || choice.min_tokens > choice.max_tokens
+                        || choice.program.is_empty()
+                })))
+            || table.columns.iter().collect::<BTreeSet<_>>().len() != table.columns.len()
+            || !m.buffers.iter().any(|b| {
+                b.name == table.buffer
+                    && b.dtype == Dtype::U64
+                    && b.shape == [LANES * layers.len() * table.columns.len()]
+            })
+            || !m
+                .buffers
+                .iter()
+                .any(|b| b.name == table.row_offset && b.dtype == Dtype::I32 && b.shape == [1])
+        {
+            return Err("Invalid Qwen causal pointer table".into());
+        }
+        for (layer, kind) in layers.iter().enumerate() {
+            let names = if kind == "linear_attention" {
+                let mut names = vec!["gates", "history", "conv"];
+                if !table.deferred && m.buffers.iter().any(|b| b.name.ends_with("_GdnLogCount")) {
+                    names.push("recurrent_materialize");
+                }
+                names.extend(["recurrent", "factors", "gated_norm"]);
+                names
+            } else if table.attention.is_empty() {
+                vec!["prepare", "attention", "attention_merge"]
+            } else {
+                vec!["prepare"]
+            };
+            let program = format!("qwen_rows/verify_state/layer{layer}");
+            m.programs
+                .insert(program.clone(), kernels(&program, &names));
+            spec.batch_programs.push(program);
+            if kind != "linear_attention" {
+                for choice in &table.attention {
+                    let program = format!("qwen_rows/verify_state/layer{layer}/{}", choice.program);
+                    if m.programs.contains_key(&program) {
+                        continue;
+                    }
+                    m.programs.insert(
+                        program.clone(),
+                        kernels(&program, &["attention", "attention_merge"]),
+                    );
+                    spec.batch_programs.push(program);
+                }
+            }
+        }
     }
     let kv = m.kv_cache.as_mut().ok_or("Missing MTP KV storage")?;
     for (name, position, tokens, length) in [
@@ -234,7 +306,7 @@ pub(super) fn commit(
 ) -> Result<abi::BatchPlan> {
     let spec = m.mtp.as_ref().ok_or("Missing Qwen MTP")?;
     let mut owners = BTreeSet::new();
-    if !(2..=LANES).contains(&segments.len())
+    if !(1..=LANES).contains(&segments.len())
         || segments
             .iter()
             .any(|s| !owners.insert(s.slot) || !spec.batch_verification_tokens.contains(&s.tokens))
@@ -253,11 +325,15 @@ pub(super) fn commit(
             "HistoryPrefixes",
             "History",
         ];
+        let columns: Vec<_> = spec.verification_table.as_ref().map_or_else(
+            || COLUMNS.to_vec(),
+            |t| t.columns.iter().map(String::as_str).collect(),
+        );
         let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
         let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
             .flat_map(|layer| {
                 let buffers = &buffers;
-                COLUMNS.iter().map(move |&role| {
+                columns.iter().map(move |&role| {
                     let name = format!("L{layer}_{role}");
                     if buffers.contains(name.as_str()) {
                         Some(name)
@@ -309,7 +385,13 @@ pub(super) fn draft(
         .try_fold(0usize, |n, s| n.checked_add(s.tokens))
         .ok_or("Draft row overflow")?;
     if segments.is_empty()
-        || total > LANES
+        || segments.len() > LANES
+        || total
+            > if operation == abi::BatchOperation::Warm {
+                spec_warm_capacity(m)
+            } else {
+                LANES
+            }
         || segments.iter().any(|s| {
             s.tokens == 0
                 || !owners.insert(s.slot)
@@ -471,4 +553,10 @@ pub(super) fn draft(
         }
     }
     Ok((out, vec![]))
+}
+
+fn spec_warm_capacity(m: &Manifest) -> usize {
+    m.mtp
+        .as_ref()
+        .map_or(LANES, |s| s.batch_warm_capacity.max(LANES))
 }

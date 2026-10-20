@@ -626,6 +626,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         | "mtp_advance" => 512,
                         "verify" | "restore" => 8,
                         name if name.starts_with("qwen_rows/state/") => LANES,
+                        name if name.starts_with("qwen_rows/verify_state/") => LANES,
                         name if name.starts_with("qwen_rows/verify/") => 8,
                         "qwen_rows/head" => head_capacity(m),
                         "qwen_rows/commit" => LANES,
@@ -825,6 +826,51 @@ impl QwenRows {
             return Err("Invalid Qwen causal row packet".into());
         }
         let verified = |lane: usize| prefills.is_some_and(|n| lane >= n);
+        let causal = prefills.and_then(|_| m.mtp.as_ref()?.verification_table.as_ref());
+        let mut causal_groups = BTreeMap::<&str, Vec<BatchSegment>>::new();
+        if let Some(table) = causal {
+            for segment in &segments[prefills.unwrap()..] {
+                let program = if table.attention.is_empty() {
+                    ""
+                } else {
+                    table
+                        .attention
+                        .iter()
+                        .find(|choice| {
+                            (choice.min_tokens..=choice.max_tokens).contains(&segment.tokens)
+                        })
+                        .ok_or("Missing causal attention selection")?
+                        .program
+                        .as_str()
+                };
+                causal_groups
+                    .entry(program)
+                    .or_default()
+                    .push(BatchSegment {
+                        slot: segment.slot,
+                        tokens: segment.tokens,
+                    });
+            }
+        }
+        let causal_bindings = || {
+            let table = causal.unwrap();
+            let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
+            let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
+                .flat_map(|layer| {
+                    let buffers = &buffers;
+                    table.columns.iter().map(move |role| {
+                        let name = format!("L{layer}_{role}");
+                        if buffers.contains(name.as_str()) {
+                            Some(name)
+                        } else {
+                            buffers.contains(role.as_str()).then(|| role.clone())
+                        }
+                    })
+                })
+                .collect();
+            let decoders: Vec<_> = causal_groups.values().flatten().cloned().collect();
+            crate::packet::private_bindings(&decoders, decoders.len(), &roles)
+        };
         let head_rows: usize = segments
             .iter()
             .enumerate()
@@ -844,7 +890,9 @@ impl QwenRows {
         if !include_plan {
             return Ok((
                 vec![],
-                if prefills.is_none() {
+                if causal.is_some() {
+                    causal_bindings()
+                } else if prefills.is_none() {
                     self.state_bindings(segments)
                 } else {
                     vec![]
@@ -912,11 +960,46 @@ impl QwenRows {
                     &empty,
                 )?;
             }
-            for (lane, (segment, v)) in segments
-                .iter()
-                .zip(&views)
-                .enumerate()
-                .filter(|(_, (s, _))| !parallel || s.tokens != 1)
+            if let Some(table) = causal {
+                append(
+                    m,
+                    &mut out,
+                    &format!("{PREFIX}/verify_state/layer{layer}"),
+                    segments.len() - prefills.unwrap(),
+                    None,
+                    &empty,
+                )?;
+                if layout.layers[layer] != "linear_attention" && !table.attention.is_empty() {
+                    let stride = layout.layers.len() * table.columns.len() * 8;
+                    let mut first = 0;
+                    for (program, group) in &causal_groups {
+                        let view = BTreeMap::from([(
+                            table.buffer.clone(),
+                            BufferView {
+                                buffer: table.buffer.clone(),
+                                offset: first * stride,
+                            },
+                        )]);
+                        append(
+                            m,
+                            &mut out,
+                            &format!("{PREFIX}/verify_state/layer{layer}/{program}"),
+                            group.len(),
+                            None,
+                            &view,
+                        )?;
+                        first += group.len();
+                    }
+                }
+            }
+            for (lane, (segment, v)) in
+                segments
+                    .iter()
+                    .zip(&views)
+                    .enumerate()
+                    .filter(|(lane, (s, _))| {
+                        (!parallel || s.tokens != 1) && !(causal.is_some() && verified(*lane))
+                    })
             {
                 append(
                     m,
@@ -1041,7 +1124,9 @@ impl QwenRows {
         }
         Ok((
             out,
-            if prefills.is_none() {
+            if causal.is_some() {
+                causal_bindings()
+            } else if prefills.is_none() {
                 self.state_bindings(segments)
             } else {
                 vec![]

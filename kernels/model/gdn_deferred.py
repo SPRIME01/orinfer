@@ -143,3 +143,106 @@ def materialize(capacity, *, key_heads=16, value_heads=48, value_tile=16, thread
                     Count[h, bv * vt + j] = 0
 
     return main
+
+
+def verification(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, threads=32):
+    """Verify from base plus pending updates without an intermediate writeback."""
+    from tvm import tirx as tir
+    from kernels.model.gdn_sequence import _gdn_sequence
+    import inspect
+
+    hk, hv, vt = key_heads, value_heads, value_tile
+    logs = [
+        tir.decl_buffer(shape, dtype, name=name)
+        for name, shape, dtype in [
+            ("LogK", (capacity, hk, 128), "float16"),
+            ("LogD", (capacity, hv, 128), "float32"),
+            ("LogG", (capacity, hv), "float32"),
+            ("Count", (hv, 128), "int32"),
+        ]
+    ]
+    logk, logd, logg, count = logs
+    replay = pending_updates(capacity, hk, hv, vt, threads)
+
+    @T.macro
+    def initialize(state, Base, h, bv):
+        for i, j in T.Parallel(128, vt):
+            state[i, j] = Base[h, i, bv * vt + j]
+        replay(state, logk, logd, logg, count[h, bv * vt], h, bv)
+
+    fn = inspect.unwrap(_gdn_sequence)(
+        tokens,
+        value_tile=vt,
+        threads=threads,
+        compact=True,
+        dynamic_rows=True,
+        key_heads=hk,
+        value_heads=hv,
+        initial_state=initialize,
+    )
+    params = list(fn.params) + [b.data for b in logs]
+    return tir.PrimFunc(
+        params, fn.body, fn.ret_type, dict(fn.buffer_map) | {b.data: b for b in logs}, fn.attrs
+    )
+
+
+def commit(capacity, *, key_heads=16, value_heads=48, tokens=8, value_tile=16, threads=128):
+    """Append an exact accepted prefix; canonicalize only when its log fills."""
+    hk, hv, vt = key_heads, value_heads, value_tile
+    validate_geometry(capacity, hk, hv, vt, threads)
+    pending = pending_updates(capacity, hk, hv, vt, threads)
+    advance = rank_one(vt, staged=True)
+
+    @T.prim_func
+    def main(
+        K: T.Tensor((hk * tokens * 128,), T.float16),
+        G: T.Tensor((tokens, hv), T.float32),
+        Update: T.Tensor((tokens, hv, 128), T.float32),
+        Accepted: T.Tensor((1,), T.int32),
+        Length: T.Tensor((1,), T.int32),
+        State: T.Tensor((hv, 128, 128), T.float32),
+        LogK: T.Tensor((capacity, hk, 128), T.float16),
+        LogD: T.Tensor((capacity, hv, 128), T.float32),
+        LogG: T.Tensor((capacity, hv), T.float32),
+        Count: T.Tensor((hv, 128), T.int32),
+    ):
+        with T.Kernel(128 // vt, hv, threads=threads) as (bv, h):
+            phase = T.alloc_local((1,), T.int32)
+            phase[0] = Count[h, bv * vt]
+            keys = T.alloc_shared((tokens, 128), T.float16)
+            for t, i in T.Parallel(tokens, 128):
+                if t < Accepted[0]:
+                    keys[t, i] = K[(h // (hv // hk) * Length[0] + t) * 128 + i]
+            T.sync_threads()
+            if phase[0] + Accepted[0] >= capacity:
+                state = T.alloc_fragment((128, vt), T.float32)
+                delta = T.alloc_fragment((vt,), T.float32)
+                T.annotate_layout({state: state_layout(vt, threads)})
+                for i, j in T.Parallel(128, vt):
+                    state[i, j] = State[h, i, bv * vt + j]
+                pending(state, LogK, LogD, LogG, phase[0], h, bv)
+                for t in T.serial(tokens):
+                    if t < Accepted[0]:
+                        for j in T.Parallel(vt):
+                            delta[j] = Update[t, h, bv * vt + j]
+                        advance(state, keys, delta, T.exp(G[t, h]), 0, t, h, bv)
+                for i, j in T.Parallel(128, vt):
+                    State[h, i, bv * vt + j] = state[i, j]
+                for j in T.Parallel(vt):
+                    Count[h, bv * vt + j] = 0
+            else:
+                for t, j in T.Parallel(tokens, vt):
+                    if t < Accepted[0]:
+                        LogD[phase[0] + t, h, bv * vt + j] = Update[t, h, bv * vt + j]
+                for j in T.Parallel(vt):
+                    Count[h, bv * vt + j] = phase[0] + Accepted[0]
+                if bv == 0:
+                    for t in T.Parallel(tokens):
+                        if t < Accepted[0]:
+                            LogG[phase[0] + t, h] = G[t, h]
+                    if h % (hv // hk) == 0:
+                        for t, i in T.Parallel(tokens, 128):
+                            if t < Accepted[0]:
+                                LogK[phase[0] + t, h // (hv // hk), i] = keys[t, i]
+
+    return main

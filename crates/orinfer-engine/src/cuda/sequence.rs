@@ -1004,6 +1004,18 @@ impl Executor {
         }
         self.upload_bytes(name, bytes)
     }
+    pub(crate) fn upload_sequence_ids(
+        &mut self,
+        slot: usize,
+        name: &str,
+        ids: &[u32],
+    ) -> Result<()> {
+        let bytes = ids.len().checked_mul(4).ok_or("Sequence input overflow")?;
+        // SAFETY: Initialized u32 storage is copied into owned pinned staging
+        // before upload_sequence_bytes returns; no host pointer is retained.
+        let raw = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), bytes) };
+        self.upload_sequence_bytes(slot, name, raw)
+    }
     fn address(
         &self,
         name: &str,
