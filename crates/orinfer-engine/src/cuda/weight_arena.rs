@@ -1,17 +1,17 @@
-//! Immutable weight slices share one owner allocation; request state stays private.
+//! Aligned buffer slices share one allocation without sharing arena ownership.
 use crate::{
     artifact::{Buffer, Result},
     weights::TensorIdentity,
 };
 use std::{alloc::Layout, collections::BTreeMap};
 
-pub(super) struct WeightsLayout {
+pub(super) struct ArenaLayout {
     pub offsets: BTreeMap<String, usize>,
     pub allocation_bytes: usize,
     pub padding_bytes: usize,
     alignment: usize,
 }
-impl WeightsLayout {
+impl ArenaLayout {
     pub fn new<'a>(buffers: impl Iterator<Item = &'a Buffer<TensorIdentity>>) -> Result<Self> {
         let mut layout = Layout::from_size_align(0, 1).map_err(|e| e.to_string())?;
         let mut offsets = BTreeMap::new();
@@ -22,9 +22,9 @@ impl WeightsLayout {
             let next = Layout::from_size_align(bytes, alignment).map_err(|e| e.to_string())?;
             let (extended, offset) = layout.extend(next).map_err(|e| e.to_string())?;
             if offsets.insert(buffer.name.clone(), offset).is_some() {
-                return Err("Duplicate immutable weight buffer".into());
+                return Err("Duplicate arena buffer".into());
             }
-            payload = payload.checked_add(bytes).ok_or("Weight arena overflow")?;
+            payload = payload.checked_add(bytes).ok_or("Buffer arena overflow")?;
             layout = extended;
         }
         // CUDA allocations guarantee 256-byte alignment. Larger contracts get
@@ -37,7 +37,7 @@ impl WeightsLayout {
         let allocation_bytes = layout
             .size()
             .checked_add(extra)
-            .ok_or("Weight arena overflow")?;
+            .ok_or("Buffer arena overflow")?;
         Ok(Self {
             offsets,
             allocation_bytes,
@@ -51,7 +51,7 @@ impl WeightsLayout {
         allocation
             .checked_add(mask)
             .map(|p| p & !mask)
-            .ok_or_else(|| "Weight arena address overflow".into())
+            .ok_or_else(|| "Buffer arena address overflow".into())
     }
 }
 
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn aligned_slices_do_not_overlap_or_escape_the_owner_allocation() {
         let buffers = [buffer("a", 3, 256), buffer("b", 37, 512), buffer("c", 9, 1)];
-        let arena = WeightsLayout::new(buffers.iter()).unwrap();
+        let arena = ArenaLayout::new(buffers.iter()).unwrap();
         let base = arena.base(256).unwrap();
         let mut previous_end = 256;
         for buffer in &buffers {
@@ -91,14 +91,14 @@ mod tests {
 
     #[test]
     fn empty_invalid_and_duplicate_layouts_are_checked_without_cuda() {
-        let arena = WeightsLayout::new(std::iter::empty()).unwrap();
+        let arena = ArenaLayout::new(std::iter::empty()).unwrap();
         assert_eq!(arena.allocation_bytes, 0);
         for buffers in [
             vec![buffer("a", 3, 3)],
             vec![buffer("a", usize::MAX, 256)],
             vec![buffer("a", 3, 256), buffer("a", 3, 256)],
         ] {
-            assert!(WeightsLayout::new(buffers.iter()).is_err());
+            assert!(ArenaLayout::new(buffers.iter()).is_err());
         }
     }
 }

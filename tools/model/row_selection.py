@@ -4,6 +4,35 @@ import math
 from collections import Counter
 
 
+def project(selection, keys):
+    """Coalesce a pipeline choice after restricting it to one component's knobs."""
+    configs, indices, names = [], {}, {}
+    for name in [selection["default"], *(r["implementation"] for r in selection["selections"])]:
+        config = {key: selection["configs"][int(name)][key] for key in keys}
+        signature = tuple(config.items())
+        if signature not in indices:
+            indices[signature] = str(len(configs))
+            configs.append(config)
+        names[name] = indices[signature]
+    default = names[selection["default"]]
+    intervals = []
+    for row in selection["selections"]:
+        name = names[row["implementation"]]
+        if name == default:
+            continue
+        item = dict(row, implementation=name)
+        if (
+            intervals
+            and intervals[-1]["implementation"] == name
+            and intervals[-1]["max_rows"] + 1 == item["min_rows"]
+            and intervals[-1].get("multiple_of", 1) == item.get("multiple_of", 1)
+        ):
+            intervals[-1]["max_rows"] = item["max_rows"]
+        else:
+            intervals.append(item)
+    return dict(configs=configs, default=default, selections=intervals)
+
+
 def ranges(records, capacity=4096):
     """Nearest measured length selects a legal implementation, then coalesce."""
     names = sorted({name for row in records for name in row["times"]})

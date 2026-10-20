@@ -1920,7 +1920,7 @@ impl ModelRuntime {
         }) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,
-                &self.model_package.state_bindings(&segments)?,
+                self.model_package.state_bindings(&segments)?,
             )?;
         }
         Ok(segments)

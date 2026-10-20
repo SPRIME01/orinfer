@@ -1,5 +1,7 @@
 """Qwen MoE FFN: shared routing, grouped integer projection and row transforms."""
 
+import inspect
+import hashlib
 import math
 import numpy as np
 from tools.model.compile import primitive
@@ -74,6 +76,219 @@ def banks(b, prefix, draft):
     return result
 
 
+def selection(b, banks):
+    if not hasattr(b, "moe_selection"):
+        import torch
+        from tools.model.expert_tuning import MoeTuner
+        from tools.model.qwen35.build import gpu_lock
+
+        w = b.weights
+        with gpu_lock(b.lock):
+            actual = dict(
+                book=torch.from_numpy(w.extra[b.book].copy()).cuda(),
+                banks=[
+                    tuple(torch.from_numpy(w.array(name).copy()).cuda() for name in bank)
+                    for bank in banks
+                ],
+            )
+            tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)
+            b.moe_selection = tuner.routed(
+                b.h,
+                b.f,
+                b.text["num_experts"],
+                b.text["num_experts_per_tok"],
+                actual,
+                [w.buffers[name]["data"]["sha256"] for bank in banks for name in bank],
+            )
+    return b.moe_selection
+
+
+def emitter(b, section, rows):
+    from kernels.operators.op30_activation_quantization import _compile as a8_compile
+
+    def emit(
+        role, fn, args, *dimensions, multiplier=1, suffix="", compiler_options=None, **options
+    ):
+        identity = repr((rows, dimensions, options, compiler_options)).encode()
+        key = "moe-" + inspect.unwrap(getattr(fn, "func", fn)).__name__
+        key += "-" + hashlib.sha256(identity).hexdigest()
+        b.emit(
+            section + "/" + role + suffix,
+            key,
+            lambda: primitive(
+                fn,
+                *dimensions,
+                compiler_options=compiler_options,
+                **({} if fn is a8_compile else dict(dynamic_rows=True)),
+                **options,
+            ),
+            args,
+            rows * multiplier,
+            row_multiplier=multiplier,
+        )
+
+    return emit
+
+
+def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
+    from kernels.model import moe
+    from tools.model.expert_tuning import expert_projection, expert_passes
+
+    w, h, f = b.weights, b.h, b.f
+    e, top = b.text["num_experts"], b.text["num_experts_per_tok"]
+    codec = "w8" if draft else "e8p_q4"
+    emit = emitter(b, section, rows)
+    selected = (
+        [("", dict(block_m=16, expand=False))]
+        if draft
+        else list(b.row_choices(selection(b, [bank_up, bank_down]), rows))
+    )
+    expanded = any(config["expand"] for _, config in selected)
+    if expanded and "MoeExpanded" not in w.buffers:
+        w.fixed("MoeExpanded", "i8", [e * 2 * f * h])
+    planes = any(config.get("folded") for _, config in selected)
+    if planes and "MoeLow" not in w.buffers:
+        for name in ("MoeLow", "MoeHigh"):
+            w.fixed(name, "i8", [4096 * top * max(h, f) // 2])
+        w.fixed("MoeSum", "i32", [4096 * top])
+
+    from tools.model.row_selection import project
+
+    routing = selected if draft else b.row_choices(project(b.moe_selection, ("block_m",)), rows)
+    for suffix, config in routing:
+        tile = config["block_m"]
+        b.emit(
+            section + "/offsets" + suffix,
+            f"moe-offsets-{e}-{tile}",
+            lambda tile=tile: primitive(moe.expert_offsets, e, tile),
+            dict(
+                Counts="MoeCounts",
+                RowOffsets="MoeOffsets",
+                TileOffsets="MoeTileOffsets",
+                TileCount="MoeTileCount",
+            ),
+            rows,
+            dynamic=False,
+        )
+        emit(
+            "tiles",
+            moe.expert_tiles,
+            dict(
+                Counts="MoeCounts",
+                TileOffsets="MoeTileOffsets",
+                TileExpert="MoeTileExpert",
+                TileRow="MoeTileRow",
+            ),
+            rows,
+            e,
+            top,
+            tile,
+            suffix=suffix,
+        )
+    common = dict(
+        Book=b.book,
+        Counts="MoeCounts",
+        Offsets="MoeOffsets",
+        TileExpert="MoeTileExpert",
+        TileRow="MoeTileRow",
+        TileCount="MoeTileCount",
+    )
+
+    def conditional_step(construct, enabled):
+        construct()
+        from tools.model.row_selection import choices
+
+        for suffix, config in choices(b.moe_selection, rows, bounded=True):
+            if not enabled(config):
+                construct(suffix.replace("/rows/", "/skip/"))
+
+    def expert(role, n, k, bank, activation, scale, output):
+        if expanded:
+
+            def expand(suffix=""):
+                b.emit(
+                    section + "/" + role + "_expand" + suffix,
+                    f"moe-expand-{e}-{n}-{k}",
+                    lambda: primitive(moe.expand_experts, n, k, e),
+                    dict(W=bank[0], Book=b.book, Counts="MoeCounts", Out="MoeExpanded"),
+                    rows,
+                    dynamic=False,
+                )
+
+            conditional_step(expand, lambda c: c["expand"])
+        if planes:
+            from kernels.model.e8p_prefill import split_prefill_a8
+
+            def pack(suffix=""):
+                emit(
+                    role + "_planes",
+                    split_prefill_a8,
+                    dict(A=activation, Low="MoeLow", High="MoeHigh", Sum="MoeSum"),
+                    rows * top,
+                    k,
+                    multiplier=top,
+                    suffix=suffix,
+                )
+
+            conditional_step(pack, lambda c: c.get("folded", False))
+        for suffix, config in selected:
+            if config.get("folded"):
+                emit(
+                    role,
+                    expert_projection,
+                    dict(
+                        Low="MoeLow",
+                        High="MoeHigh",
+                        Sum="MoeSum",
+                        P=bank[0],
+                        Book=b.book,
+                        WS=bank[1],
+                        AS=scale,
+                        Counts="MoeCounts",
+                        Offsets="MoeOffsets",
+                        TE="MoeTileExpert",
+                        TR="MoeTileRow",
+                        TC="MoeTileCount",
+                        Out=output,
+                    ),
+                    rows,
+                    n,
+                    k,
+                    e,
+                    top,
+                    multiplier=top,
+                    suffix=suffix,
+                    codec="e8p_q4",
+                    config=config,
+                    compiler_options=expert_passes("e8p_q4", config),
+                )
+                continue
+            emit(
+                role,
+                expert_projection,
+                dict(
+                    common,
+                    A=activation,
+                    W="MoeExpanded" if config["expand"] else bank[0],
+                    WS=bank[1],
+                    AS=scale,
+                    Out=output,
+                ),
+                rows,
+                n,
+                k,
+                e,
+                top,
+                codec="w8" if config["expand"] else codec,
+                compiler_options=expert_passes(codec, config),
+                suffix=suffix,
+                config=config,
+            )
+
+    expert("expert_up", 2 * f, h, bank_up, "MoeA8", "MoeAS", "MoeGateUp")
+    expert("expert_down", h, f, bank_down, "MoeDownA8", "MoeDownAS", "MoeOutput")
+
+
 def build(b, section, prefix, *, rows=4096, draft=False):
     from kernels.model import moe, rotation_a8
     from kernels.operators.op30_activation_quantization import _compile as a8_compile
@@ -85,18 +300,8 @@ def build(b, section, prefix, *, rows=4096, draft=False):
     output = "MtpHidden" if draft else "Hidden"
     gate_up = "MtpGateUp" if draft else "GateUp"
     codec = "w8" if draft else "e8p_q4"
-
-    def emit(role, fn, args, *dimensions, multiplier=1, **options):
-        b.emit(
-            section + "/" + role,
-            "moe-" + fn.__name__ + str((rows, dimensions, options)),
-            lambda: primitive(
-                fn, *dimensions, **({} if fn is a8_compile else dict(dynamic_rows=True)), **options
-            ),
-            args,
-            rows * multiplier,
-            row_multiplier=multiplier,
-        )
+    bank_up, bank_down = banks(b, prefix, draft)
+    emit = emitter(b, section, rows)
 
     router = w.combined(
         prefix + ".router", [prefix + ".gate.weight", prefix + ".shared_expert_gate.weight"]
@@ -140,33 +345,6 @@ def build(b, section, prefix, *, rows=4096, draft=False):
         rows,
         e,
         top,
-    )
-    b.emit(
-        section + "/offsets",
-        f"moe-offsets-{e}-16",
-        lambda: primitive(moe.expert_offsets, e, 16),
-        dict(
-            Counts="MoeCounts",
-            RowOffsets="MoeOffsets",
-            TileOffsets="MoeTileOffsets",
-            TileCount="MoeTileCount",
-        ),
-        rows,
-        dynamic=False,
-    )
-    emit(
-        "tiles",
-        moe.expert_tiles,
-        dict(
-            Counts="MoeCounts",
-            TileOffsets="MoeTileOffsets",
-            TileExpert="MoeTileExpert",
-            TileRow="MoeTileRow",
-        ),
-        rows,
-        e,
-        top,
-        16,
     )
     emit(
         "dispatch",
@@ -221,26 +399,6 @@ def build(b, section, prefix, *, rows=4096, draft=False):
         rows=rows,
         kind=codec,
     )
-    bank_up, bank_down = banks(b, prefix, draft)
-    common = dict(
-        Book=b.book,
-        Counts="MoeCounts",
-        Offsets="MoeOffsets",
-        TileExpert="MoeTileExpert",
-        TileRow="MoeTileRow",
-        TileCount="MoeTileCount",
-    )
-    emit(
-        "expert_up",
-        moe.integer_experts,
-        dict(common, A="MoeA8", W=bank_up[0], WS=bank_up[1], AS="MoeAS", Out="MoeGateUp"),
-        rows,
-        2 * f,
-        h,
-        e,
-        top,
-        codec=codec,
-    )
     if draft:
         emit(
             "expert_rotate",
@@ -263,19 +421,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
             True,
             multiplier=top,
         )
-    emit(
-        "expert_down",
-        moe.integer_experts,
-        dict(
-            common, A="MoeDownA8", W=bank_down[0], WS=bank_down[1], AS="MoeDownAS", Out="MoeOutput"
-        ),
-        rows,
-        h,
-        f,
-        e,
-        top,
-        codec=codec,
-    )
+    projections(b, section, bank_up, bank_down, rows=rows, draft=draft)
     emit(
         "combine",
         moe.moe_combine,

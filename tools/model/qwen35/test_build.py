@@ -54,6 +54,75 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_folded_expert_planes_follow_selected_rows_and_assignment_multiplier(self):
+        from tools.model.qwen35 import moe
+
+        def kernel(*args, **kwargs):
+            return args, kwargs
+
+        buffers = {}
+
+        def fixed(name, dtype, shape):
+            buffers[name] = dict(dtype=dtype, shape=shape)
+
+        builder = SimpleNamespace(
+            weights=SimpleNamespace(buffers=buffers, fixed=fixed),
+            h=2048,
+            f=512,
+            book="book",
+            text=dict(num_experts=256, num_experts_per_tok=8),
+            moe_selection=dict(
+                configs=[
+                    dict(block_m=32, expand=False),
+                    dict(block_m=16, expand=False, folded=True, minimum_blocks=6, sparse_rows=True),
+                ],
+                default="0",
+                selections=[dict(min_rows=2, max_rows=128, implementation="1")],
+            ),
+            row_choices=Builder.row_choices,
+        )
+        launches = []
+        builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(
+            (name, build(), bindings, rows, options)
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.moe": SimpleNamespace(
+                        expert_offsets=kernel, expert_tiles=kernel, integer_experts=kernel
+                    ),
+                    "kernels.model.e8p_prefill": SimpleNamespace(
+                        split_prefill_a8=kernel, e8p_prefill_grouped=kernel
+                    ),
+                    "kernels.operators.op30_activation_quantization": SimpleNamespace(
+                        _compile=lambda *args, **kwargs: None
+                    ),
+                },
+            ),
+            patch.object(moe, "primitive", side_effect=lambda fn, *args, **kw: (args, kw)),
+        ):
+            moe.projections(builder, "post", ("uw", "us"), ("dw", "ds"))
+        self.assertEqual(buffers["MoeLow"]["shape"], [32768 * 2048 // 2])
+        self.assertEqual(buffers["MoeSum"]["shape"], [32768])
+        folded = [x for x in launches if x[0] == "post/expert_up/rows/2-128"]
+        self.assertEqual(len(folded), 1)
+        _, (dimensions, compile_options), bindings, rows, options = folded[0]
+        self.assertEqual(dimensions, (4096, 1024, 2048, 256, 8))
+        from tools.model.expert_tuning import tile_capacity
+
+        self.assertEqual(tile_capacity(dimensions[0], dimensions[3], dimensions[4], 16), 2304)
+        self.assertEqual(rows, 32768)
+        self.assertEqual(options["row_multiplier"], 8)
+        self.assertTrue(compile_options["dynamic_rows"])
+        self.assertEqual(bindings["P"], "uw")
+        self.assertEqual(bindings["Sum"], "MoeSum")
+        names = {x[0] for x in launches}
+        for role in ("expert_up_planes", "expert_down_planes"):
+            self.assertIn("post/" + role, names)
+            self.assertIn("post/" + role + "/skip/1-1", names)
+            self.assertIn("post/" + role + "/skip/129-4096", names)
+
     def test_four_billion_requires_tied_head_and_matching_attention(self):
         candidate = config()
         t = candidate["text_config"]
@@ -109,6 +178,67 @@ class BuildTests(unittest.TestCase):
             _, header = local_header(root / "model/cache/weights" / shard.name)
             self.assertEqual(set(header) - {"__metadata__"}, {"Experts.packed"})
             self.assertEqual(hashlib.sha256(shard.read_bytes()).hexdigest(), before)
+
+    def test_moe_draft_accepts_a_jit_factory_without_a_name_attribute(self):
+        from tools.model.qwen35 import moe
+
+        def quantize(*args, **options):
+            return args, options
+
+        wrapped = SimpleNamespace(func=quantize)
+        names = (
+            "router_projection",
+            "router_topk",
+            "expert_histogram_local",
+            "expert_histogram_offsets",
+            "expert_histogram_finish",
+            "expert_offsets",
+            "expert_tiles",
+            "expert_dispatch",
+            "integer_experts",
+            "moe_combine",
+        )
+        kernels = SimpleNamespace(**{name: quantize for name in names})
+        builder = SimpleNamespace(
+            weights=SimpleNamespace(combined=lambda name, weights: name),
+            text=dict(num_experts=256, num_experts_per_tok=8),
+            h=2048,
+            f=512,
+            book="book",
+            projection=lambda *args, **kw: None,
+        )
+        launches = []
+
+        def emit(name, key, build, bindings, rows, **options):
+            launches.append((name, key, build(), rows, options))
+
+        builder.emit = emit
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.moe": kernels,
+                    "kernels.model.rotation_a8": SimpleNamespace(),
+                    "kernels.operators.op30_activation_quantization": SimpleNamespace(
+                        _compile=wrapped
+                    ),
+                },
+            ),
+            patch.object(moe, "workspace"),
+            patch.object(moe, "banks", return_value=[("up", "us"), ("down", "ds")]),
+            patch.object(moe, "primitive", side_effect=lambda fn, *a, **kw: (fn, a, kw)),
+        ):
+            moe.build(builder, "mtp", "mtp.layers.0.mlp", rows=512, draft=True)
+        quantizations = [
+            item for item in launches if item[0] in ("mtp/down_quant", "mtp/expert_rotate")
+        ]
+        self.assertEqual(len(quantizations), 2)
+        self.assertEqual([item[3] for item in quantizations], [512, 4096])
+        for _, key, (factory, args, options), _, _ in quantizations:
+            self.assertTrue(key.startswith("moe-quantize"))
+            self.assertIs(factory, wrapped)
+            self.assertEqual(args, (512, 512, False, True, 256))
+            self.assertNotIn("dynamic_rows", options)
 
     def test_moe_geometry_keeps_shared_experts_and_router_explicit(self):
         candidate = config()

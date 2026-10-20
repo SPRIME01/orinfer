@@ -14,6 +14,7 @@ pub(crate) mod experts;
 mod kernels;
 mod sequence;
 pub(crate) mod snapshot;
+mod state_table;
 mod transfers;
 mod virtual_memory;
 mod weight_arena;

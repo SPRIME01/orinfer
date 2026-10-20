@@ -88,6 +88,7 @@ pub(crate) struct Executor {
     pub(crate) workspace_save_s: f64,
     pub(crate) workspace_restore_s: f64,
     pub(super) sequences: Vec<super::sequence::Sequence>,
+    pub(super) state_table: RefCell<super::state_table::StateTable>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
     pub(super) sequence_names: std::collections::BTreeSet<String>,
@@ -229,7 +230,7 @@ impl Executor {
                     .ok_or_else(|| "Expert weight sum overflow".to_string())
             })?;
         let weight_layout =
-            super::weight_arena::WeightsLayout::new(manifest.buffers.iter().filter(|b| {
+            super::weight_arena::ArenaLayout::new(manifest.buffers.iter().filter(|b| {
                 b.data.is_some()
                     && b.access == crate::artifact::Access::Read
                     && used.contains(b.name.as_str())
@@ -573,6 +574,7 @@ impl Executor {
                 .map(|kv| kv.prefill_workspace.keys().cloned().collect())
                 .unwrap_or_default(),
             sequences: vec![super::sequence::Sequence::default()],
+            state_table: Default::default(),
             live_workspace: None,
             workspace_save_s: 0.,
             workspace_restore_s: 0.,

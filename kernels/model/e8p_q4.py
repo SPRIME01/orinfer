@@ -13,12 +13,18 @@ from tools.quantization.e8p_q4 import validate_coefficients
 def decode_source(coefficients):
     a, b = validate_coefficients(coefficients)
     coarse_scale = 4 if (a, b) == (4, 1) else 1
+    # Bias each decoded byte by 112 (coarse) and 16 (fine). Their sum is
+    # q+128 in [1,255], so a single packed addition cannot carry between
+    # bytes. The final XOR converts offset binary back to signed INT8.
+    coarse_positive, coarse_negative = (
+        ("0x749c8c7cu", "0x744c5c6cu") if (a, b) == (4, 1) else ("0x042c1c0cu", "0x04dcecfcu")
+    )
+    fine_positive, fine_negative = (
+        ("0x111b1713u", "0x11070b0fu") if (a, b) == (4, 1) else ("0x010b0703u", "0x01f7fbffu")
+    )
     combine = (
         """
-    // Coarse x already contains the exact factor four. Adding the low seven
-    // bits cannot carry between bytes; restore the sums' original sign bits.
-    return ((x & 0x7f7f7f7fu) + (y & 0x7f7f7f7fu))
-           ^ ((x ^ y) & 0x80808080u);
+    return (x + y) ^ 0x80808080u;
 """
         if (a, b) == (4, 1)
         else f"""
@@ -50,8 +56,8 @@ __device__ __forceinline__ unsigned e8p_q4_selector_flags(unsigned basis, unsign
     // Scale is a call-site constant. Fold coarse x4 into the permute constants
     // and its parity shift instead of expanding and multiplying every quad.
     asm("prmt.b32 %0, %1, %2, %3;" : "=r"(result)
-        : "r"((scale == 4u ? 0x042c1c0cu : 0x010b0703u) - shift),
-          "r"((scale == 4u ? 0x04dcecfcu : 0x01f7fbffu) - shift), "r"(selector));
+        : "r"((scale == 4u ? {coarse_positive} : {fine_positive}) - shift),
+          "r"((scale == 4u ? {coarse_negative} : {fine_negative}) - shift), "r"(selector));
     return result;
 }}
 __device__ __forceinline__ unsigned e8p_q4_combine(unsigned x, unsigned y) {{

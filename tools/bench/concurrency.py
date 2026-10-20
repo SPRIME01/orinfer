@@ -119,6 +119,38 @@ def counter_delta(before, after):
     return out
 
 
+def decode_window(samples, final_prefill, count):
+    """Longest full-cohort interval after all prompt tokens were processed."""
+    spans, current = [], []
+    for sample in [*samples, {}]:
+        stats = sample.get("scheduler_statistics") or {}
+        valid = (
+            final_prefill is not None
+            and stats.get("prefill_tokens") == final_prefill
+            and sample.get("active_requests") == count
+            and sample.get("queued_requests") == 0
+            and "observed_at_s" in sample
+            and "decode_tokens" in stats
+        )
+        if valid:
+            current.append(sample)
+        elif current:
+            if len(current) >= 2:
+                spans.append(current)
+            current = []
+    if not spans:
+        return None
+    span = max(spans, key=lambda s: s[-1]["observed_at_s"] - s[0]["observed_at_s"])
+    duration = span[-1]["observed_at_s"] - span[0]["observed_at_s"]
+    tokens = (
+        span[-1]["scheduler_statistics"]["decode_tokens"]
+        - span[0]["scheduler_statistics"]["decode_tokens"]
+    )
+    if duration < 0.2 or tokens <= 0:
+        return None
+    return dict(wall_s=duration, committed_tokens=tokens, committed_tps=tokens / duration)
+
+
 def run_round(base_url, cases, count):
     barrier = threading.Barrier(count)
     stop = threading.Event()
@@ -134,7 +166,7 @@ def run_round(base_url, cases, count):
     def monitor():
         while not stop.is_set():
             try:
-                samples.append(health())
+                samples.append(dict(health(), observed_at_s=time.perf_counter()))
             except (OSError, ValueError):
                 pass
             stop.wait(0.1)
@@ -169,6 +201,9 @@ def run_round(base_url, cases, count):
         cached_tokens=cached,
         observed_peak_active=max((s.get("active_requests", 0) for s in samples), default=None),
         observed_peak_queued=max((s.get("queued_requests", 0) for s in samples), default=None),
+        full_cohort_decode=decode_window(
+            samples, (after.get("scheduler_statistics") or {}).get("prefill_tokens"), count
+        ),
         scheduler_first=before.get("scheduler_statistics"),
         scheduler_last=after.get("scheduler_statistics"),
         scheduler_delta=counter_delta(

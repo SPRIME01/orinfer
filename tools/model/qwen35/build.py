@@ -1033,7 +1033,11 @@ class Builder:
             execution=execution_identity(
                 model_library(), engine, self.architecture, "int8_quality"
             ),
-            plan_kernel_contracts=[k["name"] for k in self.aot.kernels if "/rows/" in k["name"]],
+            plan_kernel_contracts=[
+                k["name"]
+                for k in self.aot.kernels
+                if "/rows/" in k["name"] or "/skip/" in k["name"]
+            ],
         )
         digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
         data = dict(

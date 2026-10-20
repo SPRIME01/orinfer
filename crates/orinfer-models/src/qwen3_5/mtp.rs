@@ -46,7 +46,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
             "post_quant",
         ],
     );
-    let ffn = ffn_names(moe, true);
+    let ffn = ffn_names(moe, true, false, false);
     warm.extend(kernels("qwen_rows/mtp", &ffn));
     warm.extend(kernels("qwen_rows/mtp", &["advance"]));
     let mut head = kernels(
@@ -96,6 +96,12 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
                 &format!("qwen_rows/layer{layer}/private"),
                 &["conv"],
             ));
+            if super::deferred_gdn(m) {
+                private.extend(kernels(
+                    &format!("qwen_rows/layer{layer}/private"),
+                    &["recurrent_materialize"],
+                ));
+            }
             private.extend(kernels(
                 &format!("qwen_rows/verify/layer{layer}"),
                 &["recurrent", "factors"],

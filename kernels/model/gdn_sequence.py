@@ -7,10 +7,10 @@ In-place prefill writes only the final state and supports chunks through 4096.
 Convolution history, position, and attention KV require separate handling.
 """
 
-import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
+from kernels.model.gdn_core import state_layout, predict, update_readout, rank_one
 
 HK, HV, DK, DV = 16, 48, 128, 128
 
@@ -27,6 +27,7 @@ def _gdn_sequence(
     token_unroll: int = 1,
     key_heads: int = 16,
     value_heads: int = 48,
+    shared_state: bool = False,
 ):
     HK, HV = key_heads, value_heads
     if min(HK, HV) <= 0 or HV % HK:
@@ -34,10 +35,14 @@ def _gdn_sequence(
     assert 1 <= tokens <= (4096 if in_place else 16) and q_scale > 0
     assert value_tile in (16, 32, 64, 128) and threads in (32, 64, 128, 256)
     assert not (compact and in_place)
+    if type(shared_state) is not bool or (shared_state and not in_place):
+        raise ValueError("State staging requires an in-place GDN recurrence")
     if type(token_unroll) is not int or token_unroll not in (1, 2, 4, 8):
         raise ValueError("Invalid GDN token unrolling")
     if token_unroll != 1 and not prefetch_qk:
         raise ValueError("GDN token unrolling requires the prefetch recurrence")
+    prediction = predict(value_tile, prefetched=prefetch_qk)
+    advance = update_readout(value_tile, q_scale, prefetched=prefetch_qk, saved_delta=compact)
     tokens = count = row_count(tokens, dynamic_rows)
     if (
         type(prefetch_qk) is not bool
@@ -70,52 +75,20 @@ def _gdn_sequence(
                 bs = T.alloc_shared((2,), T.float32)
             state = T.alloc_fragment((DK, value_tile), T.float32)
             product = T.alloc_fragment((DK, value_tile), T.float32)
-            if threads == 128 and value_tile == 32:
-                # Permute thread ownership without changing each lane's eight
-                # K partials or the sixteen-lane reduction tree. Both dot
-                # products now reduce within a warp rather than through a
-                # block-wide shared-memory barrier.
-                T.annotate_layout(
-                    {
-                        state: tilelang.Fragment(
-                            (DK, value_tile),
-                            forward_thread_fn=lambda i, j: (
-                                (j // 8) * 32 + (i % 16) * 2 + (j // 4) % 2
-                            ),
-                            forward_index_fn=lambda i, j: (i // 16) * 4 + j % 4,
-                        ),
-                        product: tilelang.Fragment(
-                            (DK, value_tile),
-                            forward_thread_fn=lambda i, j: (
-                                (j // 8) * 32 + (i % 16) * 2 + (j // 4) % 2
-                            ),
-                            forward_index_fn=lambda i, j: (i // 16) * 4 + j % 4,
-                        ),
-                    }
-                )
-            elif threads == 32 and value_tile == 16:
-                # Use the same eight K partials and sixteen-lane reduction as
-                # decode. A warp owns sixteen value columns instead of eight;
-                # changing prefill extent must not change the recurrent state.
-                T.annotate_layout(
-                    {
-                        state: tilelang.Fragment(
-                            (DK, value_tile),
-                            forward_thread_fn=lambda i, j: (i % 16) * 2 + j // 8,
-                            forward_index_fn=lambda i, j: (i // 16) * 8 + j % 8,
-                        ),
-                        product: tilelang.Fragment(
-                            (DK, value_tile),
-                            forward_thread_fn=lambda i, j: (i % 16) * 2 + j // 8,
-                            forward_index_fn=lambda i, j: (i // 16) * 8 + j % 8,
-                        ),
-                    }
-                )
+            if shared_state:
+                state_tile = T.alloc_shared((DK, value_tile), T.float32)
+            T.annotate_layout(
+                {buffer: state_layout(value_tile, threads) for buffer in (state, product)}
+            )
             predicted = T.alloc_fragment((value_tile,), T.float32)
             result = T.alloc_fragment((value_tile,), T.float32)
             update = T.alloc_fragment((value_tile,), T.float32)
-            for i, j in T.Parallel(DK, value_tile):
-                state[i, j] = State[h, i, bv * value_tile + j]
+            if shared_state:
+                T.copy(State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile], state_tile)
+                T.copy(state_tile, state)
+            else:
+                for i, j in T.Parallel(DK, value_tile):
+                    state[i, j] = State[h, i, bv * value_tile + j]
             if prefetch_qk:
                 T.ptx_cp_async(
                     T.access_ptr(qs[0, tid * 4], "w", 4),
@@ -177,46 +150,50 @@ def _gdn_sequence(
                                         1,
                                     )
                                 T.ptx_commit_group()
-                        for i, j in T.Parallel(DK, value_tile):
-                            state[i, j] = state[i, j] * T.exp(gs[t % 2] if prefetch_qk else G[t, h])
-                            product[i, j] = state[i, j] * T.cast(
-                                (ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32
-                            )
-                        T.reduce_sum(product, predicted, dim=0)
+                        prediction(
+                            state,
+                            product,
+                            predicted,
+                            ks if prefetch_qk else K,
+                            gs if prefetch_qk else G,
+                            kh,
+                            t,
+                            h,
+                        )
                         if compact:
                             for j in T.Parallel(value_tile):
                                 update[j] = Beta[t, h] * (
                                     T.cast(V[h, t, bv * value_tile + j], T.float32) - predicted[j]
                                 )
                                 Prefix[t, h, bv * value_tile + j] = update[j]
-                        for i, j in T.Parallel(DK, value_tile):
-                            delta = (bs[t % 2] if prefetch_qk else Beta[t, h]) * (
-                                T.cast(
-                                    vs[t % 2, j] if prefetch_qk else V[h, t, bv * value_tile + j],
-                                    T.float32,
-                                )
-                                - predicted[j]
-                            )
-                            if compact:
-                                delta = update[j]
-                            state[i, j] = (
-                                state[i, j]
-                                + T.cast((ks[t % 2, i] if prefetch_qk else K[kh, t, i]), T.float32)
-                                * delta
-                            )
-                            product[i, j] = state[i, j] * (
-                                T.cast((qs[t % 2, i] if prefetch_qk else Q[kh, t, i]), T.float32)
-                                * q_scale
-                            )
-                        T.reduce_sum(product, result, dim=0)
+                        advance(
+                            state,
+                            product,
+                            result,
+                            qs if prefetch_qk else Q,
+                            ks if prefetch_qk else K,
+                            vs if prefetch_qk else V,
+                            bs if prefetch_qk else Beta,
+                            predicted,
+                            update,
+                            kh,
+                            t,
+                            h,
+                            bv,
+                        )
                         for i, j in T.Parallel(DK, value_tile):
                             if in_place:
                                 if t == count - 1:
-                                    State[h, i, bv * value_tile + j] = state[i, j]
+                                    if shared_state:
+                                        state_tile[i, j] = state[i, j]
+                                    else:
+                                        State[h, i, bv * value_tile + j] = state[i, j]
                             elif not compact:
                                 Prefix[t, h, i, bv * value_tile + j] = state[i, j]
                         for j in T.Parallel(value_tile):
                             Out[t, h * DV + bv * value_tile + j] = result[j]
+            if shared_state:
+                T.copy(state_tile, State[h, 0:DK, bv * value_tile : (bv + 1) * value_tile])
 
     return main
 
@@ -279,6 +256,7 @@ def gdn_commit(
         raise ValueError("Invalid GDN head geometry")
     assert 1 <= tokens <= 8 and value_tile in (16, 32, 64, 128)
 
+    replay = rank_one(value_tile)
     tokens = row_count(tokens, dynamic_rows)
 
     @T.prim_func
@@ -295,13 +273,7 @@ def gdn_commit(
                 state[i, j] = State[h, i, bv * value_tile + j]
             for t in T.serial(tokens):
                 if t < Accepted[0]:
-                    for i, j in T.Parallel(DK, value_tile):
-                        state[i, j] = state[i, j] * T.exp(G[t, h])
-                        state[i, j] = (
-                            state[i, j]
-                            + T.cast(K[h // (HV // HK), t, i], T.float32)
-                            * Update[t, h, bv * value_tile + j]
-                        )
+                    replay(state, K, Update, T.exp(G[t, h]), h // (HV // HK), t, h, bv)
             for i, j in T.Parallel(DK, value_tile):
                 State[h, i, bv * value_tile + j] = state[i, j]
 

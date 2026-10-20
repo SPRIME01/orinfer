@@ -1,8 +1,75 @@
 """Measured selections cover tails without retaining losing implementations."""
 
 import unittest
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
 from tools.model.row_selection import ranges
-from tools.model.row_selection import choices, samples, split_fixed
+from tools.model.row_selection import choices, project, samples, split_fixed
+from tools.model.row_tuning import RowTuner
+
+
+class ValidationOnlyTuningTests(unittest.TestCase):
+    def test_extreme_cases_are_replayed_without_biasing_serving_cost(self):
+        checked = set()
+
+        def inputs(rows, tags=("independent",)):
+            for tag in tags:
+                # The generator deliberately shares this binding. The tuner
+                # must finish a case before advancing to the next one.
+                current = tag
+
+                def fixture(kernel, config):
+                    changed = False
+
+                    def run():
+                        self.assertEqual(current, tag)
+
+                    run.ms = (
+                        (1.0 if kernel == "fast" else 2.0)
+                        if tag == "independent"
+                        else (1000.0 if kernel == "fast" else 0.01)
+                    )
+
+                    def check():
+                        checked.add((tag, kernel, changed))
+
+                    def change():
+                        nonlocal changed
+                        changed = not changed
+
+                    return run, check, change
+
+                yield fixture
+
+        def benchmark(run, **kwargs):
+            run()
+            return dict(median_ms=run.ms), SimpleNamespace(replay=run)
+
+        modules = {
+            "torch": SimpleNamespace(manual_seed=lambda _: None),
+            "tools.operators.common": SimpleNamespace(benchmark=benchmark, SEED=20261002),
+        }
+        with tempfile.TemporaryDirectory() as output, patch.dict("sys.modules", modules):
+            result = RowTuner(output, {}).select(
+                dict(timed="independent", validation=["four", "hot"]),
+                [dict(name="fast"), dict(name="slow")],
+                lambda c: c["name"],
+                inputs,
+                measure_rows=[1],
+                validation_inputs=lambda rows: inputs(rows, ("four", "hot")),
+            )
+        self.assertEqual(result["default"], "0")
+        self.assertEqual(result["measurements"][0]["times"], {"0": 1.0, "1": 2.0})
+        self.assertEqual(
+            checked,
+            {
+                (tag, name, changed)
+                for tag in ("independent", "four", "hot")
+                for name in ("fast", "slow")
+                for changed in (False, True)
+            },
+        )
 
 
 class PrefillTuningTests(unittest.TestCase):
@@ -43,6 +110,15 @@ class PrefillTuningTests(unittest.TestCase):
 
 
 class DynamicProjectionChoicesTests(unittest.TestCase):
+    def test_pipeline_components_share_routing_when_only_codec_changes(self):
+        table = dict(
+            configs=[dict(block_m=32, expand=False), dict(block_m=32, expand=True)],
+            default="1",
+            selections=[dict(min_rows=1, max_rows=127, implementation="0")],
+        )
+        self.assertEqual(list(choices(project(table, ("block_m",)), 512)), [("", dict(block_m=32))])
+        self.assertEqual(len(list(choices(table, 512))), 2)
+
     def test_bounded_choices_cover_only_non_aot_rows_with_measured_configs(self):
         fixed = [1, 2, 3, 4, 8, 16, 32]
         table = dict(

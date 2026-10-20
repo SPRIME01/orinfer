@@ -12,6 +12,60 @@ tir = tvm.tirx
 
 
 class DynamicRowsTests(unittest.TestCase):
+    def test_shared_expert_factory_keeps_token_and_assignment_extents(self):
+        from tools.model.expert_tuning import expert_projection
+
+        for codec, config in [
+            ("w8", dict(block_m=16, stages=1, expand=False)),
+            ("e8p_q4", dict(block_m=16, stages=2, expand=False)),
+            ("e8p_q2", dict(block_m=8)),
+            ("e8p_q4", dict(block_m=16, folded=True, minimum_blocks=6, sparse_rows=True)),
+        ]:
+            fn = explicit_rows(
+                expert_projection(
+                    512,
+                    129,
+                    256,
+                    4,
+                    2,
+                    codec=codec,
+                    config=config,
+                    dynamic_rows=True,
+                )
+            )
+            (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
+            output = next(b for b in fn.buffer_map.values() if b.name == "Out")
+            multiplier = 1 if codec == "e8p_q2" or config.get("folded") else 2
+            tvm.ir.assert_structural_equal(Analyzer().simplify(output.shape[0]), rows * multiplier)
+            self.assertEqual(int(output.shape[1]), 129)
+
+    def test_sparse_expert_tail_reuses_one_decoder_mainloop(self):
+        from kernels.model.e8p_prefill import e8p_prefill_grouped
+
+        counts = []
+        for sparse in (False, True):
+            fn = e8p_prefill_grouped.__wrapped__(
+                1024,
+                256,
+                320,
+                129,
+                256,
+                codec="e8p_q4",
+                dynamic_rows=True,
+                sparse_rows=sparse,
+            )
+            decoders = []
+
+            def visit(node):
+                if isinstance(node, tir.Call) and node.op.name == "tirx.call_pure_extern":
+                    if node.args[0].value == "nib_fast":
+                        decoders.append(node)
+
+            tir.stmt_functor.post_order_visit(fn.body, visit)
+            counts.append(len(decoders))
+        self.assertGreater(counts[0], 0)
+        self.assertEqual(counts[0], counts[1], "Tail masking duplicated the expert mainloop")
+
     def test_integer_tail_and_grouping_keep_one_runtime_extent(self):
         for kind, tile in [("e8p_q4", 256), ("q4", 128), ("w8", 128)]:
             spec = dict(
@@ -187,6 +241,64 @@ class DynamicRowsTests(unittest.TestCase):
                     fn.body, list(fn.params) + [b.data for b in fn.buffer_map.values()]
                 )
             )
+
+    def test_independent_attention_split_occupancy_uses_live_owner_count(self):
+        from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
+        from kernels.model.independent_rows import independent_rows
+        from kernels.model.rows import static_rows
+
+        for primitive in (causal_attention_int8, merge_attention_int8):
+            options = dict(
+                block_m=16,
+                target_tiles=16,
+                max_splits=8,
+                query_heads=16,
+                kv_heads=2,
+                head_group=8,
+                parallel_instances=True,
+            )
+            if primitive is causal_attention_int8:
+                options["context"] = 8192
+            fn = static_rows(primitive.__wrapped__(1, **options))
+            roles = {b.name: ("private", "Scratch") for b in fn.buffer_map.values()}
+            wrapped, identities = independent_rows(
+                fn,
+                128,
+                roles,
+                dict(Scratch=0),
+                dynamic=True,
+                batch_parameters=("independent_instances",),
+            )
+            self.assertNotIn("independent_instances", identities)
+            (rows,) = [p for p in wrapped.params if p.dtype == "int32"]
+            self.assertEqual(rows.name, "m")
+            self.assertFalse(
+                tir.analysis.undefined_vars(
+                    wrapped.body,
+                    list(wrapped.params) + [b.data for b in wrapped.buffer_map.values()],
+                )
+            )
+            split_calls, split_grids = [], []
+
+            def visit(node):
+                if isinstance(node, tir.Call) and str(node.args[0]) == '"attn_split_count"':
+                    split_calls.append(node)
+                if isinstance(node, tir.For) and node.thread_binding is not None:
+                    if node.thread_binding.thread_tag == "blockIdx.z":
+                        split_grids.append(node.extent)
+
+            tir.stmt_functor.post_order_visit(wrapped.body, visit)
+            self.assertEqual(len(split_calls), 1)
+            self.assertTrue(split_calls[0].args[-1].same_as(rows))
+            if primitive is causal_attention_int8:
+                self.assertEqual(len(split_grids), 1)
+                for owners, expected in [(1, 8), (2, 8), (3, 6), (4, 4), (8, 2), (16, 1), (128, 1)]:
+                    actual = Analyzer().simplify(
+                        tir.stmt_functor.substitute(split_grids[0], {rows: owners})
+                    )
+                    self.assertEqual(int(actual), expected)
+            with self.assertRaisesRegex(ValueError, "scheduling scalar"):
+                independent_rows(fn, 128, roles, dict(Scratch=0), batch_parameters=("missing",))
 
     def test_moe_combine_bound_tracks_live_assignments_beyond_initial_capacity(self):
         for capacity in [8, 16, 128]:

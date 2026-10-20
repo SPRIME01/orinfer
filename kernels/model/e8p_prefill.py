@@ -1,9 +1,9 @@
-"""Exact short-prefill E8P products with K64-major activation planes.
+"""Exact grouped E8P products with K64-major activation planes.
 
-All warps decode directly into MMA registers. Four private compressed stages
-keep loads three K tiles ahead of consumers, hiding cp.async completion waits
-without a dedicated producer group. Integer products and rounding match the
-row-major exact expert recipe; only transient activation storage changes.
+All warps decode directly into MMA registers. Four activation stages accompany
+four compressed K64 stages for Q2 or two compressed K128 stages for Q4.
+Cooperative copies hide cp.async completion waits without a producer warp.
+Integer products and rounding match the row-major exact expert recipe.
 """
 
 import tilelang
@@ -12,6 +12,9 @@ from tools.operators.common import orin_jit
 
 from kernels.model.e8p_core import (
     SOURCE as EXACT_SOURCE,
+    DENSE_SOURCE,
+    folded_pair,
+    store_folded_rows,
     mma_pair,
     store_rows,
     low_plane,
@@ -21,6 +24,7 @@ from kernels.model.rows import row_count
 
 SOURCE = (
     EXACT_SOURCE
+    + DENSE_SOURCE
     + r"""
 // Move parity out of the selector: flipping its first bit changes the low
 // nibble by 0xe, while parity changes every decoded nibble by 0x1.
@@ -81,23 +85,37 @@ def split_prefill_a8(rows, K, dynamic_rows=False):
     }
 )
 def e8p_prefill_grouped(
-    rows, E, tiles, N, K, dynamic_rows=False, sparse_rows=False, row_major=False
+    rows,
+    E,
+    tiles,
+    N,
+    K,
+    dynamic_rows=False,
+    sparse_rows=False,
+    row_major=False,
+    codec="e8p_q2",
+    minimum_blocks=1,
 ):
-    """Keep sixteen-row routing tiles, optionally skip their unused upper half.
+    """One routed-tile mainloop; optionally predicate empty MMA row stripes.
 
-    The eight-row path has the same K traversal and integer/FP16 boundaries.
-    Its uniform device branch depends on the actual expert tail, so graph
-    replay can change routing without selecting another host launch.
+    Routing always uses sixteen-row tiles. Sparse candidates mask complete
+    hardware M8 stripes inside this body instead of instantiating a second
+    eight-row implementation. Offline tuning selects whether masking pays off.
     """
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
         or type(sparse_rows) is not bool
         or type(row_major) is not bool
+        or codec not in ("e8p_q2", "e8p_q4")
+        or type(minimum_blocks) is not int
+        or not 1 <= minimum_blocks <= 16
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
         raise ValueError("Invalid exact E8P geometry")
     BM, BN, BK = 16, 128, 64
+    q4 = codec == "e8p_q4"
+    packed_k, packed_dtype = (128, T.uint32) if q4 else (64, T.uint16)
     # Matching swizzle for sixteen-byte activation halves and ldmatrix reads.
     input_stride, input_mask = 32, 16
     rows = row_count(rows, dynamic_rows)
@@ -105,152 +123,180 @@ def e8p_prefill_grouped(
     group_stride, row_stride = (32, K // 2) if row_major else (rows * 32, 32)
     launch_tiles = T.min(tiles, T.ceildiv(rows, BM) + T.min(E, rows)) if dynamic_rows else tiles
 
-    def product(tile_rows):
-        multiply, store = mma_pair(tile_rows), store_rows(tile_rows, BN, N)
-
-        @T.macro
-        def project(
-            Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count
-        ):
-            tid = T.get_thread_binding()
-            lane, warp = tid % 32, tid // 32
-            lo = T.alloc_local((tile_rows,), T.int32)
-            hi = T.alloc_local((tile_rows,), T.int32)
-            v = T.alloc_local((4,), T.uint32)
-            a = T.alloc_local((tile_rows // 2,), T.uint32)
-            for i in T.unroll(tile_rows):
-                lo[i] = 0
-                hi[i] = 0
-            T.sync_threads()
-            for initial in T.unroll(min(3, K // BK)):
+    @T.macro
+    def prefetch_weight(P, packed, slot, step, bx, expert, tid):
+        if q4:
+            # Four lanes fetch a complete physical K128 row. Pair slots retain
+            # both K64 operands until their consumers pass the CTA barrier.
+            for group in T.unroll(4):
+                weight_row = tid // 4 + group * (BN // 4)
+                col = (tid % 4) * 4
                 T.ptx_cp_async(
-                    T.access_ptr(packed[initial, tid, 0], "w", 8),
-                    T.access_ptr(P[expert, initial, T.min(bx * BN + tid, N - 1), 0], "r", 8),
-                    8,
-                    predicate=bx * BN + tid < N,
+                    T.access_ptr(
+                        packed[(step // 2) % 2, weight_row, col ^ (((weight_row // 2) % 4) * 4)],
+                        "w",
+                        4,
+                    ),
+                    T.access_ptr(
+                        P[expert, step // 2, T.min(bx * BN + weight_row, N - 1), col], "r", 4
+                    ),
+                    4,
+                    predicate=bx * BN + weight_row < N,
                 )
-                if tid < tile_rows * 2:
-                    T.ptx_cp_async(
-                        T.access_ptr(
-                            inputs[
-                                initial,
-                                0,
-                                tid // 2,
-                                ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
-                            ],
-                            "w",
-                            16,
-                        ),
-                        T.access_ptr(
-                            Low[
-                                (initial) * group_stride
-                                + T.min(offset + tid // 2, rows - 1) * row_stride
-                                + (tid % 2) * 16
-                            ],
-                            "r",
-                            16,
-                        ),
+        else:
+            T.ptx_cp_async(
+                T.access_ptr(packed[slot, tid, 0], "w", 8),
+                T.access_ptr(P[expert, step, T.min(bx * BN + tid, N - 1), 0], "r", 8),
+                8,
+                predicate=bx * BN + tid < N,
+            )
+
+    tile_rows = BM
+    multiply = folded_pair(tile_rows) if q4 else mma_pair(tile_rows)
+    store = store_folded_rows(tile_rows, BN, N, 5) if q4 else store_rows(tile_rows, BN, N)
+
+    @T.macro
+    def project(Low, High, Sum, P, WS, AS, Out, packed, inputs, book, bx, expert, offset, count):
+        tid = T.get_thread_binding()
+        lane, warp = tid % 32, tid // 32
+        lo = T.alloc_local((tile_rows,), T.int32)
+        if not q4:
+            hi = T.alloc_local((tile_rows,), T.int32)
+        v = T.alloc_local((4,), T.uint32)
+        a = T.alloc_local((tile_rows // 2,), T.uint32)
+        for i in T.unroll(tile_rows):
+            lo[i] = 0
+            if not q4:
+                hi[i] = 0
+        T.sync_threads()
+        for initial in T.unroll(min(3, K // BK)):
+            if not q4 or initial % 2 == 0:
+                prefetch_weight(P, packed, initial, initial, bx, expert, tid)
+            if tid < tile_rows * 2:
+                T.ptx_cp_async(
+                    T.access_ptr(
+                        inputs[
+                            initial,
+                            0,
+                            tid // 2,
+                            ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                        ],
+                        "w",
                         16,
-                        predicate=offset + tid // 2 < rows,
-                    )
-                    T.ptx_cp_async(
-                        T.access_ptr(
-                            inputs[
-                                initial,
-                                1,
-                                tid // 2,
-                                ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
-                            ],
-                            "w",
-                            16,
-                        ),
-                        T.access_ptr(
-                            High[
-                                (initial) * group_stride
-                                + T.min(offset + tid // 2, rows - 1) * row_stride
-                                + (tid % 2) * 16
-                            ],
-                            "r",
-                            16,
-                        ),
+                    ),
+                    T.access_ptr(
+                        Low[
+                            (initial) * group_stride
+                            + T.min(offset + tid // 2, rows - 1) * row_stride
+                            + (tid % 2) * 16
+                        ],
+                        "r",
                         16,
-                        predicate=offset + tid // 2 < rows,
-                    )
-                T.ptx_commit_group()
-            # Four static stage positions avoid repeated modulo/address
-            # calculations. The leading barrier also protects previous
-            # readers before their shared slot is prefetched again.
-            for group in T.serial(T.ceildiv(K // BK, 4)):
-                for sub in T.unroll(4):
-                    step = group * 4 + sub
-                    if step < K // BK:
-                        slot = step % 4
+                    ),
+                    16,
+                    predicate=offset + tid // 2 < rows,
+                )
+                T.ptx_cp_async(
+                    T.access_ptr(
+                        inputs[
+                            initial,
+                            1,
+                            tid // 2,
+                            ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                        ],
+                        "w",
+                        16,
+                    ),
+                    T.access_ptr(
+                        High[
+                            (initial) * group_stride
+                            + T.min(offset + tid // 2, rows - 1) * row_stride
+                            + (tid % 2) * 16
+                        ],
+                        "r",
+                        16,
+                    ),
+                    16,
+                    predicate=offset + tid // 2 < rows,
+                )
+            T.ptx_commit_group()
+        # Four static input positions avoid repeated address calculations.
+        # The leading barrier also protects previous input/weight readers
+        # before their shared slots are prefetched again.
+        for group in T.serial(T.ceildiv(K // BK, 4)):
+            for sub in T.unroll(4):
+                step = group * 4 + sub
+                if step < K // BK:
+                    slot = step % 4
+                    if q4 and step >= 4 and step % 2 == 0:
+                        # The first half shares the next group's K128 copy.
                         if step + 2 < K // BK:
-                            T.ptx_wait_group(2)
-                        elif step + 1 < K // BK:
                             T.ptx_wait_group(1)
                         else:
                             T.ptx_wait_group(0)
-                        T.sync_threads()
-                        if step + 3 < K // BK:
-                            nxt = (step + 3) % 4
+                    elif step + 2 < K // BK:
+                        T.ptx_wait_group(2)
+                    elif step + 1 < K // BK:
+                        T.ptx_wait_group(1)
+                    else:
+                        T.ptx_wait_group(0)
+                    T.sync_threads()
+                    if step + 3 < K // BK:
+                        nxt = (step + 3) % 4
+                        # In steady state, refill only after both halves
+                        # of the old pair have completed their reads.
+                        if not q4 or (step >= 2 and step % 2 == 0):
+                            prefetch_weight(P, packed, nxt, step + 3, bx, expert, tid)
+                        if tid < tile_rows * 2:
                             T.ptx_cp_async(
-                                T.access_ptr(packed[nxt, tid, 0], "w", 8),
                                 T.access_ptr(
-                                    P[expert, step + 3, T.min(bx * BN + tid, N - 1), 0], "r", 8
+                                    inputs[
+                                        nxt,
+                                        0,
+                                        tid // 2,
+                                        ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                    ],
+                                    "w",
+                                    16,
                                 ),
-                                8,
-                                predicate=bx * BN + tid < N,
+                                T.access_ptr(
+                                    Low[
+                                        (step + 3) * group_stride
+                                        + T.min(offset + tid // 2, rows - 1) * row_stride
+                                        + (tid % 2) * 16
+                                    ],
+                                    "r",
+                                    16,
+                                ),
+                                16,
+                                predicate=offset + tid // 2 < rows,
                             )
-                            if tid < tile_rows * 2:
-                                T.ptx_cp_async(
-                                    T.access_ptr(
-                                        inputs[
-                                            nxt,
-                                            0,
-                                            tid // 2,
-                                            ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
-                                        ],
-                                        "w",
-                                        16,
-                                    ),
-                                    T.access_ptr(
-                                        Low[
-                                            (step + 3) * group_stride
-                                            + T.min(offset + tid // 2, rows - 1) * row_stride
-                                            + (tid % 2) * 16
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
+                            T.ptx_cp_async(
+                                T.access_ptr(
+                                    inputs[
+                                        nxt,
+                                        1,
+                                        tid // 2,
+                                        ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
+                                    ],
+                                    "w",
                                     16,
-                                    predicate=offset + tid // 2 < rows,
-                                )
-                                T.ptx_cp_async(
-                                    T.access_ptr(
-                                        inputs[
-                                            nxt,
-                                            1,
-                                            tid // 2,
-                                            ((tid % 2) * 16) ^ (((tid // 8) % 2) * input_mask),
-                                        ],
-                                        "w",
-                                        16,
-                                    ),
-                                    T.access_ptr(
-                                        High[
-                                            (step + 3) * group_stride
-                                            + T.min(offset + tid // 2, rows - 1) * row_stride
-                                            + (tid % 2) * 16
-                                        ],
-                                        "r",
-                                        16,
-                                    ),
+                                ),
+                                T.access_ptr(
+                                    High[
+                                        (step + 3) * group_stride
+                                        + T.min(offset + tid // 2, rows - 1) * row_stride
+                                        + (tid % 2) * 16
+                                    ],
+                                    "r",
                                     16,
-                                    predicate=offset + tid // 2 < rows,
-                                )
-                            T.ptx_commit_group()
-                        for stripe in T.unroll(tile_rows // 8):
+                                ),
+                                16,
+                                predicate=offset + tid // 2 < rows,
+                            )
+                        T.ptx_commit_group()
+                    for stripe in T.unroll(tile_rows // 8):
+                        if not sparse_rows or stripe * 8 < count:
                             r_index = lane % 8 + stripe * 8
                             col = (lane // 8 % 2) * 16
                             T.evaluate(
@@ -287,30 +333,49 @@ def e8p_prefill_grouped(
                                     T.access_ptr(a[tile_rows // 4 + stripe * 2], "w", 2),
                                 )
                             )
-                        for nt in T.unroll(2):
+                    for nt in T.unroll(2):
+                        for level in T.unroll(2 if q4 else 1):
                             for rr in T.unroll(4):
                                 n = warp * 32 + nt * 16 + lane // 4 + (rr % 2) * 8
                                 col = lane % 4 + (rr // 2) * 4
-                                code = T.cast(packed[slot, n, col], T.uint32)
-                                v[rr] = T.call_pure_extern(
-                                    "uint32", "nib_prefill", code, book[code >> 8]
-                                )
+                                if q4:
+                                    code = (
+                                        packed[
+                                            (step // 2) % 2,
+                                            n,
+                                            ((step % 2) * 8 + col) ^ (((n // 2) % 4) * 4),
+                                        ]
+                                        >> (level * 16)
+                                    ) & T.uint32(65535)
+                                    v[rr] = T.call_pure_extern(
+                                        "uint32", "nib_fast", code, book[code >> 8]
+                                    )
+                                else:
+                                    code = T.cast(packed[slot, n, col], T.uint32)
+                                    v[rr] = T.call_pure_extern(
+                                        "uint32", "nib_prefill", code, book[code >> 8]
+                                    )
                             for stripe in T.unroll(tile_rows // 8):
-                                multiply(lo, hi, v, a, nt, stripe)
+                                if not sparse_rows or stripe * 8 < count:
+                                    if q4:
+                                        if level == 0:
+                                            multiply(lo, v, a, nt, stripe, 8)
+                                        else:
+                                            multiply(lo, v, a, nt, stripe, 2)
+                                    else:
+                                        multiply(lo, hi, v, a, nt, stripe)
+        if q4:
+            store(lo, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset)
+        else:
             store(lo, hi, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset, offset)
-
-        return project
-
-    full = product(BM)
-    sparse = product(8)
 
     @T.prim_func
     def exact_e8p_int4(
         Low: T.Tensor((rows * K // 2,), T.int8),
         High: T.Tensor((rows * K // 2,), T.int8),
         Sum: T.Tensor((rows,), T.int32),
-        P: T.Tensor((E, K // 64, N, 8), T.uint16),
-        Book: T.Tensor((1, 256, 1), T.uint32),
+        P: T.Tensor((E, K // packed_k, N, packed_k // 8), packed_dtype),
+        Book: T.Tensor((256, 1) if q4 else (1, 256, 1), T.uint32),
         WS: T.Tensor((E, N), T.float16),
         AS: T.Tensor((rows,), T.float16),
         Counts: T.Tensor((E,), T.int32),
@@ -322,70 +387,42 @@ def e8p_prefill_grouped(
     ):
         with T.Kernel(T.ceildiv(N, BN), launch_tiles, threads=128) as (bx, tile):
             T.import_source(SOURCE)
+            T.annotate_min_blocks_per_sm(minimum_blocks)
             tid = T.get_thread_binding()
-            packed = T.alloc_shared((4, BN, 8), T.uint16)
+            packed = T.alloc_shared((2, BN, 16) if q4 else (4, BN, 8), packed_dtype)
             inputs = T.alloc_shared((4, 2, BM, input_stride), T.int8)
             book = T.alloc_shared((256,), T.uint32)
             if tile < TC[0]:
-                expert, first = TE[tile], TR[tile]
-                offset = Offsets[expert] + first
-                count = T.min(BM, Counts[expert] - first)
-                for i in T.unroll(2):
-                    book[tid + i * 128] = Book[0, tid + i * 128, 0]
-                # This is uniform across the block. All routing tiles still
-                # cover sixteen rows; only a short expert tail uses eight.
-                if sparse_rows:
-                    if count <= 8:
-                        sparse(
-                            Low,
-                            High,
-                            Sum,
-                            P,
-                            WS,
-                            AS,
-                            Out,
-                            packed,
-                            inputs,
-                            book,
-                            bx,
-                            expert,
-                            offset,
-                            count,
-                        )
-                    else:
-                        full(
-                            Low,
-                            High,
-                            Sum,
-                            P,
-                            WS,
-                            AS,
-                            Out,
-                            packed,
-                            inputs,
-                            book,
-                            bx,
-                            expert,
-                            offset,
-                            count,
-                        )
+                if q4:
+                    metadata = T.alloc_local((3,), T.int32)
+                    metadata[0] = TE[tile]
+                    metadata[1] = Offsets[metadata[0]] + TR[tile]
+                    metadata[2] = T.min(BM, Counts[metadata[0]] - TR[tile])
+                    expert, offset, count = metadata[0], metadata[1], metadata[2]
+                    for i in T.Parallel(256):
+                        book[i] = T.call_pure_extern("uint32", "direct_nibble_basis", Book[i, 0])
                 else:
-                    full(
-                        Low,
-                        High,
-                        Sum,
-                        P,
-                        WS,
-                        AS,
-                        Out,
-                        packed,
-                        inputs,
-                        book,
-                        bx,
-                        expert,
-                        offset,
-                        count,
-                    )
+                    expert, first = TE[tile], TR[tile]
+                    offset = Offsets[expert] + first
+                    count = T.min(BM, Counts[expert] - first)
+                    for i in T.unroll(2):
+                        book[tid + i * 128] = Book[0, tid + i * 128, 0]
+                project(
+                    Low,
+                    High,
+                    Sum,
+                    P,
+                    WS,
+                    AS,
+                    Out,
+                    packed,
+                    inputs,
+                    book,
+                    bx,
+                    expert,
+                    offset,
+                    count,
+                )
 
     return exact_e8p_int4
 

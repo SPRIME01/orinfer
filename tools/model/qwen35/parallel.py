@@ -20,7 +20,7 @@ def geometry(selection, row=1):
     return selection["configs"][int(key)]
 
 
-def factory(role, context, attention, text=None):
+def factory(role, context, attention, text=None, recurrent=None):
     from kernels.model import kv_int8
     from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
     from kernels.model.gdn_sequence import _gdn_sequence
@@ -52,16 +52,24 @@ def factory(role, context, attention, text=None):
             key_heads=hk,
             value_heads=hv,
         )
+    elif role == "recurrent" and (recurrent or {}).get("deferred"):
+        from kernels.model.gdn_deferred import recurrent as logged_recurrent
+
+        fn = logged_recurrent(
+            recurrent["capacity"],
+            key_heads=hk,
+            value_heads=hv,
+            value_tile=recurrent["value_tile"],
+            threads=recurrent["threads"],
+        )
     elif role == "recurrent":
         fn = invoke(
             _gdn_sequence,
             1,
             in_place=True,
-            value_tile=16,
-            threads=32,
-            prefetch_qk=True,
             key_heads=hk,
             value_heads=hv,
+            **(recurrent or dict(value_tile=16, threads=32, prefetch_qk=True)),
         )
     elif role == "gated_norm":
         fn = invoke(_compile_gated_norm, 1, heads=hv)
@@ -83,6 +91,7 @@ def factory(role, context, attention, text=None):
             target_tiles=ATTENTION_TARGET,
             max_splits=attention["max_splits"],
             head_group=attention["head_group"],
+            parallel_instances=True,
         )
         if role == "attention":
             options.update(
@@ -99,8 +108,12 @@ def factory(role, context, attention, text=None):
     return static_rows(fn)
 
 
-def build(b, attention=None):
-    """Add one dynamic 1..128-request kernel per private computation slot."""
+def build(b, attention=None, recurrent=None):
+    """Bind dynamic private slots, including an optional whole log pipeline.
+
+    Changing log capacity while a request is live requires materialization;
+    one package therefore uses one log geometry for its complete row domain.
+    """
     import tilelang
     from kernels.model.independent_rows import independent_rows
     from tools.model.qwen35.build import gpu_lock
@@ -108,7 +121,44 @@ def build(b, attention=None):
     if attention is None:
         with gpu_lock(b.lock):
             attention = geometry(b.row_tuner.attention(b.context))
+    if recurrent is None:
+        with gpu_lock(b.lock):
+            recurrent = b.row_tuner.private_gdn()
     w = b.weights
+    recurrent_choices = list(b.row_choices(recurrent, LANES))
+    deferred_configs = [c for _, c in recurrent_choices if c.get("deferred")]
+    deferred = bool(deferred_configs)
+    if deferred:
+        if len(recurrent_choices) != 1:
+            raise ValueError("Deferred GDN requires one request-state geometry")
+        from kernels.model import gdn_deferred
+        from tools.model.compile import primitive
+
+        config = deferred_configs[0]
+        capacity = config["capacity"]
+        hk, hv = b.text["linear_num_key_heads"], b.text["linear_num_value_heads"]
+        gdn_deferred.validate_geometry(capacity, hk, hv, config["value_tile"], config["threads"])
+        for layer, kind in enumerate(b.text["layer_types"]):
+            if kind != "linear_attention":
+                continue
+            bindings = dict(State=f"L{layer}_State")
+            for argument, suffix, dtype, shape in [
+                ("LogK", "GdnLogKey", "f16", [capacity, hk, 128]),
+                ("LogD", "GdnLogDelta", "f32", [capacity, hv, 128]),
+                ("LogG", "GdnLogGate", "f32", [capacity, hv]),
+                ("Count", "GdnLogCount", "i32", [hv, 128]),
+            ]:
+                name = f"L{layer}_{suffix}"
+                w.fixed(name, dtype, shape, "sequence")
+                b.reset.append(name)
+                bindings[argument] = name
+            b.emit(
+                f"layer{layer}/private/recurrent_materialize",
+                f"gdn-materialize-{hk}-{hv}-{capacity}",
+                lambda: primitive(gdn_deferred.materialize, capacity, key_heads=hk, value_heads=hv),
+                bindings,
+                dynamic=False,
+            )
     kernels = {k["name"]: k for k in b.aot.kernels}
     row_roles = set(["QKV", "Zout", "AB", "FullX", "FullQ", "FullGate", "MixerIn"])
     layers = []
@@ -122,12 +172,30 @@ def build(b, attention=None):
             if kind == "linear_attention"
             else ["prepare", "attention", "attention_merge"]
         )
-        for role in names:
+        for role, suffix, config in [
+            (role, suffix, config)
+            for role in names
+            for suffix, config in (
+                b.row_choices(recurrent, LANES) if role == "recurrent" else [("", None)]
+            )
+        ]:
             old = kernels[f"qwen_rows/layer{layer}/private/{role}"]
             pointers = b.aot.compiler.pointers(old)
+            if config and config.get("deferred"):
+                pointers.update(
+                    {
+                        key: dict(kind="buffer", name=f"L{layer}_{value}")
+                        for key, value in dict(
+                            LogK="GdnLogKey",
+                            LogD="GdnLogDelta",
+                            LogG="GdnLogGate",
+                            Count="GdnLogCount",
+                        ).items()
+                    }
+                )
             if role == "conv":
                 pointers["History"] = pointers["HI"]
-            fn = factory(role, b.context, attention, b.text)
+            fn = factory(role, b.context, attention, b.text, config)
             modes = {}
             normalized = dict(pointers)
             from tvm import tirx as tir
@@ -165,7 +233,7 @@ def build(b, attention=None):
                     size = math.prod(int(n) for n in buf.shape) * dtypes[storage["dtype"]]
                     scratch[name] = max(scratch.get(name, 0), size)
                 modes[buf.name] = (mode, identity)
-            entries.append((role, fn, modes, normalized))
+            entries.append((role, suffix, config, fn, modes, normalized))
         layers.append(entries)
     offsets = {}
     cursor = 0
@@ -179,7 +247,7 @@ def build(b, attention=None):
     column_map = {name: i for i, name in enumerate(columns)}
     print("PRIVATE ROWS", len(columns), "columns", cursor, "scratch bytes/request", flush=True)
     for layer, entries in enumerate(layers):
-        for role, fn, modes, pointers in entries:
+        for role, suffix, config, fn, modes, pointers in entries:
             args_offsets = {
                 name: offsets[arg["name"]]
                 for name, arg in pointers.items()
@@ -193,6 +261,9 @@ def build(b, attention=None):
                 row_stride=len(layers) * len(columns),
                 dynamic=True,
                 offsets=args_offsets,
+                batch_parameters=("independent_instances",)
+                if role in ("attention", "attention_merge")
+                else (),
             )
             bindings = {}
             for name in inputs:
@@ -204,9 +275,9 @@ def build(b, attention=None):
             bindings["Pointers"] = dict(
                 kind="buffer_slice", name=TABLE, offset=layer * len(columns) * 8
             )
-            key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else ''}"
+            key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else config}"
 
-            def compile_wrapped(wrapped=wrapped, role=role):
+            def compile_wrapped(wrapped=wrapped, role=role, config=config):
                 return tilelang.compile(
                     wrapped,
                     out_idx=[],
@@ -216,8 +287,8 @@ def build(b, attention=None):
                         "tl.disable_thread_storage_sync": True,
                         "tl.disable_shared_memory_reuse": True,
                     }
-                    if role == "recurrent"
+                    if role == "recurrent" and config.get("prefetch_qk")
                     else {},
                 )
 
-            b.emit(f"state/layer{layer}/{role}", key, compile_wrapped, bindings, LANES)
+            b.emit(f"state/layer{layer}/{role}{suffix}", key, compile_wrapped, bindings, LANES)

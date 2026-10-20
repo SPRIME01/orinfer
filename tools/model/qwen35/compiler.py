@@ -28,6 +28,8 @@ class Aot:
         for file in [
             ROOT / "tools/model/compile.py",
             ROOT / "tools/model/row_tuning.py",
+            ROOT / "tools/model/expert_tuning.py",
+            ROOT / "tools/model/gdn_tuning.py",
             ROOT / "tools/model/row_selection.py",
             ROOT / "tools/model/flash_next/compiler.py",
             ROOT / "tools/model/flash_next/decode_tuning.py",

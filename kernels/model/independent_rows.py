@@ -21,12 +21,23 @@ __device__ __forceinline__ void* orin_row_offset(const void* base, unsigned long
 """
 
 
-def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=False, offsets=None):
+def independent_rows(
+    function,
+    rows,
+    roles,
+    columns,
+    row_stride=None,
+    dynamic=False,
+    offsets=None,
+    batch_parameters=(),
+):
     """roles maps input buffer names to ('weight'|'row'|'private', identity).
 
     columns is the architecture's private-buffer column map. Returns a PrimFunc
     and its input names in parameter order (None denotes the pointer table).
     offsets optionally selects each input's byte range within its private arena.
+    batch_parameters binds named scheduling scalars to the live owner count,
+    without changing the single-owner tensor shapes or address strides.
     Only used inputs survive, so unused prefix snapshots need no allocation.
     """
     if not 2 <= rows <= 128:
@@ -56,8 +67,12 @@ def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=Fa
     params, buffers, identities = [pointer_param], {pointer_param: pointers}, [None]
     replacement, data, lets, flat = {}, {}, [], {}
     private_columns = []
+    scalar_replacement = {}
     for param in function.params:
         if param not in function.buffer_map:
+            if param.name in batch_parameters:
+                scalar_replacement[param] = count
+                continue
             if param in used:
                 params.append(param)
                 identities.append(param.name)
@@ -111,6 +126,8 @@ def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=Fa
             data=pointer,
         )
         lets.append((pointer, value))
+    if {p.name for p in scalar_replacement} != set(batch_parameters):
+        raise ValueError("Missing independent-row scheduling scalar")
     if not private_columns:
         raise ValueError("Independent rows require private state for padding")
 
@@ -177,7 +194,8 @@ def independent_rows(function, rows, roles, columns, row_stride=None, dynamic=Fa
 
     body = tir.stmt_functor.ir_transform(function.body, None, replace_buffer)
     body = tir.stmt_functor.substitute(
-        body, {grid.loop_var: tir.floormod(grid.loop_var, grid.extent), **data}
+        body,
+        {grid.loop_var: tir.floormod(grid.loop_var, grid.extent), **data, **scalar_replacement},
     )
     # Restore the loop's binding variable: substitution rewrites its uses only.
     body = tir.stmt_functor.ir_transform(body, None, rewrite)

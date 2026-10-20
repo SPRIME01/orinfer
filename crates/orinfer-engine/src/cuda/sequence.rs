@@ -81,6 +81,8 @@ pub(super) struct Sequence {
     pub graphs: BTreeMap<String, Handle>,
     pub leased: bool,
     pub quarantined: bool,
+    fixed_allocation: Option<u64>,
+    fixed_slices: std::collections::BTreeSet<String>,
 }
 
 impl Executor {
@@ -158,25 +160,12 @@ impl Executor {
     pub(crate) fn upload_sequence_addresses(
         &self,
         name: &str,
-        bindings: &[Option<(usize, String)>],
+        bindings: std::rc::Rc<orinfer_model_sdk::abi::StateBindings>,
     ) -> Result<()> {
-        let mut bytes = Vec::with_capacity(bindings.len() * 8);
-        for binding in bindings {
-            let address = if let Some((slot, buffer)) = binding {
-                let arena = self
-                    .sequences
-                    .get(*slot)
-                    .filter(|s| s.leased)
-                    .ok_or("Address table references an unleased arena")?;
-                *arena
-                    .addresses
-                    .get(buffer)
-                    .ok_or("Address table requires private state")?
-            } else {
-                0
-            };
-            bytes.extend_from_slice(&address.to_le_bytes());
-        }
+        let bytes = self
+            .state_table
+            .borrow_mut()
+            .resolve(bindings, &self.sequences)?;
         self.upload_bytes(name, &bytes)
     }
     /// Read controls from leased arenas without rebinding the active sequence.
@@ -254,13 +243,25 @@ impl Executor {
         Ok(free)
     }
     pub(crate) fn request_fixed_bytes(&self, limits: &BTreeMap<String, usize>) -> Result<usize> {
-        self.sequence_specs
+        let payload = self
+            .sequence_specs
             .iter()
             .filter(|b| !self.sequence_strides.contains_key(&b.name))
             .try_fold(0usize, |sum, b| {
                 sum.checked_add(limits.get(&b.name).copied().unwrap_or(b.bytes()?))
-                    .ok_or("Sequence size overflow".into())
-            })
+                    .ok_or_else(|| "Sequence size overflow".to_string())
+            })?;
+        payload
+            .checked_add(self.fixed_sequence_layout(limits)?.padding_bytes)
+            .ok_or("Sequence arena size overflow".into())
+    }
+    fn fixed_sequence_layout(
+        &self,
+        limits: &BTreeMap<String, usize>,
+    ) -> Result<super::weight_arena::ArenaLayout> {
+        super::weight_arena::ArenaLayout::new(self.sequence_specs.iter().filter(|b| {
+            !self.sequence_strides.contains_key(&b.name) && !limits.contains_key(&b.name)
+        }))
     }
     pub(crate) fn lease_sequence(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         let reused = self.idle_sequence(limits)?;
@@ -408,7 +409,7 @@ impl Executor {
                             "initialize request metadata",
                         )?;
                         let old = self.sequences[slot].addresses[&name];
-                        if old != 0 {
+                        if old != 0 && !self.sequences[slot].fixed_slices.remove(&name) {
                             check(sys::cuMemFree_v2(old), "free idle metadata")?;
                             self.session.buffers.retain(|&p| p != old);
                         }
@@ -426,9 +427,40 @@ impl Executor {
         let mut sequence = Sequence::default();
         let mut allocated = Vec::new();
         let result = (|| -> Result<()> {
+            let layout = self.fixed_sequence_layout(limits)?;
+            let base = if layout.allocation_bytes > 0 {
+                let mut owner = 0;
+                // SAFETY: The session owns the allocation before initialization;
+                // each aligned slice remains private to this request arena.
+                unsafe {
+                    check(
+                        sys::cuMemAlloc_v2(&mut owner, layout.allocation_bytes),
+                        "allocate request arena",
+                    )?;
+                    self.session.buffers.push(owner);
+                    allocated.push(owner);
+                    sequence.fixed_allocation = Some(owner);
+                    check(
+                        sys::cuMemsetD8Async(
+                            owner,
+                            0,
+                            layout.allocation_bytes,
+                            self.session.stream,
+                        ),
+                        "initialize request arena",
+                    )?;
+                }
+                layout.base(owner)?
+            } else {
+                0
+            };
             for b in &self.sequence_specs {
                 let bytes = limits.get(&b.name).copied().unwrap_or(b.bytes()?);
-                let address = if let Some(&stride) = self.sequence_strides.get(&b.name) {
+                let address = if let Some(&offset) = layout.offsets.get(&b.name) {
+                    sequence.fixed_slices.insert(b.name.clone());
+                    base.checked_add(offset as u64)
+                        .ok_or("Request arena address overflow")?
+                } else if let Some(&stride) = self.sequence_strides.get(&b.name) {
                     let r =
                         super::virtual_memory::Reservation::reserve(&self.session, bytes, stride)?;
                     let address = r.address;
@@ -527,6 +559,9 @@ impl Executor {
         Ok(())
     }
     fn invalidate_current_graphs(&mut self) -> Result<()> {
+        // Arena address replacement must retire resolved tables as well as
+        // graph arguments. KV page mapping preserves the reserved addresses.
+        self.state_table.get_mut().invalidate();
         let keys: Vec<_> = self
             .batch_graphs
             .get_mut()
@@ -807,16 +842,28 @@ impl Executor {
             self.sequences[slot].quarantined = true;
             for name in names {
                 let address = self.sequences[slot].addresses[&name];
-                // SAFETY: Unleased arena, synchronized stream, invalidated
-                // graphs. Ownership is removed immediately after successful free.
-                unsafe {
-                    check(sys::cuMemFree_v2(address), "reclaim idle request state")?;
+                if !self.sequences[slot].fixed_slices.contains(&name) {
+                    // SAFETY: Unleased arena, synchronized stream, invalidated
+                    // graphs. Ownership is removed immediately after successful free.
+                    unsafe {
+                        check(sys::cuMemFree_v2(address), "reclaim idle request state")?;
+                    }
+                    self.session.buffers.retain(|&p| p != address);
                 }
-                self.session.buffers.retain(|&p| p != address);
                 self.sequences[slot].addresses.insert(name.clone(), 0);
                 self.sequences[slot].sizes.insert(name.clone(), 0);
                 self.pointers.insert(name.clone(), 0);
                 self.sizes.insert(name, 0);
+            }
+            if let Some(owner) = self.sequences[slot].fixed_allocation {
+                // SAFETY: Every slice in this unleased arena has been retired;
+                // no graph or pending stream operation can retain its owner.
+                unsafe {
+                    check(sys::cuMemFree_v2(owner), "reclaim idle request arena")?;
+                }
+                self.session.buffers.retain(|&p| p != owner);
+                self.sequences[slot].fixed_allocation = None;
+                self.sequences[slot].fixed_slices.clear();
             }
             self.sequences[slot].quarantined = false;
         }
@@ -1952,9 +1999,7 @@ impl Executor {
         key: &[(usize, usize)],
         repetitions: usize,
     ) -> Result<Vec<f32>> {
-        let graph = if key.len() == 1 {
-            self.program_graph("decode")?
-        } else {
+        let batch = {
             self.batch_graphs
                 .borrow()
                 .iter()
@@ -1965,9 +2010,14 @@ impl Executor {
                             && cached.rows == key.len()
                             && key.iter().all(|(_, tokens)| *tokens == 1)
                 })
-                .ok_or("Missing hot batch graph")?
-                .1
-                .0
+                .map(|(_, graph)| graph.0)
+        };
+        let graph = if let Some(graph) = batch {
+            graph
+        } else if key.len() == 1 {
+            self.program_graph("decode")?
+        } else {
+            return Err("Missing hot batch graph".into());
         };
         self.profile_graph_time(graph, repetitions)
     }
@@ -2320,14 +2370,23 @@ mod graph_cache_tests {
     #[test]
     fn node_budget_evicts_coldest_before_entry_limit() {
         let mut cache = super::super::executor::BatchGraphCache::new();
-        cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, 8000, 1));
-        cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, 3000, 1));
-        assert_eq!(batch_graph_victim(&cache, 1288), None);
-        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(0, 1)].into()));
+        let large = BATCH_GRAPH_NODES * 2 / 3;
+        let small = BATCH_GRAPH_NODES / 4;
+        let remaining = BATCH_GRAPH_NODES - large - small;
+        cache.insert(vec![(2, 1)].into(), (ptr::null_mut(), 8, large, 1));
+        cache.insert(vec![(0, 1)].into(), (ptr::null_mut(), 3, small, 1));
+        assert_eq!(batch_graph_victim(&cache, remaining), None);
+        assert_eq!(
+            batch_graph_victim(&cache, remaining + 1),
+            Some(vec![(0, 1)].into())
+        );
         cache.get_mut(&vec![(0, 1)].into()).unwrap().3 = 10;
-        assert_eq!(batch_graph_victim(&cache, 1289), Some(vec![(2, 1)].into()));
+        assert_eq!(
+            batch_graph_victim(&cache, remaining + 1),
+            Some(vec![(2, 1)].into())
+        );
         cache.remove(&vec![(0, 1)].into());
-        assert_eq!(batch_graph_victim(&cache, 4000), None);
+        assert_eq!(batch_graph_victim(&cache, BATCH_GRAPH_NODES - large), None);
     }
     #[test]
     fn entry_limit_bounds_small_graphs() {

@@ -8,21 +8,21 @@ and tile sizes are selected offline, never from a context-length enumeration.
 
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.rows import row_count, explicit_rows
+from kernels.model.rows import row_count, explicit_rows, explicit_scalar
 from kernels.model.kv_int8 import HALF2_SOURCE, int8_kv_tile
 
 
 SCALAR_SOURCE = r"""
-__device__ __forceinline__ int attn_split_count(int rows,int groups,int bm,int target,int maximum) {
-    int tiles=(rows*groups+bm-1)/bm;
+__device__ __forceinline__ int attn_split_count(int rows,int groups,int bm,int target,int maximum,int instances) {
+    int tiles=((rows*groups+bm-1)/bm)*instances;
     return min(maximum,(target+tiles-1)/tiles);
 }
 """
 
 
-def geometry(rows, block_m, target_tiles, max_splits, groups):
+def geometry(rows, block_m, target_tiles, max_splits, groups, instances=1):
     tiles = T.ceildiv(rows * groups, block_m)
-    splits = T.min(max_splits, T.ceildiv(target_tiles, tiles))
+    splits = T.min(max_splits, T.ceildiv(target_tiles, tiles * instances))
     return tiles, splits
 
 
@@ -46,6 +46,7 @@ def causal_attention_int8(
     head_group=None,
     threads=128,
     stages=0,
+    parallel_instances=False,
 ):
     groups = query_heads // kv_heads if head_group is None else head_group
     if (
@@ -62,9 +63,10 @@ def causal_attention_int8(
     ):
         raise ValueError("Invalid dynamic GQA geometry")
     m = row_count(capacity, True)
+    instances = T.dynamic("independent_instances") if parallel_instances else 1
     work_heads = query_heads // groups
     heads_per_kv = query_heads // kv_heads // groups
-    tiles, splits = geometry(m, block_m, target_tiles, max_splits, groups)
+    tiles, splits = geometry(m, block_m, target_tiles, max_splits, groups, instances)
     # splits > 1 implies tiles < target_tiles, and tiles*splits < 2*target_tiles.
     workspace_tiles = 2 * target_tiles
     load_kv = int8_kv_tile(block_n, dimension, threads)
@@ -88,7 +90,7 @@ def causal_attention_int8(
             T.import_source(HALF2_SOURCE + SCALAR_SOURCE)
             split_count = T.alloc_local((1,), T.int32)
             split_count[0] = T.call_pure_extern(
-                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits
+                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits, instances
             )
             q = T.alloc_shared((block_m, dimension), T.float16)
             k = T.alloc_shared((block_n, dimension), T.float16)
@@ -189,7 +191,8 @@ def causal_attention_int8(
                         value = T.if_then_else(denom[i] > 0, out[i, d] / T.max(denom[i], 1e-30), 0)
                         Y[token, head, d] = gate_result(value, Gate[token, head, d])
 
-    return explicit_rows(main)
+    main = explicit_rows(main)
+    return explicit_scalar(main, instances) if parallel_instances else main
 
 
 @orin_jit
@@ -202,16 +205,22 @@ def merge_attention_int8(
     kv_heads=4,
     dimension=256,
     head_group=None,
+    parallel_instances=False,
 ):
     m = row_count(capacity, True)
+    instances = T.dynamic("independent_instances") if parallel_instances else 1
     groups = query_heads // kv_heads if head_group is None else head_group
     if groups <= 0 or (query_heads // kv_heads) % groups or max_splits not in (1, 2, 4, 8, 16):
         raise ValueError("Invalid query-head group")
     reduction_levels = max_splits.bit_length() - 1
     work_heads = query_heads // groups
-    _, splits = geometry(m, block_m, target_tiles, max_splits, groups)
+    _, splits = geometry(m, block_m, target_tiles, max_splits, groups, instances)
     workspace_tiles = 2 * target_tiles
-    grid = T.min(m * query_heads, 1 + (splits - 1) * target_tiles * block_m * query_heads)
+    grid = (
+        m * query_heads
+        if parallel_instances
+        else T.min(m * query_heads, 1 + (splits - 1) * target_tiles * block_m * query_heads)
+    )
 
     @T.prim_func
     def main(
@@ -225,7 +234,7 @@ def merge_attention_int8(
             T.import_source(SCALAR_SOURCE)
             split_count = T.alloc_local((1,), T.int32)
             split_count[0] = T.call_pure_extern(
-                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits
+                "int32", "attn_split_count", m, groups, block_m, target_tiles, max_splits, instances
             )
             if split_count[0] > 1:
                 token = work // query_heads
@@ -273,7 +282,8 @@ def merge_attention_int8(
             else:
                 # Keep a real buffer argument when an unsplit specialization
                 # folds the merge away; NVRTC's adapter rejects zero arguments.
-                if T.get_thread_binding() == 0:
+                if work == 0 and T.get_thread_binding() == 0:
                     Denominator[0, 0, 0] = 0.0
 
-    return explicit_rows(main)
+    main = explicit_rows(main)
+    return explicit_scalar(main, instances) if parallel_instances else main

@@ -40,8 +40,12 @@ mod mtp;
 const PRE_GDN: &[&str] = &["norm_rotate", "qkv", "z", "ab"];
 const PRE_ATTN: &[&str] = &["norm_rotate", "q", "k", "v"];
 const PRIVATE_GDN: &[&str] = &["gates", "conv", "history", "recurrent", "gated_norm"];
+const DEFERRED_COLUMNS: &[&str] = &["GdnLogCount", "GdnLogDelta", "GdnLogGate", "GdnLogKey"];
+fn deferred_gdn(m: &Manifest) -> bool {
+    m.buffers.iter().any(|b| b.name.ends_with("_GdnLogCount"))
+}
 const PRIVATE_ATTN: &[&str] = &["prepare", "attention", "attention_merge"];
-fn ffn_names(moe: bool, draft: bool) -> Vec<&'static str> {
+fn ffn_names(moe: bool, draft: bool, expanded: bool, planes: bool) -> Vec<&'static str> {
     let mut names = Vec::new();
     if moe {
         names.extend([
@@ -63,7 +67,20 @@ fn ffn_names(moe: bool, draft: bool) -> Vec<&'static str> {
     });
     names.push("down");
     if moe {
-        names.extend(["expert_up", "expert_rotate", "expert_down", "combine"]);
+        if expanded {
+            names.push("expert_up_expand");
+        }
+        if planes {
+            names.push("expert_up_planes");
+        }
+        names.extend(["expert_up", "expert_rotate"]);
+        if expanded {
+            names.push("expert_down_expand");
+        }
+        if planes {
+            names.push("expert_down_planes");
+        }
+        names.extend(["expert_down", "combine"]);
     }
     names
 }
@@ -112,6 +129,84 @@ fn validate_weights(
 ) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
+    if deferred_gdn(m) {
+        for (layer, kind) in t.layer_types.iter().enumerate() {
+            if kind != "linear_attention" {
+                continue;
+            }
+            let gate = format!("L{layer}_GdnLogGate");
+            let capacity = map
+                .get(gate.as_str())
+                .and_then(|b| b.shape.first())
+                .copied();
+            let capacity = capacity
+                .filter(|n| [2, 4, 8, 16, 32].contains(n))
+                .ok_or("Invalid deferred GDN capacity")?;
+            for (suffix, dtype, shape) in [
+                (
+                    "GdnLogCount",
+                    Dtype::I32,
+                    vec![t.linear_num_value_heads, 128],
+                ),
+                (
+                    "GdnLogDelta",
+                    Dtype::F32,
+                    vec![capacity, t.linear_num_value_heads, 128],
+                ),
+                (
+                    "GdnLogGate",
+                    Dtype::F32,
+                    vec![capacity, t.linear_num_value_heads],
+                ),
+                (
+                    "GdnLogKey",
+                    Dtype::F16,
+                    vec![capacity, t.linear_num_key_heads, 128],
+                ),
+            ] {
+                let name = format!("L{layer}_{suffix}");
+                if map.get(name.as_str()).is_none_or(|b| {
+                    b.dtype != dtype
+                        || b.shape != shape
+                        || b.data.is_some()
+                        || b.access != Access::ReadWrite
+                }) || !m.reset_buffers.contains(&name)
+                {
+                    return Err(format!("Invalid request-owned deferred GDN state: {name}"));
+                }
+            }
+        }
+    }
+    if ["MoeLow", "MoeHigh", "MoeSum"]
+        .iter()
+        .any(|name| map.contains_key(name))
+    {
+        if t.num_experts == 0 {
+            return Err("E8P expert planes require routed experts".into());
+        }
+        for (name, dtype, size) in [
+            (
+                "MoeLow",
+                Dtype::I8,
+                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+            ),
+            (
+                "MoeHigh",
+                Dtype::I8,
+                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+            ),
+            ("MoeSum", Dtype::I32, CAPACITY * t.num_experts_per_tok),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != dtype
+                    || b.shape != [size]
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid E8P expert plane workspace: {name}"));
+            }
+        }
+    }
     let check = |name: String, dtype: Dtype, shape: Vec<usize>| -> Result<()> {
         if map.get(name.as_str()).is_none_or(|b| {
             b.dtype != dtype || b.shape != shape || b.access != Access::Read || b.data.is_none()
@@ -384,11 +479,11 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             &format!("layer{layer}/pre"),
             if gdn { PRE_GDN } else { PRE_ATTN },
         ));
-        let mut private = section(
-            m,
-            &format!("layer{layer}/private"),
-            if gdn { PRIVATE_GDN } else { PRIVATE_ATTN },
-        );
+        let mut private_names = if gdn { PRIVATE_GDN } else { PRIVATE_ATTN }.to_vec();
+        if gdn && deferred_gdn(m) {
+            private_names.insert(3, "recurrent_materialize");
+        }
+        let mut private = section(m, &format!("layer{layer}/private"), &private_names);
         if gdn {
             // History is a fixed-size private state, independent of live rows.
             private[2] = Operation::Copy {
@@ -401,7 +496,12 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
         forward.extend(private);
         let mut post = vec!["quantize", "out", "norm_rotate"];
-        post.extend(ffn_names(t.num_experts > 0, false));
+        post.extend(ffn_names(
+            t.num_experts > 0,
+            false,
+            m.buffers.iter().any(|b| b.name == "MoeExpanded"),
+            m.buffers.iter().any(|b| b.name == "MoeLow"),
+        ));
         forward.extend(section(m, &format!("layer{layer}/post"), &post));
         layer_ends.push(forward.len());
     }
@@ -458,7 +558,12 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     });
     {
         let columns = &m.batch_layout.as_ref().unwrap().state_columns;
-        if columns != STATE_COLUMNS
+        let mut expected_columns = STATE_COLUMNS.to_vec();
+        if deferred_gdn(m) {
+            expected_columns.extend(DEFERRED_COLUMNS);
+            expected_columns.sort_unstable();
+        }
+        if *columns != expected_columns
             || m.buffers
                 .iter()
                 .find(|b| b.name == "QwenRowPointers")
@@ -945,6 +1050,111 @@ mod tests {
         request_geometry(false)
     }
 
+    fn deferred_request() -> CreateRequest {
+        let mut r = request_geometry(true);
+        let layers = r.config["text_config"]["layer_types"].as_array().unwrap();
+        for (layer, kind) in layers.iter().enumerate() {
+            if kind != "linear_attention" {
+                continue;
+            }
+            for (suffix, dtype, shape) in [
+                ("GdnLogCount", "i32", vec![16, 128]),
+                ("GdnLogDelta", "f32", vec![8, 16, 128]),
+                ("GdnLogGate", "f32", vec![8, 16]),
+                ("GdnLogKey", "f16", vec![8, 16, 128]),
+            ] {
+                let name = format!("L{layer}_{suffix}");
+                r.metadata.reset_buffers.push(name.clone());
+                r.metadata.buffers.push(
+                    serde_json::from_value(json!({
+                        "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
+                        "alignment":256,"access":"read_write"
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        let columns = &mut r.metadata.batch_layout.as_mut().unwrap().state_columns;
+        columns.extend(DEFERRED_COLUMNS.iter().map(|s| (*s).to_owned()));
+        columns.sort_unstable();
+        r.metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "QwenRowPointers")
+            .unwrap()
+            .shape = vec![LANES * layers.len() * columns.len()];
+        r
+    }
+
+    #[test]
+    fn pending_gdn_updates_are_private_and_materialized_before_dense_execution() {
+        let (adapter, plan) = create(deferred_request(), Policy::Int8Quality).unwrap();
+        let m = &plan.metadata;
+        let names = |program: &str| {
+            m.programs[program]
+                .iter()
+                .filter_map(|o| match o {
+                    Operation::Kernel { name } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let private = names("qwen_rows/layer0/private");
+        assert!(
+            private
+                .iter()
+                .position(|n| n.ends_with("/recurrent_materialize"))
+                .unwrap()
+                < private
+                    .iter()
+                    .position(|n| n.ends_with("/recurrent"))
+                    .unwrap()
+        );
+        let parallel = names("qwen_rows/state/layer0");
+        assert_eq!(
+            parallel
+                .iter()
+                .filter(|n| n.ends_with("/recurrent"))
+                .count(),
+            1
+        );
+        let (_, state) = adapter
+            .batch(&[BatchSegment { slot: 3, tokens: 1 }], true)
+            .unwrap();
+        assert!(state.iter().any(|s| {
+            s.as_ref()
+                .is_some_and(|(slot, name)| *slot == 3 && name == "L0_GdnLogDelta")
+        }));
+        let (_, speculative) = create(with_mtp(deferred_request()), Policy::Int8Quality).unwrap();
+        let verify = &speculative.metadata.programs["qwen_rows/verify/layer0/private"];
+        let materialize = verify
+            .iter()
+            .position(|o| {
+                matches!(o, Operation::Kernel { name }
+            if name.ends_with("/recurrent_materialize"))
+            })
+            .unwrap();
+        let recurrent = verify
+            .iter()
+            .position(|o| {
+                matches!(o, Operation::Kernel { name }
+            if name.ends_with("/recurrent"))
+            })
+            .unwrap();
+        assert!(materialize < recurrent);
+        let mut bad = deferred_request();
+        bad.metadata.reset_buffers.retain(|n| n != "L0_GdnLogCount");
+        assert!(create(bad, Policy::Int8Quality).is_err());
+        let mut bad = deferred_request();
+        bad.metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "L0_GdnLogDelta")
+            .unwrap()
+            .dtype = Dtype::F16;
+        assert!(create(bad, Policy::Int8Quality).is_err());
+    }
+
     fn request_geometry(small: bool) -> CreateRequest {
         let dimensions = if small {
             (2048, 6144, 24, 16, 8, 2, true)
@@ -1168,6 +1378,39 @@ mod tests {
             })
             .collect();
         assert_eq!(conditions, [Some(7), Some(2)]);
+        let mut planes: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        for (name, dtype, size) in [
+            ("MoeLow", "i8", 32768 * 2048 / 2),
+            ("MoeHigh", "i8", 32768 * 2048 / 2),
+            ("MoeSum", "i32", 32768),
+        ] {
+            planes.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":dtype,"shape":[size],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let copied = serde_json::from_value(serde_json::to_value(&planes).unwrap()).unwrap();
+        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        for role in ["expert_up", "expert_down"] {
+            let index = |suffix: &str| {
+                post.iter()
+                    .position(|op| matches!(op,Operation::Kernel{name} if name.ends_with(suffix)))
+                    .unwrap()
+            };
+            assert!(index(&format!("/{role}_planes")) < index(&format!("/{role}")));
+        }
+        assert!(
+            plan.metadata.programs["mtp_post"]
+                .iter()
+                .all(|op| { !matches!(op,Operation::Kernel{name} if name.ends_with("_planes")) })
+        );
+        planes.metadata.buffers.retain(|b| b.name != "MoeSum");
+        assert!(create(planes, Policy::Int8Quality).is_err());
         request
             .metadata
             .buffers
