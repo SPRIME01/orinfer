@@ -332,7 +332,11 @@ impl Writer {
                     synced = Instant::now();
                 }
             }
-            file.sync_data().map_err(|e| e.to_string())
+            let result = file.sync_data().map_err(|e| e.to_string());
+            // Release the cloned descriptor before publishing task completion;
+            // it shares the journal's flock and must not delay a resumed run.
+            drop(file);
+            result
         });
         Ok(Self { sender, handle })
     }

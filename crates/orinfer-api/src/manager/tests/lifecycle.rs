@@ -374,3 +374,26 @@ async fn claimed_idle_victim_cannot_accept_a_racing_request() {
     drop(replacement);
     fixture.unload().await;
 }
+
+#[tokio::test]
+async fn temporary_resource_lock_contention_waits_without_caching_startup_failure() {
+    let fixture = Fixture::new();
+    let owner = locked_file(&fixture.manager.config.gpu_lock).unwrap();
+    let manager = Arc::clone(&fixture.manager);
+    let waiting = tokio::spawn(async move { manager.acquire("fixture:2b").await });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(fixture.starts(), 0);
+    assert!(fixture.manager.failures.lock().await.is_empty());
+    drop(owner);
+    let lease = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(fixture.starts(), 1);
+    drop(lease);
+    fixture.unload().await;
+    fixture.assert_gpu_released().await;
+}

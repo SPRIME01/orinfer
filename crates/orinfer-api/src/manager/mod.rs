@@ -147,6 +147,15 @@ fn runner_key(record: &ModelRecord) -> String {
     )
 }
 
+fn retryable(message: &str) -> bool {
+    message.starts_with("Insufficient unified memory")
+        || message.starts_with("Resource lock is busy:")
+        || matches!(
+            message,
+            "Model is loading" | "Model is draining" | "Model is executing an offline batch job"
+        )
+}
+
 impl Manager {
     async fn acquire(self: &Arc<Self>, name: &str) -> Result<(Lease, ModelRecord)> {
         let manager = Arc::clone(self);
@@ -192,12 +201,7 @@ impl Manager {
                     }
                     Err(error) => Err(error),
                 };
-                let wait = result.as_ref().err().is_some_and(|e| {
-                    e.starts_with("Insufficient unified memory")
-                        || e == "Model is loading"
-                        || e == "Model is draining"
-                        || e == "Model is executing an offline batch job"
-                });
+                let wait = result.as_ref().err().is_some_and(|e| retryable(e));
                 if !wait
                     || manager.stopping.load(Ordering::Acquire)
                     || started.elapsed() >= Duration::from_secs(manager.config.load_timeout_s)
@@ -290,7 +294,7 @@ impl Manager {
                 Ok(Acquisition::Loading(Lease(runner, None), record, budget))
             }
             Err(error) => {
-                if !error.starts_with("Insufficient unified memory") {
+                if !retryable(&error) {
                     self.failures
                         .lock()
                         .await
