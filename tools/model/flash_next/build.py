@@ -15,14 +15,14 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from tools.model.flash_next.build_cache import BuildCache, identity  # noqa: E402
+from tools.model.build_cache import BuildCache, identity  # noqa: E402
 from tools.model.flash_next.construction import (
     expert_matrices,
     fixed_extents,
     prefill_names,
     projection,
 )  # noqa: E402
-from tools.model.flash_next.compiler import Compiler  # noqa: E402
+from tools.model.host_compiler import Compiler  # noqa: E402
 from tools.model.publication import (  # noqa: E402
     ROOT,
     atomic_model,
@@ -162,7 +162,7 @@ def rebuild(args):
         print(json.dumps(report, indent=2), flush=True)
         return
 
-    from tools.model.flash_next.decode_tuning import DecodeTuner
+    from tools.model.projection_tuning import ProjectionTuner
     from tools.operators.common import export_kernel
     import torch
 
@@ -193,12 +193,12 @@ def rebuild(args):
         print("COMPLETE cached publication", output_data["execution_package"], flush=True)
         return
 
-    tuning = DecodeTuner(args.output, args.cache / "tuning")
+    tuning = ProjectionTuner(args.output, args.cache / "tuning")
     records = []
     certificates = []
     # Validate both legal expert tiles at actual N/K/E, without independently
     # changing the certified coupled route + up + down selection table.
-    from tools.model.flash_next.decode_tuning import make_prim, EXACT_PASSES, TARGET
+    from tools.model.projection_tuning import make_prim, EXACT_PASSES, TARGET
     import tilelang
 
     for (count, n, k), operands in sorted(experts.items()):
@@ -233,7 +233,7 @@ def rebuild(args):
                     pass_configs=EXACT_PASSES,
                 )
                 for live in (1, 17, 512, 4096):
-                    DecodeTuner._validate(candidate, spec, config, live, actual)
+                    ProjectionTuner._validate(candidate, spec, config, live, actual)
                 export_kernel(candidate, folder)
                 write_json(
                     folder / "validation.json", dict(config=config, checked_rows=[1, 17, 512, 4096])
@@ -319,7 +319,7 @@ def rebuild(args):
         package["dynamic_batch_kernels"] = [
             launches.get(k["name"], k) for k in package["dynamic_batch_kernels"]
         ]
-        from tools.model.flash_next.converge_kernels import coalesce_adjacent_selections
+        from tools.model.row_convergence import coalesce_adjacent_selections
         from tools.model.compact import compact_package
 
         from tools.model.sampling import append as append_sampling

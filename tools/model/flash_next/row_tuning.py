@@ -14,7 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from tools.model.publication import AssetReader, load_model, write_json
-from tools.model.flash_next.compiler import Compiler
+from tools.model.host_compiler import Compiler
 from tools.model.row_selection import ranges, samples
 from tools.operators.abi import evaluate
 

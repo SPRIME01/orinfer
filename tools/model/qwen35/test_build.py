@@ -438,7 +438,7 @@ class BuildTests(unittest.TestCase):
         self.assertNotIn("stages", launches[1][0])
         self.assertNotIn("live_k", launches[1][1])
 
-    def test_staged_attention_preserves_private_kv_and_skips_small_rows(self):
+    def test_staged_attention_preserves_private_kv_and_obeys_measured_decoder_ranges(self):
         first, merge, decoder = (lambda: None), (lambda: None), (lambda: None)
         first.__name__, merge.__name__, decoder.__name__ = "attention", "merge", "decode"
         baseline = dict(block_m=64, block_n=64, head_group=1, max_splits=8, threads=256, stages=1)
@@ -454,7 +454,7 @@ class BuildTests(unittest.TestCase):
         selection = dict(
             configs=[baseline, staged],
             default="1",
-            selections=[dict(min_rows=1, max_rows=128, multiple_of=1, implementation="0")],
+            selections=[dict(min_rows=1, max_rows=73, multiple_of=1, implementation="0")],
         )
         builder = Builder.__new__(Builder)
         builder.context, builder.lock, builder.qh, builder.kvh = 262144, None, 16, 2
@@ -492,13 +492,13 @@ class BuildTests(unittest.TestCase):
                 staging=True,
             )
         role = "layer3/private/attention"
-        self.assertIn(role + "_decode/skip/1-128", launches)
+        self.assertIn(role + "_decode/skip/1-73", launches)
         self.assertEqual(launches[role + "_decode"][1]["K"], "L3_KPages")
         self.assertEqual(launches[role + "_decode"][1]["DK"], "AttentionDecodedK")
         self.assertTrue(launches[role][0]["decoded_kv"])
         self.assertEqual(launches[role][1]["live_k"], "AttentionDecodedK")
-        self.assertFalse(launches[role + "/rows/1-128"][0]["decoded_kv"])
-        self.assertEqual(launches[role + "/rows/1-128"][1]["K"], "L3_KPages")
+        self.assertFalse(launches[role + "/rows/1-73"][0]["decoded_kv"])
+        self.assertEqual(launches[role + "/rows/1-73"][1]["K"], "L3_KPages")
         self.assertEqual(
             buffers,
             {name: ("f16", [262144, 512]) for name in ("AttentionDecodedK", "AttentionDecodedV")},

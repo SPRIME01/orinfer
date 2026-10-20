@@ -10,7 +10,7 @@ from kernels.model.e8p_exact import split_a8
 from kernels.model.moe import expert_dispatch
 from kernels.model.rotation_a8 import rotate_activation_a8
 from kernels.model.rows import explicit_rows
-from tools.model.flash_next.decode_tuning import profile_stream
+from tools.model.projection_tuning import profile_stream
 from tools.operators.common import configure, write_json
 
 

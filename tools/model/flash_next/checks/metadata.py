@@ -16,7 +16,7 @@ def tune_stripes(output, capacity):
     from kernels.model import qsa
     from kernels.model.rows import explicit_rows
     from tools.operators.abi import parse_host
-    from tools.model.flash_next.compiler import replace_binding
+    from tools.model.host_compiler import replace_binding
     from tools.model.publication import file_hash
     from tools.operators.common import export_kernel
 

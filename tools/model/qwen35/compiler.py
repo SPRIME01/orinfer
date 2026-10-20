@@ -2,9 +2,9 @@
 
 import hashlib
 from pathlib import Path
-from tools.model.flash_next.build_cache import BuildCache
-from tools.model.flash_next.compiler import Compiler
-from tools.model.flash_next.converge_kernels import divide_rows
+from tools.model.build_cache import BuildCache
+from tools.model.host_compiler import Compiler
+from tools.model.row_convergence import divide_rows
 from tools.operators.common import export_kernel
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -31,10 +31,10 @@ class Aot:
             ROOT / "tools/model/expert_tuning.py",
             ROOT / "tools/model/gdn_tuning.py",
             ROOT / "tools/model/row_selection.py",
-            ROOT / "tools/model/flash_next/compiler.py",
-            ROOT / "tools/model/flash_next/decode_tuning.py",
-            ROOT / "tools/model/flash_next/decode_policy.py",
-            ROOT / "tools/model/flash_next/converge_kernels.py",
+            ROOT / "tools/model/host_compiler.py",
+            ROOT / "tools/model/projection_tuning.py",
+            ROOT / "tools/model/projection_policy.py",
+            ROOT / "tools/model/row_convergence.py",
             ROOT / "tools/operators/abi.py",
             ROOT / "tools/operators/common.py",
         ]:

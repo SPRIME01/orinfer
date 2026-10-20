@@ -87,9 +87,9 @@ def factories(b, attention, conv):
         ),
         "attention_merge": lambda: invoke(merge_attention_int8, 8, **gqa),
     }
-    log = next((v for n, v in b.weights.buffers.items() if n.endswith("_GdnLogGate")), None)
-    if log:
-        out["recurrent"] = lambda: gdn_deferred.verification(log["shape"][0], **common)
+    decode = b.gdn_execution["decode"]
+    if decode["kind"] == "deferred":
+        out["recurrent"] = lambda: gdn_deferred.verification(decode["capacity"], **common)
     return out
 
 
@@ -207,7 +207,7 @@ def build(b, *, attention=None, conv=None):
         buffer=TABLE,
         columns=columns,
         row_offset=OFFSET,
-        deferred=any(n.endswith("_GdnLogCount") for n in b.weights.buffers),
+        deferred=b.gdn_execution["decode"]["kind"] == "deferred",
         attention=choices,
     )
     for layer, role, fn, variables, modes, pointers in entries:

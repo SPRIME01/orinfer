@@ -94,7 +94,7 @@ class PrefillTuningTests(unittest.TestCase):
             expected = "2" if row > 16 else "1" if row <= 3 or row % 8 == 0 else "0"
             self.assertEqual(actual, expected)
 
-    def test_attention_staging_uses_aggregate_cost_and_preserves_bounded_choices(self):
+    def test_attention_staging_boundaries_follow_complete_pipeline_measurements(self):
         original = dict(
             configs=[
                 dict(block_m=64, block_n=64, head_group=1, max_splits=8),
@@ -103,30 +103,46 @@ class PrefillTuningTests(unittest.TestCase):
             default="0",
             selections=[dict(min_rows=1, max_rows=32, implementation="1")],
         )
+        seen = {}
+
+        def measure(context, spec, configs, *, measure_rows):
+            seen.update(configs=configs, rows=measure_rows)
+            # Staging wins on both sides of the old 128-row cutoff. It loses
+            # again at large extents: either boundary must come from timings.
+            records = [
+                dict(
+                    rows=n,
+                    times={"0": 2.0, "1": 3.0, "2": 1.0 if 17 <= n <= 129 else 4.0, "3": 5.0},
+                )
+                for n in [1, 17, 73, 128, 129, 511, 4096]
+            ]
+            return dict(configs=configs, measurements=records, **ranges(records))
+
         with tempfile.TemporaryDirectory() as output:
             tuner = RowTuner(output, {}, dict(num_attention_heads=16, num_key_value_heads=2))
-            with patch.object(
-                tuner,
-                "_measure_attention",
-                return_value=dict(
-                    measurements=[
-                        dict(rows=129, times={"0": 1.0, "1": 0.1, "2": 0.4}),
-                        dict(rows=4096, times={"0": 10.0, "1": 6.0, "2": 4.0}),
-                    ]
-                ),
-            ):
+            with patch.object(tuner, "_measure_attention", side_effect=measure):
                 result = tuner.staged_attention(262144, original)
-        self.assertEqual(result["configs"][int(result["default"])]["block_m"], 128)
-        self.assertTrue(result["configs"][int(result["default"])]["decoded_kv"])
+                self.assertIs(result, tuner.staged_attention(262144, original))
+        self.assertIn(1, seen["rows"])
+        self.assertIn(127, seen["rows"])
+        self.assertIn(129, seen["rows"])
         published = list(choices(result, 4096, bounded=True))
-        for suffix, config in published:
-            first, last = map(int, suffix.removeprefix("/rows/").split("-"))
-            if first > 128:
-                self.assertEqual(last, 4096)
-                self.assertTrue(config["decoded_kv"])
-            else:
-                self.assertLessEqual(last, 128)
-                self.assertEqual(config, original["configs"][1 if first <= 32 else 0])
+        for row, expected in [
+            (1, False),
+            (17, True),
+            (73, True),
+            (128, True),
+            (129, True),
+            (4096, False),
+        ]:
+            config = next(
+                c
+                for suffix, c in published
+                if int(suffix.split("/")[-1].split("-")[0])
+                <= row
+                <= int(suffix.split("/")[-1].split("-")[1])
+            )
+            self.assertEqual(config.get("decoded_kv", False), expected)
 
     def test_one_winner_has_no_other_runtime_implementation(self):
         result = ranges([dict(rows=n, times=dict(a=2.0, b=1.0)) for n in [1, 17, 257, 512]], 512)

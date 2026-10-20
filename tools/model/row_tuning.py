@@ -296,50 +296,44 @@ class RowTuner:
         return result
 
     def staged_attention(self, context, selection):
-        """Choose one prefill pipeline including the cost of temporary KV decoding."""
-        from tools.model.row_selection import prefill_fallback
+        """Measure complete INT8 and temporary-FP16 KV pipelines at every row extent."""
+        from tools.model.row_selection import samples
 
-        baseline = selection["configs"][int(selection["default"])]
+        names = dict.fromkeys(
+            [
+                selection["default"],
+                *(choice["implementation"] for choice in selection["selections"]),
+            ]
+        )
+        configs = [selection["configs"][int(name)] for name in names]
+        configs += [
+            dict(
+                block_m=m,
+                block_n=64,
+                head_group=g,
+                threads=t,
+                stages=1,
+                max_splits=1,
+                decoded_kv=True,
+            )
+            for m, g, t in [(64, 1, 256), (128, 2, 512)]
+            if (self.qh // self.kvh) % g == 0
+        ]
         spec = dict(
             kind="staged_attention",
             context=context,
             query_heads=self.qh,
             kv_heads=self.kvh,
-            baseline=baseline,
+            candidates=configs,
         )
-        if str(spec) in self.records:
-            return self.records[str(spec)]
-        configs = [
-            baseline,
-            *[
-                dict(
-                    block_m=m,
-                    block_n=64,
-                    head_group=g,
-                    threads=t,
-                    stages=1,
-                    max_splits=1,
-                    decoded_kv=True,
-                )
-                for m, g, t in [(64, 1, 256), (128, 2, 512)]
-                if (self.qh // self.kvh) % g == 0
-            ],
-        ]
-        measured = self._measure_attention(
-            context, spec, configs, measure_rows=[129, 512, 2048, 4096]
-        )
-        winner = min(
-            range(len(configs)),
-            key=lambda i: sum(row["times"][str(i)] for row in measured["measurements"]),
-        )
-        result = selection
-        if winner:
-            result = prefill_fallback(
-                dict(selection, configs=[*selection["configs"], configs[winner]]),
-                str(len(selection["configs"])),
+        key = str(spec)
+        if key not in self.records:
+            # Decoder launch, attention and merge are timed together. Small
+            # prefill tails compete with large extents; no row cutoff is assumed.
+            self.records[key] = self._measure_attention(
+                context, spec, configs, measure_rows=samples(4096)
             )
-        self.records[str(spec)] = result
-        return result
+        return self.records[key]
 
     def _measure_attention(self, context, spec, configs, *, measure_rows=None):
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
@@ -519,7 +513,7 @@ class RowTuner:
         """Choose time tiles while preserving the native per-row reduction."""
         import torch
         from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         spec = dict(kind="gdn_convolution", key_heads=self.hk, value_heads=self.hv)
         if str(spec) in self.records:

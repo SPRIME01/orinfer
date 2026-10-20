@@ -202,6 +202,7 @@ class Builder:
         self.state = state
         self.context = context
         self.lock = lock
+        self.gdn_execution = dict(prefill="sequential", decode=dict(kind="dense"))
         self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
         prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
@@ -649,7 +650,7 @@ class Builder:
         )
         if kind == "e8p_q4":
             bind["Book"] = self.book
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         shapes = [(rows, dynamic, name)]
         if dynamic:
@@ -694,7 +695,7 @@ class Builder:
         self, weight, kind, n, k, rows, dynamic, dtype, stride=None, *, select_rows=False
     ):
         import torch
-        from tools.model.flash_next.decode_tuning import DecodeTuner
+        from tools.model.projection_tuning import ProjectionTuner
         from tools.model.row_selection import samples
 
         w = self.weights
@@ -710,9 +711,9 @@ class Builder:
         identity = w.buffers[weight + suffix]["data"]["sha256"]
         if kind == "e8p_q4":
             identity += w.buffers[self.book]["data"]["sha256"]
-        tuner = DecodeTuner(self.output / "tuning", self.aot.cache.root / "tuning")
+        tuner = ProjectionTuner(self.output / "tuning", self.aot.cache.root / "tuning")
         compile = tuner.compile_choices if select_rows else tuner.compile
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         result = compile(
             kind,
@@ -1065,6 +1066,7 @@ class Builder:
             ),
             vision=self.vision,
             mtp=self.mtp,
+            gdn_execution=self.gdn_execution,
             batch_layout=dict(
                 layers=self.text["layer_types"],
                 row_strides={},

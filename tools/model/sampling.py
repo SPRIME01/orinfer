@@ -16,7 +16,7 @@ from tools.model.publication import atomic_model, clone_model, load_model, write
 
 def append(data, package, root, output):
     from kernels.model import sampling
-    from tools.model.flash_next.compiler import Compiler
+    from tools.model.host_compiler import Compiler
 
     metadata = data["metadata"]
     vocab, context = metadata["vocab"], metadata["max_context"]

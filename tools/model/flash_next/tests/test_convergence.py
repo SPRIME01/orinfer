@@ -1,7 +1,7 @@
 """Length arithmetic and legal fixed AOT exclusions during convergence."""
 
 import unittest
-from tools.model.flash_next.converge_kernels import divide_rows
+from tools.model.row_convergence import divide_rows
 from tools.model.row_selection import split_fixed
 from tools.model.flash_next.row_tuning import intervals
 
@@ -34,7 +34,7 @@ class ConvergenceTests(unittest.TestCase):
             radix_shift("choose", "unrelated kernel")
 
     def test_dynamic_tuning_covers_the_allocation_instead_of_one_short_sample(self):
-        from tools.model.flash_next.decode_tuning import profile_rows
+        from tools.model.projection_tuning import profile_rows
 
         for capacity in (1, 7, 128, 1024, 4096):
             samples = profile_rows(capacity)
@@ -46,7 +46,7 @@ class ConvergenceTests(unittest.TestCase):
 
     def test_adjacent_merge_keeps_gaps_arguments_and_launch_contracts(self):
         import copy
-        from tools.model.flash_next.converge_kernels import coalesce_adjacent_selections
+        from tools.model.row_convergence import coalesce_adjacent_selections
 
         def entry(first, last, scalar=99):
             name = f"body/k0/rows/{first}-{last}"

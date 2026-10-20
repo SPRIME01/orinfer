@@ -9,7 +9,7 @@ from tools.model.qwen35.build import gpu_lock, primitive
 
 def run():
     import torch
-    from tools.model.flash_next.decode_tuning import DecodeTuner, make_prim
+    from tools.model.projection_tuning import ProjectionTuner, make_prim
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.kv_int8 import attention_prefill_int8
     from tools.quantization.vq import rotate
@@ -40,7 +40,7 @@ def run():
                 target={"kind": "cuda", "arch": "sm_87"},
             )
             for live in [1, 5, 17]:
-                DecodeTuner._validate(kernel, spec, config, live)
+                ProjectionTuner._validate(kernel, spec, config, live)
             checks.append(
                 dict(
                     kind="strided_" + kind,

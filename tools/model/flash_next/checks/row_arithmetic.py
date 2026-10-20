@@ -10,7 +10,7 @@ from kernels.model.flash_next import dense_projection
 from kernels.model.hyperconnection import hc_down_partial, hc_up_mix
 from kernels.model.hc_bf16_cache import hc_up13_mix
 from kernels.model.rows import explicit_rows
-from tools.model.flash_next.decode_tuning import profile_stream
+from tools.model.projection_tuning import profile_stream
 from tools.model.flash_next.hc_bf16 import pack
 from tools.operators.common import configure, write_json
 

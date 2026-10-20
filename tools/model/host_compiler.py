@@ -105,7 +105,7 @@ class Compiler:
                         "tl.disable_shared_memory_reuse": True,
                     }
                 if key.startswith("expert-"):
-                    from tools.model.flash_next.decode_tuning import EXACT_PASSES
+                    from tools.model.expert_tuning import EXACT_EXPERT_PASSES as EXACT_PASSES
 
                     passes = EXACT_PASSES
                 if artifact is None and kernel is None:

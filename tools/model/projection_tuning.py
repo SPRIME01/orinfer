@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import tempfile
 
-from tools.model.flash_next.decode_policy import (
+from tools.model.projection_policy import (
     q4_configs,
     e8p_q4_configs,
     w8_configs,
@@ -184,7 +184,7 @@ def profile_stream(kernel):
     return kernel
 
 
-class DecodeTuner:
+class ProjectionTuner:
     def __init__(self, output: Path, cache: Path | None = None):
         self.output = output
         self.output.mkdir(parents=True, exist_ok=True)
@@ -266,9 +266,9 @@ class DecodeTuner:
         samples = measurement_rows(rows, dynamic, measure_rows)
         sample = samples[0]
         source = hashlib.sha256()
-        for file in ("decode_tuning.py", "decode_policy.py"):
+        for file in ("projection_tuning.py", "projection_policy.py"):
             source.update(Path(__file__).with_name(file).read_bytes())
-        root = Path(__file__).resolve().parents[3]
+        root = Path(__file__).resolve().parents[2]
         source.update((root / "tools/model/row_selection.py").read_bytes())
         source.update((root / "tools/model/compile.py").read_bytes())
         source.update((root / "tools/model/expert_tuning.py").read_bytes())
@@ -750,7 +750,7 @@ class DecodeTuner:
     def _validate(kernel, spec, config, live, weights=None):
         import torch
 
-        supply, _, check = DecodeTuner._inputs(spec, live, weights)
+        supply, _, check = ProjectionTuner._inputs(spec, live, weights)
         args = supply(kernel.get_profiler()._get_params(with_output=False))
         kernel.adapter.func(*args, stream=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()

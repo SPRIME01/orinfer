@@ -20,6 +20,7 @@ def prefill(b, section, layer):
     with gpu_lock(b.lock):
         selection = chunked(b.row_tuner)
     config = selection["configs"][int(selection["default"])]
+    b.gdn_execution["prefill"] = "chunked"
     common = dict(Q="Q", K="K", W="GdnChunkW", U="GdnChunkU", D="GdnChunkD", GP="GdnChunkG")
     identity = f"{b.hk}-{hv}-{config}"
     b.emit(

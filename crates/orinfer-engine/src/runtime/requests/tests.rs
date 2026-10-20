@@ -330,19 +330,36 @@ fn validate_mtp_partial_prefix() {
             "Changed continuation after prefix restore diverged"
         );
         let actual_state = state(&mut model, &mut restored);
+        let mut deferred_state_buffers = 0;
         for (name, expected) in &expected_state {
+            let deferred = ["_GdnLogCount", "_GdnLogKey", "_GdnLogDelta", "_GdnLogGate"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix));
+            deferred_state_buffers += usize::from(deferred);
             if name.ends_with("_State")
                 || name.ends_with("_History")
                 || name.ends_with("_gdn")
                 || name.ends_with("_conv")
                 || name.ends_with("_pending")
                 || name == "State_ple"
+                || deferred
             {
                 assert_eq!(
                     &actual_state[name], expected,
                     "Restored causal state differs: {name}"
                 );
             }
+        }
+        if model
+            .manifest
+            .gdn_execution
+            .as_ref()
+            .is_some_and(|g| g.deferred_capacity().is_some())
+        {
+            assert!(
+                deferred_state_buffers > 0,
+                "Deferred GDN state was not compared"
+            );
         }
         let target = &model.manifest.position;
         let draft = &model.manifest.mtp.as_ref().unwrap().position;
@@ -379,6 +396,7 @@ fn validate_mtp_partial_prefix() {
         rows.push(json!({"partial_prefix_tokens":checkpoint,
             "checkpoint_mtp_tokens":checkpoint-1,"prompt_tokens":source.input_tokens.len(),
             "changed_continuation_tokens_equal":true,"gdn_and_conv_state_equal":true,
+            "deferred_state_buffers_equal":deferred_state_buffers,
             "target_and_draft_kv_equal":true,"target_position":target_position,
             "draft_position":draft_position,
             "shared_kv_bytes":shared_kv_bytes,

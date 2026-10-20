@@ -60,10 +60,9 @@ def build(b):
     columns = table["columns"] if table else COLUMNS
     target = table["buffer"] if table else TABLE
     capacity = 0
-    if table and table.get("deferred"):
-        capacity = next(
-            v["shape"][0] for n, v in b.weights.buffers.items() if n.endswith("_GdnLogGate")
-        )
+    decode = b.gdn_execution["decode"]
+    if decode["kind"] == "deferred":
+        capacity = decode["capacity"]
     if not table:
         b.weights.fixed(target, "u64", [LANES * layers * len(columns)])
     for layer, kind in enumerate(b.text["layer_types"]):

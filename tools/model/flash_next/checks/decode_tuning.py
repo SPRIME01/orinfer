@@ -3,8 +3,8 @@
 import argparse
 from pathlib import Path
 
-from tools.model.flash_next.decode_policy import SPECIALIZATIONS
-from tools.model.flash_next.decode_tuning import DecodeTuner
+from tools.model.projection_policy import SPECIALIZATIONS
+from tools.model.projection_tuning import ProjectionTuner
 
 
 def main():
@@ -15,7 +15,7 @@ def main():
     p.add_argument("--rows", type=int, nargs="+", default=list(SPECIALIZATIONS))
     args = p.parse_args()
     configure()
-    tuner = DecodeTuner(args.output)
+    tuner = ProjectionTuner(args.output)
     for kind in ("q4", "w8", "swiglu", "expert"):
         for rows, dynamic in [(row, False) for row in args.rows] + [(128, True)]:
             print("TUNE", kind, rows, dynamic, flush=True)

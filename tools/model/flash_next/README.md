@@ -78,4 +78,4 @@ PYTHONPATH=. .venv/bin/python -m tools.model.flash_next.weights \
 
 数值验证固定 seed 20261002，对同一 teacher-forced 历史比较 top3 概率、KL/NLL 和任务结果；token 不完全一致不自动判失败。完整 BF16 参考位于 `reference/`，部分层结果不能视为整模型基线。`checks/` 提供 kernel、尾部和 replay 验证，Rust GPU 测试覆盖状态、prefix、MTP 和混合请求。性能以 Rust CLI 完整请求为准，不能用微测外推 TPS。
 
-源码职责：`construction.py`/`build.py` 管理正式重建，`decode_tuning.py` 管理整数候选；`weights.py`/`checkpoint.py` 读取离线权重，`native.py`/`mtp.py` 保留数学参考。公共算子在 `kernels/model/`，在线架构适配器在 `crates/orinfer-models/src/flash_next/`。
+源码职责：`construction.py`/`build.py` 管理正式重建，公共 `../projection_tuning.py` 管理整数候选；`weights.py`/`checkpoint.py` 读取离线权重，`native.py`/`mtp.py` 保留数学参考。公共算子在 `kernels/model/`，在线架构适配器在 `crates/orinfer-models/src/flash_next/`。

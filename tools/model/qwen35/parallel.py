@@ -136,6 +136,7 @@ def build(b, attention=None, recurrent=None):
 
         config = deferred_configs[0]
         capacity = config["capacity"]
+        b.gdn_execution["decode"] = dict(kind="deferred", capacity=capacity)
         hk, hv = b.text["linear_num_key_heads"], b.text["linear_num_value_heads"]
         gdn_deferred.validate_geometry(capacity, hk, hv, config["value_tile"], config["threads"])
         for layer, kind in enumerate(b.text["layer_types"]):

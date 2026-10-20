@@ -81,6 +81,9 @@ pub struct Manifest {
     pub prefill_batch_profiles: Vec<crate::architecture::PrefillProfile>,
     #[serde(default)]
     pub greedy_sampling: bool,
+    /// Model-owned GDN construction policy; never inferred from scratch names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gdn_execution: Option<crate::operators::gdn::Execution>,
     /// Derived by the native library from its shared sampling bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<Sampling>,

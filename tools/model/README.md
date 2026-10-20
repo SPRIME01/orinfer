@@ -28,6 +28,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 模型目录保留 HF 配置、tokenizer、chat template、标准 safetensors 分片和 `cache/model.json`。数据描述通过 digest 绑定独立执行包，包内包含 Rust 模型库、去重的 cubin、源码及 host ABI；格式与 C ABI 均为版本 1。在线模型不接受裸 AOT manifest。
 
 - `compile.py`、`row_contract.py`、`row_selection.py`：动态行工厂、host ABI 合同与离线选择规则。
+- `host_compiler.py`、`build_cache.py`：公共 host ABI 生成与内容缓存；`projection_policy.py`、`projection_tuning.py`：共享整数投影候选与离线测量；`row_convergence.py`：动态 launch 表达式及相邻选择合并。
 - `catalog.py`、`binding_templates.py`：共享编译定义和原生参数模板。
 - `publication.py`、`compact.py`：不可变资产复用、safetensors 合并及原子发布。
 - `package.py`：离线执行包校验、XZ 归档、发布工具内部安装及前端资源固定；部署使用 Rust 的 `orinfer package install`。
@@ -59,3 +60,5 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
 ```
 
 该入口重建Rust绑定库并原子发布当前schema-1模型，沿用完整程序与ABI检查。新包仍需完整请求、状态隔离及prefix/MTP验收。GPU采样不改变greedy路径；需要top_logprobs或MTP p/q分布的调用保留CPU路径。
+
+Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器校验所声明策略的全部状态和工作区，不通过 buffer 名称推断策略。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，覆盖小行数、非对齐尾部和大 prefill，不设置固定行数分界。

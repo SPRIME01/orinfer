@@ -6,7 +6,7 @@ import torch
 import tilelang
 from kernels.model.moe import route_metadata, expert_histogram, expert_offsets, expert_tiles
 from kernels.model.rows import explicit_rows
-from tools.model.flash_next.decode_tuning import profile_stream
+from tools.model.projection_tuning import profile_stream
 from tools.operators.common import configure, write_json
 
 

@@ -6,7 +6,7 @@ import torch
 import tilelang
 from kernels.model.bf16_single import bf16_single, bf16_rows
 from kernels.model.rows import explicit_rows
-from tools.model.flash_next.decode_tuning import profile_stream
+from tools.model.projection_tuning import profile_stream
 from tools.operators.common import configure, write_json
 
 

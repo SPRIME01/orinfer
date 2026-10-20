@@ -5,7 +5,7 @@ from tilelang import tvm
 
 from kernels.model.rows import explicit_rows
 from tools.model.flash_next.dynamic_batch import factory
-from tools.model.flash_next.decode_tuning import factory as projection_factory, make_prim
+from tools.model.projection_tuning import factory as projection_factory, make_prim
 
 Analyzer = tvm.arith.Analyzer
 tir = tvm.tirx

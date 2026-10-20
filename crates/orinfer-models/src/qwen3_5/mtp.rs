@@ -192,6 +192,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         }
         m.programs.insert("qwen_rows/commit".into(), operations);
     }
+    let deferred = super::deferred_gdn(m);
     let spec = m.mtp.as_mut().unwrap();
     spec.batch_verification_tokens = (2..=8).collect();
     spec.mixed_verification_tokens = spec.batch_verification_tokens.clone();
@@ -246,7 +247,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
         for (layer, kind) in layers.iter().enumerate() {
             let names = if kind == "linear_attention" {
                 let mut names = vec!["gates", "history", "conv"];
-                if !table.deferred && m.buffers.iter().any(|b| b.name.ends_with("_GdnLogCount")) {
+                if table.deferred != deferred {
                     names.push("recurrent_materialize");
                 }
                 names.extend(["recurrent", "factors", "gated_norm"]);

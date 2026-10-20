@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 import tilelang
 import torch
-from tools.model.flash_next.decode_tuning import DecodeTuner, make_prim, profile_stream
+from tools.model.projection_tuning import ProjectionTuner, make_prim, profile_stream
 from tools.operators.common import configure, write_json
 
 
@@ -36,7 +36,7 @@ def main():
             )
         )
         for rows in [129, 257, 513]:
-            DecodeTuner._validate(kernel, spec, config, rows)
+            ProjectionTuner._validate(kernel, spec, config, rows)
             evidence.append(
                 dict(kind=kind, outputs=n, inputs=k, rows=rows, exact=True, replay=True)
             )
@@ -54,7 +54,7 @@ def main():
         )
         tiles = (1024 * 10 + 15) // 16 + 512
         from kernels.model.rows import explicit_rows
-        from tools.model.flash_next.decode_tuning import EXACT_PASSES
+        from tools.model.projection_tuning import EXACT_PASSES
 
         kernel = profile_stream(
             tilelang.compile(
@@ -81,8 +81,8 @@ def main():
             )
         )
         for rows in [129, 257, 513]:
-            DecodeTuner._validate(kernel, spec, dict(block_m=16), rows)
-            supply, _, check = DecodeTuner._inputs(spec, rows)
+            ProjectionTuner._validate(kernel, spec, dict(block_m=16), rows)
+            supply, _, check = ProjectionTuner._inputs(spec, rows)
             inputs = supply(kernel.get_profiler()._get_params(with_output=False))
             assignments = rows * 10
             inputs[:2] = [

@@ -50,10 +50,14 @@ const PRE_ATTN: &[&str] = &["norm_rotate", "q", "k", "v"];
 const PRIVATE_GDN: &[&str] = &["gates", "conv", "history", "recurrent", "gated_norm"];
 const DEFERRED_COLUMNS: &[&str] = &["GdnLogCount", "GdnLogDelta", "GdnLogGate", "GdnLogKey"];
 fn deferred_gdn(m: &Manifest) -> bool {
-    m.buffers.iter().any(|b| b.name.ends_with("_GdnLogCount"))
+    m.gdn_execution
+        .as_ref()
+        .is_some_and(|g| g.deferred_capacity().is_some())
 }
 fn chunked_gdn(m: &Manifest) -> bool {
-    m.buffers.iter().any(|b| b.name == "GdnChunkW")
+    m.gdn_execution
+        .as_ref()
+        .is_some_and(|g| g.prefill == orinfer_model_sdk::operators::gdn::Prefill::Chunked)
 }
 const PRIVATE_ATTN: &[&str] = &["prepare", "attention", "attention_merge"];
 fn ffn_names(
@@ -152,6 +156,20 @@ fn validate_weights(
 ) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
+    let gdn = m
+        .gdn_execution
+        .as_ref()
+        .ok_or("Missing explicit Qwen GDN execution contract")?;
+    if !chunked_gdn(m) && map.keys().any(|name| name.starts_with("GdnChunk")) {
+        return Err("Chunkwise GDN buffers disagree with the execution contract".into());
+    }
+    if !deferred_gdn(m)
+        && map
+            .keys()
+            .any(|name| DEFERRED_COLUMNS.iter().any(|role| name.ends_with(role)))
+    {
+        return Err("Deferred GDN buffers disagree with the execution contract".into());
+    }
     let staged = ["AttentionDecodedK", "AttentionDecodedV"];
     if staged.iter().any(|name| map.contains_key(name)) {
         for name in staged {
@@ -207,12 +225,8 @@ fn validate_weights(
             if kind != "linear_attention" {
                 continue;
             }
-            let gate = format!("L{layer}_GdnLogGate");
-            let capacity = map
-                .get(gate.as_str())
-                .and_then(|b| b.shape.first())
-                .copied();
-            let capacity = capacity
+            let capacity = gdn
+                .deferred_capacity()
                 .filter(|n| [2, 4, 8, 16, 32].contains(n))
                 .ok_or("Invalid deferred GDN capacity")?;
             for (suffix, dtype, shape) in [
@@ -1284,6 +1298,8 @@ mod tests {
 
     fn deferred_request() -> CreateRequest {
         let mut r = request_geometry(true);
+        r.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 8 };
         let layers = r.config["text_config"]["layer_types"].as_array().unwrap();
         for (layer, kind) in layers.iter().enumerate() {
             if kind != "linear_attention" {
@@ -1449,8 +1465,25 @@ mod tests {
     }
 
     #[test]
+    fn gdn_execution_is_required_and_cannot_be_inferred_from_buffers() {
+        let mut missing = request();
+        missing.metadata.gdn_execution = None;
+        assert!(create(missing, Policy::Int8Quality).is_err());
+        let mut mismatch = deferred_request();
+        mismatch.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Dense;
+        assert!(create(mismatch, Policy::Int8Quality).is_err());
+        let mut capacity = deferred_request();
+        capacity.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 4 };
+        assert!(create(capacity, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
     fn chunked_gdn_prefill_preserves_sequential_decode_and_verification() {
         let mut request = with_mtp(dense_request((2048, 6144, 24, 16, 8, 2, true), true));
+        request.metadata.gdn_execution.as_mut().unwrap().prefill =
+            orinfer_model_sdk::operators::gdn::Prefill::Chunked;
         for (name, dtype, width) in [
             ("GdnChunkW", "f16", 128),
             ("GdnChunkU", "f16", 128),
@@ -1623,7 +1656,7 @@ mod tests {
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
             "architecture":"qwen3_5","compute_policy":"int8_quality",
             "prefill_profiles":[{"tokens":4096,"min_tokens":1,"kind":"qwen_q4_rows"}],
-            "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
+            "metadata":{"gdn_execution":{"prefill":"sequential","decode":{"kind":"dense"}},"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
                 "status":"TokenStatus","logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
                 "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":h,"state_columns":STATE_COLUMNS},
