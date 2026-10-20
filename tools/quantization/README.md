@@ -1,5 +1,7 @@
 # 离线量化
 
+**简体中文** | [English](../../docs/en/tools/quantization/README.md)
+
 CPU 工具使用项目 uv 环境，GPU 编码使用固定编译镜像。编码、存储重排和执行包构建分别完成；量化产物通过独立质量验收后才能部署。
 
 ## 当前表示

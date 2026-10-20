@@ -1,5 +1,7 @@
 # Offline model builds
 
+[简体中文](../../../../tools/model/README.md) | **English**
+
 Python is used for weight preparation, TileLang compilation, tuning, and validation. Rust handles online model loading, execution, and serving.
 
 ## Supported build entry points
@@ -28,6 +30,7 @@ The compiler environment is pinned to `orinfer-compiler:0.1.2`. See [Build and r
 Prepared model directories retain the HF configuration, tokenizer, chat template, standard safetensors shards, and `cache/model.json`. A digest binds the model descriptor to a standalone execution package containing the Rust model library, deduplicated cubins, sources, and host ABI. Both the data format and C ABI are version 1. The online engine does not accept a bare AOT manifest.
 
 - `compile.py`, `row_contract.py`, `row_selection.py`: dynamic-row factories, host ABI contracts, and offline selection.
+- `host_compiler.py`, `build_cache.py`: shared host ABI generation and content-based cache; `projection_policy.py`, `projection_tuning.py`: integer projection candidates and offline measurement; `row_convergence.py`: dynamic launch expressions and merging adjacent selections.
 - `catalog.py`, `binding_templates.py`: shared compile definitions and native parameter templates.
 - `publication.py`, `compact.py`: immutable asset reuse, safetensors merging, and atomic publication.
 - `package.py`: offline execution-package verification, XZ packaging, internal installer, and frontend asset binding. For deployment, use Rust's `orinfer package install`.
@@ -48,4 +51,4 @@ make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 
 `validate-model` fully verifies files and payloads; `plan-model` produces a CPU-only execution plan. GPU acceptance covers dynamic batching, request isolation, prefix restoration, MTP, and image input. Quantization quality is checked separately against same-model BF16/FP8 fixed-history references. See [Quality evaluation](../eval/README.md).
 
-`run.sh` records complete Rust requests and machine state; `profile.sh` and `profile_summary.py` support Nsight profiling. Operator microbenchmarks, short-output profiles, and end-to-end request throughput should be reported separately; see [Performance](../../docs/performance.md).
+`run.sh` records complete Rust requests and machine state; `profile.sh` and `profile_summary.py` support Nsight profiling. Operator microbenchmarks, short-output profiles, and end-to-end request throughput should be reported separately; see [Performance](../../performance.md).

@@ -1,5 +1,7 @@
 # Quality evaluation tools
 
+[简体中文](../../../../tools/eval/README.md) | **English**
+
 `quick_quality.py` compares baseline and candidate token probabilities over the **same teacher-forced history**. Probabilities are normalized over the full vocabulary, and the baseline's top-three token IDs are explicitly queried. Different selected token IDs are diagnostic evidence, not an automatic quality failure.
 
 `scoring_common.py` validates fixed seeds, history identity, probability fields, and task outcomes. `run_quality.py` connects to a configured scoring endpoint and builds evaluation requests from `fixtures/quick-quality-scenarios.json`. You must supply the reference server.

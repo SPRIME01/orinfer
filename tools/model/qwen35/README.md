@@ -1,5 +1,7 @@
 # Qwen3.5 Dense 原生 Q4A8 构建
 
+**简体中文** | [English](../../../docs/en/tools/model/qwen35/README.md)
+
 当前基线是官方 27B 的 beam8 重新编码、两级 E8P Q4A8 量化目录。它使用 signed-block128 旋转、两级固定整数码表和输出行 scale；Embedding、mixer 输出投影和 MTP 草稿矩阵保留 W8，敏感小权重及视觉保留浮点。本机量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`，完整模型为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`。
 
 同一构建入口也支持 Index-Translate-2B 的 24 层和 Index-Translate-9B 的 32 层架构，使用 `tools/quantization/qwen_e8p.py` 从固定 BF16 来源编码。GDN/GQA、FFN、视觉、MTP、动态行及状态控制按配置复用，不复制执行流程。9B 使用独立的 embedding 和输出头 E8P Q4 bank。2B 的 embedding 和输出头共享一份 E8P Q4 bank：embedding 按需解码并逆旋转所选行，输出头复用相同压缩权重和旋转 A8 投影。视觉大矩阵也使用相同 Q4A8 投影，bias/GELU 保留原 FP16 边界；patch、位置表、norm 等小参数保留浮点，敏感输出/MTP 矩阵保留 W8。主干使用相同的两级 E8P Q4A8 契约，实际平均位数包含这些高精度例外。

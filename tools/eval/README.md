@@ -1,5 +1,7 @@
 # 质量评测工具
 
+**简体中文** | [English](../../docs/en/tools/eval/README.md)
+
 `quick_quality.py`分析同一teacher-forced历史下的baseline/candidate token概率；概率按完整词表归一化，并显式查询baseline top-3 IDs。token身份不同用于诊断，不单独作为质量失败条件。
 
 `scoring_common.py`校验固定seed、历史身份、概率字段及任务结果。`run_quality.py`连接配置的评分接口，使用`fixtures/quick-quality-scenarios.json`生成评测请求。参考服务需自行提供。

@@ -1,5 +1,7 @@
 # Flash Next offline build
 
+[简体中文](../../../../../tools/model/flash_next/README.md) | **English**
+
 Rust executes online inference. TileLang is used only for offline compilation. Deployment directories contain Hugging Face configuration/tokenizer assets, `cache/model.json`, standard safetensors weights, and a digest-pinned execution package. Data format and C ABI are both version 1.
 
 ## Rebuilding a current native model
@@ -55,7 +57,7 @@ QSA KV is group-64 INT8 and recurrent GDN state is FP32. KV, pending buffers, co
 
 MTP supports 1–7 drafts; `0` disables it and `auto` uses the package default. Stochastic sampling uses p/q acceptance and residual correction. Short tails and scheduler time budgets may narrow verification width. Prefix restoration preserves complete target/draft state. History-based continuation drafts require explicit `--prompt-lookup`.
 
-See [Serving](../../../docs/serving.md) for requests, deployment defaults, and images. Vision capacity is declared by the input model; text-only rebuilds do not expand vision or context capacity.
+See [Serving](../../../serving.md) for requests, deployment defaults, and images. Vision capacity is declared by the input model; text-only rebuilds do not expand vision or context capacity.
 
 ## Original weights and reference tools
 

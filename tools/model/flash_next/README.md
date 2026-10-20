@@ -1,5 +1,7 @@
 # Flash Next 离线构建
 
+**简体中文** | [English](../../../docs/en/tools/model/flash_next/README.md)
+
 在线推理由 Rust 执行，TileLang 只参与离线编译。部署目录使用 HF 配置与 tokenizer、`cache/model.json`、标准 safetensors 权重，以及由 digest 固定的执行包。数据格式与 C ABI 均为版本 1。
 
 ## 重建当前原生模型

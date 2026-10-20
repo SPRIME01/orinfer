@@ -1,8 +1,12 @@
 # Qwen3.5 Dense native Q4A8 build
 
+[简体中文](../../../../../tools/model/qwen35/README.md) | **English**
+
 The current 27B baseline uses the official model's beam-8-reencoded, two-stage E8P Q4A8 quantized weights. It uses signed-block128 rotation, two fixed integer codebook stages, and per-output-row scales. Embeddings, mixer output projections, and MTP draft matrices retain W8; small sensitive weights and vision paths remain floating point. Local artifacts: `artifacts/quantization/qwen35-e8p-beam8-20261016/converted` and `artifacts/models/qwen3.8-27b-e8p-q4a8-current`.
 
 The same builder supports Index-Translate-2B (24 layers) and Index-Translate-9B (32 layers), encoded from pinned BF16 source by `tools/quantization/qwen_e8p.py`. GDN/GQA, FFN, vision, MTP, dynamic rows, and state control are reused according to configuration, without duplicating execution paths. The 9B model has separate E8P Q4 embedding and output-head banks. The 2B model ties them to one bank: selected embedding rows are decoded and inverse-rotated on demand; output projection uses the same compressed weights with rotated A8 computation. Large vision matrices use Q4A8 with original FP16 bias/GELU boundaries; small patch, position-table, and norm parameters remain floating point, and sensitive output/MTP matrices remain W8. Average bits per weight account for those exceptions.
+
+Qwen3.5-4B uses this same build entry point with its official 2,560-hidden, 9,216-FFN, 32-layer configuration and tied embedding/output head. When `generation_config.json` is missing, the builder pins EOS and padding using the model configuration and tokenizer, including model-end and chat-end markers; explicitly supplied generation configuration retains its original bytes.
 
 ## Quantized-weight contract
 

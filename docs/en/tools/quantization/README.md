@@ -1,5 +1,7 @@
 # Offline quantization
 
+[简体中文](../../../../tools/quantization/README.md) | **English**
+
 CPU utilities use the project's `uv` environment; GPU encoders run in the pinned compiler image. Encoding, storage repacking, and execution-package building are separate steps. Quantized outputs require independent quality acceptance before deployment.
 
 ## Current representations

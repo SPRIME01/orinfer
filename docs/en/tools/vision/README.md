@@ -1,8 +1,10 @@
 # Images and multi-image inference
 
+[简体中文](../../../../tools/vision/README.md) | **English**
+
 The 27B and Flash Next models share the ViT implementation in `kernels/vision/encoder.py`. Each text architecture declares its own merger output dimension, feature injection, and MRoPE state. The [27B native builder](../model/qwen35/README.md) creates a vision-enabled model, while the [Flash Next native rebuild](../model/flash_next/README.md) preserves the input model's vision contract.
 
-Rust handles online image preprocessing, position generation, request-private feature tables, and execution. Vision uses one dynamic patch template for single images and ordered multi-image inputs. **Video is not supported.** The default ceiling is 32,768 patches (8,192 visual tokens), subject to context and per-request memory budgets. See [Serving](../../docs/serving.md) for request examples.
+Rust handles online image preprocessing, position generation, request-private feature tables, and execution. Vision uses one dynamic patch template for single images and ordered multi-image inputs. **Video is not supported.** The default ceiling is 32,768 patches (8,192 visual tokens), subject to context and per-request memory budgets. See [Serving](../../serving.md) for request examples.
 
 ## Kernel and reference checks
 
