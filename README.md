@@ -2,24 +2,26 @@
 
 LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87** 的推理引擎：Rust 负责在线运行和服务，TileLang 算子离线编译为独立 GPU 包。支持 Qwen3.8-27B（`Qwen3_5`）和 Qwen3.8-Flash-Next（`qwen4_exp`）的文本、图片和多图推理。开发版新增 Index-Translate-2B/9B 翻译适配；图片输入已接通，复杂图片的翻译质量仍需改进。
+Orinfer is an inference engine targeting **Jetson AGX Orin 64GB / CUDA SM87**. Rust handles online execution and serving; TileLang operators are compiled offline into standalone GPU execution packages. It supports text, single-image, and multi-image inference for Qwen3.8-27B (`Qwen3_5`) and Qwen3.8-Flash-Next (`qwen4_exp`). Development builds also include Index-Translate-2B/9B adapters. Image input is wired up for translation, although translation quality on complex images still needs improvement.
 
-## 功能
+## Features
 
-- OpenAI Chat Completions API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
-- [JSONL 离线推理](docs/batch.md)：连续批处理、逐条落盘和断点续跑，无需 HTTP 服务。
-- 27B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
-- 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。Flash Next 的 MTP 草稿上限可用 `--mtp-drafts 1..7` 调整，`0` 关闭，默认 `auto` 使用包设置（3 个草稿）。
-- 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
-- CUDA Graph 提供 `decode_only`、`full`、`off` 三种模式，默认 `decode_only`。
+- OpenAI-compatible Chat Completions API with streaming, thinking, sampling, strict function calling, JSON Schema constraints, and token log probabilities.
+- [Offline JSONL inference](docs/batch.md) with continuous batching, incremental result persistence, and resumable jobs—no HTTP server required.
+- Two-stage E8P Q4/W8 mixed weights for the 27B and Index-Translate-2B/9B models; custom E8P Q2 experts and mixed Q4/W8 projections for Flash Next. Computation uses INT8 mixed precision, retaining BF16/FP16/FP32 on sensitive paths.
+- Chunked prefill, isolated per-request state, prefix caching, native MTP, and continuous batching, with admission queuing when memory is insufficient. For Flash Next, `--mtp-drafts 1..7` selects the maximum draft count; `0` disables MTP, while the default `auto` follows the execution package setting (three drafts).
+- Prefix caching for mixed architectures, INT8 KV, and demand-mapped memory. Model packages can be configured for contexts up to 256K tokens.
+- CUDA Graph modes: `decode_only` (default), `full`, and `off`.
 
-## 快速开始
+## Quick start
 
-部署需要 aarch64 Linux 和 NVIDIA CUDA Driver，**不需要 Python、PyTorch、TileLang 或 Rust 编译器**。
+Deployment requires **aarch64 Linux and an NVIDIA CUDA driver**. It does **not** require Python, PyTorch, TileLang, or the Rust toolchain.
 
-从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎发行包、模型匹配的执行包和 `SHA256SUMS`，校验下载文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。模型目录单独下载，包含配置、tokenizer、chat template 和原生量化 safetensors；模型描述中的 `execution_package` 必须与执行包 digest 一致。发行包不附带权重，**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**。
+Download an engine release archive, the matching model execution package, and `SHA256SUMS` from the [upstream releases](https://github.com/iMMIQ/orinfer/releases). Verify the downloads, unpack the engine archive, and add `bin/orinfer` to your `PATH`. Download the prepared model directory separately; it contains the model configuration, tokenizer, chat template, and native quantized safetensors. The `execution_package` digest in the model descriptor must match the installed execution package.
 
-从 v0.1.4 起，发行包统一使用 `.tar.xz`，执行包通过 `package install` 安装；该命令也接受旧 `.tar.gz`。v0.1.3 的安装方式见[旧版安装说明](docs/model-packages.md#安装已发布的-v013)。
+**Release archives do not include model weights. Orinfer cannot directly load arbitrary Hugging Face, AWQ, or GGUF directories.**
+
+Starting with v0.1.4, release archives use `.tar.xz`, and execution packages are installed with `package install` (which also accepts legacy `.tar.gz` packages). See [legacy v0.1.3 installation instructions](docs/model-packages.md#installing-released-v013-packages) if using an older release.
 
 ```bash
 sha256sum --ignore-missing -c SHA256SUMS
@@ -28,63 +30,63 @@ orinfer validate-model /path/to/prepared-model
 orinfer serve /path/to/prepared-model --model qwen3.8-27b
 ```
 
-默认监听 `0.0.0.0:8088`。设置 `ORINFER_API_KEY` 可启用 `/v1` 的 Bearer 鉴权。
+The server listens on `0.0.0.0:8088` by default. Set `ORINFER_API_KEY` to require Bearer authentication for `/v1` routes.
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"用一句话介绍你自己。"}],"max_tokens":512,"stream":true}'
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"Introduce yourself in one sentence."}],"max_tokens":512,"stream":true}'
 ```
 
-提供 `/health`、`/v1/models` 和 `/v1/chat/completions`，支持流式文本、工具、thinking、JSON 约束与图片/多图。[服务使用指南](docs/serving.md)包含参数说明，以及 [OpenCode](examples/opencode.json) 和 [Pi](examples/pi-models.json) 接入配置。
+Endpoints include `/health`, `/v1/models`, and `/v1/chat/completions`. Chat supports streamed text, tools, thinking, constrained JSON, and single/multiple images. The [serving guide](docs/serving.md) explains request parameters and provides configurations for [OpenCode](examples/opencode.json) and [Pi](examples/pi-models.json).
 
-## 常用配置
+## Common configuration
 
-| 配置 | 默认值 | 用途 |
+| Option | Default | Purpose |
 | --- | --- | --- |
-| `--listen` | `0.0.0.0:8088` | 监听地址 |
-| `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
-| `--cuda-graph` | `decode_only` | Graph 模式 |
-| `--resident-experts` | `full` | 专家全量常驻；Flash Next 可指定每层等效容量，按需从 SSD 加载 |
-| `--prefix-cache-mib` | `12288` | GPU 前缀缓存预算；0 关闭 |
-| `--max-active-requests` | `32` | 活跃请求上限，支持 1–128 |
-| `--max-batch-tokens` | `128` | decode/验证行预算；混合 prefill 可使用执行包容量 |
-| `--prefill-budget-ms` | `200` | 混合 prefill 的预测耗时目标 |
+| `--listen` | `0.0.0.0:8088` | Listen address |
+| `--default-request-params` | `{}` | Default JSON request parameters; explicit request fields take precedence |
+| `--cuda-graph` | `decode_only` | CUDA Graph mode |
+| `--resident-experts` | `full` | Keep all experts resident; for Flash Next, specify an equivalent per-layer capacity and stream other experts from SSD |
+| `--prefix-cache-mib` | `12288` | GPU prefix-cache budget; `0` disables it |
+| `--max-active-requests` | `32` | Active request limit (1–128) |
+| `--max-batch-tokens` | `128` | Decode/verification row budget; mixed prefill can use package capacity |
+| `--prefill-budget-ms` | `200` | Predicted-time target for mixed prefill |
 
-实际并发和上下文容量受执行包及可用内存限制。环境变量统一使用 `ORINFER_*`；共享模型包默认安装到 `~/.cache/orinfer/packages`，可用 `ORINFER_EXECUTION_CACHE` 指定位置。完整配置见[服务使用指南](docs/serving.md)和 `orinfer serve --help`。
+Actual concurrency and context capacity depend on the execution package and available memory. Environment variables use the `ORINFER_*` prefix. Shared execution packages are installed under `~/.cache/orinfer/packages` by default; override this with `ORINFER_EXECUTION_CACHE`. See the [serving guide](docs/serving.md) and `orinfer serve --help` for the complete configuration.
 
-## 性能与范围
+## Performance and scope
 
-Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包：512-token 输入的执行层 prefill 为 **1008.9 tokens/s**。通过 Rust CLI 的流式 Chat API，从零生成 Rust 代码，开启 `medium` thinking、总输出预算 16K，实际生成 6.2K–7.6K tokens 时，单流 decode 关闭 MTP 为 **29.49–29.72 tokens/s**，开启最多 3 个草稿后为 **44.99–45.82 tokens/s**，提升 **1.51–1.55 倍**。
+On a **Jetson AGX Orin 64GB**, using the current development build and a matching optimized Flash Next execution package, execution-layer prefill on a 512-token input measured **1,008.9 tokens/s**. In the streaming Rust CLI Chat API, generating Rust code from scratch with `medium` thinking and a 16K total output budget yielded 6.2K–7.6K tokens. Single-stream decode measured **29.49–29.72 tokens/s** with MTP disabled and **44.99–45.82 tokens/s** with up to three drafts: a **1.51–1.55×** speedup.
 
-详细 prefill、API 首 token 时延、代码阶段吞吐、prefix cache 命中及 27B 测量结果见[性能参考](docs/performance.md)。数据对应重建后的执行包，测试配置、预热次数和计时口径均在该文档中说明。
+The [performance reference](docs/performance.md) includes detailed prefill, API time-to-first-token, code-generation throughput, prefix-cache, and 27B results. These measurements apply to rebuilt execution packages; the test configurations, warmup counts, and timing definitions are documented there.
 
-Index-Translate-2B 的量化权重约 **1.23 GB / 4.32 bit**。开发版 Rust CLI 固定长度基准中，512／2K／8K prefill 约 **7.6K／7.9K／6.5K tokens/s**，关闭 MTP 的 decode 约 **108／105／94 tokens/s**；普通请求路径约 **113／109／98 tokens/s**。关闭 MTP 的 150 TPS 目标尚未达到。测量口径、文本快速评测和图片质量限制见[同页记录](docs/performance.md#index-translate-2b2026-10-18)。
+**Index-Translate-2B:** quantized weights occupy approximately **1.23 GB / 4.32 bits per weight**. In development-build Rust CLI fixed-length measurements, prefill at 512/2K/8K tokens was approximately **7.6K/7.9K/6.5K tokens/s**; decode with MTP off was approximately **108/105/94 tokens/s**. The ordinary request path measured approximately **113/109/98 tokens/s**. The goal of 150 decode tokens/s without MTP has **not** been reached. See the [2B measurement details](docs/performance.md#index-translate-2b-2026-10-18) for methodology, text quality spot checks, and image-quality limitations.
 
-Index-Translate-9B 的量化权重约 **5.44 GB / 4.51 bit**，复用相同执行组件并保留独立 embedding/输出头。Rust CLI 固定长度基准中，512／2K／8K prefill 约 **2153／2220／1956 tokens/s**，关闭 MTP 的 decode 约 **33.4／32.6／29.8 tokens/s**。测试范围与 BF16 快速质量对照见[9B 测量](docs/performance.md#index-translate-9b2026-10-18)。
+**Index-Translate-9B:** quantized weights occupy approximately **5.44 GB / 4.51 bits per weight**. This adapter reuses the execution components but retains separate embedding and output heads. Rust CLI fixed-length prefill at 512/2K/8K tokens measured approximately **2,153/2,220/1,956 tokens/s**; decode with MTP off measured approximately **33.4/32.6/29.8 tokens/s**. See the [9B measurements](docs/performance.md#index-translate-9b-2026-10-18) and BF16 spot comparisons.
 
-目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
+The engine currently targets only the hardware and architectures described above. Video, audio, `n > 1`, and cloud-storage APIs are not supported. The [serving guide](docs/serving.md) describes the supported JSON Schema subset. Quantization quality is checked against fixed scenarios and matched-history probabilities from same-source BF16/FP8 references; comprehensive LLM benchmarks and an independent BF16 256K-context quality evaluation remain outstanding. See [quality evaluation](tools/eval/README.md).
 
-## 开发与文档
+## Development and documentation
 
 ```bash
-git clone https://github.com/iMMIQ/orinfer.git
+git clone https://github.com/SPRIME01/orinfer.git
 cd orinfer
 cargo fetch --locked
-make build       # 仅构建 Rust；工具链固定在 rust-toolchain.toml
-make python-env  # uv 创建并同步 CPU .venv
-make check       # 格式、编译、clippy、Rust/CPU 测试
+make build       # Build Rust only; toolchain pinned in rust-toolchain.toml
+make python-env  # Create/sync the CPU .venv with uv
+make check       # Formatting, compilation, Clippy, Rust and CPU tests
 ```
 
-自行量化、编译 TileLang 算子或重新构建模型时才需要离线 Python 环境；下载已发布模型及匹配执行包后可直接部署。执行包的 `.so + cubin` 格式见[执行包接口与构建](docs/model-packages.md)。
+The offline Python environment is necessary only to quantize weights, compile TileLang operators, or rebuild models. Deploying released, prepared models and matching execution packages does not require it. The `.so + cubin` execution-package format is described in [execution-package contracts and builds](docs/model-packages.md).
 
-- [构建与发布](tools/build/README.md)：编译镜像、CPU/GPU 检查与发行包。
-- [模型与执行包](tools/model/README.md)：离线准备、布局、MTP 和上下文扩展。
-- [服务使用](docs/serving.md)：API、图片、缓存、并发和资源配置。
-- [图文构建](tools/vision/README.md) · [API 验证](tools/api/README.md) · [TileLang kernels](kernels/README.md)。
+- [Build and release](tools/build/README.md): compiler image, CPU/GPU checks, and release artifacts.
+- [Models and execution packages](tools/model/README.md): offline preparation, layout, MTP, and context extension.
+- [Serving](docs/serving.md): API, images, caching, concurrency, and resource controls.
+- [Vision builds](tools/vision/README.md), [API validation](tools/api/README.md), and [TileLang kernels](kernels/README.md).
 
-在线代码位于 `crates/orinfer-{engine,api,cli}`，模型适配器及计算策略位于 `crates/orinfer-models`，公共 ABI 位于 `crates/orinfer-model-sdk`；GPU 算子与离线工具分别位于 `kernels/`、`tools/`。
+Online Rust code lives in `crates/orinfer-{engine,api,cli}`; model adapters and compute policies are in `crates/orinfer-models`, and the shared ABI is in `crates/orinfer-model-sdk`. GPU operators and offline tools live in `kernels/` and `tools/`, respectively.
 
-## 许可证
+## License
 
-**LGPL-3.0-or-later**，见 [LICENSE](LICENSE) 和 [COPYING](COPYING)。第三方依赖及模型权重遵循各自许可证。
+**LGPL-3.0-or-later**; see [LICENSE](LICENSE) and [COPYING](COPYING). Third-party dependencies and model weights retain their respective licenses.
