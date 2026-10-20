@@ -1058,6 +1058,23 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         options: &scheduler::Options,
     ) -> Result<Vec<StepOutput>> {
+        self.advance_requests_with(requests, options, || {})
+    }
+    pub(crate) fn advance_requests_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
+        let mut maintenance = Some(maintenance);
+        let mut maintenance_s = 0.;
+        let mut overlap = || {
+            if let Some(f) = maintenance.take() {
+                let start = Instant::now();
+                f();
+                maintenance_s += start.elapsed().as_secs_f64();
+            }
+        };
         #[cfg(test)]
         profile::mark("entry");
         self.reap_abandoned()?;
@@ -1111,7 +1128,7 @@ impl ModelRuntime {
                     .filter(|(i, _)| requests[*i].prefilling)
                     .collect();
                 let began = Instant::now();
-                self.speculative_mixed_step(requests, &selected, &mut output)?;
+                self.speculative_mixed_step_with(requests, &selected, &mut output, &mut overlap)?;
                 let rows: usize = selected.iter().map(|(_, n)| n).sum();
                 for (i, n) in prefills {
                     requests[i].served = self.scheduler_statistics.iterations;
@@ -1128,7 +1145,7 @@ impl ModelRuntime {
             }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
-                self.speculative_batch_step(requests, &selected, &mut output)?;
+                self.speculative_packet_step(requests, &selected, &[], &mut output, &mut overlap)?;
                 self.scheduler_statistics.speculative_iterations += 1;
                 *self
                     .scheduler_statistics
@@ -1206,7 +1223,7 @@ impl ModelRuntime {
                 if selected.iter().any(|&(i, _)| !requests[i].prefilling) {
                     self.unmerged_prefill_s = 0.;
                 }
-                self.execute_selected(requests, &selected, &mut output)?;
+                self.execute_selected_with(requests, &selected, &mut output, &mut overlap)?;
             }
             Work::Idle => {}
         }
@@ -1255,6 +1272,9 @@ impl ModelRuntime {
                 );
             }
         }
+        overlap();
+        self.scheduler_statistics.maintenance_calls += 1;
+        self.scheduler_statistics.maintenance_s += maintenance_s;
         self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
         Ok(output)
     }
@@ -1580,6 +1600,15 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
+        self.execute_selected_with(requests, selected, output, &mut || {})
+    }
+    fn execute_selected_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
+    ) -> Result<()> {
         if selected.len() == 1
             && selected[0].1 == 1
             && (requests[selected[0].0].prefilling || !self.manifest.batch_profiles.contains(&1))
@@ -1623,7 +1652,9 @@ impl ModelRuntime {
                 model.upload_segment_controls(1)?;
                 #[cfg(test)]
                 profile::mark("single_controls");
-                model.launch_program("decode", phase)?;
+                model.execution.submit_program("decode", phase)?;
+                overlap();
+                model.execution.sync()?;
                 #[cfg(test)]
                 profile::mark("single_execute");
                 if let Some(spec) = &model.manifest.mtp {
@@ -1654,7 +1685,7 @@ impl ModelRuntime {
                 .observe((at.elapsed().as_secs_f64() - capture_s - load_s).max(0.000001));
             return Ok(());
         }
-        self.execute_batch_selected(requests, selected, output)
+        self.execute_batch_selected(requests, selected, output, overlap)
     }
 
     fn execute_batch_selected(
@@ -1662,6 +1693,7 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
     ) -> Result<()> {
         #[cfg(test)]
         profile::mark("policy");
@@ -1686,13 +1718,15 @@ impl ModelRuntime {
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
         let capture_before = self.execution.batch_statistics.get().capture_s;
-        self.execution.execute_batch(
+        self.execution.execute_batch_operation_with(
+            orinfer_model_sdk::abi::BatchOperation::Ordinary,
             graph_key,
             &plan,
             decode_only,
             selected
                 .iter()
                 .all(|&(i, _)| requests[i].limit - requests[i].generated >= 2),
+            overlap,
         )?;
         #[cfg(test)]
         profile::mark("execute");
@@ -1950,6 +1984,27 @@ impl ModelRuntime {
         }
         if self.read_control(&self.manifest.status)? != 0 {
             return Err("Model token status failure".into());
+        }
+        if self.manifest.sampling.is_some()
+            && req.sampling.temperature > 0.
+            && req.sampling.top_logprobs.is_none()
+        {
+            let mask = req.decoder.gpu_mask()?;
+            if mask.as_ref().is_some_and(|words| {
+                words.iter().enumerate().all(|(i, &bits)| {
+                    let live = self.manifest.vocab.saturating_sub(i * 32).min(32);
+                    live == 0 || bits & (u32::MAX >> (32 - live)) == 0
+                })
+            }) {
+                req.decoder.fail("Grammar permits no tokens".into());
+                return Err("Grammar permits no tokens".into());
+            }
+            if let Some(token) =
+                self.gpu_sample(&req.history, &req.sampling, req.generated, mask.as_deref())?
+            {
+                req.decoder.consume(token)?;
+                return Ok(token);
+            }
         }
         if req.sampling.is_greedy() && req.sampling.top_logprobs.is_none() {
             let selected = self.read_control(&self.manifest.token)? as u32;

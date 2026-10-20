@@ -81,6 +81,9 @@ pub struct Manifest {
     pub prefill_batch_profiles: Vec<crate::architecture::PrefillProfile>,
     #[serde(default)]
     pub greedy_sampling: bool,
+    /// Derived by the native library from its shared sampling bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampling: Option<Sampling>,
     #[serde(default)]
     pub batch_gdn: bool,
     #[serde(default)]
@@ -89,6 +92,19 @@ pub struct Manifest {
     pub segment_controls: Option<SegmentControls>,
     #[serde(default)]
     pub batch_layout: Option<crate::architecture::BatchLayout>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sampling {
+    pub program: String,
+    pub history: String,
+    pub bias_ids: String,
+    pub bias_values: String,
+    pub mask: String,
+    pub control: String,
+    pub parameters: String,
+    pub output: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -409,6 +425,30 @@ impl Manifest {
                     return Err(format!(
                         "{name}: invalid token-major KV allocation contract"
                     ));
+                }
+            }
+        }
+        if let Some(sampling) = &self.sampling {
+            use crate::artifact::Dtype;
+            if self
+                .programs
+                .get(&sampling.program)
+                .is_none_or(Vec::is_empty)
+            {
+                return Err("Missing GPU sampling program".into());
+            }
+            for (name, dtype, elements) in [
+                (&sampling.history, Dtype::I32, self.max_context),
+                (&sampling.bias_ids, Dtype::I32, self.vocab),
+                (&sampling.bias_values, Dtype::F64, self.vocab),
+                (&sampling.mask, Dtype::U32, self.vocab.div_ceil(32)),
+                (&sampling.control, Dtype::I32, 4),
+                (&sampling.parameters, Dtype::F64, 6),
+                (&sampling.output, Dtype::I32, 2),
+            ] {
+                let b = lookup(name)?;
+                if b.dtype != dtype || b.shape != [elements] || b.access != Access::ReadWrite {
+                    return Err(format!("Invalid GPU sampling buffer {name}"));
                 }
             }
         }

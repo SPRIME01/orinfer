@@ -1724,6 +1724,7 @@ impl Executor {
         segments: &[(usize, usize)],
         operations: &[Invocation],
         decode: bool,
+        overlap: &mut dyn FnMut(),
     ) -> Result<bool> {
         if !(self.cuda_graph == crate::execution::CudaGraphMode::Full
             || decode && self.cuda_graph == crate::execution::CudaGraphMode::DecodeOnly)
@@ -1770,6 +1771,7 @@ impl Executor {
                 "hot batch graph",
             )?;
         }
+        overlap();
         self.sync()?;
         let mut stats = self.batch_statistics.get();
         stats.graph_hits += 1;
@@ -1784,6 +1786,24 @@ impl Executor {
         operations: &[Invocation],
         decode: bool,
         allow_capture: bool,
+    ) -> Result<()> {
+        self.execute_batch_operation_with(
+            operation,
+            segments,
+            operations,
+            decode,
+            allow_capture,
+            &mut || {},
+        )
+    }
+    pub(crate) fn execute_batch_operation_with(
+        &mut self,
+        operation: orinfer_model_sdk::abi::BatchOperation,
+        segments: Vec<(usize, usize)>,
+        operations: &[Invocation],
+        decode: bool,
+        allow_capture: bool,
+        overlap: &mut dyn FnMut(),
     ) -> Result<()> {
         if operations.is_empty() && decode && segments.iter().all(|(_, n)| *n == 1) {
             let cached = {
@@ -1822,12 +1842,13 @@ impl Executor {
             };
             if let Some((graph, rebind)) = cached {
                 if let Some(operations) = rebind {
-                    return self.execute_batch_operation(
+                    return self.execute_batch_operation_with(
                         operation,
                         segments,
                         &operations,
                         decode,
                         allow_capture,
+                        overlap,
                     );
                 }
                 self.save_live_workspace()?;
@@ -1840,6 +1861,7 @@ impl Executor {
                         "hot indirect batch graph",
                     )?;
                 }
+                overlap();
                 self.sync()?;
                 let mut stats = self.batch_statistics.get();
                 stats.graph_hits += 1;
@@ -1883,7 +1905,7 @@ impl Executor {
                 self.ensure_writable_range(name, offset, bytes)?;
             }
         }
-        if self.replay_cached_batch(operation, &segments, operations, decode)? {
+        if self.replay_cached_batch(operation, &segments, operations, decode, overlap)? {
             return Ok(());
         }
         // A fully indirect plan captures only session-owned table/workspace
@@ -1993,6 +2015,7 @@ impl Executor {
                     "batch graph",
                 )?;
             }
+            overlap();
             self.sync()?;
             let mut statistics = self.batch_statistics.get();
             statistics.replay_s += at.elapsed().as_secs_f64();
@@ -2006,6 +2029,7 @@ impl Executor {
                     self.invoke(op)?;
                 }
             }
+            overlap();
             self.sync()?;
             let mut statistics = self.batch_statistics.get();
             statistics.direct_s += at.elapsed().as_secs_f64();

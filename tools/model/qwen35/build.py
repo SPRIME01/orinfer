@@ -1096,6 +1096,14 @@ class Builder:
                 if "/rows/" in k["name"] or "/skip/" in k["name"]
             ],
         )
+        from tools.model.sampling import append as append_sampling
+
+        append_sampling(
+            dict(metadata=metadata, buffer_scopes=w.scopes),
+            package,
+            self.root / "cache",
+            self.output / "sampling",
+        )
         digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
         data = dict(
             schema_version=1,
@@ -1116,7 +1124,7 @@ class Builder:
         if result.returncode:
             raise ValueError(f"Native plan validation failed: {result.stderr.strip()}")
         plan = json.loads(result.stdout)["manifest"]
-        if len(plan["kernels"]) != len(self.aot.kernels):
+        if len(plan["kernels"]) != len(package["kernels"]) or not plan.get("sampling"):
             raise ValueError("Native execution bindings were lost during publication")
         shutil.rmtree(self.root / "cache/shared-rows")
         write_json(

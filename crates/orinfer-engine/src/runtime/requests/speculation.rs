@@ -178,14 +178,17 @@ impl ModelRuntime {
         if key.batch == 0 {
             return None;
         }
-        let mut widths = selected
+        // Reallocated packets keep the same total row budget as the nominal
+        // controller arm; request-local depths need not be equal.
+        let rows: usize = selected
             .iter()
             .filter(|(i, _)| !requests[*i].prefilling)
-            .map(|(_, n)| *n);
-        let width = widths.next()?;
-        if widths.any(|n| n != width) {
+            .map(|(_, n)| *n)
+            .sum();
+        if !rows.is_multiple_of(key.batch) {
             return None;
         }
+        let width = rows / key.batch;
         Some(Feedback {
             key,
             width,
@@ -222,18 +225,33 @@ impl ModelRuntime {
         } else {
             spec.verification_widths()
         };
-        let limit = joint
+        let mut plans = plans;
+        plans.sort_unstable();
+        plans.dedup();
+        let owners: Vec<_> = joint
             .iter()
             .filter(|(i, _)| !requests[*i].prefilling)
-            .map(|(i, _)| {
-                (requests[*i].limit - requests[*i].generated).min(
-                    self.manifest
-                        .max_context
-                        .saturating_sub(requests[*i].history.len().saturating_sub(1)),
-                )
+            .map(|(i, _)| *i)
+            .collect();
+        let choices: Vec<Vec<_>> = owners
+            .iter()
+            .map(|&i| {
+                let req = &requests[i];
+                let limit = (req.limit - req.generated)
+                    .min(
+                        self.manifest
+                            .max_context
+                            .saturating_sub(req.history.len().saturating_sub(1)),
+                    )
+                    .min(spec.default_verification_tokens);
+                plans
+                    .iter()
+                    .copied()
+                    .filter(|&n| n >= 2 && n <= limit)
+                    .map(|n| (n, req.draft_acceptance.expected(n - 1)))
+                    .collect()
             })
-            .min()?
-            .min(spec.default_verification_tokens);
+            .collect();
         if joint
             .iter()
             .any(|(i, _)| !requests[*i].prefilling && requests[*i].mtp_blocked)
@@ -247,13 +265,17 @@ impl ModelRuntime {
             options.max_speculative_tokens
         };
         let mut candidates = vec![];
-        for width in plans
-            .into_iter()
-            .filter(|&n| n >= 2 && n <= limit && n * key.batch <= row_budget)
-        {
+        let mut allocations = BTreeMap::new();
+        for width in plans.into_iter().filter(|&n| {
+            n >= 2 && n <= spec.default_verification_tokens && n * key.batch <= row_budget
+        }) {
+            let Some(depths) = control::allocate(&choices, width * key.batch) else {
+                continue;
+            };
+            let depths: BTreeMap<_, _> = owners.iter().copied().zip(depths).collect();
             let selected: Vec<_> = joint
                 .iter()
-                .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
+                .map(|&(i, n)| (i, depths.get(&i).copied().unwrap_or(n)))
                 .collect();
             let mut segments: Vec<_> = selected
                 .iter()
@@ -283,11 +305,12 @@ impl ModelRuntime {
             if packet && !self.model_package.supports_batch(&segments, operation) {
                 continue;
             }
-            let expected_tokens = joint
+            let expected_tokens = selected
                 .iter()
                 .filter(|(i, _)| !requests[*i].prefilling)
-                .map(|(i, _)| requests[*i].draft_acceptance.expected(width - 1))
+                .map(|(i, n)| requests[*i].draft_acceptance.expected(n - 1))
                 .sum();
+            allocations.insert(width, selected.clone());
             candidates.push(control::Candidate {
                 width,
                 expected_tokens,
@@ -306,12 +329,17 @@ impl ModelRuntime {
             .or_default() += 1;
         let (width, exploring) = decision?;
         self.scheduler_statistics.mtp_probe_iterations += usize::from(exploring);
-        Some(BatchChoice {
-            selected: joint
-                .iter()
-                .map(|&(i, n)| (i, if requests[i].prefilling { n } else { width }))
-                .collect(),
-        })
+        let selected = allocations.remove(&width)?;
+        for &(i, n) in &selected {
+            if !requests[i].prefilling {
+                *self
+                    .scheduler_statistics
+                    .mtp_request_depth_histogram
+                    .entry(n - 1)
+                    .or_default() += 1;
+            }
+        }
+        Some(BatchChoice { selected })
     }
     pub(super) fn select_mixed_speculation(
         &mut self,
@@ -323,11 +351,21 @@ impl ModelRuntime {
         self.select_auto_speculation(requests, joint, options, slack)
             .map(|choice| choice.selected)
     }
+    #[cfg(test)]
     pub(super) fn speculative_mixed_step(
         &mut self,
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
+    ) -> Result<()> {
+        self.speculative_mixed_step_with(requests, selected, output, &mut || {})
+    }
+    pub(super) fn speculative_mixed_step_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
     ) -> Result<()> {
         let (prefills, decoders): (Vec<_>, Vec<_>) = selected
             .iter()
@@ -341,24 +379,26 @@ impl ModelRuntime {
         {
             return Err("Invalid mixed speculative work".into());
         }
-        self.speculative_packet_step(requests, &decoders, &prefills, output)
+        self.speculative_packet_step(requests, &decoders, &prefills, output, overlap)
     }
 
+    #[cfg(test)]
     pub(super) fn speculative_batch_step(
         &mut self,
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
-        self.speculative_packet_step(requests, selected, &[], output)
+        self.speculative_packet_step(requests, selected, &[], output, &mut || {})
     }
 
-    fn speculative_packet_step(
+    pub(super) fn speculative_packet_step(
         &mut self,
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
         prefills: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
     ) -> Result<()> {
         let mut rounds = vec![];
         let mut drafts = vec![];
@@ -503,7 +543,7 @@ impl ModelRuntime {
             self.execution
                 .upload_sequence_addresses(&table.buffer, std::rc::Rc::clone(&bindings))?;
         }
-        self.execution.execute_batch_operation(
+        self.execution.execute_batch_operation_with(
             operation,
             segments.iter().map(|s| (s.slot, s.tokens)).collect(),
             &plan,
@@ -511,6 +551,7 @@ impl ModelRuntime {
             rounds
                 .iter()
                 .all(|(i, _)| requests[*i].limit - requests[*i].generated >= 2),
+            overlap,
         )?;
         let seconds = at.elapsed().as_secs_f64();
         if !prefills.is_empty() {

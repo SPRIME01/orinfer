@@ -96,7 +96,11 @@ fn validate_joint_target_verification() {
                 let mut rounds = vec![];
                 for lane in 0..count {
                     let lane_width = if f.heterogeneous {
-                        [2, 4, 8][lane % 3]
+                        let widths: Vec<_> = [2, 4, 8]
+                            .into_iter()
+                            .filter(|n| supported.contains(n))
+                            .collect();
+                        widths[lane % widths.len()]
                     } else {
                         width
                     };

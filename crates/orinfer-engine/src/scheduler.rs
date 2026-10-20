@@ -371,6 +371,9 @@ pub struct BatchExecutionStatistics {
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Statistics {
     pub mtp_probe_iterations: usize,
+    pub mtp_request_depth_histogram: std::collections::BTreeMap<usize, usize>,
+    pub maintenance_calls: usize,
+    pub maintenance_s: f64,
     pub mtp_depth_histogram: std::collections::BTreeMap<usize, usize>,
     pub mtp_catchup_tokens: usize,
     pub mtp_catchup_s: f64,

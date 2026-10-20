@@ -273,6 +273,16 @@ impl Model {
     ) -> Result<Vec<StepOutput>> {
         self.0.advance_requests(requests, options)
     }
+    /// Run bounded CPU-only queue/output work while a submitted packet executes.
+    /// The callback cannot access the model or commit request state.
+    pub fn advance_requests_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &crate::scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
+        self.0.advance_requests_with(requests, options, maintenance)
+    }
     pub fn finish_request(&mut self, request: &mut RequestState, cache: bool) -> Result<()> {
         self.0.finish_request(request, cache)
     }

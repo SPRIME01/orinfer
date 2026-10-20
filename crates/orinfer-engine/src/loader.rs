@@ -189,6 +189,23 @@ fn validate_scopes(model: &Manifest, scopes: &BTreeMap<String, BufferScope>) -> 
             }
         }
     }
+    if let Some(sampling) = &model.sampling {
+        for name in [
+            &sampling.history,
+            &sampling.bias_ids,
+            &sampling.bias_values,
+            &sampling.mask,
+            &sampling.control,
+            &sampling.parameters,
+            &sampling.output,
+        ] {
+            if scopes.get(name) != Some(&BufferScope::Workspace)
+                || model.reset_buffers.contains(name)
+            {
+                return Err(format!("{name}: sampling scratch must be workspace"));
+            }
+        }
+    }
     if let Some(kv) = &model.kv_cache {
         for name in kv.prefill_workspace.keys() {
             if scopes.get(name) != Some(&BufferScope::Workspace)

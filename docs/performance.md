@@ -2,6 +2,36 @@
 
 本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
+## GPU随机采样（2026-10-20）
+
+共享TileLang采样程序在GPU执行惩罚、bias、grammar mask、top-k和top-p，保留原计数器seed。普通随机请求仅回读token及状态；greedy、logprobs和MTP p/q校正沿用原路径。两种模型正式构建器均发布相同采样组件。
+
+Index-Translate-2B使用Rust release JSONL入口，8条独立段落翻译，temperature=0.8、top_p=0.9、top_k=0、seed=20261002，关闭MTP及prefix cache。全部自然结束、共618个输出tokens，CPU/GPU采样的正文、usage及停止原因一致。完整调用包括加载、前端、排队与落盘：
+
+| 并发 | CPU采样总输出TPS | GPU采样总输出TPS |
+| --- | ---: | ---: |
+| 1 | 41.80 | 77.25 |
+| 4 | 55.08 | 140.68 |
+
+此前交替顺序的两轮，单流为39.64–40.19 → 71.85–71.95 TPS，四并发为51.81–52.19 → 122.75–123.09 TPS；绝对值受运行条件影响。
+
+Flash Next另测一条相同参数的自然翻译请求，125个输入、95个输出tokens，关闭MTP/prefix。完整生成耗时（含prefill、排除加载）由5.038降至4.592秒，即18.86 → 20.69 TPS，正文、usage和停止原因相同。GPU路径首输出0.515秒；本项仅测一对请求，不包含并发收益。加载分别耗时43.099和18.209秒，前者权重读取等待34.023秒，不能用两次完整进程耗时估算采样加速。
+
+最终release二进制对同一翻译输入各执行一次预热和三次完整请求，prefix保持关闭，三次生成耗时中位数为4.861 → 3.777秒，即19.54 → 25.15 TPS（约1.29倍）。各次均自然输出95 tokens，正文、usage和停止原因一致。该结果衡量随机翻译；代码生成的greedy/MTP性能按下文独立口径比较。
+
+27B、Flash Next及2B各自的三组64-token固定seed采样与完整提交状态一致；MTP verification/mixed、partial-prefix恢复检查通过。独立采样算子覆盖非对齐vocab、mask/惩罚/bias和改变输入后的Graph replay，Compute Sanitizer无错误。
+
+### Flash Next完整代码生成复测
+
+最终release另复用下文完整代码生成的512-token原始Chat请求：greedy、seed=20261002、medium thinking、总输出与思考上限各16384、MTP最多3草稿、decode_only、专家全量常驻、prefix预算1024 MiB、单并发。冷、热请求均自然输出8265 tokens（其中思考3574），两次正文与思考完全一致；热请求命中512-token前缀。
+
+| 请求 | 完整HTTP耗时（s） | TTFT（s） | 完整decode TPS |
+| --- | ---: | ---: | ---: |
+| 冷请求 | 189.909 | 1.443 | 43.85 |
+| 前缀命中 | 165.741 | 0.0164 | 49.87 |
+
+Decode沿用`(completion_tokens-1)/(HTTP耗时-TTFT)`，包含思考、代码和SSE收尾。本次热态高于历史44.99 TPS，未观察到该场景的性能回退；历史请求输出6276 tokens，因此不能将两次吞吐差直接归因为某一项优化。生成代码可编译，自带17项测试有16项通过，另1项错误地断言收到最后一个payload字节后仍没有完整帧；保留原始生成结果，不算作全部任务测试通过。
+
 ## 部署启动（2026-10-19）
 
 通过 [startup 基准](../tools/bench/README.md) 启动真实 Rust release CLI，等待 HTTP 就绪后发送首个流式翻译请求。相同模型、权重和执行包，比较前端串行准备、逐张量分配的实现，与前端并行准备、只读权重 arena、分片读取和 DMA 流水线的实现；两者均已将动态行数穷举检查移至离线验证。每项取三个新进程的中位数，保留文件缓存，计时排除共享 GPU 锁等待和进程退出。

@@ -2,6 +2,7 @@ mod auto_speculation;
 mod decode_quality;
 mod decode_template;
 mod flash_batch;
+mod sampling;
 mod single_decode;
 mod single_row;
 mod vision_rows;

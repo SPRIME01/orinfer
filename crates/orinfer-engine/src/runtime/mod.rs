@@ -20,6 +20,7 @@ mod prefix;
 #[cfg(test)]
 mod reference_generation;
 pub(crate) mod requests;
+mod sampling;
 pub(crate) mod scoring;
 mod speculation;
 mod startup;

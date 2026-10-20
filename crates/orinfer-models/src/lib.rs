@@ -9,6 +9,7 @@ mod policy;
 mod prefill;
 mod qwen3_5;
 mod registry;
+mod sampling;
 mod vision;
 use orinfer_model_sdk::{
     abi::{self, CreateRequest, CreatedPlan, ModelImplementation},
@@ -45,7 +46,13 @@ impl ModelImplementation for Models {
             request.kernel_contracts = bindings::kernels(catalog, request.expert_contracts)?;
             request.metadata.dynamic_batch_kernels = bindings::dynamic(catalog)?;
         }
+        let sampling_bindings = request
+            .kernel_contracts
+            .iter()
+            .map(|k| k.name.clone())
+            .collect();
         let (adapter, mut plan) = registry::create(request)?;
+        sampling::register(&mut plan.metadata, &sampling_bindings)?;
         let programs = if native {
             std::mem::take(&mut plan.metadata.programs)
         } else {

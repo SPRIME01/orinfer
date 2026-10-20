@@ -23,7 +23,7 @@ fn step(model: &mut ModelRuntime, req: &mut RequestState, unified: bool) {
     let mut output = Vec::new();
     if unified {
         model
-            .execute_batch_selected(&mut [req], &[(0, 1)], &mut output)
+            .execute_batch_selected(&mut [req], &[(0, 1)], &mut output, &mut || {})
             .unwrap();
     } else {
         let tokens = model

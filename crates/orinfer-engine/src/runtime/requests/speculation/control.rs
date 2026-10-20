@@ -34,6 +34,42 @@ impl Acceptance {
     }
 }
 
+/// Spend a fixed verification-row budget on request prefixes. The estimates
+/// come exclusively from earlier committed rounds, never the current drafts.
+/// Every increment is a legal package width, including packages with holes.
+pub(in crate::runtime) fn allocate(
+    choices: &[Vec<(usize, f64)>],
+    budget: usize,
+) -> Option<Vec<usize>> {
+    let mut indices = vec![0; choices.len()];
+    let mut used = choices
+        .iter()
+        .try_fold(0usize, |n, c| n.checked_add(c.first()?.0))?;
+    if used > budget {
+        return None;
+    }
+    while used < budget {
+        let next = choices
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let current = c[indices[i]];
+                let next = *c.get(indices[i] + 1)?;
+                let rows = next.0.checked_sub(current.0)?;
+                (rows > 0 && rows <= budget - used).then_some((
+                    i,
+                    rows,
+                    (next.1 - current.1) / rows as f64,
+                ))
+            })
+            // Lower request index wins ties; comparisons use frozen estimates.
+            .max_by(|a, b| a.2.total_cmp(&b.2).then_with(|| b.0.cmp(&a.0)))?;
+        used += next.1;
+        indices[next.0] += 1;
+    }
+    Some(choices.iter().zip(indices).map(|(c, i)| c[i].0).collect())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::runtime) struct Key {
     pub batch: usize,
@@ -124,8 +160,30 @@ impl Controller {
             .arms
             .values()
             .map(|a| a.time.upper())
+            .chain(
+                candidates
+                    .iter()
+                    .map(|c| c.prior_seconds)
+                    .filter(|s| s.is_finite() && *s > 0. && *s <= slack),
+            )
             .fold(normal_seconds * 4., f64::max);
         cohort.probe_credit = (cohort.probe_credit + normal_seconds * 0.02).min(credit_cap);
+        let bootstrap = candidates
+            .iter()
+            .filter(|c| c.width >= 2)
+            .map(|c| c.width)
+            .min();
+        let cold_pending = candidates.iter().any(|c| {
+            c.width >= 2
+                && c.expected_tokens > 0.
+                && c.prior_seconds.is_finite()
+                && c.prior_seconds > 0.
+                && c.prior_seconds <= slack
+                && cohort
+                    .arms
+                    .get(&c.width)
+                    .is_none_or(|a| a.time.samples == 0)
+        });
         let mut best = None;
         let mut probe = None;
         for candidate in candidates {
@@ -134,20 +192,28 @@ impl Controller {
             }
             let arm = cohort.arms.get(&candidate.width);
             let seconds = arm.map_or(candidate.prior_seconds, |a| a.time.upper());
-            if !seconds.is_finite() || seconds > slack {
+            if !seconds.is_finite() || seconds <= 0. || seconds > slack {
                 continue;
             }
             let samples = arm.map_or(0, |a| a.time.samples);
             let score = arm.map_or(f64::INFINITY, |a| {
                 a.time.mean / candidate.expected_tokens.min(a.tokens).max(1.)
             });
-            // One bounded initial trial, then collect at least three samples
-            // for plausible winners. Expensive losers are periodically revisited
-            // using accumulated time credit, including while ordinary decode wins.
-            let initial = samples == 0;
+            // Bootstrap the cheapest depth even with an uncertain cold prior.
+            // Other cold depths must either predict a win or spend accumulated
+            // time credit; a short cohort cannot afford a free sweep of all arms.
+            // Include cold priors in credit_cap so pessimistic estimates never
+            // permanently prevent discovering a profitable depth.
+            let initial = samples == 0
+                && (Some(candidate.width) == bootstrap
+                    || candidate.prior_seconds / candidate.expected_tokens < baseline);
             let promising = samples < 3 && score < baseline * 1.1;
             let stale = arm.is_some_and(|a| cohort.calls.saturating_sub(a.last_trial) >= 32);
-            let retry = stale && cohort.probe_credit >= seconds;
+            // Cheap stale losers must not repeatedly consume all credit before
+            // a more expensive, still unseen depth gets its first measurement.
+            let retry = (stale || samples == 0)
+                && (samples == 0 || !cold_pending)
+                && cohort.probe_credit >= seconds;
             if (initial || promising || retry) && probe.is_none() {
                 probe = Some((candidate.width, if retry { seconds } else { 0. }));
             }
@@ -181,6 +247,19 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn row_budget_favors_accepting_prefixes_and_respects_caps_and_holes() {
+        let choices = vec![
+            vec![(2, 1.9), (3, 2.7), (4, 3.4)],
+            vec![(2, 1.2), (3, 1.22), (4, 1.221)],
+        ];
+        assert_eq!(allocate(&choices, 6), Some(vec![4, 2]));
+        assert_eq!(allocate(&choices, 8), Some(vec![4, 4]));
+        assert_eq!(allocate(&choices, 9), None);
+        assert_eq!(allocate(&choices, 3), None);
+        assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 3), None);
+        assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 4), Some(vec![4]));
+    }
     fn key(batch: usize) -> Key {
         Key {
             batch,
@@ -261,5 +340,43 @@ mod tests {
         }];
         c.observe(k, 2, 0.2, 1);
         assert!((0..1000).any(|_| c.choose(k, &plans, 0.02, 1.) == Some((2, true))));
+    }
+    #[test]
+    fn cold_expensive_depths_wait_for_credit_without_becoming_unreachable() {
+        let mut c = Controller::default();
+        let k = key(1);
+        normal(&mut c, k);
+        let plans = [
+            Candidate {
+                width: 2,
+                expected_tokens: 1.5,
+                prior_seconds: 0.04,
+            },
+            Candidate {
+                width: 3,
+                expected_tokens: 1.6,
+                prior_seconds: 0.2,
+            },
+        ];
+        assert_eq!(c.choose(k, &plans, 0.02, 1.), Some((2, true)));
+        c.observe(k, 2, 0.04, 1);
+        for _ in 0..20 {
+            assert_eq!(c.choose(k, &plans, 0.02, 1.), None);
+        }
+        let mut discovered = false;
+        for _ in 0..1000 {
+            match c.choose(k, &plans, 0.02, 1.) {
+                Some((2, _)) => c.observe(k, 2, 0.04, 1),
+                Some((3, _)) => {
+                    discovered = true;
+                    break;
+                }
+                _ => (),
+            }
+        }
+        assert!(
+            discovered,
+            "Cold prior must not cap credit below its trial cost"
+        );
     }
 }

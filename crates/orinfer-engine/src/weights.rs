@@ -102,6 +102,7 @@ impl Weights {
             Dtype::F16 => safetensors::Dtype::F16,
             Dtype::Bf16 => safetensors::Dtype::BF16,
             Dtype::F32 => safetensors::Dtype::F32,
+            Dtype::F64 => safetensors::Dtype::F64,
             Dtype::U32 => safetensors::Dtype::U32,
             Dtype::I32 => safetensors::Dtype::I32,
             Dtype::U64 => safetensors::Dtype::U64,

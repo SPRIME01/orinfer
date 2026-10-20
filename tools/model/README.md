@@ -49,3 +49,13 @@ make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 `validate-model` 完整校验文件与 payload，`plan-model` 只生成 CPU 执行计划。GPU 验收覆盖动态 batch、请求隔离、prefix 恢复、MTP 和图片输入；量化质量另外与同模型 BF16/FP8 固定历史对照。详细口径见[评测说明](../eval/README.md)。
 
 `run.sh` 记录完整 Rust 请求和机器状态；`profile.sh` 与 `profile_summary.py` 用于 Nsight 分析。算子微测、短输出 profile 和完整请求吞吐分别记录，性能参考见[性能文档](../../docs/performance.md)。
+
+共享GPU采样由Qwen3_5与Flash Next正式构建器发布，也可只重建现有原生包的采样部分，保持权重与前端资源：
+
+```bash
+bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
+  --model artifacts/models/source-model \
+  --model-output artifacts/models/model-with-gpu-sampling
+```
+
+该入口重建Rust绑定库并原子发布当前schema-1模型，沿用完整程序与ABI检查。新包仍需完整请求、状态隔离及prefix/MTP验收。GPU采样不改变greedy路径；需要top_logprobs或MTP p/q分布的调用保留CPU路径。

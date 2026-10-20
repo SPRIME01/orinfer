@@ -322,6 +322,9 @@ def rebuild(args):
         from tools.model.flash_next.converge_kernels import coalesce_adjacent_selections
         from tools.model.compact import compact_package
 
+        from tools.model.sampling import append as append_sampling
+
+        append_sampling(data, package, root, args.output / "sampling")
         coalesce_adjacent_selections(package)
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)
