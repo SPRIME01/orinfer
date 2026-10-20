@@ -8,6 +8,7 @@ check. Only selected tiles are emitted; no tuning runs in the Rust runtime.
 import hashlib
 import json
 import math
+from itertools import chain
 from pathlib import Path
 from tools.model.compile import primitive
 from tools.model.row_selection import ranges
@@ -44,7 +45,17 @@ class RowTuner:
         self.qh = text.get("num_attention_heads", 24)
         self.kvh = text.get("num_key_value_heads", 4)
 
-    def select(self, spec, configs, build, inputs, *, measure_rows=None):
+    def select(
+        self,
+        spec,
+        configs,
+        build,
+        inputs,
+        *,
+        measure_rows=None,
+        relative_tolerance=0.0,
+        validation_inputs=None,
+    ):
         from tools.operators.common import benchmark, SEED
         import torch
 
@@ -52,10 +63,14 @@ class RowTuner:
         if not measured or any(type(r) is not int or not 1 <= r <= 4096 for r in measured):
             raise ValueError("Invalid row tuning measurements")
         measured = sorted(set(measured))
+        if not 0 <= relative_tolerance <= 0.1:
+            raise ValueError("Invalid row selection tolerance")
         torch.manual_seed(SEED)
         identity = dict(
             toolchain=self.identity, spec=spec, configs=configs, seed=SEED, samples=measured
         )
+        if relative_tolerance:
+            identity["selection_tolerance"] = relative_tolerance
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         path = self.output / (key + ".json")
         if path.exists():
@@ -67,28 +82,121 @@ class RowTuner:
         records = []
         for rows in measured:
             times = {str(i): [] for i in range(len(configs))}
-            for fixture in inputs(rows):
+            fixtures = chain(
+                ((True, fixture) for fixture in inputs(rows)),
+                (
+                    ((False, fixture) for fixture in validation_inputs(rows))
+                    if validation_inputs is not None
+                    else ()
+                ),
+            )
+            for measured_case, fixture in fixtures:
                 for index, pair in enumerate(kernels):
                     run, check, change = fixture(pair, configs[index])
                     run()
                     check()
-                    pilot, _ = benchmark(run, repetitions=1, warmup=1)
-                    repetitions = max(1, min(32, math.ceil(0.25 / pilot["median_ms"])))
+                    repetitions = 1
+                    if measured_case:
+                        pilot, _ = benchmark(run, repetitions=1, warmup=1)
+                        repetitions = max(1, min(32, math.ceil(0.25 / pilot["median_ms"])))
                     timing, graph = benchmark(run, repetitions=repetitions, warmup=0)
                     change()
                     graph.replay()
                     check()
                     change()
-                    times[str(index)].append(timing["median_ms"])
+                    if measured_case:
+                        times[str(index)].append(timing["median_ms"])
             record = dict(
                 rows=rows,
                 times={k: math.exp(sum(map(math.log, v)) / len(v)) for k, v in times.items()},
             )
             records.append(record)
-            print("ROW TUNING", spec, record, flush=True)
-        chosen = ranges(records, capacity=4096)
+            # The cache record retains the full fixture identity, including
+            # measured routing histograms. Keep progress output bounded.
+            print("ROW TUNING", spec.get("kind", "pipeline"), key, record, flush=True)
+        decisions = records
+        if relative_tolerance:
+            preferred = min(
+                records[0]["times"],
+                key=lambda name: sum(math.log(r["times"][name]) for r in records),
+            )
+            # Prefer the aggregate winner when differences are within noise.
+            # Keep original measurements intact in the published tuning report.
+            decisions = [
+                dict(
+                    rows=r["rows"],
+                    times={
+                        name: value * (1 if name == preferred else 1 + relative_tolerance)
+                        for name, value in r["times"].items()
+                    },
+                )
+                for r in records
+            ]
+        chosen = ranges(decisions, capacity=4096)
         result = dict(identity=identity, configs=configs, measurements=records, **chosen)
         write_json(path, result)
+        return result
+
+    def activation_rotation(self, k, swiglu, *, multiplier=1):
+        """Choose one exact row transform across the full prefill extent."""
+        import torch
+        from kernels.model.rotation_a8 import rotate_activation_a8
+
+        if type(multiplier) is not int or multiplier <= 0:
+            raise ValueError("Invalid activation row multiplier")
+        spec = dict(kind="activation_rotation", k=k, swiglu=swiglu, multiplier=multiplier)
+        key = str(spec)
+        if key in self.records:
+            return self.records[key]
+        configs = [dict(registers=value) for value in (False, True)]
+
+        def build(config):
+            return primitive(
+                rotate_activation_a8,
+                4096 * multiplier,
+                k,
+                swiglu=swiglu,
+                dynamic_rows=True,
+                **config,
+            )
+
+        reference = build(configs[0])
+
+        def inputs(rows):
+            live = rows * multiplier
+            x = torch.randn((live, k * (2 if swiglu else 1)), device="cuda", dtype=torch.float16)
+            signs = torch.randint(0, 2, (k,), device="cuda", dtype=torch.int8) * 2 - 1
+            eq = torch.empty((live, k), device="cuda", dtype=torch.int8)
+            es = torch.empty(live, device="cuda", dtype=torch.float16)
+
+            def fixture(kernel, config):
+                storage = torch.full((live + 1, k), 91, device="cuda", dtype=torch.int8)
+                scales = torch.full((live + 1,), 91, device="cuda", dtype=torch.float16)
+                q, s = storage[:live], scales[:live]
+
+                def run():
+                    launch(kernel, x, signs, q, s, live)
+
+                def check():
+                    launch(reference, x, signs, eq, es, live)
+                    assert torch.equal(q, eq) and torch.equal(s, es)
+                    assert bool(torch.all(storage[live:] == 91)) and bool(
+                        torch.all(scales[live:] == 91)
+                    )
+
+                return run, check, lambda: x.neg_()
+
+            yield fixture
+
+        result = self.select(
+            spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
+        )
+        default = min(
+            result["used"],
+            key=lambda name: sum(row["times"][name] for row in result["measurements"]),
+        )
+        result = dict(result, default=default, selections=[], used=[default])
+        self.records[key] = result
         return result
 
     def rotation(self, k, swiglu, *, plane_rows=0):
@@ -163,10 +271,6 @@ class RowTuner:
         return result
 
     def attention(self, context):
-        from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
-        from kernels.model.kv_int8 import attention_prefill_int8
-        import torch
-
         spec = dict(
             kind="attention",
             context=context,
@@ -187,6 +291,55 @@ class RowTuner:
         # Include the unsplit reference geometry in the same computation body.
         # This removes split bookkeeping at compile time, without a row cutoff.
         configs.append(dict(head_group=1, block_m=32, block_n=32, max_splits=1))
+        result = self._measure_attention(context, spec, configs)
+        self.records[str(spec)] = result
+        return result
+
+    def staged_attention(self, context, selection):
+        """Measure complete INT8 and temporary-FP16 KV pipelines at every row extent."""
+        from tools.model.row_selection import samples
+
+        names = dict.fromkeys(
+            [
+                selection["default"],
+                *(choice["implementation"] for choice in selection["selections"]),
+            ]
+        )
+        configs = [selection["configs"][int(name)] for name in names]
+        configs += [
+            dict(
+                block_m=m,
+                block_n=64,
+                head_group=g,
+                threads=t,
+                stages=1,
+                max_splits=1,
+                decoded_kv=True,
+            )
+            for m, g, t in [(64, 1, 256), (128, 2, 512)]
+            if (self.qh // self.kvh) % g == 0
+        ]
+        spec = dict(
+            kind="staged_attention",
+            context=context,
+            query_heads=self.qh,
+            kv_heads=self.kvh,
+            candidates=configs,
+        )
+        key = str(spec)
+        if key not in self.records:
+            # Decoder launch, attention and merge are timed together. Small
+            # prefill tails compete with large extents; no row cutoff is assumed.
+            self.records[key] = self._measure_attention(
+                context, spec, configs, measure_rows=samples(4096)
+            )
+        return self.records[key]
+
+    def _measure_attention(self, context, spec, configs, *, measure_rows=None):
+        from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
+        from kernels.model.kv_int8 import attention_prefill_int8, dequantize_attention_kv
+        import torch
+
         reference = primitive(
             attention_prefill_int8,
             1,
@@ -212,6 +365,7 @@ class RowTuner:
                     kv_heads=self.kvh,
                     threads=c.get("threads", 128),
                     stages=c.get("stages", 0),
+                    decoded_kv=c.get("decoded_kv", False),
                 ),
                 primitive(
                     merge_attention_int8,
@@ -223,6 +377,9 @@ class RowTuner:
                     query_heads=self.qh,
                     kv_heads=self.kvh,
                 ),
+                primitive(dequantize_attention_kv, 4096, context, kv_heads=self.kvh)
+                if c.get("decoded_kv")
+                else None,
             )
 
         def inputs(rows):
@@ -256,7 +413,7 @@ class RowTuner:
                     lengths=lengths,
                     expected=expected,
                 ):
-                    first, second = pair
+                    first, second, decoder = pair
                     bm = c["block_m"]
                     heads = self.qh // c["head_group"]
                     partial = torch.empty((heads, 2 * ATTENTION_TARGET, bm, 256), device="cuda")
@@ -266,12 +423,24 @@ class RowTuner:
                         (rows + 1, self.qh, 256), 91, device="cuda", dtype=torch.float16
                     )
                     out = storage[:rows]
+                    decoded = (
+                        [
+                            torch.empty(
+                                (1, context, self.kvh * 256), device="cuda", dtype=torch.float16
+                            )
+                            for _ in range(2)
+                        ]
+                        if decoder
+                        else []
+                    )
 
                     def run():
+                        if decoder:
+                            launch(decoder, *kv, *scales, lengths, *decoded, rows)
                         launch(
                             first,
                             q,
-                            *kv,
+                            *(decoded if decoder else kv),
                             *scales,
                             gate,
                             pos,
@@ -289,13 +458,15 @@ class RowTuner:
                         torch.testing.assert_close(out, expected, atol=4e-5, rtol=0.005)
                         assert bool(torch.all(storage[rows:] == 91))
 
-                    return run, check, lambda: q.neg_()
+                    def change():
+                        q.neg_()
+                        kv[1].neg_()
+
+                    return run, check, change
 
                 yield fixture
 
-        result = self.select(spec, configs, build, inputs)
-        self.records[str(spec)] = result
-        return result
+        return self.select(spec, configs, build, inputs, measure_rows=measure_rows)
 
     def gdn_ab(self):
         """Tune CTA coverage while preserving the FP16 MMA K accumulation order."""
@@ -342,7 +513,7 @@ class RowTuner:
         """Choose time tiles while preserving the native per-row reduction."""
         import torch
         from kernels.operators.op08_gdn_conv_prep import gdn_conv_prep
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         spec = dict(kind="gdn_convolution", key_heads=self.hk, value_heads=self.hv)
         if str(spec) in self.records:
@@ -478,5 +649,119 @@ class RowTuner:
             yield fixture
 
         result = self.select(spec, configs, build, inputs)
+        self.records[str(spec)] = result
+        return result
+
+    def private_gdn(self):
+        from tools.model.gdn_tuning import select
+
+        return select(self, self._private_gdn_dense())
+
+    def _private_gdn_dense(self):
+        """Measure request-parallel ownership with the same FP32 sum tree."""
+        import torch
+        import tilelang
+        from kernels.model.gdn_sequence import _gdn_sequence
+        from kernels.model.independent_rows import independent_rows
+
+        spec = dict(kind="private_gdn", key_heads=self.hk, value_heads=self.hv)
+        if str(spec) in self.records:
+            return self.records[str(spec)]
+        configs = [
+            dict(value_tile=16, threads=32, prefetch_qk=True),
+            dict(value_tile=32, threads=128, prefetch_qk=False),
+            dict(value_tile=16, threads=64, prefetch_qk=False, shared_state=True),
+            dict(value_tile=64, threads=256, prefetch_qk=False, shared_state=True),
+        ]
+
+        def build(config):
+            fn = _gdn_sequence(1, in_place=True, key_heads=self.hk, value_heads=self.hv, **config)
+            roles = {
+                b.name: ("private", "State") if b.name == "State" else ("row", b.name)
+                for b in fn.buffer_map.values()
+            }
+            fn, names = independent_rows(fn, 128, roles, {"State": 0}, dynamic=True)
+            kernel = tilelang.compile(
+                fn,
+                out_idx=[],
+                execution_backend="nvrtc",
+                target={"kind": "cuda", "arch": "sm_87"},
+                pass_configs={
+                    "tl.disable_thread_storage_sync": True,
+                    "tl.disable_shared_memory_reuse": True,
+                }
+                if config["prefetch_qk"]
+                else {},
+            )
+            return kernel, names
+
+        reference = build(configs[0])
+
+        def inputs(rows):
+            q = torch.nn.functional.normalize(
+                torch.randn((rows, self.hk, 1, 128), device="cuda"), dim=-1
+            ).half()
+            values = dict(
+                Q=q,
+                K=torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).half(),
+                V=torch.randn((rows, self.hv, 1, 128), device="cuda", dtype=torch.float16) * 0.1,
+                G=-torch.rand((rows, 1, self.hv), device="cuda") * 0.1,
+                Beta=torch.rand((rows, 1, self.hv), device="cuda"),
+            )
+            initial = torch.randn((rows, self.hv, 128, 128), device="cuda") * 0.01
+
+            def fixture(pair, _config):
+                state = torch.full((rows + 1, self.hv, 128, 128), 91.0, device="cuda")
+                out = torch.full(
+                    (rows + 1, 1, self.hv * 128), 91.0, device="cuda", dtype=torch.float16
+                )
+                expected_state = torch.empty_like(initial)
+                expected = torch.empty_like(out[:rows])
+
+                def invoke(compiled, current, output):
+                    kernel, names = compiled
+                    pointers = torch.tensor(
+                        [[current[i].data_ptr()] for i in range(rows)],
+                        dtype=torch.uint64,
+                        device="cuda",
+                    )
+                    return kernel, [
+                        pointers
+                        if name is None
+                        else rows
+                        if name == "__rows__"
+                        else output
+                        if name == "Out"
+                        else values[name]
+                        for name in names
+                    ]
+
+                kernel, args = invoke(pair, state, out)
+                original, ref_args = invoke(reference, expected_state, expected)
+
+                def run():
+                    state[:rows].copy_(initial)
+                    launch(kernel, *args)
+
+                def check():
+                    expected_state.copy_(initial)
+                    launch(original, *ref_args)
+                    assert torch.equal(state[:rows], expected_state) and torch.equal(
+                        out[:rows], expected
+                    ), "Private GDN changed the FP32 state or FP16 output"
+                    assert bool(torch.all(state[rows:] == 91)) and bool(torch.all(out[rows:] == 91))
+
+                return run, check, lambda: values["V"].neg_()
+
+            yield fixture
+
+        result = self.select(
+            spec,
+            configs,
+            build,
+            inputs,
+            measure_rows=[1, 2, 3, 4, 8, 17, 32, 64, 128],
+            relative_tolerance=0.03,
+        )
         self.records[str(spec)] = result
         return result

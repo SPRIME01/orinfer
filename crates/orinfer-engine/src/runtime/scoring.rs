@@ -47,7 +47,10 @@ pub struct ScoreReport {
     pub probes: Vec<Probe>,
 }
 
-fn scoring_context_hash(history: &[u32], images: &[crate::vision::ImageInput]) -> Result<String> {
+pub(super) fn scoring_context_hash(
+    history: &[u32],
+    images: &[crate::vision::ImageInput],
+) -> Result<String> {
     let mut context =
         serde_json::json!({"token_ids":history,"positions":(0..history.len()).collect::<Vec<_>>()});
     if !images.is_empty() {

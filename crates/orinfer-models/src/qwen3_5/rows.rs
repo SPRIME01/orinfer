@@ -17,6 +17,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CAPACITY: usize = 4096;
 const LANES: usize = 128;
+fn head_capacity(m: &Manifest) -> usize {
+    m.buffers
+        .iter()
+        .find(|b| b.name == "HeadHidden")
+        .and_then(|b| b.shape.first())
+        .copied()
+        .unwrap_or(LANES)
+}
 const PREFIX: &str = "qwen_rows";
 // This order is the address-table contract compiled into the private kernels.
 const STATE_COLUMNS: &[&str] = &[
@@ -40,17 +48,69 @@ mod mtp;
 const PRE_GDN: &[&str] = &["norm_rotate", "qkv", "z", "ab"];
 const PRE_ATTN: &[&str] = &["norm_rotate", "q", "k", "v"];
 const PRIVATE_GDN: &[&str] = &["gates", "conv", "history", "recurrent", "gated_norm"];
+const DEFERRED_COLUMNS: &[&str] = &["GdnLogCount", "GdnLogDelta", "GdnLogGate", "GdnLogKey"];
+fn deferred_gdn(m: &Manifest) -> bool {
+    m.gdn_execution
+        .as_ref()
+        .is_some_and(|g| g.deferred_capacity().is_some())
+}
+fn chunked_gdn(m: &Manifest) -> bool {
+    m.gdn_execution
+        .as_ref()
+        .is_some_and(|g| g.prefill == orinfer_model_sdk::operators::gdn::Prefill::Chunked)
+}
 const PRIVATE_ATTN: &[&str] = &["prepare", "attention", "attention_merge"];
-const POST: &[&str] = &[
-    "quantize",
-    "out",
-    "norm_rotate",
-    "gate",
-    "up",
-    "swiglu_rotate",
-    "swiglu_quantize",
-    "down",
-];
+fn ffn_names(
+    moe: bool,
+    draft: bool,
+    expanded: bool,
+    planes: bool,
+    cold: bool,
+) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if moe {
+        names.extend([
+            "router",
+            "topk",
+            "histogram_local",
+            "histogram_offsets",
+            "histogram_finish",
+            "offsets",
+            "tiles",
+            "dispatch",
+        ]);
+    }
+    names.extend(["gate", "up"]);
+    names.extend(if draft {
+        &["down_quant"][..]
+    } else {
+        &["swiglu_rotate", "swiglu_quantize"][..]
+    });
+    names.push("down");
+    if moe {
+        if cold {
+            names.extend(["expert_up_cold_planes", "expert_up_cold"]);
+        }
+        if expanded {
+            names.push("expert_up_expand");
+        }
+        if planes {
+            names.push("expert_up_planes");
+        }
+        names.extend(["expert_up", "expert_rotate"]);
+        if cold {
+            names.extend(["expert_down_cold_planes", "expert_down_cold"]);
+        }
+        if expanded {
+            names.push("expert_down_expand");
+        }
+        if planes {
+            names.push("expert_down_planes");
+        }
+        names.extend(["expert_down", "combine"]);
+    }
+    names
+}
 const HEAD: &[&str] = &["rotate", "project", "partials", "merge"];
 
 struct QwenRows {
@@ -96,6 +156,180 @@ fn validate_weights(
 ) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
+    let gdn = m
+        .gdn_execution
+        .as_ref()
+        .ok_or("Missing explicit Qwen GDN execution contract")?;
+    if !chunked_gdn(m) && map.keys().any(|name| name.starts_with("GdnChunk")) {
+        return Err("Chunkwise GDN buffers disagree with the execution contract".into());
+    }
+    if !deferred_gdn(m)
+        && map
+            .keys()
+            .any(|name| DEFERRED_COLUMNS.iter().any(|role| name.ends_with(role)))
+    {
+        return Err("Deferred GDN buffers disagree with the execution contract".into());
+    }
+    let staged = ["AttentionDecodedK", "AttentionDecodedV"];
+    if staged.iter().any(|name| map.contains_key(name)) {
+        for name in staged {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != Dtype::F16
+                    || b.shape != [m.max_context, t.num_key_value_heads * t.head_dim]
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+                    || m.reset_buffers.iter().any(|reset| reset == name)
+                    || m.kv_cache
+                        .as_ref()
+                        .is_some_and(|kv| kv.buffers.contains_key(name))
+            }) {
+                return Err(format!("Invalid temporary attention workspace: {name}"));
+            }
+        }
+    }
+    if chunked_gdn(m) {
+        for (name, dtype, shape) in [
+            (
+                "GdnChunkW",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 128],
+            ),
+            (
+                "GdnChunkU",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 128],
+            ),
+            (
+                "GdnChunkD",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 32],
+            ),
+            (
+                "GdnChunkG",
+                Dtype::F32,
+                vec![t.linear_num_value_heads, CAPACITY, 2],
+            ),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != dtype
+                    || b.shape != shape
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid chunkwise GDN workspace: {name}"));
+            }
+        }
+    }
+    if deferred_gdn(m) {
+        for (layer, kind) in t.layer_types.iter().enumerate() {
+            if kind != "linear_attention" {
+                continue;
+            }
+            let capacity = gdn
+                .deferred_capacity()
+                .filter(|n| [2, 4, 8, 16, 32].contains(n))
+                .ok_or("Invalid deferred GDN capacity")?;
+            for (suffix, dtype, shape) in [
+                (
+                    "GdnLogCount",
+                    Dtype::I32,
+                    vec![t.linear_num_value_heads, 128],
+                ),
+                (
+                    "GdnLogDelta",
+                    Dtype::F32,
+                    vec![capacity, t.linear_num_value_heads, 128],
+                ),
+                (
+                    "GdnLogGate",
+                    Dtype::F32,
+                    vec![capacity, t.linear_num_value_heads],
+                ),
+                (
+                    "GdnLogKey",
+                    Dtype::F16,
+                    vec![capacity, t.linear_num_key_heads, 128],
+                ),
+            ] {
+                let name = format!("L{layer}_{suffix}");
+                if map.get(name.as_str()).is_none_or(|b| {
+                    b.dtype != dtype
+                        || b.shape != shape
+                        || b.data.is_some()
+                        || b.access != Access::ReadWrite
+                }) || !m.reset_buffers.contains(&name)
+                {
+                    return Err(format!("Invalid request-owned deferred GDN state: {name}"));
+                }
+            }
+        }
+    }
+    if ["MoeLow", "MoeHigh", "MoeSum"]
+        .iter()
+        .any(|name| map.contains_key(name))
+    {
+        if t.num_experts == 0 {
+            return Err("E8P expert planes require routed experts".into());
+        }
+        for (name, dtype, size) in [
+            (
+                "MoeLow",
+                Dtype::I8,
+                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+            ),
+            (
+                "MoeHigh",
+                Dtype::I8,
+                CAPACITY * t.num_experts_per_tok * t.hidden_size.max(t.moe_intermediate_size) / 2,
+            ),
+            ("MoeSum", Dtype::I32, CAPACITY * t.num_experts_per_tok),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != dtype
+                    || b.shape != [size]
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid E8P expert plane workspace: {name}"));
+            }
+        }
+    }
+    let cold_names = [
+        "MoeColdTileOffsets",
+        "MoeColdTileCount",
+        "MoeColdTileExpert",
+        "MoeColdTileRow",
+    ];
+    if cold_names.iter().any(|name| map.contains_key(name)) {
+        if t.num_experts == 0 || !map.contains_key("MoeLow") {
+            return Err("Expert partition requires routed E8P planes".into());
+        }
+        let slots = CAPACITY * t.num_experts_per_tok;
+        let expert = map
+            .get("MoeColdTileExpert")
+            .ok_or("Missing cold expert tiles")?;
+        if expert.shape.len() != 1
+            || expert.shape[0] < slots.min(t.num_experts)
+            || expert.shape[0] > slots + t.num_experts
+        {
+            return Err("Invalid cold expert tile capacity".into());
+        }
+        for (name, shape) in [
+            (cold_names[0], vec![t.num_experts]),
+            (cold_names[1], vec![1]),
+            (cold_names[2], expert.shape.clone()),
+            (cold_names[3], expert.shape.clone()),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != Dtype::I32
+                    || b.shape != shape
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid expert partition workspace: {name}"));
+            }
+        }
+    }
     let check = |name: String, dtype: Dtype, shape: Vec<usize>| -> Result<()> {
         if map.get(name.as_str()).is_none_or(|b| {
             b.dtype != dtype || b.shape != shape || b.access != Access::Read || b.data.is_none()
@@ -138,7 +372,30 @@ fn validate_weights(
             ("up_proj", t.intermediate_size, t.hidden_size),
             ("down_proj", t.hidden_size, t.intermediate_size),
         ] {
-            q4(format!("{p}.mlp.{name}.weight"), n, k)?;
+            let branch = if t.num_experts > 0 {
+                "shared_expert."
+            } else {
+                ""
+            };
+            q4(format!("{p}.mlp.{branch}{name}.weight"), n, k)?;
+        }
+        if t.num_experts > 0 {
+            for (name, n, k) in [
+                ("gate_up_proj", 2 * t.moe_intermediate_size, t.hidden_size),
+                ("down_proj", t.hidden_size, t.moe_intermediate_size),
+            ] {
+                let name = format!("{p}.mlp.experts.{name}");
+                let packed = format!("{name}.packed");
+                check(
+                    packed.clone(),
+                    Dtype::U32,
+                    vec![t.num_experts, k / 128, n, 16],
+                )?;
+                if map[packed.as_str()].layout != "e8p-q4-k128-u32" {
+                    return Err("Invalid Qwen MoE E8P bank layout".into());
+                }
+                check(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
+            }
         }
         let shapes: &[(&str, usize)] = if kind == "linear_attention" {
             &[
@@ -279,8 +536,23 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         (5120, 17408, 64, 24, 4, 48, false)
             | (4096, 12288, 32, 16, 4, 32, false)
             | (2048, 6144, 24, 8, 2, 16, true)
+            | (2560, 9216, 32, 16, 4, 32, true)
+            | (2048, 512, 40, 16, 2, 32, false)
     );
+    let moe_geometry = if t.num_experts > 0 {
+        e8p && t.hidden_size == 2048
+            && t.num_hidden_layers == 40
+            && t.num_experts == 256
+            && t.num_experts_per_tok == 8
+            && t.moe_intermediate_size == 512
+            && t.shared_expert_intermediate_size == 512
+            && t.intermediate_size == 512
+            && t.mlp_only_layers.is_empty()
+    } else {
+        t.intermediate_size != 512 && t.num_experts_per_tok == 0
+    };
     if !geometry
+        || !moe_geometry
         || (t.tie_word_embeddings && !embedding_q4)
         || t.head_dim != 256
         || t.linear_num_key_heads != 16
@@ -330,11 +602,22 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             &format!("layer{layer}/pre"),
             if gdn { PRE_GDN } else { PRE_ATTN },
         ));
-        let mut private = section(
-            m,
-            &format!("layer{layer}/private"),
-            if gdn { PRIVATE_GDN } else { PRIVATE_ATTN },
-        );
+        let mut private_names = if gdn { PRIVATE_GDN } else { PRIVATE_ATTN }.to_vec();
+        if !gdn && m.buffers.iter().any(|b| b.name == "AttentionDecodedK") {
+            private_names.insert(1, "attention_decode");
+        }
+        if gdn && deferred_gdn(m) {
+            private_names.insert(3, "recurrent_materialize");
+        }
+        if gdn && chunked_gdn(m) {
+            let index = private_names
+                .iter()
+                .position(|name| *name == "recurrent")
+                .unwrap();
+            private_names[index] = "recurrent_chunk";
+            private_names.insert(index, "recurrent_prepare");
+        }
+        let mut private = section(m, &format!("layer{layer}/private"), &private_names);
         if gdn {
             // History is a fixed-size private state, independent of live rows.
             private[2] = Operation::Copy {
@@ -346,7 +629,15 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 .insert(format!("{PREFIX}/layer{layer}/private"), private.clone());
         }
         forward.extend(private);
-        forward.extend(section(m, &format!("layer{layer}/post"), POST));
+        let mut post = vec!["quantize", "out", "norm_rotate"];
+        post.extend(ffn_names(
+            t.num_experts > 0,
+            false,
+            m.buffers.iter().any(|b| b.name == "MoeExpanded"),
+            m.buffers.iter().any(|b| b.name == "MoeLow"),
+            m.buffers.iter().any(|b| b.name == "MoeColdTileCount"),
+        ));
+        forward.extend(section(m, &format!("layer{layer}/post"), &post));
         layer_ends.push(forward.len());
     }
     forward.extend(section(m, "end", &["advance"]));
@@ -369,7 +660,17 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         destination: m.input.clone(),
         bytes: 4,
     }];
-    decode.extend(forward);
+    decode.extend(forward.into_iter().filter_map(|mut operation| {
+        if let Operation::Kernel { name } = &mut operation {
+            if name.ends_with("/private/recurrent_prepare") {
+                return None;
+            }
+            if let Some(prefix) = name.strip_suffix("/private/recurrent_chunk") {
+                *name = format!("{prefix}/private/recurrent");
+            }
+        }
+        Some(operation)
+    }));
     decode.extend(m.programs["head"].clone());
     m.programs.insert("decode".into(), decode);
     m.prefill_plans = vec![PrefillPlan {
@@ -402,7 +703,12 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     });
     {
         let columns = &m.batch_layout.as_ref().unwrap().state_columns;
-        if columns != STATE_COLUMNS
+        let mut expected_columns = STATE_COLUMNS.to_vec();
+        if deferred_gdn(m) {
+            expected_columns.extend(DEFERRED_COLUMNS);
+            expected_columns.sort_unstable();
+        }
+        if *columns != expected_columns
             || m.buffers
                 .iter()
                 .find(|b| b.name == "QwenRowPointers")
@@ -430,7 +736,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             );
         }
     }
-    mtp::register(m)?;
+    mtp::register(m, t.num_experts > 0)?;
     vision(m, c.vision_depth, t.hidden_size)?;
     let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
     m.row_execution = Some(RowExecution {
@@ -457,8 +763,10 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         | "mtp_advance" => 512,
                         "verify" | "restore" => 8,
                         name if name.starts_with("qwen_rows/state/") => LANES,
+                        name if name.starts_with("qwen_rows/verify_state/") => LANES,
                         name if name.starts_with("qwen_rows/verify/") => 8,
-                        "qwen_rows/head" => LANES,
+                        "qwen_rows/head" => head_capacity(m),
+                        "qwen_rows/commit" => LANES,
                         _ => CAPACITY,
                     },
                 )
@@ -468,26 +776,41 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     });
     let slots = m
         .programs
-        .values()
-        .flatten()
-        .filter_map(|op| match op {
-            Operation::Kernel { name } => Some(name.as_str()),
-            _ => None,
+        .iter()
+        .flat_map(|(program, operations)| {
+            let capacity = m.row_execution.as_ref().unwrap().program_capacity(program);
+            operations.iter().filter_map(move |op| match op {
+                Operation::Kernel { name } => Some((name.as_str(), capacity)),
+                _ => None,
+            })
         })
-        .collect::<BTreeSet<_>>();
+        .fold(
+            BTreeMap::<_, usize>::new(),
+            |mut slots, (name, capacity)| {
+                slots
+                    .entry(name)
+                    .and_modify(|bound| *bound = (*bound).max(capacity))
+                    .or_insert(capacity);
+                slots
+            },
+        );
     let rows = m
         .row_execution
         .as_mut()
         .ok_or("Missing Qwen dynamic rows")?;
     for kernel in &request.kernel_contracts {
-        let Some((slot, choice)) =
+        let Some((slot, mut choice)) =
             orinfer_model_sdk::operators::rows::specialization(&kernel.name, CAPACITY)?
         else {
             continue;
         };
-        if !slots.contains(slot) {
-            return Err("Qwen local row choice has no computation slot".into());
+        let capacity = *slots
+            .get(slot)
+            .ok_or("Qwen local row choice has no computation slot")?;
+        if choice.min_rows > capacity {
+            continue;
         }
+        choice.max_rows = choice.max_rows.min(capacity);
         rows.variants.entry(slot.into()).or_default().push(choice);
     }
     for choices in rows.variants.values_mut() {
@@ -655,12 +978,57 @@ impl QwenRows {
             return Err("Invalid Qwen causal row packet".into());
         }
         let verified = |lane: usize| prefills.is_some_and(|n| lane >= n);
+        let causal = prefills.and_then(|_| m.mtp.as_ref()?.verification_table.as_ref());
+        let mut causal_groups = BTreeMap::<&str, Vec<BatchSegment>>::new();
+        if let Some(table) = causal {
+            for segment in &segments[prefills.unwrap()..] {
+                let program = if table.attention.is_empty() {
+                    ""
+                } else {
+                    table
+                        .attention
+                        .iter()
+                        .find(|choice| {
+                            (choice.min_tokens..=choice.max_tokens).contains(&segment.tokens)
+                        })
+                        .ok_or("Missing causal attention selection")?
+                        .program
+                        .as_str()
+                };
+                causal_groups
+                    .entry(program)
+                    .or_default()
+                    .push(BatchSegment {
+                        slot: segment.slot,
+                        tokens: segment.tokens,
+                    });
+            }
+        }
+        let causal_bindings = || {
+            let table = causal.unwrap();
+            let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
+            let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
+                .flat_map(|layer| {
+                    let buffers = &buffers;
+                    table.columns.iter().map(move |role| {
+                        let name = format!("L{layer}_{role}");
+                        if buffers.contains(name.as_str()) {
+                            Some(name)
+                        } else {
+                            buffers.contains(role.as_str()).then(|| role.clone())
+                        }
+                    })
+                })
+                .collect();
+            let decoders: Vec<_> = causal_groups.values().flatten().cloned().collect();
+            crate::packet::private_bindings(&decoders, decoders.len(), &roles)
+        };
         let head_rows: usize = segments
             .iter()
             .enumerate()
             .map(|(lane, s)| if verified(lane) { s.tokens } else { 1 })
             .sum();
-        if head_rows > LANES
+        if head_rows > head_capacity(m)
             || segments.iter().enumerate().any(|(lane, s)| {
                 verified(lane)
                     && !m
@@ -674,7 +1042,9 @@ impl QwenRows {
         if !include_plan {
             return Ok((
                 vec![],
-                if prefills.is_none() {
+                if causal.is_some() {
+                    causal_bindings()
+                } else if prefills.is_none() {
                     self.state_bindings(segments)
                 } else {
                     vec![]
@@ -742,11 +1112,46 @@ impl QwenRows {
                     &empty,
                 )?;
             }
-            for (lane, (segment, v)) in segments
-                .iter()
-                .zip(&views)
-                .enumerate()
-                .filter(|(_, (s, _))| !parallel || s.tokens != 1)
+            if let Some(table) = causal {
+                append(
+                    m,
+                    &mut out,
+                    &format!("{PREFIX}/verify_state/layer{layer}"),
+                    segments.len() - prefills.unwrap(),
+                    None,
+                    &empty,
+                )?;
+                if layout.layers[layer] != "linear_attention" && !table.attention.is_empty() {
+                    let stride = layout.layers.len() * table.columns.len() * 8;
+                    let mut first = 0;
+                    for (program, group) in &causal_groups {
+                        let view = BTreeMap::from([(
+                            table.buffer.clone(),
+                            BufferView {
+                                buffer: table.buffer.clone(),
+                                offset: first * stride,
+                            },
+                        )]);
+                        append(
+                            m,
+                            &mut out,
+                            &format!("{PREFIX}/verify_state/layer{layer}/{program}"),
+                            group.len(),
+                            None,
+                            &view,
+                        )?;
+                        first += group.len();
+                    }
+                }
+            }
+            for (lane, (segment, v)) in
+                segments
+                    .iter()
+                    .zip(&views)
+                    .enumerate()
+                    .filter(|(lane, (s, _))| {
+                        (!parallel || s.tokens != 1) && !(causal.is_some() && verified(*lane))
+                    })
             {
                 append(
                     m,
@@ -871,7 +1276,9 @@ impl QwenRows {
         }
         Ok((
             out,
-            if prefills.is_none() {
+            if causal.is_some() {
+                causal_bindings()
+            } else if prefills.is_none() {
                 self.state_bindings(segments)
             } else {
                 vec![]
@@ -889,6 +1296,113 @@ mod tests {
         request_geometry(false)
     }
 
+    fn deferred_request() -> CreateRequest {
+        let mut r = request_geometry(true);
+        r.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 8 };
+        let layers = r.config["text_config"]["layer_types"].as_array().unwrap();
+        for (layer, kind) in layers.iter().enumerate() {
+            if kind != "linear_attention" {
+                continue;
+            }
+            for (suffix, dtype, shape) in [
+                ("GdnLogCount", "i32", vec![16, 128]),
+                ("GdnLogDelta", "f32", vec![8, 16, 128]),
+                ("GdnLogGate", "f32", vec![8, 16]),
+                ("GdnLogKey", "f16", vec![8, 16, 128]),
+            ] {
+                let name = format!("L{layer}_{suffix}");
+                r.metadata.reset_buffers.push(name.clone());
+                r.metadata.buffers.push(
+                    serde_json::from_value(json!({
+                        "name":name,"dtype":dtype,"shape":shape,"layout":"native_contiguous",
+                        "alignment":256,"access":"read_write"
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        let columns = &mut r.metadata.batch_layout.as_mut().unwrap().state_columns;
+        columns.extend(DEFERRED_COLUMNS.iter().map(|s| (*s).to_owned()));
+        columns.sort_unstable();
+        r.metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "QwenRowPointers")
+            .unwrap()
+            .shape = vec![LANES * layers.len() * columns.len()];
+        r
+    }
+
+    #[test]
+    fn pending_gdn_updates_are_private_and_materialized_before_dense_execution() {
+        let (adapter, plan) = create(deferred_request(), Policy::Int8Quality).unwrap();
+        let m = &plan.metadata;
+        let names = |program: &str| {
+            m.programs[program]
+                .iter()
+                .filter_map(|o| match o {
+                    Operation::Kernel { name } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let private = names("qwen_rows/layer0/private");
+        assert!(
+            private
+                .iter()
+                .position(|n| n.ends_with("/recurrent_materialize"))
+                .unwrap()
+                < private
+                    .iter()
+                    .position(|n| n.ends_with("/recurrent"))
+                    .unwrap()
+        );
+        let parallel = names("qwen_rows/state/layer0");
+        assert_eq!(
+            parallel
+                .iter()
+                .filter(|n| n.ends_with("/recurrent"))
+                .count(),
+            1
+        );
+        let (_, state) = adapter
+            .batch(&[BatchSegment { slot: 3, tokens: 1 }], true)
+            .unwrap();
+        assert!(state.iter().any(|s| {
+            s.as_ref()
+                .is_some_and(|(slot, name)| *slot == 3 && name == "L0_GdnLogDelta")
+        }));
+        let (_, speculative) = create(with_mtp(deferred_request()), Policy::Int8Quality).unwrap();
+        let verify = &speculative.metadata.programs["qwen_rows/verify/layer0/private"];
+        let materialize = verify
+            .iter()
+            .position(|o| {
+                matches!(o, Operation::Kernel { name }
+            if name.ends_with("/recurrent_materialize"))
+            })
+            .unwrap();
+        let recurrent = verify
+            .iter()
+            .position(|o| {
+                matches!(o, Operation::Kernel { name }
+            if name.ends_with("/recurrent"))
+            })
+            .unwrap();
+        assert!(materialize < recurrent);
+        let mut bad = deferred_request();
+        bad.metadata.reset_buffers.retain(|n| n != "L0_GdnLogCount");
+        assert!(create(bad, Policy::Int8Quality).is_err());
+        let mut bad = deferred_request();
+        bad.metadata
+            .buffers
+            .iter_mut()
+            .find(|b| b.name == "L0_GdnLogDelta")
+            .unwrap()
+            .dtype = Dtype::F16;
+        assert!(create(bad, Policy::Int8Quality).is_err());
+    }
+
     fn request_geometry(small: bool) -> CreateRequest {
         let dimensions = if small {
             (2048, 6144, 24, 16, 8, 2, true)
@@ -896,6 +1410,154 @@ mod tests {
             (5120, 17408, 64, 48, 24, 4, false)
         };
         dense_request(dimensions, small)
+    }
+
+    #[test]
+    fn attention_staging_is_shared_scratch_with_request_owned_inputs() {
+        let staged = || {
+            let mut request = request_geometry(true);
+            for name in ["AttentionDecodedK", "AttentionDecodedV"] {
+                request.metadata.buffers.push(
+                    serde_json::from_value(json!({
+                        "name":name,"dtype":"f16","shape":[request.metadata.max_context,512],
+                        "layout":"native_contiguous","alignment":256,"access":"read_write"
+                    }))
+                    .unwrap(),
+                );
+            }
+            request
+        };
+        let (_, plan) = create(staged(), Policy::Int8Quality).unwrap();
+        let private = &plan.metadata.programs["qwen_rows/layer3/private"];
+        let roles = private
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => name.rsplit('/').next(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                "prepare",
+                "attention_decode",
+                "attention",
+                "attention_merge"
+            ]
+        );
+        assert!(
+            !plan.metadata.programs["qwen_rows/state/layer3"].iter().any(
+                |op| matches!(op,Operation::Kernel{name} if name.ends_with("attention_decode"))
+            )
+        );
+        let mut missing = staged();
+        missing
+            .metadata
+            .buffers
+            .retain(|b| b.name != "AttentionDecodedV");
+        assert!(create(missing, Policy::Int8Quality).is_err());
+        let mut request = staged();
+        request
+            .metadata
+            .reset_buffers
+            .push("AttentionDecodedK".into());
+        assert!(create(request, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn gdn_execution_is_required_and_cannot_be_inferred_from_buffers() {
+        let mut missing = request();
+        missing.metadata.gdn_execution = None;
+        assert!(create(missing, Policy::Int8Quality).is_err());
+        let mut mismatch = deferred_request();
+        mismatch.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Dense;
+        assert!(create(mismatch, Policy::Int8Quality).is_err());
+        let mut capacity = deferred_request();
+        capacity.metadata.gdn_execution.as_mut().unwrap().decode =
+            orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 4 };
+        assert!(create(capacity, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn chunked_gdn_prefill_preserves_sequential_decode_and_verification() {
+        let mut request = with_mtp(dense_request((2048, 6144, 24, 16, 8, 2, true), true));
+        request.metadata.gdn_execution.as_mut().unwrap().prefill =
+            orinfer_model_sdk::operators::gdn::Prefill::Chunked;
+        for (name, dtype, width) in [
+            ("GdnChunkW", "f16", 128),
+            ("GdnChunkU", "f16", 128),
+            ("GdnChunkD", "f16", 32),
+            ("GdnChunkG", "f32", 2),
+        ] {
+            request.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":dtype,"shape":[16,4096,width],
+                    "layout":"native_contiguous","alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let mut invalid: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        invalid.metadata.buffers.retain(|b| b.name != "GdnChunkG");
+        assert!(create(invalid, Policy::Int8Quality).is_err());
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let names = |program: &str| {
+            plan.metadata.programs[program]
+                .iter()
+                .filter_map(|op| match op {
+                    Operation::Kernel { name } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let prefill = names("prefill");
+        assert_eq!(
+            prefill
+                .iter()
+                .filter(|n| n.ends_with("/recurrent_prepare"))
+                .count(),
+            18
+        );
+        assert_eq!(
+            prefill
+                .iter()
+                .filter(|n| n.ends_with("/recurrent_chunk"))
+                .count(),
+            18
+        );
+        for program in ["decode", "verify"] {
+            let calls = names(program);
+            assert!(calls.iter().all(|n| !n.ends_with("/recurrent_prepare") && !n.ends_with("/recurrent_chunk")));
+        }
+        let (calls, _) = adapter
+            .batch(&[BatchSegment { slot: 0, tokens: 1 }], false)
+            .unwrap();
+        assert!(calls.iter().all(|call| match &call.operation {
+            Operation::Kernel { name } => !name.ends_with("/recurrent_chunk"),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn four_billion_reuses_tied_dense_row_and_mtp_programs() {
+        let request = with_mtp(dense_request((2560, 9216, 32, 32, 16, 4, true), true));
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let layout = plan.metadata.batch_layout.as_ref().unwrap();
+        assert_eq!(layout.hidden, 2560);
+        assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 32);
+        assert!(plan.metadata.programs.contains_key("mtp_warm"));
+        let (calls, _) = adapter
+            .batch(
+                &[
+                    BatchSegment { slot: 2, tokens: 1 },
+                    BatchSegment { slot: 5, tokens: 3 },
+                ],
+                true,
+            )
+            .unwrap();
+        assert!(calls.iter().any(|c| c.sequence == Some(5)));
     }
 
     fn dense_request(
@@ -994,13 +1656,180 @@ mod tests {
         serde_json::from_value(json!({"config":config,"expected_signature":signature,
             "architecture":"qwen3_5","compute_policy":"int8_quality",
             "prefill_profiles":[{"tokens":4096,"min_tokens":1,"kind":"qwen_q4_rows"}],
-            "metadata":{"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
+            "metadata":{"gdn_execution":{"prefill":"sequential","decode":{"kind":"dense"}},"schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,"max_context":262144,
                 "vocab":248320,"toolchain":{},"buffers":buffers,"reset_buffers":["Step"],"input":"Input","token":"Token",
                 "status":"TokenStatus","logits":"Logits","position":"Step","weight_bytes":0,"weight_parameters":0,"weight_scope":"test",
                 "batch_layout":{"layers":[],"row_strides":{},"profiles":{},"hidden":h,"state_columns":STATE_COLUMNS},
                 "kv_cache":{"direct_prefill":true,"demand_mapping":true,"buffers":{},"prefill_workspace":{}},
                 "dynamic_batch_kernels":{"qwen_rows/layer0/pre/norm_rotate":{"name":"qwen_rows/layer0/pre/norm_rotate","capacity":4096,
                     "grid":[{"op":"rows"},{"op":"constant","value":1},{"op":"constant","value":1}],"arguments":[]}}}})).unwrap()
+    }
+
+    #[test]
+    fn moe_reuses_dense_causal_rows_with_compressed_expert_banks() {
+        let mut request = dense_request((2048, 512, 40, 32, 16, 2, false), true);
+        request.config["model_type"] = json!("qwen3_5_moe");
+        for (key, value) in [
+            ("num_experts", 256),
+            ("num_experts_per_tok", 8),
+            ("moe_intermediate_size", 512),
+            ("shared_expert_intermediate_size", 512),
+        ] {
+            request.config["text_config"][key] = json!(value);
+        }
+        request.expected_signature = Configuration::parse(request.config.clone())
+            .unwrap()
+            .signature;
+        for b in &mut request.metadata.buffers {
+            if b.name.contains(".mlp.") {
+                b.name = b.name.replace(".mlp.", ".mlp.shared_expert.");
+                b.data.as_mut().unwrap().tensor = b.name.clone();
+            }
+        }
+        for layer in 0..40 {
+            for (role, n, k) in [("gate_up_proj", 1024, 2048), ("down_proj", 2048, 512)] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{role}");
+                for (suffix, dtype, shape, layout) in [
+                    (
+                        "packed",
+                        "u32",
+                        vec![256, k / 128, n, 16],
+                        "e8p-q4-k128-u32",
+                    ),
+                    ("scale", "f16", vec![256, n], "native_contiguous"),
+                ] {
+                    request.metadata.buffers.push(
+                        serde_json::from_value(json!({"name":format!("{name}.{suffix}"),
+                        "dtype":dtype,"shape":shape,"layout":layout,"alignment":256,"access":"read",
+                        "data":{"tensor":format!("{name}.{suffix}"),"sha256":"0".repeat(64)}}))
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        request.metadata.buffers.push(
+            serde_json::from_value(json!({
+                "name":"MoeLogits","dtype":"f32","shape":[4096,256],
+                "layout":"native_contiguous","alignment":256,"access":"read_write"
+            }))
+            .unwrap(),
+        );
+        let copied = serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        let (adapter, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        assert_eq!(plan.metadata.prefill_plans[0].stages.len(), 40);
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        assert!(
+            post.iter()
+                .any(|op| matches!(op,Operation::Kernel{name} if name.ends_with("/expert_down")))
+        );
+        assert!(
+            post.iter()
+                .any(|op| matches!(op,Operation::Kernel{name} if name.ends_with("/combine")))
+        );
+        let (calls, _) = adapter
+            .batch_operation(
+                &[
+                    BatchSegment { slot: 7, tokens: 3 },
+                    BatchSegment { slot: 2, tokens: 2 },
+                ],
+                abi::BatchOperation::Warm,
+                true,
+            )
+            .unwrap();
+        let experts: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                matches!(&c.operation,Operation::Kernel{name}
+            if name=="qwen_rows/mtp/expert_up")
+            })
+            .collect();
+        assert_eq!(experts.len(), 1);
+        assert_eq!(experts[0].sequence, None);
+        let conditions: Vec<_> = calls
+            .iter()
+            .filter_map(|c| {
+                matches!(&c.operation,
+            Operation::Copy{destination,..} if destination=="MtpCondition")
+                .then_some(c.sequence)
+            })
+            .collect();
+        assert_eq!(conditions, [Some(7), Some(2)]);
+        let mut planes: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        for (name, dtype, size) in [
+            ("MoeLow", "i8", 32768 * 2048 / 2),
+            ("MoeHigh", "i8", 32768 * 2048 / 2),
+            ("MoeSum", "i32", 32768),
+        ] {
+            planes.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":dtype,"shape":[size],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let copied = serde_json::from_value(serde_json::to_value(&planes).unwrap()).unwrap();
+        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        for role in ["expert_up", "expert_down"] {
+            let index = |suffix: &str| {
+                post.iter()
+                    .position(|op| matches!(op,Operation::Kernel{name} if name.ends_with(suffix)))
+                    .unwrap()
+            };
+            assert!(index(&format!("/{role}_planes")) < index(&format!("/{role}")));
+        }
+        assert!(
+            plan.metadata.programs["mtp_post"]
+                .iter()
+                .all(|op| { !matches!(op,Operation::Kernel{name} if name.ends_with("_planes")) })
+        );
+        let mut partition: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&planes).unwrap()).unwrap();
+        for (name, size) in [
+            ("MoeColdTileOffsets", 256),
+            ("MoeColdTileCount", 1),
+            ("MoeColdTileExpert", 1280),
+            ("MoeColdTileRow", 1280),
+        ] {
+            partition.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":"i32","shape":[size],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let copied = serde_json::from_value(serde_json::to_value(&partition).unwrap()).unwrap();
+        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        for role in ["expert_up", "expert_down"] {
+            let index = |suffix: &str| {
+                post.iter()
+                    .position(|op| matches!(op,Operation::Kernel{name} if name.ends_with(suffix)))
+                    .unwrap()
+            };
+            assert!(index(&format!("/{role}_cold_planes")) < index(&format!("/{role}_cold")));
+            assert!(index(&format!("/{role}_cold")) < index(&format!("/{role}")));
+        }
+        assert!(
+            plan.metadata.programs["mtp_post"]
+                .iter()
+                .all(|op| { !matches!(op,Operation::Kernel{name} if name.contains("_cold")) })
+        );
+        partition
+            .metadata
+            .buffers
+            .retain(|b| b.name != "MoeColdTileRow");
+        assert!(create(partition, Policy::Int8Quality).is_err());
+        planes.metadata.buffers.retain(|b| b.name != "MoeSum");
+        assert!(create(planes, Policy::Int8Quality).is_err());
+        request
+            .metadata
+            .buffers
+            .retain(|b| !b.name.ends_with("layers.0.mlp.experts.down_proj.scale"));
+        assert!(create(request, Policy::Int8Quality).is_err());
     }
 
     #[test]
@@ -1230,20 +2059,25 @@ mod tests {
     }
 
     fn mtp_request() -> CreateRequest {
-        let mut r = request();
+        with_mtp(request())
+    }
+
+    fn with_mtp(mut r: CreateRequest) -> CreateRequest {
+        let configuration = Configuration::parse(r.config.clone()).unwrap();
+        let t = configuration.text();
         for (name, width, dtype) in [
-            ("MtpEmbedding", 5120, "f16"),
-            ("MtpConcat", 10240, "f16"),
-            ("MtpHidden", 5120, "f16"),
-            ("MtpNorm", 5120, "f16"),
-            ("MtpR0", 5120, "f32"),
-            ("MtpR1", 5120, "f32"),
-            ("MtpFullX", 14336, "f16"),
-            ("MtpFullQ", 6144, "f16"),
-            ("MtpFullGate", 6144, "f16"),
-            ("MtpMixer", 6144, "f16"),
-            ("MtpMix", 5120, "f16"),
-            ("MtpGateUp", 34816, "f16"),
+            ("MtpEmbedding", t.hidden_size, "f16"),
+            ("MtpConcat", 2 * t.hidden_size, "f16"),
+            ("MtpHidden", t.hidden_size, "f16"),
+            ("MtpNorm", t.hidden_size, "f16"),
+            ("MtpR0", t.hidden_size, "f32"),
+            ("MtpR1", t.hidden_size, "f32"),
+            ("MtpFullX", t.full_x(), "f16"),
+            ("MtpFullQ", t.mixer(), "f16"),
+            ("MtpFullGate", t.mixer(), "f16"),
+            ("MtpMixer", t.mixer(), "f16"),
+            ("MtpMix", t.hidden_size, "f16"),
+            ("MtpGateUp", 2 * t.intermediate_size, "f16"),
         ] {
             r.metadata.buffers.push(
                 serde_json::from_value(json!({
@@ -1265,6 +2099,50 @@ mod tests {
             "verification_plans":[{"tokens":8,"min_tokens":2,"program":"verify","restore_program":"restore","capture_program":"capture"}]
         })).unwrap());
         r
+    }
+
+    #[test]
+    fn owner_parallel_commit_keeps_acceptance_and_compact_stride_private() {
+        let mut r = mtp_request();
+        let layers = r.config["text_config"]["num_hidden_layers"]
+            .as_u64()
+            .unwrap() as usize;
+        for name in ["AcceptedInputs", "SegmentLength"] {
+            if !r.metadata.buffers.iter().any(|b| b.name == name) {
+                r.metadata.buffers.push(serde_json::from_value(json!({"name":name,"dtype":"i32","shape":[1],"layout":"native_contiguous","alignment":256,"access":"read_write"})).unwrap());
+            }
+        }
+        r.metadata.buffers.push(serde_json::from_value(json!({"name":"QwenCommitPointers","dtype":"u64","shape":[128*layers*8],"layout":"native_contiguous","alignment":256,"access":"read_write"})).unwrap());
+        let (a, plan) = create(r, Policy::Int8Quality).unwrap();
+        assert_eq!(
+            plan.metadata
+                .mtp
+                .as_ref()
+                .unwrap()
+                .commit_state_table
+                .as_deref(),
+            Some("QwenCommitPointers")
+        );
+        let segments = [
+            BatchSegment { slot: 7, tokens: 3 },
+            BatchSegment {
+                slot: 31,
+                tokens: 8,
+            },
+        ];
+        let (calls, bindings) = a
+            .batch_operation(&segments, abi::BatchOperation::Commit, true)
+            .unwrap();
+        assert!(calls.iter().all(|c| c.sequence.is_none()));
+        assert!(calls.iter().any(|c|matches!(&c.operation,Operation::Kernel{name} if name=="qwen_rows/commit/layer0/state")));
+        assert_eq!(bindings.len(), 2 * layers * 8);
+        assert_eq!(bindings[3], Some((7, "AcceptedInputs".into())));
+        assert_eq!(bindings[4], Some((7, "SegmentLength".into())));
+        assert_eq!(
+            bindings[layers * 8 + 3],
+            Some((31, "AcceptedInputs".into()))
+        );
+        assert_eq!(bindings[layers * 8 + 4], Some((31, "SegmentLength".into())));
     }
 
     #[test]

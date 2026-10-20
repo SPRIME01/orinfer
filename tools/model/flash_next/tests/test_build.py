@@ -5,14 +5,14 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from tools.model.flash_next.build_cache import BuildCache
+from tools.model.build_cache import BuildCache
 from tools.model.flash_next.construction import projection
-from tools.model.flash_next.decode_tuning import measurement_rows, profile_rows
+from tools.model.projection_tuning import measurement_rows, profile_rows
 
 
 class BuildTests(unittest.TestCase):
     def test_prefill_portfolio_keeps_legal_wide_tiles_at_every_capacity(self):
-        from tools.model.flash_next.decode_policy import q4_configs, w8_configs
+        from tools.model.projection_policy import q4_configs, w8_configs
 
         for rows in (1, 8, 128, 4096):
             self.assertIn(

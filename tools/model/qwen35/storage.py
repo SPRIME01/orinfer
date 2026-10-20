@@ -55,19 +55,23 @@ class Weights:
                 if name in packed and self.packed_k:
                     if (
                         info["dtype"] != "U32"
-                        or len(shape) != 2
+                        or len(shape) not in (2, 3)
                         or min(shape) <= 0
-                        or shape[1] % (self.packed_k // 8)
+                        or shape[-1] % (self.packed_k // 8)
                         or metadata.get(f"orin.layout.{name}") != "e8p-q4-row-u32"
                     ):
                         raise ValueError(f"Invalid source E8P weight layout: {name}")
                     source = np.memmap(
                         path, mode="r", offset=begin + first, dtype="<u4", shape=shape
                     )
-                    n, vectors = shape
+                    n, vectors = shape[-2:]
                     codes = self.packed_k // 8
                     data = np.ascontiguousarray(
                         source.reshape(n, vectors // codes, codes).transpose(1, 0, 2)
+                        if len(shape) == 2
+                        else source.reshape(shape[0], n, vectors // codes, codes).transpose(
+                            0, 2, 1, 3
+                        )
                     )
                     payload = Path(tmp) / f"{len(tensors)}.bin"
                     data.tofile(payload)
@@ -226,6 +230,27 @@ class Weights:
             str(self.directory / "runtime.safetensors"),
             metadata={f"orin.layout.{n}": "native_contiguous" for n in self.extra},
         )
+        # Assembled banks replace individually stored tensors. Prune unbound
+        # source data from each adopted shard without changing bound bytes.
+        for filename in set(self.mapping.values()) - {"runtime.safetensors"}:
+            path = self.directory / filename
+            begin, specs = local_header(path)
+            names = {n for n, f in self.mapping.items() if f == filename}
+            if names == set(specs) - {"__metadata__"}:
+                continue
+            entries = []
+            for name in sorted(names):
+                info = specs[name]
+                first, last = info["data_offsets"]
+                entries.append(
+                    dict(
+                        name=name,
+                        dtype=info["dtype"],
+                        shape=info["shape"],
+                        segments=[(path, begin + first, last - first)],
+                    )
+                )
+            write_shard(path, entries, specs.get("__metadata__"))
         total = sum(
             math.prod(b["shape"])
             * {"f16": 2, "f32": 4, "bf16": 2, "i8": 1, "u8": 1, "i32": 4, "u32": 4}[b["dtype"]]

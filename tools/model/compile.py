@@ -3,7 +3,7 @@
 import inspect
 
 
-def primitive(function, *args, **kwargs):
+def primitive(function, *args, compiler_options=None, **kwargs):
     import tilelang
     from kernels.model.rows import explicit_rows
 
@@ -11,15 +11,19 @@ def primitive(function, *args, **kwargs):
     fn = factory(*args, **kwargs)
     if kwargs.get("dynamic_rows"):
         fn = explicit_rows(fn)
+    passes = (
+        {
+            "tl.disable_thread_storage_sync": True,
+            "tl.disable_shared_memory_reuse": True,
+        }
+        if kwargs.get("prefetch_qk")
+        else {}
+    )
+    passes.update(compiler_options or {})
     return tilelang.compile(
         fn,
         out_idx=[],
         execution_backend="nvrtc",
         target={"kind": "cuda", "arch": "sm_87"},
-        pass_configs={
-            "tl.disable_thread_storage_sync": True,
-            "tl.disable_shared_memory_reuse": True,
-        }
-        if kwargs.get("prefetch_qk")
-        else {},
+        pass_configs=passes,
     )

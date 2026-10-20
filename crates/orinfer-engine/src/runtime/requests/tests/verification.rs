@@ -10,6 +10,10 @@ fn validate_joint_target_verification() {
         output: std::path::PathBuf,
         cases: Vec<GenerationInput>,
         cuda_graph: String,
+        #[serde(default)]
+        ordinary_steps: usize,
+        #[serde(default)]
+        heterogeneous: bool,
     }
     let f: Fixture = crate::model::read(&std::path::PathBuf::from(
         std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
@@ -28,6 +32,17 @@ fn validate_joint_target_verification() {
     .unwrap();
     let spec = model.manifest.mtp.clone().unwrap();
     let options = scheduler::Options::default();
+    let prepare = |model: &mut ModelRuntime, req: &mut RequestState| {
+        while req.prefilling {
+            model.advance_requests(&mut [req], &options).unwrap();
+        }
+        let fixed = model.dynamic_speculation.fixed_width;
+        model.dynamic_speculation.fixed_width = Some(1);
+        for _ in 0..f.ordinary_steps {
+            model.advance_requests(&mut [req], &options).unwrap();
+        }
+        model.dynamic_speculation.fixed_width = fixed;
+    };
     let input = |lane: usize, short: bool| {
         let mut tokens = f.cases[0].input_tokens.clone();
         if short {
@@ -62,7 +77,11 @@ fn validate_joint_target_verification() {
     };
     let mut results = vec![];
     for mixed in [false, true] {
-        for width in [2, 4, 8] {
+        for width in if f.heterogeneous {
+            vec![2]
+        } else {
+            vec![2, 4, 8]
+        } {
             let supported = if mixed {
                 &spec.mixed_verification_tokens
             } else {
@@ -76,14 +95,21 @@ fn validate_joint_target_verification() {
                 let mut requests = vec![];
                 let mut rounds = vec![];
                 for lane in 0..count {
+                    let lane_width = if f.heterogeneous {
+                        let widths: Vec<_> = [2, 4, 8]
+                            .into_iter()
+                            .filter(|n| supported.contains(n))
+                            .collect();
+                        widths[lane % widths.len()]
+                    } else {
+                        width
+                    };
                     let mut reference = model.start_request(input(lane, false), &|| false).unwrap();
-                    while reference.prefilling {
-                        model
-                            .advance_requests(&mut [&mut reference], &options)
-                            .unwrap();
-                    }
+                    prepare(&mut model, &mut reference);
                     let round = model
-                        .with_request(&mut reference, |m, r| m.prepare_speculative_round(r, width))
+                        .with_request(&mut reference, |m, r| {
+                            m.prepare_speculative_round(r, lane_width)
+                        })
                         .unwrap();
                     let Preparation::Round(round) = round else {
                         panic!("Unexpected finished verification reference")
@@ -110,11 +136,9 @@ fn validate_joint_target_verification() {
                     expected.push((round.verification.clone(), baseline));
                     model.finish_request(&mut reference, false).unwrap();
                     let mut req = model.start_request(input(lane, false), &|| false).unwrap();
-                    while req.prefilling {
-                        model.advance_requests(&mut [&mut req], &options).unwrap();
-                    }
+                    prepare(&mut model, &mut req);
                     let Preparation::Round(round) = model
-                        .with_request(&mut req, |m, r| m.prepare_speculative_round(r, width))
+                        .with_request(&mut req, |m, r| m.prepare_speculative_round(r, lane_width))
                         .unwrap()
                     else {
                         panic!("Unexpected finished verification packet")

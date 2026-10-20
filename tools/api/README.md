@@ -1,13 +1,13 @@
-# API validation
+# API验证
 
-`smoke.py` acts only as a client of a running real-model server. It covers arbitrary input lengths, EOS, SSE and usage accounting, fixed seeds, stop sequences, queuing, isolation after disconnects, error formats, integer-argument tool calls, and tool-result follow-ups. The output path must not exist. If the server requires authentication, the client reads `ORINFER_API_KEY` from the environment.
+`smoke.py`只作为客户端连接运行中的真实模型服务，覆盖任意输入长度、EOS、SSE/usage、固定seed、stop、排队和断开后的状态隔离、错误格式，以及带整数参数的工具调用和结果回传。输出路径必须不存在；启用服务鉴权时从环境变量`ORINFER_API_KEY`读取凭据。
 
 ```bash
 python3 tools/api/smoke.py --base-url http://127.0.0.1:8088/v1 \
   --output artifacts/api-smoke-results.json
 ```
 
-`compatibility.py` additionally checks nullable parameters, signed seeds, field-specific errors, JSON/schema constraints with thinking, strict and forced tool choice with incremental arguments, target log probabilities, Unicode bytes, and request isolation. With server-side MTP enabled, the same suite covers its constraints and probability paths; providing a tokenizer directory also validates token-ID bias.
+`compatibility.py`进一步验证 nullable 参数、有符号 seed、字段定位错误、JSON/schema 与 thinking、严格/指定工具及参数增量、target logprobs、Unicode bytes 和请求隔离。服务开启 MTP 时，同一套测试覆盖其约束及概率路径；传入模型目录还会验证 token-ID bias。
 
 ```bash
 python3 tools/api/compatibility.py --model qwen-flash-next \
@@ -15,9 +15,9 @@ python3 tools/api/compatibility.py --model qwen-flash-next \
   --output artifacts/api-compatibility.json
 ```
 
-The optional `--long-logprobs` case requests up to 512 output tokens with 20 candidate log probabilities per token. It validates non-streaming responses over 512 KiB and takes longer to run.
+增加 `--long-logprobs` 会另外生成最多 512 tokens、每 token 20 个候选概率的完整响应，检查超过 512 KiB 的非流式输出；此项耗时更长。
 
-`template_reference.py` is an offline Transformers-based reference tool. It renders the original checkpoint template to token IDs and compares against the Rust template/tokenizer for plain text, tools, tool history, and thinking. JSON key ordering is first normalized to match Rust.
+`template_reference.py`是离线参考工具，需要Transformers。它使用原始checkpoint模板生成token IDs，对照Rust模板和分词器；包含文本、tools、工具历史和thinking四种场景。JSON对象的key顺序先与Rust一致化。
 
 ```bash
 python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
@@ -27,9 +27,9 @@ ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 
-The [OpenCode configuration](../../examples/opencode.json) and [Pi configuration](../../examples/pi-models.json) can be used for coding workflows; see [OpenCode and Pi](../../docs/serving.md#opencode-and-pi). Clients execute tools and return their results to the Chat API. Test in an isolated directory: verify file reads/edits, running tests, tool-error responses, thinking, compaction, and session continuation. Do not commit the test directory, generated files, session databases, or logs.
+[OpenCode配置](../../examples/opencode.json)和[Pi配置](../../examples/pi-models.json)提供日常编码接入；配置与命令见[服务指南](../../docs/serving.md#opencode-与-pi)。客户端执行工具并把结果发送回 Chat API。使用独立测试目录，验证读取、修改文件、运行测试、工具错误回传、thinking、压缩与继续会话；目录、生成文件、会话数据库和日志不提交源码库。
 
-To validate single-image, multi-image, image-history, and thinking templates, use a built vision manifest and a local PNG:
+增加图片、多图、图片历史和thinking模板对照时，使用已构建的视觉manifest和本机PNG图片：
 
 ```bash
 python3 tools/api/template_reference.py --tokenizer-dir /path/to/tokenizer-dir \
@@ -40,4 +40,4 @@ ORINFER_CHAT_REFERENCE="$PWD/artifacts/chat-image-reference.json" \
   cargo test --offline checkpoint_matches_reference_tokens -- --ignored
 ```
 
-The reference side uses the original Transformers template and `Qwen3VLProcessor` to produce complete input IDs, including native image-token expansion. The Rust side compares token by token along the actual Chat-request processing path.
+参考端由Transformers原始模板和Qwen3VLProcessor生成完整input IDs，包括其原生图片token展开；Rust端通过实际Chat请求处理路径做逐token比较。

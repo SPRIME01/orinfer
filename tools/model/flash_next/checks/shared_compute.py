@@ -11,7 +11,7 @@ import numpy as np
 import tilelang
 import torch
 
-from tools.model.flash_next.decode_tuning import make_prim, profile_stream, TARGET
+from tools.model.projection_tuning import make_prim, profile_stream, TARGET
 from kernels.model.q4_projection import MAGNITUDES
 from tools.operators.common import configure, write_json
 

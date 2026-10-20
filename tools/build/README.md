@@ -1,19 +1,19 @@
-# Build, checks, and release
+# 构建、检查与发布
 
-The online service needs only a Rust binary, CUDA driver, prepared model directory, and execution package. Python, PyTorch, and TileLang belong to the **offline** build environment.
+在线服务只依赖 Rust 二进制、CUDA 驱动、准备好的模型目录和算子包。Python、PyTorch、TileLang 均属于离线环境。
 
-## Compiler environment
+## 编译环境
 
 ```bash
 make compiler-image
 make check-offline
 ```
 
-`compiler.Dockerfile` pins a public NVIDIA Jetson CUDA 12.6 / PyTorch 2.9.1 base-image digest. Pinned `uv` manages `/opt/venv` in the image and installs TileLang 0.1.15, Transformers 5.20.1, Tokenizers 0.23.3, and Hub 2.2.0. Models and compile caches are not copied into the image. `compiler-requirements.txt` pins all Python and build dependencies; `uv` synchronization removes unrelated inherited service dependencies. The original Jetson PyTorch 2.9.1 and torchvision 0.24.1 remain unchanged, and the build verifies that Torch still links to CUDA 12.6. System packages are pinned by the base-image digest. The GPU compiler keeps Python 3.10 and NumPy 2.2.6; TVM FFI and Z3 follow TileLang's constraints.
+`compiler.Dockerfile`使用公开 NVIDIA Jetson CUDA 12.6/PyTorch 2.9.1 镜像的固定 digest，使用固定版本uv管理镜像内的`/opt/venv`，安装TileLang 0.1.15、Transformers 5.20.1、Tokenizers 0.23.3和Hub 2.2.0，不复制模型或编译缓存。`compiler-requirements.txt`固定完整Python依赖和构建工具，由uv同步并移除基底遗留的无关服务依赖。Jetson原生Torch 2.9.1/torchvision 0.24.1保持不变，构建后检查Torch仍链接CUDA12.6；系统依赖由基底镜像digest固定。GPU编译环境保留Python3.10和NumPy2.2.6；TVM FFI、Z3遵守TileLang约束。默认镜像名为`orinfer-compiler:0.1.2`，可用`ORINFER_OPERATOR_IMAGE`覆盖。
 
-The default image is `orinfer-compiler:0.1.2`, overridable with `ORINFER_OPERATOR_IMAGE`. NVRTC uses CUDA Python 12.6.2.post1; some offline native-operator references use Triton 3.5.1. Both are pinned alongside TileLang in the compiler image. Deployment loads only precompiled native execution packages.
+GPU编译入口：
 
-GPU compilation example:
+NVRTC后端使用CUDA Python 12.6.2.post1；部分离线原生算子参考保留Triton 3.5.1。两者与TileLang一同固定在编译镜像中，在线部署只加载已编译的原生执行包。
 
 ```bash
 ORINFER_CHECKPOINT_DIR=/path/to/converted \
@@ -22,35 +22,33 @@ ORINFER_CHECKPOINT_DIR=/path/to/converted \
   --gpu-lock-held
 ```
 
-GPU entry points run under the invoking UID/GID and supplementary device groups to avoid root-owned outputs. The repository and output directories are mounted at their current absolute paths; `ORINFER_CHECKPOINT_DIR` mounts external checkpoints read-only. See [Model builds](../model/README.md) for input requirements. The 27B builder reads fully quantized custom-codebook weights; the Flash Next builder reads a current native model with its execution contract. Neither imports arbitrary bare model weights.
+GPU入口使用调用者UID/GID及补充设备组，避免生成root所有的模型/cache。仓库与输出目录按当前绝对路径挂载；外部checkpoint通过`ORINFER_CHECKPOINT_DIR`只读挂载。模型输入约束与构建参数见[模型构建说明](../model/README.md)。27B 构建器读取完成量化的自有码表权重；Flash Next 重建器读取当前原生模型及其固定执行契约。两者均不导入任意裸权重。
 
-A new compiler environment can be smoke-tested without a checkpoint:
+新环境的最小GPU编译验收无需checkpoint：
 
 ```bash
 bash tools/operators/run.sh tools/build/smoke.py artifacts/build/compiler-smoke
 ```
 
-This compiles actual production norm and dynamic-row greedy reduction from an empty cache, checking unaligned tails, cubin sharing across 3/7 rows, scalar ABI for affine shapes, output guards, CUDA Graph replay after input changes, and AOT export.
+它从空缓存编译实际生产norm与动态行数greedy归约，检查非对齐尾部、3/7行共用cubin、仿射shape的标量ABI、输出guard和改变输入的graph replay，并导出AOT。
 
-## Automated checks
+## 自动检查
 
-`make check` runs Rust/Ruff formatting, Python static checks, compilation, Clippy, Rust/CPU Python tests, and acceptance-config validation. GitHub Actions runs the same entry point on x86_64 and aarch64; native C ABI loading is tested on aarch64, using `rust-toolchain.toml`. `make fmt` formats; `make lint` runs formatting and static analysis. Rust builds reject dead code, and Clippy warnings are errors.
+`make check`包含Rust/Ruff格式、Python静态检查、编译、clippy、Rust/CPU Python测试和验收配置校验；GitHub Actions在x86_64和aarch64 runner执行同一入口；原生C ABI加载测试在aarch64执行，读取`rust-toolchain.toml`。`make fmt`统一格式，`make lint`执行格式和静态检查；Rust编译拒绝死代码，clippy拒绝警告。使用`uv`隔离CPU依赖：`make python-env`创建Python3.12的`.venv`并同步固定版本；检查默认使用`.venv/bin/python`，无需修改主机Python环境，可通过`PYTHON`覆盖解释器；CI和编译镜像固定uv0.13.1，Rust版本由`rust-toolchain.toml`固定。Python源码仍兼容GPU编译环境的3.10语法。
 
-`make python-env` uses `uv` to create a Python 3.12 `.venv` with pinned dependencies. Checks default to `.venv/bin/python` and do not modify system Python; override with `PYTHON`. CI and the compiler image pin uv 0.13.1. Rust is pinned by `rust-toolchain.toml`. Python sources remain syntax-compatible with Python 3.10 for GPU builds.
-
-`make check-offline` checks imports across offline modules in the compiler image and runs Torch-dependent CPU reference math and dynamic-row ABI tests, without a GPU.
+`make check-offline`在编译镜像中检查全部离线模块引用，并执行需要Torch的CPU参考数学及动态行数ABI测试，不使用GPU。
 
 ```bash
 make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 ```
 
-This builds native Chat-template fixtures for text, image, and multi-image cases using seed 20261002. It checks dynamic batching in `off`/`decode_only`/`full` modes, cancellation/reordering/reuse isolation, request cleanup, and matched-history probabilities. The old serial plan exists only as a testing reference; production full-request generation and serving share the same state machine. This does **not** replace independent BF16 quality acceptance.
+该入口生成原生Chat模板的文本、图片、多图夹具，固定seed20261002，依次验证off/decode_only/full模式的动态batch、取消/重排/复用隔离、请求丢弃清理和同历史概率。原串行计划只在测试构建中作为独立参考存在，生产整请求生成和服务使用同一状态机。此检查不替代独立BF16质量验收。
 
-GPU jobs acquire `artifacts/gpu-experiment.lock` and exit if it is held. They do not stop unrelated services, change power/frequency settings, or clear global caches. Release only idle services started by your own test.
+GPU入口获取`artifacts/gpu-experiment.lock`；锁被占用时退出。它不会停止服务、调整功耗/频率或清理全局缓存；先释放自己部署的空闲服务，保留其他服务。
 
-## Releases
+## 发布
 
-Commit sources, update the workspace version, and create an annotated tag pointing to that commit. Then run:
+提交源码、更新workspace版本并建立指向该提交的annotated tag后，运行：
 
 ```bash
 python3 tools/release/package.py --version v0.1.4 \
@@ -59,10 +57,8 @@ python3 tools/release/package.py --version v0.1.4 \
   --output artifacts/releases/v0.1.4
 ```
 
-By default this builds and verifies artifacts without publishing. The tool requires a clean working tree, builds from `Cargo.lock`, verifies aarch64 and version identity, and packages the complete sources, license, dependency notices, model packaging tools, and architecture contract. Each native execution package and library identity is verified. Engine, execution, and bundled source archives use XZ compression (`.tar.xz`, preset 6). Legacy `.tar.gz` execution-package inputs are verified and *repacked* to XZ, not merely renamed. Asset names derive from architecture, compute policy, and GPU target; `RELEASE.json` lists each package digest. Full offline tools and Flash Next documentation accompany the release. Weights are excluded.
+默认仅生成和校验产物。工具要求工作区干净，使用`Cargo.lock`构建，验证aarch64/版本，打包完整源码、许可证、依赖声明、模型打包工具和架构契约，并逐个验证原生执行包及实际库身份。引擎、执行包和随附的源码归档统一使用 XZ 压缩（`.tar.xz`，preset 6）；输入旧 `.tar.gz` 执行包会经过验证并重新归档为 XZ，不只是更改后缀。资产名称取自架构、计算策略和GPU目标，`RELEASE.json`列出每个包的digest；完整离线工具及Flash Next文档随包提供。权重不进入发行包。安装执行包使用 `orinfer package install`，不需要 Python；详见[安装说明](../../docs/model-packages.md#安装执行包)。
 
-Install an execution package with `orinfer package install`; Python is not required. See [Installing execution packages](../../docs/model-packages.md#installing-execution-packages).
+0.1.2只接受当前schema 1原生执行包（包含`.so`与cubin）；0.1.1发行包中的旧算子资产不兼容。已有旧格式模型需要用当前构建/组装工具重新发布，不能直接复用旧包。当前原生格式的模型可以用[执行库更新工具](../../docs/model-packages.md)生成新目录，保留权重和kernel资产。
 
-Release 0.1.2 accepts only current schema-1 native execution packages containing `.so` and cubins; old operator assets from v0.1.1 are incompatible. Models in the old format must be rebuilt or reassembled with current tools. Current native models can use the [execution-library update workflow](../../docs/model-packages.md), preserving compatible weights and kernel assets.
-
-To publish, add `--publish --notes /path/to/release-notes.md`. The tool checks that the tag points to the source revision, pushes it, creates a GitHub Release, then downloads and SHA256-verifies all uploaded assets. Existing releases are never overwritten.
+实际发布时添加`--publish --notes /path/to/release-notes.md`。工具核对tag与源码revision，推送tag，创建GitHub Release，再重新下载并核对所有上传资产的SHA256。已有release不会覆盖。

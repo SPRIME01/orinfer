@@ -2,9 +2,9 @@
 
 import hashlib
 from pathlib import Path
-from tools.model.flash_next.build_cache import BuildCache
-from tools.model.flash_next.compiler import Compiler
-from tools.model.flash_next.converge_kernels import divide_rows
+from tools.model.build_cache import BuildCache
+from tools.model.host_compiler import Compiler
+from tools.model.row_convergence import divide_rows
 from tools.operators.common import export_kernel
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -28,11 +28,13 @@ class Aot:
         for file in [
             ROOT / "tools/model/compile.py",
             ROOT / "tools/model/row_tuning.py",
+            ROOT / "tools/model/expert_tuning.py",
+            ROOT / "tools/model/gdn_tuning.py",
             ROOT / "tools/model/row_selection.py",
-            ROOT / "tools/model/flash_next/compiler.py",
-            ROOT / "tools/model/flash_next/decode_tuning.py",
-            ROOT / "tools/model/flash_next/decode_policy.py",
-            ROOT / "tools/model/flash_next/converge_kernels.py",
+            ROOT / "tools/model/host_compiler.py",
+            ROOT / "tools/model/projection_tuning.py",
+            ROOT / "tools/model/projection_policy.py",
+            ROOT / "tools/model/row_convergence.py",
             ROOT / "tools/operators/abi.py",
             ROOT / "tools/operators/common.py",
         ]:
@@ -47,7 +49,24 @@ class Aot:
             target="sm_87",
         )
 
-    def emit(self, name, key, build, bindings, rows=4096, *, dynamic=True, row_divisor=1):
+    def emit(
+        self,
+        name,
+        key,
+        build,
+        bindings,
+        rows=4096,
+        *,
+        dynamic=True,
+        row_divisor=1,
+        row_multiplier=1,
+    ):
+        if (
+            row_multiplier < 1
+            or rows % row_multiplier
+            or (row_multiplier != 1 and row_divisor != 1)
+        ):
+            raise ValueError("Invalid dynamic assignment row multiplier")
         if key not in self.objects:
 
             def construct(folder):
@@ -66,7 +85,8 @@ class Aot:
                 k: (dict(kind="buffer", name=v) if isinstance(v, str) else v)
                 for k, v in bindings.items()
             },
-            rows,
+            rows // row_multiplier,
+            multiplier=row_multiplier,
             key=key,
             artifact=artifact,
         )

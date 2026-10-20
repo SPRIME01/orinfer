@@ -53,8 +53,8 @@ def publish(data, package, compiler):
     from tools.model.flash_next.dynamic_batch import factory
     from tools.model.flash_next.mixed_verify import Interfaces
     from tools.model.flash_next.mixed_draft import PRIVATE
-    from tools.model.flash_next.decode_policy import decode_shapes
-    from tools.model.flash_next.decode_tuning import DecodeTuner, make_prim
+    from tools.model.projection_policy import decode_shapes
+    from tools.model.projection_tuning import ProjectionTuner, make_prim
 
     metadata, buffers = data["metadata"], compiler.buffers
     original = {k["name"]: k for k in package["kernels"]}
@@ -170,7 +170,9 @@ def publish(data, package, compiler):
         contracts.append(launch)
         return name
 
-    tuner = DecodeTuner(compiler.output / "draft-tuning", getattr(compiler, "tuning_cache", None))
+    tuner = ProjectionTuner(
+        compiler.output / "draft-tuning", getattr(compiler, "tuning_cache", None)
+    )
     common_books = [
         compiler.pointers(k)["Book"]
         for k in original.values()

@@ -144,7 +144,7 @@ def build(args):
                 shutil.copyfile(ROOT / name, bundle / name)
         # Ship complete offline tools and their imports; only tracked files are included.
         for name in command(
-            "git", "ls-files", "docs", "examples", "tools", "kernels", "configs"
+            "git", "ls-files", "docs", "examples", "tools", "kernels", "configs", "fixtures"
         ).splitlines():
             (bundle / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, bundle / name)

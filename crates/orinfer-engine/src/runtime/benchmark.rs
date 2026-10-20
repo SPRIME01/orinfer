@@ -272,6 +272,7 @@ impl ModelRuntime {
             }
         }
         self.execution.session.cleanup()?;
+        let weight_bytes = manifest.weight_bytes + stats.load_stages.weight_arena_padding_bytes;
         Ok(Report {
             resident_experts: stats.resident_experts,
             expert_cache: self.execution.expert_statistics(),
@@ -279,6 +280,7 @@ impl ModelRuntime {
             model: manifest.model.clone(),
             device: stats.device,
             load_to_ready_s: stats.load_to_ready_s,
+            load_stages: stats.load_stages,
             verify_weights: stats.verify_weights,
             load_workers: stats.load_workers,
             preloaded_modules: stats.preloaded_modules,
@@ -293,9 +295,8 @@ impl ModelRuntime {
             buffer_capacity_bytes: stats.buffer_capacity_bytes,
             peak_kv_bytes: self.execution.peak_kv_bytes.get(),
             peak_prefill_workspace_bytes: self.execution.peak_prefill_workspace_bytes.get(),
-            weight_bytes: manifest.weight_bytes,
-            effective_weight_bits: 8.0 * manifest.weight_bytes as f64
-                / manifest.weight_parameters as f64,
+            weight_bytes,
+            effective_weight_bits: 8.0 * weight_bytes as f64 / manifest.weight_parameters as f64,
             weight_scope: manifest.weight_scope.clone(),
             requests: reports,
             seed: 20261002,

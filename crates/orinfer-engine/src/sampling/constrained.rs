@@ -105,6 +105,13 @@ impl Decoder {
         }
         result
     }
+    pub(crate) fn gpu_mask(&mut self) -> Result<Option<Vec<u32>>> {
+        let result = self.constraint.as_mut().map(|c| c.mask()).transpose();
+        if let Err(error) = &result {
+            self.fail(error.clone());
+        }
+        result
+    }
     pub fn law(&mut self, logits: &[f32], history: &[u32], options: &Options) -> Result<Law> {
         let mask = match self.constraint.as_mut().map(|c| c.mask()).transpose() {
             Ok(mask) => mask,

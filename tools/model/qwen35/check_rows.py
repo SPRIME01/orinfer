@@ -21,8 +21,53 @@ def rotation_checks():
     def stream():
         return torch.cuda.current_stream().cuda_stream
 
-    for k, swiglu in [(640, True), (2560, False), (5120, False), (17408, True)]:
+    for k, swiglu in [
+        (512, True),
+        (640, True),
+        (2048, False),
+        (2560, False),
+        (4096, False),
+        (5120, False),
+        (17408, True),
+    ]:
         reference = primitive(rotate_activation_a8, 4096, k, swiglu=swiglu, dynamic_rows=True)
+        register = primitive(
+            rotate_activation_a8, 4096, k, swiglu=swiglu, dynamic_rows=True, registers=True
+        )
+        for live in [1, 17, 129, 512]:
+            x = torch.randn((live, k * (2 if swiglu else 1)), device="cuda", dtype=torch.float16)
+            signs = torch.randint(0, 2, (k,), device="cuda", dtype=torch.int8) * 2 - 1
+            storage = torch.full((live + 1, k), 91, device="cuda", dtype=torch.int8)
+            scales = torch.full((live + 1,), 91, device="cuda", dtype=torch.float16)
+            q, s = storage[:live], scales[:live]
+            eq, es = torch.empty_like(q), torch.empty_like(s)
+
+            def run_register():
+                register.adapter.func(x, signs, q, s, live, stream=stream())
+
+            def check_register():
+                reference.adapter.func(x, signs, eq, es, live, stream=stream())
+                assert torch.equal(q, eq) and torch.equal(s, es), (k, live, "register rotation")
+                assert bool(torch.all(storage[live:] == 91)) and bool(
+                    torch.all(scales[live:] == 91)
+                )
+
+            run_register()
+            check_register()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_register()
+            x.neg_()
+            signs.neg_()
+            graph.replay()
+            check_register()
+            x.zero_()
+            graph.replay()
+            check_register()
+            assert bool(torch.all(q == 0)) and bool(torch.all(s == 1))
+            results.append(
+                dict(kind="register_rotation", k=k, rows=live, exact=True, changed_input_graph=True)
+            )
         for tile in [512, 1024]:
             first = primitive(rotate_activation_tiles, 4096, k, tile, swiglu, dynamic_rows=True)
             second = primitive(quantize_rotation_tiles, 4096, k, tile, dynamic_rows=True)

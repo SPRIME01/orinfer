@@ -3,7 +3,7 @@
 import unittest
 from tools.model.flash_next.mixed_verify import share_verification_state
 
-from tools.model.flash_next.compiler import (
+from tools.model.host_compiler import (
     pointer_bindings,
     replace_binding,
 )

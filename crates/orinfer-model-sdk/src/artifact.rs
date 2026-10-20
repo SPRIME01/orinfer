@@ -28,6 +28,7 @@ pub enum Dtype {
     F16,
     Bf16,
     F32,
+    F64,
     U32,
     I32,
     U64,
@@ -39,7 +40,7 @@ impl Dtype {
             Self::U8 | Self::I8 => 1,
             Self::F16 | Self::Bf16 | Self::U16 => 2,
             Self::F32 | Self::U32 | Self::I32 => 4,
-            Self::U64 | Self::I64 => 8,
+            Self::U64 | Self::I64 | Self::F64 => 8,
         }
     }
 }

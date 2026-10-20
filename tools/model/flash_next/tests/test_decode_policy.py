@@ -1,7 +1,7 @@
 """AOT specializations and the symbolic fallback cover rows without gaps."""
 
 import unittest
-from tools.model.flash_next.decode_policy import (
+from tools.model.projection_policy import (
     decode_shapes,
     selection_name,
     q4_configs,

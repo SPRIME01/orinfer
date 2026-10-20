@@ -22,7 +22,7 @@ from tools.eval.scoring_common import SEED, context_hash, image_fingerprints
 from tools.model.safetensors_source import Source, SIZES
 
 
-def configure_torch_reference():
+def configure_torch_reference(backend=modeling):
     """Freeze the official Torch equations before optional kernel dispatch."""
     functions = {}
     for name in (
@@ -31,8 +31,8 @@ def configure_torch_reference():
         "torch_chunk_gated_delta_rule",
         "torch_recurrent_gated_delta_rule",
     ):
-        function = inspect.unwrap(getattr(modeling, name))
-        setattr(modeling, name, function)
+        function = inspect.unwrap(getattr(backend, name))
+        setattr(backend, name, function)
         functions[name] = hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
     return functions
 
@@ -186,23 +186,50 @@ def main():
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     # Use the official Torch equations even when optional FLA/conv packages are
     # installed. Their binary kernels may not support this Orin's SM87 target.
-    reference_functions = configure_torch_reference()
     config_raw = (a.checkpoint / "config.json").read_bytes()
     config_json = json.loads(config_raw)
-    config = Qwen3_5TextConfig(**config_json.get("text_config", config_json))
+    backend, full_type, text_type, class_prefix = (
+        modeling,
+        Qwen3_5Config,
+        Qwen3_5TextConfig,
+        "Qwen3_5",
+    )
+    if config_json.get("model_type") == "qwen3_5_moe":
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe
+        from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
+            Qwen3_5MoeConfig,
+            Qwen3_5MoeTextConfig,
+        )
+
+        backend, full_type, text_type, class_prefix = (
+            modeling_qwen3_5_moe,
+            Qwen3_5MoeConfig,
+            Qwen3_5MoeTextConfig,
+            "Qwen3_5Moe",
+        )
+    reference_functions = configure_torch_reference(backend)
+    config = text_type(**config_json.get("text_config", config_json))
     config._attn_implementation = "sdpa"
     multimodal = any(c.get("images") for c in requests["cases"])
     with torch.device("meta"):
         if multimodal:
-            full_config = Qwen3_5Config(**config_json)
+            full_config = full_type(**config_json)
             full_config.text_config._attn_implementation = "sdpa"
             full_config.vision_config._attn_implementation = "sdpa"
-            model = modeling.Qwen3_5Model(full_config).to(dtype=torch.bfloat16).eval()
+            model = (
+                getattr(backend, class_prefix + "Model")(full_config)
+                .to(dtype=torch.bfloat16)
+                .eval()
+            )
             text_model = model.language_model
         else:
-            model = modeling.Qwen3_5TextModel(config).to(dtype=torch.bfloat16).eval()
+            model = (
+                getattr(backend, class_prefix + "TextModel")(config).to(dtype=torch.bfloat16).eval()
+            )
             text_model = model
-    text_model.rotary_emb = modeling.Qwen3_5TextRotaryEmbedding(config).to("cuda")
+    text_model.rotary_emb = getattr(backend, class_prefix + "TextRotaryEmbedding")(config).to(
+        "cuda"
+    )
     index_raw = (a.checkpoint / "model.safetensors.index.json").read_bytes()
     index = json.loads(index_raw)["weight_map"]
     sources = (
@@ -222,6 +249,8 @@ def main():
     )
 
     def tensor(name):
+        if name not in index and name.startswith("model.visual."):
+            name = name.removeprefix("model.")
         if remote:
             return remote.tensor(name)
         return sources[index[name]].get_tensor(name).to("cuda")
@@ -229,18 +258,21 @@ def main():
     def attach(module, prefix):
         def load(current, inputs):
             names = list(current.state_dict())
+            source_names = {name: prefix + name for name in names}
+            if prefix == "model.visual." and all("visual." + name in index for name in names):
+                source_names = {name: "visual." + name for name in names}
             if remote:
-                loaded = remote.tensors([prefix + name for name in names])
-                state = {name: loaded[prefix + name] for name in names}
+                loaded = remote.tensors(list(source_names.values()))
+                state = {name: loaded[source_names[name]] for name in names}
             else:
-                state = {name: tensor(prefix + name) for name in names}
+                state = {name: tensor(source_names[name]) for name in names}
             current.load_state_dict(state, strict=True, assign=True)
             if prefix == "model.visual.":
                 # The nonpersistent buffer starts on meta and is unloaded with
                 # the vision weights. Recreate the official formula per call.
-                current.rotary_pos_emb = modeling.Qwen3_5VisionRotaryEmbedding(current.config).to(
-                    "cuda"
-                )
+                current.rotary_pos_emb = getattr(backend, class_prefix + "VisionRotaryEmbedding")(
+                    current.config
+                ).to("cuda")
 
         def unload(current, inputs, result):
             current.to_empty(device="meta")

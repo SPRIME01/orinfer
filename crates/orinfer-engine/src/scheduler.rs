@@ -76,6 +76,8 @@ pub struct Options {
     pub policy: Policy,
     pub max_active: usize,
     pub max_batch_tokens: usize,
+    /// Total verification rows; zero uses the model package's legal capacity.
+    pub max_speculative_tokens: usize,
     pub prefill_budget_ms: f64,
     pub target_tpot_ms: f64,
     pub memory_reserve_bytes: usize,
@@ -86,6 +88,7 @@ impl Default for Options {
             policy: Policy::Latency,
             max_active: 32,
             max_batch_tokens: 128,
+            max_speculative_tokens: 0,
             prefill_budget_ms: 200.,
             target_tpot_ms: 400.,
             memory_reserve_bytes: 1 << 30,
@@ -96,6 +99,7 @@ impl Options {
     pub fn validate(&self) -> Result<()> {
         if !(1..=128).contains(&self.max_active)
             || !(1..=128).contains(&self.max_batch_tokens)
+            || self.max_speculative_tokens > 4096
             || !self.prefill_budget_ms.is_finite()
             || self.prefill_budget_ms <= 0.
             || !self.target_tpot_ms.is_finite()
@@ -366,6 +370,13 @@ pub struct BatchExecutionStatistics {
 
 #[derive(Default, Clone, Debug, Serialize)]
 pub struct Statistics {
+    pub mtp_probe_iterations: usize,
+    pub mtp_request_depth_histogram: std::collections::BTreeMap<usize, usize>,
+    pub maintenance_calls: usize,
+    pub maintenance_s: f64,
+    pub mtp_depth_histogram: std::collections::BTreeMap<usize, usize>,
+    pub mtp_catchup_tokens: usize,
+    pub mtp_catchup_s: f64,
     pub layered_prefill_iterations: usize,
     pub prefill_suspend_s: f64,
     pub prefill_resume_s: f64,

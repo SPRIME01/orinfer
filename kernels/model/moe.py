@@ -2,13 +2,175 @@
 
 Router logits and probabilities remain FP32. Top-k uses ascending expert IDs
 to break exact ties, and can normalize over the selected experts or all experts.
-These kernels do not copy or expand weights. Dispatch owns the output-slot map.
+Dispatch owns the output-slot map. Optional expert expansion uses a reusable
+temporary workspace and retains the single packed weight bank.
 """
 
 import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
+
+
+@orin_jit
+def router_projection(M, H, E, dynamic_rows=False, block_m=16, block_n=32, block_k=128, stages=2):
+    """One floating projection for the router and the shared expert's gate."""
+    from kernels.model.floating_core import mma_loop
+
+    if (
+        min(M, H, E) <= 0
+        or block_m not in (16, 32, 64, 128)
+        or block_n not in (32, 64, 128)
+        or block_k not in (128, 256)
+        or H % block_k
+        or stages not in (1, 2)
+    ):
+        raise ValueError("Invalid floating router geometry")
+    m = row_count(M, dynamic_rows)
+    product = mma_loop(m, H, block_m, block_n, block_k, dtype="float16", stages=stages)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((m, H), T.float16),
+        W: T.Tensor((E + 1, H), T.float16),
+        Logits: T.Tensor((m, E), T.float32),
+        SharedGate: T.Tensor((m,), T.float16),
+    ):
+        with T.Kernel(T.ceildiv(m, block_m), T.ceildiv(E + 1, block_n), threads=128) as (by, bx):
+            acc = T.alloc_fragment((block_m, block_n), T.float32)
+            product(X, W, acc, by, bx, 0)
+            for i, j in T.Parallel(block_m, block_n):
+                if by * block_m + i < m:
+                    if bx * block_n + j < E:
+                        Logits[by * block_m + i, bx * block_n + j] = acc[i, j]
+                    elif bx * block_n + j == E:
+                        SharedGate[by * block_m + i] = acc[i, j]
+
+    return main
+
+
+@orin_jit
+def integer_experts(
+    M,
+    N,
+    K,
+    E,
+    top_k,
+    *,
+    codec="e8p_q4",
+    block_m=16,
+    block_n=64,
+    block_k=128,
+    stages=2,
+    dynamic_rows=False,
+    tail_m=0,
+    minimum_blocks=1,
+):
+    """Routed bank/row views around the shared dense integer MMA computation."""
+    from kernels.model.integer_core import tensor_core, tensor_core_tiles
+    from kernels.model.e8p_q4 import decode_source
+
+    if (
+        min(M, N, K, E, top_k) <= 0
+        or top_k > E
+        or K % 128
+        or block_m not in (8, 16, 32, 64, 128, 256)
+        or block_n not in (32, 64, 128)
+        or codec not in ("w8", "e8p_q4")
+        or (codec == "w8" and (block_m == 8 or block_n == 32))
+        or block_k not in (128, 256)
+        or K % block_k
+        or stages not in (1, 2)
+        or type(minimum_blocks) is not int
+        or minimum_blocks <= 0
+    ):
+        raise ValueError("Invalid grouped integer projection geometry")
+    tiles = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
+    m = row_count(M, dynamic_rows)
+    rows = m * top_k
+    packed = codec == "e8p_q4"
+    threads = 64 if packed and block_n == 32 else 128
+    operands = dict(
+        stages=stages,
+        codec=codec,
+        source=decode_source((4, 1)) if packed else "",
+        packed_k=128 if packed else 0,
+        grouped=True,
+    )
+    if tail_m:
+        _, product = tensor_core_tiles(
+            rows, N, K, block_m, block_n, block_k, tail_m=tail_m, **operands
+        )
+    else:
+        product = tensor_core(
+            rows,
+            N,
+            K,
+            block_m,
+            block_n,
+            block_k,
+            **operands,
+        )
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, K), T.int8),
+        W: T.Tensor((E, K // 128, N, 16) if packed else (E, N, K), T.uint32 if packed else T.int8),
+        Book: T.Tensor((256, 1), T.uint32),
+        WS: T.Tensor((E, N), T.float16),
+        AS: T.Tensor((rows,), T.float16),
+        Counts: T.Tensor((E,), T.int32),
+        Offsets: T.Tensor((E,), T.int32),
+        TileExpert: T.Tensor((tiles,), T.int32),
+        TileRow: T.Tensor((tiles,), T.int32),
+        TileCount: T.Tensor((1,), T.int32),
+        Out: T.Tensor((rows, N), T.float16),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, block_n), T.ceildiv(rows, block_m) + T.min(E, rows), threads=threads
+        ) as (bx, tile):
+            T.annotate_min_blocks_per_sm(minimum_blocks)
+            metadata = T.alloc_local((3,), T.int32)
+            if tile < TileCount[0]:
+                # Routing is immutable for this launch. Materialize these loads
+                # before barriers and MMA so opaque operations cannot cause the
+                # compiler to reload the address expressions inside the K loop.
+                metadata[0] = TileExpert[tile]
+                metadata[1] = Offsets[metadata[0]] + TileRow[tile]
+                metadata[2] = T.min(block_m, Counts[metadata[0]] - TileRow[tile])
+                product(A, W, Book, WS, WS, AS, Out, 0, bx, metadata[0], metadata[1], metadata[2])
+
+    return main
+
+
+@orin_jit
+def expand_experts(N, K, E, block_n=64, block_k=256):
+    """Decode only routed banks into a reusable, temporary INT8 workspace."""
+    from kernels.model.e8p_q4 import decode_source
+    from kernels.model.integer_core import prepare_e8p_book, weight_loader
+
+    if min(N, K, E) <= 0 or N % block_n or K % block_k:
+        raise ValueError("Invalid routed E8P expansion geometry")
+    load = weight_loader(
+        "e8p_q4", N, block_n, block_k, decode_source((4, 1)), packed_k=128, grouped=True
+    )
+
+    @T.prim_func
+    def main(
+        W: T.Tensor((E, K // 128, N, 16), T.uint32),
+        Book: T.Tensor((256, 1), T.uint32),
+        Counts: T.Tensor((E,), T.int32),
+        Out: T.Tensor((E, N, K), T.int8),
+    ):
+        with T.Kernel(N // block_n, K // block_k, E, threads=128) as (bx, kg, expert):
+            if Counts[expert] > 0:
+                book = T.alloc_shared((512, 1), T.uint32)
+                tile = T.alloc_shared((block_n, block_k), T.int8)
+                prepare_e8p_book(Book, book)
+                load(W, book, tile, bx, kg, expert)
+                T.copy(tile, Out[expert, bx * block_n, kg * block_k])
+
+    return main
 
 
 @orin_jit
@@ -51,7 +213,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool =
 @orin_jit
 def expert_offsets(E: int = 512, block_m: int = 16):
     """Build (Counts, RowOffsets[E], TileOffsets[E], TileCount[1]), INT32."""
-    if type(E) is not int or E <= 0 or block_m not in (8, 16, 32, 64):
+    if type(E) is not int or E <= 0 or block_m not in (8, 16, 32, 64, 128, 256):
         raise ValueError("Invalid MoE expert prefix dimensions")
     width = 1 << (E - 1).bit_length()
 
@@ -89,7 +251,14 @@ def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16, dynam
     Output capacity ceil(M*top_k/block_m)+min(E,M*top_k) bounds all distributions.
     Only the prefix indicated by expert_offsets.TileCount is initialized/read.
     """
-    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (8, 16, 32, 64):
+    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+    ):
         raise ValueError("Invalid MoE tile dimensions")
     assignments = M * top_k
     capacity = (assignments + block_m - 1) // block_m + min(E, assignments)

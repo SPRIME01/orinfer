@@ -21,7 +21,7 @@ use axum::{
     routing::{get, post},
 };
 use chat::{ChatCodec, ChatRequest, Prepared};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use orinfer_engine::model::Model;
 use serde_json::{Value, json};
 use std::{
@@ -101,6 +101,7 @@ pub fn run(settings: Settings) -> Result<()> {
     result
 }
 async fn serve(settings: Settings) -> Result<()> {
+    let started = Instant::now();
     let worker = startup::start(&settings).await?;
     let state = worker.state.clone();
     let shutdown = Arc::clone(&worker.shutdown);
@@ -128,12 +129,26 @@ async fn serve(settings: Settings) -> Result<()> {
             request_id,
         ))
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(&settings.listen)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (tcp, unix) = if let Some(path) = settings.listen.strip_prefix("unix:") {
+        (
+            None,
+            Some(tokio::net::UnixListener::bind(path).map_err(|e| e.to_string())?),
+        )
+    } else {
+        (
+            Some(
+                tokio::net::TcpListener::bind(&settings.listen)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            ),
+            None,
+        )
+    };
     eprintln!(
-        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128",
-        settings.listen, scheduler.max_active
+        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
+        settings.listen,
+        scheduler.max_active,
+        started.elapsed().as_secs_f64()
     );
     let shutdown_at = Arc::new(std::sync::Mutex::new(None));
     let signal_shutdown_at = Arc::clone(&shutdown_at);
@@ -142,17 +157,26 @@ async fn serve(settings: Settings) -> Result<()> {
     let signal_draining = Arc::clone(&draining);
     let signal_lifecycle = Arc::clone(&lifecycle);
     let result = {
-        let server = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown_signal().await;
-                if let Ok(mut started) = signal_shutdown_at.lock() {
-                    *started = Some(Instant::now());
-                }
-                signal_lifecycle.drain();
-                signal_shutdown.store(true, Ordering::Relaxed);
-                signal_draining.notify_one();
-            })
-            .into_future();
+        let shutdown = async move {
+            shutdown_signal().await;
+            if let Ok(mut started) = signal_shutdown_at.lock() {
+                *started = Some(Instant::now());
+            }
+            signal_lifecycle.drain();
+            signal_shutdown.store(true, Ordering::Relaxed);
+            signal_draining.notify_one();
+        };
+        let server = if let Some(listener) = tcp {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown)
+                .into_future()
+                .boxed()
+        } else {
+            axum::serve(unix.unwrap(), router)
+                .with_graceful_shutdown(shutdown)
+                .into_future()
+                .boxed()
+        };
         tokio::pin!(server);
         tokio::select! {
             result = &mut server => result.map_err(|e| e.to_string()),
@@ -204,7 +228,7 @@ async fn request_id(
         .insert("x-request-id", id.parse().unwrap());
     response
 }
-fn error(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response {
     let kind = match status {
         StatusCode::UNAUTHORIZED => "authentication_error",
         StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
@@ -433,7 +457,7 @@ async fn wait_worker(worker: &std::thread::JoinHandle<()>, timeout_ms: u64) -> b
     true
 }
 
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {

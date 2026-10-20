@@ -88,6 +88,7 @@ pub(crate) struct Executor {
     pub(crate) workspace_save_s: f64,
     pub(crate) workspace_restore_s: f64,
     pub(super) sequences: Vec<super::sequence::Sequence>,
+    pub(super) state_table: RefCell<super::state_table::StateTable>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
     pub(super) sequence_names: std::collections::BTreeSet<String>,
@@ -118,6 +119,7 @@ pub(crate) struct LoadStats {
     pub(crate) manifest_sha256: String,
     pub(crate) device: DeviceInfo,
     pub(crate) load_to_ready_s: f64,
+    pub(crate) load_stages: crate::model::LoadStages,
     pub(crate) verify_weights: bool,
     pub(crate) load_workers: usize,
     pub(crate) preloaded_modules: usize,
@@ -227,7 +229,20 @@ impl Executor {
                 sum.checked_add(b.bytes()?)
                     .ok_or_else(|| "Expert weight sum overflow".to_string())
             })?;
+        let weight_layout =
+            super::weight_arena::ArenaLayout::new(manifest.buffers.iter().filter(|b| {
+                b.data.is_some()
+                    && b.access == crate::artifact::Access::Read
+                    && used.contains(b.name.as_str())
+                    && !expert_plan
+                        .as_ref()
+                        .is_some_and(|p| p.names.contains(&b.name))
+            }))?;
+        let capacity_bytes = capacity_bytes
+            .checked_add(weight_layout.padding_bytes)
+            .ok_or("Model allocation sum overflow")?;
         let buffer_bytes = capacity_bytes - lazy_bytes - unused_weights - paged_bytes;
+        let init_started = Instant::now();
         let mut s = Session::new(Driver::load()?);
         let mut pointers = BTreeMap::new();
         let mut sizes = BTreeMap::new();
@@ -297,6 +312,34 @@ impl Executor {
                 );
             }
         }
+        let mut load_stages = crate::model::LoadStages {
+            cuda_init_s: init_started.elapsed().as_secs_f64(),
+            buffer_alloc_s: 0.,
+            kernel_assets_s: 0.,
+            weight_read_wait_s: 0.,
+            weight_dma_wait_s: 0.,
+            weight_upload_chunks: 0,
+            final_sync_s: 0.,
+            cuda_allocations: 0,
+            weight_arena_padding_bytes: weight_layout.padding_bytes,
+        };
+        let allocation_started = Instant::now();
+        let mut weight_base = 0;
+        if weight_layout.allocation_bytes != 0 {
+            // SAFETY: Validated layout; register the single owner before any
+            // fallible binding. Logical slices are never freed individually.
+            unsafe {
+                check(
+                    sys::cuMemAlloc_v2(&mut weight_base, weight_layout.allocation_bytes),
+                    "allocate immutable weight arena",
+                )?;
+            }
+            s.buffers.push(weight_base);
+            weight_base = weight_layout.base(weight_base)?;
+            load_stages.cuda_allocations += 1;
+        }
+        load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
+        allocations.weights.bytes = weight_layout.padding_bytes;
         let (mut weight_io_hash_s, mut weight_upload_s) = (0.0, 0.0);
         let mut weights = crate::weights::Weights::open(base, options.verify_weights)?;
         let mut uploads = Vec::new();
@@ -322,7 +365,12 @@ impl Executor {
                         .or_else(|| kv.prefill_workspace.get(&b.name))
                 })
                 .copied();
-            if paged {
+            let allocation_started = Instant::now();
+            if let Some(&offset) = weight_layout.offsets.get(&b.name) {
+                address = weight_base
+                    .checked_add(offset as u64)
+                    .ok_or("Weight slice address overflow")?;
+            } else if paged {
                 let reservation = super::virtual_memory::Reservation::reserve(&s, bytes, 1)?;
                 address = reservation.address;
                 s.expert_buffers
@@ -343,7 +391,9 @@ impl Executor {
                     )?;
                 }
                 s.buffers.push(address);
+                load_stages.cuda_allocations += 1;
             }
+            load_stages.buffer_alloc_s += allocation_started.elapsed().as_secs_f64();
             if address % b.alignment != 0 {
                 return Err("Model allocation alignment".into());
             }
@@ -398,10 +448,14 @@ impl Executor {
         }
         drop(weights);
         let t = Instant::now();
-        super::weight_upload::upload(&s, uploads, load_workers)?;
+        let upload_stats = super::weight_upload::upload(&s, uploads, load_workers)?;
+        load_stages.weight_read_wait_s = upload_stats.read_wait_s;
+        load_stages.weight_dma_wait_s = upload_stats.dma_wait_s;
+        load_stages.weight_upload_chunks = upload_stats.chunks;
         weight_upload_s += t.elapsed().as_secs_f64();
         let module_started = Instant::now();
         let mut catalog = super::kernels::Catalog::new(&s, kernel_base, &manifest.kernels)?;
+        load_stages.kernel_assets_s = module_started.elapsed().as_secs_f64();
         let mut launches = BTreeMap::new();
         for k in &manifest.kernels {
             let function = if preload.contains(&k.name) {
@@ -436,11 +490,13 @@ impl Executor {
         let preloaded_modules = catalog.loaded_modules();
         let registered_modules = catalog.registered_modules();
         let module_load_bind_s = module_started.elapsed().as_secs_f64();
+        let sync_started = Instant::now();
         // SAFETY: Flush all default-stream uploads and workspace initialization
         // before capture on a nonblocking stream. No allocation occurs in graphs.
         unsafe {
             check(sys::cuCtxSynchronize(), "model uploads complete")?;
         }
+        load_stages.final_sync_s = sync_started.elapsed().as_secs_f64();
         // Request limits can replace initial private buffers on the first lease.
         // Capture only when a program is submitted with its final arena bindings;
         // this also avoids retaining unused MTP and prefill graphs at startup.
@@ -458,6 +514,10 @@ impl Executor {
         eprintln!(
             "GPU LOAD complete after {load_to_ready_s:.3}s; {buffer_bytes} resident buffer bytes, {capacity_bytes} capacity bytes; cuda_graph={cuda_graph}, {} captured programs",
             captured_programs.len()
+        );
+        eprintln!(
+            "LOAD STAGES {}",
+            serde_json::to_string(&load_stages).map_err(|e| e.to_string())?
         );
         let device = DeviceInfo {
             name: String::from_utf8_lossy(&name)
@@ -514,6 +574,7 @@ impl Executor {
                 .map(|kv| kv.prefill_workspace.keys().cloned().collect())
                 .unwrap_or_default(),
             sequences: vec![super::sequence::Sequence::default()],
+            state_table: Default::default(),
             live_workspace: None,
             workspace_save_s: 0.,
             workspace_restore_s: 0.,
@@ -543,6 +604,7 @@ impl Executor {
             manifest_sha256: fingerprint,
             device,
             load_to_ready_s,
+            load_stages,
             verify_weights: options.verify_weights,
             load_workers,
             preloaded_modules,

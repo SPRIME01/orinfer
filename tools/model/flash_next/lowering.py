@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 
 from tools.model.flash_next.kernel_policy import expert_implementation, projection_policies
-from tools.model.flash_next.compiler import pointer_bindings, replace_binding
+from tools.model.host_compiler import pointer_bindings, replace_binding
 from tools.model.flash_next.expert_layout import row_tile
 from tools.model.publication import (
     AssetReader,
@@ -31,7 +31,7 @@ def operand_key(argument):
 def lower(data, package, operator, output):
     from kernels.model.e8p_exact import e8p_exact_grouped, split_a8
     from kernels.model.bf16_single import bf16_single
-    from tools.model.flash_next.decode_tuning import DecodeTuner
+    from tools.model.projection_tuning import ProjectionTuner
     from kernels.model.rotation_a8 import rotate_activation_a8
     from kernels.model.rows import explicit_rows
     from tools.model.row_contract import contract
@@ -39,7 +39,7 @@ def lower(data, package, operator, output):
     import tilelang
 
     reader, hosts, compiled = AssetReader(operator), {}, {}
-    tuner = DecodeTuner(output / "integer-tuning")
+    tuner = ProjectionTuner(output / "integer-tuning")
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
     policies = projection_policies(buffers)
     dynamics = {d["name"]: d for d in package.get("dynamic_batch_kernels", [])}

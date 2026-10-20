@@ -1,21 +1,21 @@
-# Quality evaluation tools
+# 质量评测工具
 
-`quick_quality.py` compares baseline and candidate token probabilities over the **same teacher-forced history**. Probabilities are normalized over the full vocabulary, and the baseline's top-three token IDs are explicitly queried. Different selected token IDs are diagnostic evidence, not an automatic quality failure.
+`quick_quality.py`分析同一teacher-forced历史下的baseline/candidate token概率；概率按完整词表归一化，并显式查询baseline top-3 IDs。token身份不同用于诊断，不单独作为质量失败条件。
 
-`scoring_common.py` validates fixed seeds, history identity, probability fields, and task outcomes. `run_quality.py` connects to a configured scoring endpoint and builds evaluation requests from `fixtures/quick-quality-scenarios.json`. You must supply the reference server.
+`scoring_common.py`校验固定seed、历史身份、概率字段及任务结果。`run_quality.py`连接配置的评分接口，使用`fixtures/quick-quality-scenarios.json`生成评测请求。参考服务需自行提供。
 
 ```bash
 python3 -m unittest discover -s tools/eval -p 'test_*.py' -v
 python3 tools/eval/run_quality.py --help
 ```
 
-Use official BF16 or same-model FP8 as the quantization quality reference. Comparisons against the same AWQ weights are for implementation diagnostics only. Scenario success, target NLL, and long-context tasks require separate evaluation.
+官方BF16或同模型FP8用作量化质量参考；同AWQ权重对照只用于实现诊断。场景检查、target NLL与长上下文任务需要分别评估。
 
-For translation models, `offline_quality prepare` accepts `--fixtures fixtures/translation-quality-scenarios.json`. The fixtures cover Chinese, English, Japanese, and German translation, terminology, JSON placeholders, negation, and business tone. Reference translations define fixed probability-scoring histories; free generation may produce other correct translations. These spot checks do not constitute a comprehensive multilingual benchmark. Evaluate vision probabilities and API-level image/multi-image tasks separately.
+翻译模型可在 `offline_quality prepare` 时指定 `--fixtures fixtures/translation-quality-scenarios.json`，覆盖中英日德翻译、术语、JSON 占位符、否定和商务语气。参考译文用于固定概率评分历史；自由生成允许其他准确译法。这组快速检查不代表完整多语言 benchmark，图片和多图另做视觉概率及 API 任务验收。
 
-## Offline BF16 comparison
+## 离线 BF16 对照
 
-`reference_bf16.py` uses a Transformers version supporting Qwen3_5 to load raw safetensors one layer at a time, avoiding the need to keep the full BF16 model resident on the GPU. The reference executes full-sequence prefill; `score-model` performs normal prefill and token-by-token teacher-forced decode. Reports label the two paths separately and preserve full-vocabulary-normalized top-three probabilities, requested-token probabilities, and the actual history SHA256.
+`reference_bf16.py`使用支持Qwen3_5的Transformers，从原始safetensors逐层加载权重，避免整份BF16权重常驻GPU。参考执行完整序列prefill；`score-model`执行正常prefill及逐token teacher-forced decode。报告明确标记两条路径，保留完整词表归一化的top-3、指定token概率与实际历史SHA256。
 
 ```bash
 python3 -m tools.eval.offline_quality prepare --checkpoint MODEL_DIR --output artifacts/quality/requests.json
@@ -29,12 +29,12 @@ python3 -m tools.eval.offline_quality compare --requests artifacts/quality/queri
   --output artifacts/quality/comparison.json
 ```
 
-Serialize GPU jobs using `flock artifacts/gpu-experiment.lock`. Reference and candidate use seed 20261002 and identical original token IDs. Scenario answers freeze the scoring history; task correctness under independent free generation still requires validation. Probability comparisons are not a complete LLM benchmark and do not independently establish equivalence of BF16 autoregressive generation.
+GPU任务通过`flock artifacts/gpu-experiment.lock`串行执行。参考与candidate使用固定seed20261002和相同原始token IDs。场景答案用于冻结评分历史，独立自由生成仍需验证任务结果；该概率比较不代表完整LLM benchmark，也不单独证明BF16 autoregressive路径。
 
-If the raw checkpoint will not fit on disk, use `--remote-repo REPO --revision COMMIT` with a directory retaining the original configuration, tokenizer, and weight index. `COMMIT` must be a pinned 40-character commit. The reader checks HTTP Range boundaries, fetches original tensors by component in parallel, and records the SHA256 of bytes actually read; it never reconstructs original tensors from quantized weights. `--read-workers` controls network concurrency (1–16). Optional `--tensor-cache DIR` consumes prefetched standard safetensors, validates source revision and payload hash, and deletes files once consumed. This streaming path is for quality comparison. Its network-inclusive runtime must not be reported as model startup performance.
+磁盘放不下原始checkpoint时，可在保留原始配置、tokenizer和权重index的目录上使用`--remote-repo REPO --revision COMMIT`。COMMIT必须是固定的40位提交，读取器校验HTTP Range边界，按文本组件并行读取原始tensor，记录实际读取字节的SHA256；不经过量化权重重建。`--read-workers`控制网络并发，范围1–16。可选的`--tensor-cache DIR`消费预取的标准safetensors，校验来源提交和payload hash，加载后删除已消费文件。该流式读取用于质量对照，耗时包含网络，不能当作模型启动性能。
 
-`prepare --long-context-tokens 512 2048 8192` adds deterministic middle-document retrieval cases. These retain the full Chat template and produce actual token lengths close to, but no greater than, the requested budget. The scoring history fixes the correct retrieved answer. The reference `--batch-size` defaults to 1; larger batches reduce weight reads, but BF16 rounding can change with GEMM shape. Use a single-stream reference when accepting single-stream quality.
+`prepare --long-context-tokens 512 2048 8192`追加确定性的中部资料检索场景。保留完整Chat模板，实际token长度接近且不超过给定预算；评分历史固定为正确资料答案。参考的`--batch-size`默认1，可合批以减少读取权重的次数；BF16舍入也会随GEMM形状变化，单流验收应使用单流参考。
 
-Image-scoring cases add an `images` array. Each image contains `grid_height`, `grid_width`, and normalized FP32 patches in `pixels`, matching the online `ImageInput` contract. `prompt_ids` must include the native template and expanded image-placeholder IDs. Reference and candidate use identical patches. The reference runs the official BF16 vision encoder, feature injection, and MRoPE, not features exported by the candidate. Input fingerprints include image dimensions, SHA256 of little-endian FP32 pixels, and image order to prevent mismatched comparisons. This measures from vision encoding through token probabilities; compare raw-image decode/resize independently, and validate task results with free generation.
+图片评分在每个case增加`images`数组，每项为`grid_height`、`grid_width`及归一化FP32 patch数组`pixels`，与在线`ImageInput`契约一致。`prompt_ids`须包含原生模板和展开后的图片占位token；参考和candidate共享相同patch输入。参考使用官方BF16视觉编码器、特征注入和MRoPE，不读取candidate视觉特征。输入指纹包含图片尺寸、FP32 little-endian像素SHA256和图片顺序，防止错误配对。该对照覆盖编码器至token概率；原始图片解码/resize应另用预处理参考验证，任务结果仍需独立自由生成。
 
-The Transformers image reference requires explicit `mm_token_type_ids`: expanded image-pad tokens are `1`; text and delimiters are `0`. Preserve this field for free generation as well so MRoPE is used. The deployed tokenizer must incorporate added-token settings from `tokenizer_config.json` and match actual Transformers token IDs; identical rendered strings do not necessarily tokenize identically.
+Transformers 的图像参考需要显式传入 `mm_token_type_ids`：展开的 image-pad 为 1，文本及界定符为 0；自由生成也必须保留该字段，确保使用 MRoPE。部署 tokenizer 应合并 `tokenizer_config.json` 的 added-token 配置，并与 Transformers 对照实际 token IDs；相同渲染字符串仍可能被切成不同 tokens。

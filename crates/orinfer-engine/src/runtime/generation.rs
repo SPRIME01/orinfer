@@ -76,6 +76,9 @@ impl ModelRuntime {
         if status != 0 {
             return Err("Model token status failure".into());
         }
+        if let Some(token) = self.gpu_sample(history, options, step, None)? {
+            return Ok(token);
+        }
         if m.greedy_sampling
             && options.temperature == 0.0
             && !options.is_greedy()

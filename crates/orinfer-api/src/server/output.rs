@@ -310,6 +310,15 @@ impl Output {
         }
         message
     }
+    pub fn finish_reason(&self, exhausted: bool) -> &'static str {
+        if exhausted || self.incomplete_call {
+            "length"
+        } else if !self.calls.is_empty() {
+            "tool_calls"
+        } else {
+            "stop"
+        }
+    }
 }
 fn json_value_end(text: &str) -> Option<usize> {
     let mut parser = serde_json::Deserializer::from_str(text).into_iter::<Value>();
@@ -515,6 +524,104 @@ fn parse_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ollama_output_vectors_preserve_semantics_at_every_character_split() {
+        let tools = vec![
+            json!({"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}),
+            json!({"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}),
+        ];
+        for case in crate::test_fixtures::ollama()["output"].as_array().unwrap() {
+            let raw = case["raw"].as_str().unwrap();
+            for at in (0..=raw.len()).filter(|&at| raw.is_char_boundary(at)) {
+                let mut output = Output::new(false, tools.clone(), vec![], "test");
+                let mut deltas = output.push(&raw[..at], false).unwrap();
+                deltas.extend(output.push(&raw[at..], false).unwrap());
+                deltas.extend(output.finish(false, &json!("auto"), true).unwrap());
+                assert_eq!(
+                    json!(output.content),
+                    case["content"],
+                    "{} split={at}",
+                    case["id"]
+                );
+                assert_eq!(
+                    json!(output.reasoning_content),
+                    case["reasoning"],
+                    "{} split={at}",
+                    case["id"]
+                );
+                for field in ["content", "reasoning_content"] {
+                    let streamed: String = deltas
+                        .iter()
+                        .filter_map(|delta| delta[field].as_str())
+                        .collect();
+                    let expected = if field == "content" {
+                        &case["content"]
+                    } else {
+                        &case["reasoning"]
+                    };
+                    assert_eq!(
+                        json!(streamed),
+                        *expected,
+                        "{} {field} split={at}",
+                        case["id"]
+                    );
+                }
+                assert!(
+                    deltas
+                        .iter()
+                        .all(|delta| delta.as_object().unwrap().len() == 1)
+                );
+                let expected = case["calls"].as_array().unwrap();
+                assert_eq!(output.calls.len(), expected.len());
+                for (index, call) in output.calls.iter().enumerate() {
+                    assert_eq!(call["function"]["name"], expected[index]["name"]);
+                    let arguments: Value =
+                        serde_json::from_str(call["function"]["arguments"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(arguments, expected[index]["arguments"]);
+                    let fragments: Vec<_> = deltas
+                        .iter()
+                        .flat_map(|delta| delta["tool_calls"].as_array().into_iter().flatten())
+                        .filter(|call| call["index"] == index)
+                        .collect();
+                    assert_eq!(
+                        fragments
+                            .iter()
+                            .filter(|call| call.get("id").is_some())
+                            .count(),
+                        1
+                    );
+                    let joined: String = fragments
+                        .iter()
+                        .filter_map(|call| call["function"]["arguments"].as_str())
+                        .collect();
+                    assert_eq!(joined, call["function"]["arguments"].as_str().unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ollama_finish_reason_vectors_keep_length_precedence_over_tools() {
+        for case in crate::test_fixtures::ollama()["finish"]["cases"]
+            .as_array()
+            .unwrap()
+        {
+            let mut output = Output::new(false, vec![], vec![], "test");
+            if case["has_tool"] == true {
+                output.calls.push(json!({"type":"function"}));
+            }
+            assert_eq!(
+                output.finish_reason(case["exhausted"].as_bool().unwrap()),
+                case["expected"].as_str().unwrap(),
+                "{}",
+                case["id"]
+            );
+        }
+        let mut output = Output::new(false, vec![], vec![], "test");
+        output.incomplete_call = true;
+        assert_eq!(output.finish_reason(false), "length");
+    }
     #[test]
     fn strict_calls_validate_ranges_patterns_array_limits_and_local_references() {
         let tools = vec![

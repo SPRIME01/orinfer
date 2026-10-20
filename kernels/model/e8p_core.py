@@ -22,6 +22,15 @@ __device__ __forceinline__ void nib_ldm4(const signed char* p,unsigned* out) {un
 __device__ __forceinline__ void nib_ldm2(const signed char* p,unsigned* out) {unsigned a=__cvta_generic_to_shared(p);asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(out[0]),"=r"(out[1]) : "r"(a));}
 __device__ __forceinline__ void nib_store(signed char* p,unsigned x){*reinterpret_cast<unsigned*>(p)=x;}
 __device__ __forceinline__ int nib_sum(unsigned a,unsigned b){return __dp4a((int)a,0x01010101,__dp4a((int)b,0x01010101,0));}
+
+// Produce one K64 partial at a time. The caller folds it into the final
+// INT32 accumulator before reusing these four output registers.
+__device__ __forceinline__ void e8p_fold_low(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
+ asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.u4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};" : "=r"(d[0]),"=r"(d[1]),"=r"(d[2]),"=r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0));
+}
+__device__ __forceinline__ void e8p_fold_high(int* d,unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1) {
+ asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};" : "=r"(d[0]),"=r"(d[1]),"=r"(d[2]),"=r"(d[3]) : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),"r"(0));
+}
 """
 
 
@@ -100,6 +109,65 @@ def mma_pair(bm):
         )
 
     return product
+
+
+def folded_pair(bm):
+    """Keep the full A8 product in one INT32 bank across E8P stages."""
+
+    @T.macro
+    def product(acc, v, a, nt, stripe, coefficient):
+        partial = T.alloc_local((4,), T.int32)
+        T.evaluate(
+            T.call_extern(
+                "void",
+                "e8p_fold_low",
+                T.access_ptr(partial[0], "w", 4),
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                a[stripe * 2],
+                a[stripe * 2 + 1],
+            )
+        )
+        for j in T.unroll(4):
+            acc[nt * (bm // 2) + stripe * 4 + j] += coefficient * partial[j]
+        T.evaluate(
+            T.call_extern(
+                "void",
+                "e8p_fold_high",
+                T.access_ptr(partial[0], "w", 4),
+                v[0],
+                v[1],
+                v[2],
+                v[3],
+                a[bm // 4 + stripe * 2],
+                a[bm // 4 + stripe * 2 + 1],
+            )
+        )
+        for j in T.unroll(4):
+            acc[nt * (bm // 2) + stripe * 4 + j] += (coefficient * 16) * partial[j]
+
+    return product
+
+
+def store_folded_rows(bm, bn, n, coefficient_sum):
+    @T.macro
+    def store(acc, Sum, WS, AS, Out, bx, warp, lane, count, expert, offset):
+        for nt in T.unroll(2):
+            for stripe in T.unroll(bm // 8):
+                for r in T.unroll(2):
+                    col = bx * bn + warp * 32 + nt * 16 + lane // 4 + r * 8
+                    for t in T.unroll(2):
+                        row = stripe * 8 + (lane % 4) * 2 + t
+                        if row < count and col < n:
+                            j = nt * (bm // 2) + stripe * 4 + r * 2 + t
+                            value = acc[j] + coefficient_sum * Sum[offset + row]
+                            Out[offset + row, col] = rescale(
+                                value, WS[expert, col], AS[offset + row]
+                            )
+
+    return store
 
 
 def store_rows(bm, bn, n):

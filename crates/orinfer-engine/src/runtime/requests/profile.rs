@@ -271,7 +271,10 @@ fn profile_cached_generation() {
                 // Equal proposal widths isolate kernel arithmetic from the
                 // normal latency-adaptive profile selection during validation.
                 if fixture["fixed_speculation"].as_bool() == Some(true) {
-                    request.speculation_costs.clear();
+                    model.dynamic_speculation.fixed_width = Some(
+                        (fixture["mtp_drafts"].as_u64().unwrap() as usize + 1)
+                            .min(request.limit - request.generated),
+                    );
                 }
                 let steps = model
                     .advance_requests(&mut [&mut request], &scheduler::Options::default())
@@ -1049,6 +1052,8 @@ fn profile_continuous_decode() {
     // Isolate target decode. This is not a quality assessment or API benchmark.
     model.manifest.mtp = None;
     let options = scheduler::Options::default();
+    let iterations = fixture["iterations"].as_u64().unwrap_or(64) as usize;
+    assert!((1..=128).contains(&iterations));
     let mut rows = vec![];
     let batches: Vec<usize> = fixture
         .get("batches")
@@ -1073,10 +1078,12 @@ fn profile_continuous_decode() {
                     .unwrap()
             })
             .collect();
-        while requests.iter().any(|r| r.prefilling) {
-            model
-                .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
-                .unwrap();
+        // Prepare the cohort without generating ahead on its earliest rows.
+        // Admission/prefill are outside this fixed-batch decode diagnostic.
+        for request in &mut requests {
+            while request.prefilling {
+                model.advance_requests(&mut [request], &options).unwrap();
+            }
         }
         for _ in 0..2 {
             model
@@ -1093,7 +1100,7 @@ fn profile_continuous_decode() {
                 .live_graph_events
                 .set(Some([live_events[0], live_events[1]]));
         }
-        for _ in 0..64 {
+        for _ in 0..iterations {
             MARKS.with(|m| *m.borrow_mut() = Some(vec![]));
             let started = Instant::now();
             let steps = model
@@ -1141,8 +1148,50 @@ fn profile_continuous_decode() {
         for request in &requests {
             model
                 .execution
-                .ensure_sequence_program(request.slot, "prefill_m32")
+                .ensure_sequence_program_at(request.slot, "decode", request.history.len() + 128, 1)
                 .unwrap();
+        }
+        // Reserve can invalidate graph/workspace bindings. Prepare a fresh
+        // native packet before replaying, including the one-request packet.
+        model
+            .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
+            .unwrap();
+        let plan = model.model_package.batch_plan(&segments).unwrap();
+        if fixture["ncu"].as_bool() == Some(true) {
+            profile_native_ncu(&mut model, &plan);
+            rows.push(json!({"batch":count,"operations":plan,"wall_median_ms":median(&walls)}));
+            for request in &mut requests {
+                model.finish_request(request, false).unwrap();
+            }
+            continue;
+        }
+        // Sample actual routing outside every timing window. Diverse requests
+        // can touch many more expert banks than repeated-prompt diagnostics.
+        let mut routing = Vec::new();
+        if fixture["routing_statistics"].as_bool() == Some(true) {
+            for operation in &plan {
+                model
+                    .execution
+                    .execute_batch(vec![], std::slice::from_ref(operation), false, false)
+                    .unwrap();
+                if let crate::model::Operation::Kernel { name } = &operation.operation
+                    && name.contains("/post/expert_up/")
+                {
+                    let raw = model
+                        .execution
+                        .download_bytes("MoeCounts", model.execution.sizes["MoeCounts"])
+                        .unwrap();
+                    let (words, remainder) = raw.as_chunks::<4>();
+                    assert!(remainder.is_empty(), "Misaligned expert count buffer");
+                    let counts: Vec<_> = words.iter().map(|b| i32::from_le_bytes(*b)).collect();
+                    assert!(counts.iter().all(|&n| n >= 0));
+                    routing.push(json!({"kernel":name,"counts":counts}));
+                }
+            }
+            assert!(
+                !routing.is_empty(),
+                "No expert projections in routing diagnostic"
+            );
         }
         let gpu: Vec<f64> = model
             .execution
@@ -1151,20 +1200,6 @@ fn profile_continuous_decode() {
             .into_iter()
             .map(f64::from)
             .collect();
-        let plan = if count == 1 {
-            model.manifest.programs["decode"]
-                .iter()
-                .cloned()
-                .map(|operation| Invocation {
-                    operation,
-                    sequence: None,
-                    launch: None,
-                    views: BTreeMap::new(),
-                })
-                .collect()
-        } else {
-            model.model_package.batch_plan(&segments).unwrap()
-        };
         let trials = model.execution.profile_graph_operations(&plan).unwrap();
         let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut operations = Vec::with_capacity(plan.len());
@@ -1206,22 +1241,23 @@ fn profile_continuous_decode() {
                     "median_ms":median(&times), "scope":"Isolated real kernels with stale inputs and two external timing events; diagnostic only, not additive and not model inference."}));
             }
         }
-        let row = json!({"batch":count,"iterations":64,"wall_median_ms":median(&walls),
+        let row = json!({"batch":count,"iterations":iterations,"wall_median_ms":median(&walls),
             "target_tokens_per_second":count as f64*1000./(walls.iter().sum::<f64>()/walls.len() as f64),
             "phases_median_ms":phases.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>(),
             "hot_graph_gpu_median_ms":median(&gpu),"operation_count":plan.len(),
             "instrumented_gpu_median_ms":median(&trials.iter().map(|t| t.iter().map(|x|f64::from(*x)).sum()).collect::<Vec<f64>>()),
             "gpu_operations":operations,
+            "routing_statistics":routing,
             "isolated_subsets":subsets,
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>()});
         eprintln!("PROFILE {row}");
         rows.push(row);
-        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"64 real target decode iterations per fixed batch; no MTP, admission/prefill/API excluded. GPU operation timing uses external-event nodes in an instrumented replay, compare its overhead with the uninstrumented hot graph.","rows":rows})).unwrap()).unwrap();
+        std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"Real target decode iterations per fixed batch (count recorded in each row); no MTP, admission/prefill/API excluded. GPU operation timing uses external-event nodes in an instrumented replay, compare its overhead with the uninstrumented hot graph.","rows":rows})).unwrap()).unwrap();
         for request in &mut requests {
             model.finish_request(request, false).unwrap();
         }
     }
-    if fixture["live_only"].as_bool() == Some(true) {
+    if fixture["live_only"].as_bool() == Some(true) || fixture["ncu"].as_bool() == Some(true) {
         std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"Live autoregressive iterations; two graph timing events, CPU stage timestamps; diagnostic only.","rows":rows})).unwrap()).unwrap();
     }
 }
@@ -1363,5 +1399,147 @@ fn capture_prefill_partitions() {
         )
         .unwrap();
         eprintln!("prefill capture complete: {label}");
+    }
+}
+
+#[test]
+#[ignore = "Requires real model and exclusive GPU experiment lock"]
+fn profile_adaptive_mtp_decode() {
+    #[derive(serde::Deserialize)]
+    struct Fixture {
+        model: std::path::PathBuf,
+        output: std::path::PathBuf,
+        cases: Vec<GenerationInput>,
+        batches: Vec<usize>,
+        iterations: usize,
+        repetitions: usize,
+        mtp_drafts: usize,
+        #[serde(default)]
+        force_mtp: bool,
+    }
+    let fixture: Fixture = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    assert!(!fixture.output.exists());
+    assert!(!fixture.cases.is_empty());
+    assert!((1..=64).contains(&fixture.iterations) && fixture.repetitions > 0);
+    assert!(fixture.batches.iter().all(|b| (1..=128).contains(b)));
+    let mut model = ModelRuntime::load_with_options(
+        &fixture.model,
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(fixture.mtp_drafts),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mtp = model.manifest.mtp.clone().unwrap();
+    let options = scheduler::Options {
+        max_active: 128,
+        ..Default::default()
+    };
+    let totals = |requests: &[RequestState]| -> [usize; 3] {
+        requests.iter().fold([0; 3], |mut sum, req| {
+            sum[0] += req.mtp.rounds;
+            sum[1] += req.mtp.proposed_tokens;
+            sum[2] += req.mtp.accepted_draft_tokens;
+            sum
+        })
+    };
+    let mut rows = vec![];
+    for count in fixture.batches {
+        for repetition in 0..fixture.repetitions {
+            // Alternate paired order; both modes use the normal scheduler and
+            // identical distinct prompt histories. Neither forces speculation.
+            for enabled in if repetition.is_multiple_of(2) {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                model.manifest.mtp = enabled.then(|| mtp.clone());
+                model.dynamic_speculation = Default::default();
+                if enabled && fixture.force_mtp {
+                    model.dynamic_speculation.fixed_width = Some(fixture.mtp_drafts + 1);
+                }
+                let mut requests: Vec<_> = (0..count)
+                    .map(|i| {
+                        let source = &fixture.cases[i % fixture.cases.len()];
+                        assert!(source.images.is_empty());
+                        model
+                            .start_request(
+                                GenerationInput {
+                                    input_tokens: source.input_tokens.clone(),
+                                    images: vec![],
+                                    max_new_tokens: 512,
+                                    sampling: source.sampling.clone(),
+                                    prefix_hints: vec![],
+                                },
+                                &|| false,
+                            )
+                            .unwrap()
+                    })
+                    .collect();
+                for request in &mut requests {
+                    while request.prefilling {
+                        model.advance_requests(&mut [request], &options).unwrap();
+                    }
+                }
+                // Warm graph capture, ordinary cost estimation and initial MTP
+                // probes before measuring. Retain the learned policy normally.
+                for _ in 0..8 {
+                    model
+                        .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
+                        .unwrap();
+                }
+                let before = totals(&requests);
+                let before_depths = model.scheduler_statistics.mtp_depth_histogram.clone();
+                let mut emitted = 0;
+                let began = Instant::now();
+                for _ in 0..fixture.iterations {
+                    assert!(requests.iter().all(|r| !r.is_finished()));
+                    let steps = model
+                        .advance_requests(&mut requests.iter_mut().collect::<Vec<_>>(), &options)
+                        .unwrap();
+                    emitted += steps.iter().map(|s| s.tokens.len()).sum::<usize>();
+                }
+                let seconds = began.elapsed().as_secs_f64();
+                let after = totals(&requests);
+                let proposed = after[1] - before[1];
+                let accepted = after[2] - before[2];
+                if !enabled {
+                    assert_eq!(after, [0; 3]);
+                    assert_eq!(emitted, count * fixture.iterations);
+                }
+                let depth_histogram: BTreeMap<_, _> = model
+                    .scheduler_statistics
+                    .mtp_depth_histogram
+                    .iter()
+                    .map(|(&depth, &count)| {
+                        (
+                            depth,
+                            count - before_depths.get(&depth).copied().unwrap_or(0),
+                        )
+                    })
+                    .collect();
+                if enabled && fixture.force_mtp {
+                    assert!(proposed > 0, "Forced MTP never executed");
+                }
+                let row = json!({"batch":count,"repetition":repetition,"mtp_enabled":enabled,
+                    "iterations":fixture.iterations,"committed_tokens":emitted,"wall_s":seconds,
+                    "decode_tps":emitted as f64/seconds,"mtp_rounds":after[0]-before[0],
+                    "proposed_tokens":proposed,"accepted_draft_tokens":accepted,
+                    "depth_histogram":depth_histogram,"forced":fixture.force_mtp,
+                    "acceptance":(proposed>0).then(||accepted as f64/proposed as f64)});
+                eprintln!("adaptive MTP decode {row}");
+                rows.push(row);
+                for request in &mut requests {
+                    model.finish_request(request, false).unwrap();
+                }
+                std::fs::write(&fixture.output,serde_json::to_vec_pretty(&json!({"rows":rows,
+                    "scheduler":options,"scope":"Fixed active cohort; normal adaptive MTP policy, actual committed tokens only. Eight warmup calls excluded; admission/prefill/API excluded. Distinct frozen translation prompts, EOS intentionally ignored as in the target decode diagnostic; no request reaches its output budget."})).unwrap()).unwrap();
+            }
+        }
     }
 }

@@ -7,10 +7,41 @@ import unittest
 
 from tokenizers import Tokenizer, models, pre_tokenizers
 
-from tools.model.frontend import prepare_chat_template, prepare_tokenizer
+from tools.model.frontend import (
+    prepare_chat_template,
+    prepare_generation_config,
+    prepare_tokenizer,
+)
 
 
 class FrontendTests(unittest.TestCase):
+    def test_generation_defaults_preserve_explicit_source_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = b'{"eos_token_id": [2], "temperature": 0.7}\r\n'
+            (root / "generation_config.json").write_bytes(original)
+            prepare_generation_config(root, root / "prepared.json")
+            self.assertEqual((root / "prepared.json").read_bytes(), original)
+
+    def test_missing_generation_defaults_keep_model_and_chat_terminators(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tokenizer = Tokenizer(models.WordLevel({"?": 0, "end": 1, "im_end": 2}, "?"))
+            tokenizer.save(str(root / "tokenizer.json"))
+            (root / "tokenizer_config.json").write_text(json.dumps(dict(eos_token="im_end")))
+            config = dict(text_config=dict(eos_token_id=1))
+            (root / "config.json").write_text(json.dumps(config))
+            prepare_generation_config(root, root / "prepared.json")
+            self.assertEqual(
+                json.loads((root / "prepared.json").read_text()),
+                dict(eos_token_id=[1, 2], pad_token_id=1),
+            )
+            for invalid in (True, -1, 3, None):
+                config["text_config"]["eos_token_id"] = invalid
+                (root / "config.json").write_text(json.dumps(config))
+                with self.subTest(eos=invalid), self.assertRaises(ValueError):
+                    prepare_generation_config(root, root / "invalid.json")
+
     def test_embedded_chat_template_is_preserved_and_standalone_takes_priority(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

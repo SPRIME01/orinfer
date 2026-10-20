@@ -7,8 +7,7 @@ mod prefill;
 #[cfg(test)]
 mod profile;
 mod prompt_lookup;
-mod speculation;
-pub(super) use speculation::Profile as SpeculationProfile;
+pub(super) mod speculation;
 #[cfg(test)]
 mod tests;
 
@@ -45,11 +44,10 @@ pub struct RequestState {
     last_output: Instant,
     last_prefill: Instant,
     credit_s: f64,
-    speculation_costs: BTreeMap<usize, speculation::Profile>,
     lookup_costs: BTreeMap<usize, speculation::Profile>,
-    speculation_probe_token: usize,
     prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
+    draft_acceptance: speculation::control::Acceptance,
     decoder: crate::sampling::Decoder,
     cache_prompt: bool,
     cache_generated: bool,
@@ -128,7 +126,7 @@ pub struct StepOutput {
 }
 
 enum Work {
-    Speculative(usize, usize, bool),
+    Speculative(usize, usize),
     SpeculativeBatch(speculation::BatchChoice),
     MixedSpeculative(Vec<(usize, usize)>),
     Prefill(usize, usize, bool, f64),
@@ -619,11 +617,10 @@ impl ModelRuntime {
                 last_output: Instant::now(),
                 last_prefill: Instant::now(),
                 credit_s: 0.,
-                speculation_costs: Default::default(),
                 lookup_costs: Default::default(),
-                speculation_probe_token: 0,
                 prompt_lookup: Default::default(),
                 mtp_blocked: false,
+                draft_acceptance: Default::default(),
                 decoder: Default::default(),
                 cache_prompt: true,
                 cache_generated: true,
@@ -835,18 +832,6 @@ impl ModelRuntime {
                 self.scheduler_statistics.max_bounded_prefill_s.max(seconds);
         }
         Ok((chunk, tokens))
-    }
-    fn batch_speculation_key(
-        requests: &[&mut RequestState],
-        selected: &[(usize, usize)],
-    ) -> (usize, usize, usize, usize) {
-        let mut key = Self::iteration_key(requests, selected);
-        // Distinguish heterogeneous short chains with equal total token rows.
-        key.3 = selected
-            .iter()
-            .enumerate()
-            .fold(0, |bits, (lane, (_, n))| bits | ((n - 2) << (lane * 3)));
-        key
     }
     fn iteration_key(
         requests: &[&mut RequestState],
@@ -1073,6 +1058,23 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         options: &scheduler::Options,
     ) -> Result<Vec<StepOutput>> {
+        self.advance_requests_with(requests, options, || {})
+    }
+    pub(crate) fn advance_requests_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
+        let mut maintenance = Some(maintenance);
+        let mut maintenance_s = 0.;
+        let mut overlap = || {
+            if let Some(f) = maintenance.take() {
+                let start = Instant::now();
+                f();
+                maintenance_s += start.elapsed().as_secs_f64();
+            }
+        };
         #[cfg(test)]
         profile::mark("entry");
         self.reap_abandoned()?;
@@ -1107,7 +1109,11 @@ impl ModelRuntime {
             self.unmerged_prefill_s = 0.;
             self.decode_until = None;
         }
+        let feedback_at = Instant::now();
+        let feedback_stats = self.execution.batch_statistics.get();
+        self.maintain_lazy_drafts(requests)?;
         let prefill_work = self.select_work(requests, options, &initialized)?;
+        let feedback = self.speculation_feedback(requests, &prefill_work);
         let does_prefill = match &prefill_work {
             Work::Prefill(..) => true,
             Work::MixedSpeculative(_) => true,
@@ -1116,44 +1122,13 @@ impl ModelRuntime {
         };
         match prefill_work {
             Work::MixedSpeculative(selected) => {
-                let key = Self::iteration_key(requests, &selected);
                 let prefills: Vec<_> = selected
                     .iter()
                     .copied()
-                    .filter(|&(i, _)| requests[i].prefilling)
+                    .filter(|(i, _)| requests[*i].prefilling)
                     .collect();
-                let progress: usize = selected
-                    .iter()
-                    .filter(|(i, _)| !requests[*i].prefilling)
-                    .map(|(i, _)| requests[*i].generated)
-                    .sum();
                 let began = Instant::now();
-                let before = self.execution.batch_statistics.get();
-                let output_start = output.len();
-                self.speculative_mixed_step(requests, &selected, &mut output)?;
-                let after = self.execution.batch_statistics.get();
-                let tokens = output[output_start..]
-                    .iter()
-                    .filter(|s| !prefills.iter().any(|(i, _)| *i == s.request))
-                    .map(|s| s.tokens.len())
-                    .sum();
-                let cold_s = after.kernel_load_s - before.kernel_load_s + after.capture_s
-                    - before.capture_s
-                    + after.sequence_capture_s
-                    - before.sequence_capture_s;
-                if self.mixed_speculation_costs.len() >= 256
-                    && !self.mixed_speculation_costs.contains_key(&key)
-                {
-                    self.mixed_speculation_costs.clear();
-                }
-                self.mixed_speculation_costs
-                    .entry(key)
-                    .or_default()
-                    .observe_steady(
-                        (began.elapsed().as_secs_f64() - cold_s).max(0.000001),
-                        tokens,
-                        progress + tokens,
-                    );
+                self.speculative_mixed_step_with(requests, &selected, &mut output, &mut overlap)?;
                 let rows: usize = selected.iter().map(|(_, n)| n).sum();
                 for (i, n) in prefills {
                     requests[i].served = self.scheduler_statistics.iterations;
@@ -1170,37 +1145,7 @@ impl ModelRuntime {
             }
             Work::SpeculativeBatch(choice) => {
                 let selected = choice.selected;
-                if choice.exploring {
-                    for &(i, _) in &selected {
-                        requests[i].speculation_probe_token = requests[i].generated;
-                    }
-                }
-                let key = Self::batch_speculation_key(requests, &selected);
-                let began = Instant::now();
-                let stats_before = self.execution.batch_statistics.get();
-                let before = output.iter().map(|s| s.tokens.len()).sum::<usize>();
-                self.speculative_batch_step(requests, &selected, &mut output)?;
-                let tokens = output.iter().map(|s| s.tokens.len()).sum::<usize>() - before;
-                if self.batch_speculation_costs.len() >= 256
-                    && !self.batch_speculation_costs.contains_key(&key)
-                {
-                    self.batch_speculation_costs.clear();
-                }
-                let progress = selected.iter().map(|&(i, _)| requests[i].generated).sum();
-                let stats_after = self.execution.batch_statistics.get();
-                let cold_s = stats_after.kernel_load_s - stats_before.kernel_load_s
-                    + stats_after.capture_s
-                    - stats_before.capture_s
-                    + stats_after.sequence_capture_s
-                    - stats_before.sequence_capture_s;
-                self.batch_speculation_costs
-                    .entry(key)
-                    .or_default()
-                    .observe_steady(
-                        (began.elapsed().as_secs_f64() - cold_s).max(0.000001),
-                        tokens,
-                        progress,
-                    );
+                self.speculative_packet_step(requests, &selected, &[], &mut output, &mut overlap)?;
                 self.scheduler_statistics.speculative_iterations += 1;
                 *self
                     .scheduler_statistics
@@ -1209,11 +1154,8 @@ impl ModelRuntime {
                     .or_default() += 1;
                 self.unmerged_prefill_s = 0.;
             }
-            Work::Speculative(i, rows, exploring) => {
+            Work::Speculative(i, rows) => {
                 self.unmerged_prefill_s = 0.;
-                if exploring {
-                    requests[i].speculation_probe_token = requests[i].generated;
-                }
                 let began = Instant::now();
                 let lookup_rounds = requests[i].mtp.lookup_rounds;
                 let result = self.with_request(requests[i], |model, req| {
@@ -1226,18 +1168,17 @@ impl ModelRuntime {
                 };
                 let seconds = began.elapsed().as_secs_f64();
                 let per_token = seconds / tokens.len().max(1) as f64;
-                let progress = requests[i].generated;
                 // Copies and model drafts have different costs and acceptance.
                 // A successful copy must not make a later model draft look
                 // artificially profitable at the same verification width.
                 let request = &mut requests[i];
-                let costs = if request.mtp.lookup_rounds != lookup_rounds {
-                    &mut request.lookup_costs
-                } else {
-                    &mut request.speculation_costs
-                };
-                let cost = costs.entry(rows).or_default();
-                cost.observe(seconds, tokens.len(), progress);
+                if request.mtp.lookup_rounds != lookup_rounds {
+                    request
+                        .lookup_costs
+                        .entry(rows)
+                        .or_default()
+                        .observe(seconds);
+                }
                 self.mtp_seconds_per_token = self.mtp_seconds_per_token * 0.8 + per_token * 0.2;
                 self.scheduler_statistics.speculative_iterations += 1;
                 self.scheduler_statistics.decode_tokens += tokens.len();
@@ -1282,7 +1223,7 @@ impl ModelRuntime {
                 if selected.iter().any(|&(i, _)| !requests[i].prefilling) {
                     self.unmerged_prefill_s = 0.;
                 }
-                self.execute_selected(requests, &selected, &mut output)?;
+                self.execute_selected_with(requests, &selected, &mut output, &mut overlap)?;
             }
             Work::Idle => {}
         }
@@ -1311,6 +1252,29 @@ impl ModelRuntime {
                 req.last_output = Instant::now();
             }
         }
+        if let Some(feedback) = feedback {
+            let stats = self.execution.batch_statistics.get();
+            let cold = stats.kernel_load_s - feedback_stats.kernel_load_s + stats.capture_s
+                - feedback_stats.capture_s
+                + stats.sequence_capture_s
+                - feedback_stats.sequence_capture_s;
+            if requests.iter().map(|r| r.mtp.lookup_rounds).sum::<usize>() == feedback.lookups {
+                self.dynamic_speculation.observe(
+                    feedback.key,
+                    feedback.width,
+                    (feedback_at.elapsed().as_secs_f64() - cold).max(1e-6),
+                    feedback
+                        .indices
+                        .iter()
+                        .map(|&i| requests[i].generated)
+                        .sum::<usize>()
+                        - feedback.generated,
+                );
+            }
+        }
+        overlap();
+        self.scheduler_statistics.maintenance_calls += 1;
+        self.scheduler_statistics.maintenance_s += maintenance_s;
         self.scheduler_statistics.compute_s += at.elapsed().as_secs_f64();
         Ok(output)
     }
@@ -1381,103 +1345,67 @@ impl ModelRuntime {
         if decode_round && prefill.is_some() {
             self.scheduler_statistics.decode_burst_iterations += 1;
         }
-        let batch_speculation = decode_round
-            && (2..=8).contains(&decode.len())
-            && self
-                .manifest
-                .mtp
-                .as_ref()
-                .is_some_and(|s| !s.batch_verification_tokens.is_empty());
-        // A cold prior cannot tell whether speculation beats a fast target
-        // batch. Measure ordinary execution before evaluating either drafter.
-        let baseline_ready = self
-            .iteration_costs
-            .get(&Self::iteration_key(requests, &target))
-            .is_some_and(|e| e.samples >= 3);
-        if batch_speculation
-            && baseline_ready
-            && let Some(selected) = self.select_speculative_batch(
-                requests,
-                &decode,
-                options,
-                self.predict_iteration(requests, &target),
-                self.iteration_costs[&Self::iteration_key(requests, &target)].mean,
-            )
-        {
-            return Ok(Work::SpeculativeBatch(selected));
+        // Prompt lookup remains an explicitly enabled proposal source. Its
+        // timing/acceptance never trains the model-draft controller.
+        if decode_round && decode.len() == 1 && self.prompt_lookup {
+            let i = decode[0];
+            if let Some(spec) = &self.manifest.mtp {
+                let req = &requests[i];
+                let slack = if throughput {
+                    f64::INFINITY
+                } else {
+                    req.decode_slack_s(options.target_tpot_ms)
+                        .unwrap_or(f64::INFINITY)
+                };
+                if req.sampling.is_greedy()
+                    && req.sampling.top_logprobs.is_none()
+                    && let Some(width) = spec
+                        .verification_widths()
+                        .into_iter()
+                        .filter(|&n| {
+                            n <= spec.default_verification_tokens
+                                && n <= req.limit - req.generated
+                                && (options.max_speculative_tokens == 0
+                                    || n <= options.max_speculative_tokens)
+                                && n <= self
+                                    .manifest
+                                    .max_context
+                                    .saturating_sub(req.history.len().saturating_sub(1))
+                                && req.prompt_lookup.available(&req.history, n - 1)
+                                && req.lookup_costs.get(&n).map_or(
+                                    self.mtp_seconds_per_token * n as f64,
+                                    speculation::Profile::upper,
+                                ) <= slack
+                        })
+                        .max()
+                {
+                    return Ok(Work::Speculative(i, width));
+                }
+            }
         }
-        let prefer_mtp = decode_round
-            && (!batch_speculation || baseline_ready)
-            && options.max_batch_tokens >= 2
-            && self.manifest.mtp.is_some()
-            && !decode.is_empty()
-            && (decode.len() == 1
-                || (decode.len() <= 4
-                    && self.mtp_seconds_per_token
-                        < self.predict_iteration(requests, &target) / decode.len() as f64));
-        if prefer_mtp {
-            let i = decode[self.scheduler_cursor % decode.len()];
-            self.scheduler_cursor = self.scheduler_cursor.wrapping_add(1);
-            let req = &requests[i];
-            let spec = self.manifest.mtp.as_ref().unwrap();
-            let plans: Vec<_> = spec
-                .verification_widths()
-                .into_iter()
-                .filter(|&n| {
-                    n <= options.max_batch_tokens
-                        && n <= spec.default_verification_tokens
-                        && n <= req.limit - req.generated
-                })
-                .collect();
+        if decode_round && !decode.is_empty() {
             let slack = if throughput {
                 f64::INFINITY
             } else {
                 decode
                     .iter()
-                    .filter(|&&j| j != i)
-                    .filter_map(|&j| requests[j].decode_slack_s(options.target_tpot_ms))
+                    .filter_map(|&i| requests[i].decode_slack_s(options.target_tpot_ms))
                     .fold(f64::INFINITY, f64::min)
             };
-            // A long matching suffix predicts a different proposal source
-            // from the model draft whose earlier timings ranked these rows.
-            // Try the widest eligible copy, still bounded by peer deadlines.
-            let lookup_rows = (self.prompt_lookup
-                && req.sampling.is_greedy()
-                && req.sampling.top_logprobs.is_none())
-            .then(|| {
-                plans
-                    .iter()
-                    .copied()
-                    .filter(|&n| {
-                        req.prompt_lookup.available(&req.history, n - 1)
-                            && req
-                                .lookup_costs
-                                .get(&n)
-                                .or_else(|| req.speculation_costs.get(&n))
-                                .map_or(self.mtp_seconds_per_token * n as f64, |p| p.upper())
-                                <= slack
+            if let Some(choice) = self.select_auto_speculation(requests, &target, options, slack) {
+                if choice.selected.len() == 1
+                    && self.manifest.mtp.as_ref().is_some_and(|spec| {
+                        !spec
+                            .batch_verification_tokens
+                            .contains(&choice.selected[0].1)
                     })
-                    .max()
-            })
-            .flatten();
-            let candidate = lookup_rows.map(|n| (n, false)).or_else(|| {
-                speculation::select_profile(
-                    &plans,
-                    &req.speculation_costs,
-                    req.generated,
-                    req.speculation_probe_token,
-                    slack,
-                    self.mtp_seconds_per_token,
-                )
-            });
-            if let Some((rows, exploring)) = candidate {
-                let worthwhile = lookup_rows.is_some()
-                    || exploring
-                    || req.speculation_costs[&rows].score().unwrap()
-                        < self.predict_iteration(requests, &target) / decode.len() as f64;
-                if worthwhile {
-                    return Ok(Work::Speculative(i, rows, exploring));
+                {
+                    return Ok(Work::Speculative(
+                        choice.selected[0].0,
+                        choice.selected[0].1,
+                    ));
                 }
+                return Ok(Work::SpeculativeBatch(choice));
             }
         }
         let mixed = self.manifest.batch_layout.as_ref().is_none_or(|layout| {
@@ -1672,6 +1600,15 @@ impl ModelRuntime {
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
     ) -> Result<()> {
+        self.execute_selected_with(requests, selected, output, &mut || {})
+    }
+    fn execute_selected_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+        output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
+    ) -> Result<()> {
         if selected.len() == 1
             && selected[0].1 == 1
             && (requests[selected[0].0].prefilling || !self.manifest.batch_profiles.contains(&1))
@@ -1715,7 +1652,9 @@ impl ModelRuntime {
                 model.upload_segment_controls(1)?;
                 #[cfg(test)]
                 profile::mark("single_controls");
-                model.launch_program("decode", phase)?;
+                model.execution.submit_program("decode", phase)?;
+                overlap();
+                model.execution.sync()?;
                 #[cfg(test)]
                 profile::mark("single_execute");
                 if let Some(spec) = &model.manifest.mtp {
@@ -1746,7 +1685,7 @@ impl ModelRuntime {
                 .observe((at.elapsed().as_secs_f64() - capture_s - load_s).max(0.000001));
             return Ok(());
         }
-        self.execute_batch_selected(requests, selected, output)
+        self.execute_batch_selected(requests, selected, output, overlap)
     }
 
     fn execute_batch_selected(
@@ -1754,6 +1693,7 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
         output: &mut Vec<StepOutput>,
+        overlap: &mut dyn FnMut(),
     ) -> Result<()> {
         #[cfg(test)]
         profile::mark("policy");
@@ -1778,13 +1718,15 @@ impl ModelRuntime {
         self.scheduler_statistics.batch_plan_s += plan_at.elapsed().as_secs_f64();
         let key = Self::iteration_key(requests, selected);
         let capture_before = self.execution.batch_statistics.get().capture_s;
-        self.execution.execute_batch(
+        self.execution.execute_batch_operation_with(
+            orinfer_model_sdk::abi::BatchOperation::Ordinary,
             graph_key,
             &plan,
             decode_only,
             selected
                 .iter()
                 .all(|&(i, _)| requests[i].limit - requests[i].generated >= 2),
+            overlap,
         )?;
         #[cfg(test)]
         profile::mark("execute");
@@ -1830,6 +1772,23 @@ impl ModelRuntime {
             let tokens = u32::try_from(tokens).map_err(|_| "Segment length exceeds u32")?;
             self.upload_ids(&controls.length, &[tokens])?;
             self.upload_ids(
+                &controls.last_index,
+                &[tokens.checked_sub(1).ok_or("Empty segment")?],
+            )?;
+        }
+        Ok(())
+    }
+    pub(super) fn upload_sequence_segment_controls(
+        &mut self,
+        slot: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        if let Some(controls) = &self.manifest.segment_controls {
+            let tokens = u32::try_from(tokens).map_err(|_| "Segment length exceeds u32")?;
+            self.execution
+                .upload_sequence_ids(slot, &controls.length, &[tokens])?;
+            self.execution.upload_sequence_ids(
+                slot,
                 &controls.last_index,
                 &[tokens.checked_sub(1).ok_or("Empty segment")?],
             )?;
@@ -1920,7 +1879,7 @@ impl ModelRuntime {
         }) {
             self.execution.upload_sequence_addresses(
                 &table.buffer,
-                &self.model_package.state_bindings(&segments)?,
+                self.model_package.state_bindings(&segments)?,
             )?;
         }
         Ok(segments)
@@ -2025,6 +1984,27 @@ impl ModelRuntime {
         }
         if self.read_control(&self.manifest.status)? != 0 {
             return Err("Model token status failure".into());
+        }
+        if self.manifest.sampling.is_some()
+            && req.sampling.temperature > 0.
+            && req.sampling.top_logprobs.is_none()
+        {
+            let mask = req.decoder.gpu_mask()?;
+            if mask.as_ref().is_some_and(|words| {
+                words.iter().enumerate().all(|(i, &bits)| {
+                    let live = self.manifest.vocab.saturating_sub(i * 32).min(32);
+                    live == 0 || bits & (u32::MAX >> (32 - live)) == 0
+                })
+            }) {
+                req.decoder.fail("Grammar permits no tokens".into());
+                return Err("Grammar permits no tokens".into());
+            }
+            if let Some(token) =
+                self.gpu_sample(&req.history, &req.sampling, req.generated, mask.as_deref())?
+            {
+                req.decoder.consume(token)?;
+                return Ok(token);
+            }
         }
         if req.sampling.is_greedy() && req.sampling.top_logprobs.is_none() {
             let selected = self.read_control(&self.manifest.token)? as u32;

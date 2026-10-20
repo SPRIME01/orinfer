@@ -12,7 +12,7 @@ from tools.model.publication import (
     load_model,
     write_json,
 )
-from tools.model.flash_next.compiler import Compiler
+from tools.model.host_compiler import Compiler
 
 
 def history_geometry(buffer, channels=10240):

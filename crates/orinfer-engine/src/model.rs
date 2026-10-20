@@ -33,6 +33,19 @@ pub struct RequestReport {
     pub diagnostic: bool,
 }
 #[derive(Debug, Serialize)]
+pub struct LoadStages {
+    pub cuda_init_s: f64,
+    pub buffer_alloc_s: f64,
+    pub kernel_assets_s: f64,
+    pub weight_read_wait_s: f64,
+    pub weight_dma_wait_s: f64,
+    pub weight_upload_chunks: usize,
+    pub final_sync_s: f64,
+    pub cuda_allocations: usize,
+    pub weight_arena_padding_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub resident_experts: crate::execution::ResidentExperts,
     pub expert_cache: Option<crate::execution::ExpertCacheStatistics>,
@@ -40,6 +53,7 @@ pub struct Report {
     pub model: String,
     pub device: crate::cuda::DeviceInfo,
     pub load_to_ready_s: f64,
+    pub load_stages: LoadStages,
     pub verify_weights: bool,
     pub load_workers: usize,
     pub preloaded_modules: usize,
@@ -258,6 +272,16 @@ impl Model {
         options: &crate::scheduler::Options,
     ) -> Result<Vec<StepOutput>> {
         self.0.advance_requests(requests, options)
+    }
+    /// Run bounded CPU-only queue/output work while a submitted packet executes.
+    /// The callback cannot access the model or commit request state.
+    pub fn advance_requests_with(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        options: &crate::scheduler::Options,
+        maintenance: impl FnOnce(),
+    ) -> Result<Vec<StepOutput>> {
+        self.0.advance_requests_with(requests, options, maintenance)
     }
     pub fn finish_request(&mut self, request: &mut RequestState, cache: bool) -> Result<()> {
         self.0.finish_request(request, cache)

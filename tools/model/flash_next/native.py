@@ -414,7 +414,7 @@ class Model:
                 q, as_ = quantize(a, rows) if a8 is None else a8
                 od = str(out.dtype).split(".")[-1]
                 # Independent reference uses one portable matrix implementation.
-                # Published integer bodies are selected by DecodeTuner, not here.
+                # Published integer bodies are selected by ProjectionTuner, not here.
                 bm, bn, bk, gm = 16, 64, 64, 0
                 call(
                     f"dense-a8-{rows}-{n}-{width}-{od}-{bm}-{bn}-{bk}-{gm}",

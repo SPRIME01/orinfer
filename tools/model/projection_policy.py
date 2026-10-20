@@ -88,9 +88,11 @@ def e8p_q4_configs(rows, *, direct=False):
 def w8_configs(rows, outputs):
     if outputs <= 0:
         raise ValueError("Invalid W8 output width")
-    return [
-        dict(block_m=m, block_n=n, block_k=128) for m in (16, 32, 64, 128) for n in (64, 128)
-    ] + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
+    return (
+        [dict(block_m=m, block_n=n, block_k=128) for m in (16, 32, 64, 128) for n in (64, 128)]
+        + [dict(block_m=128, block_n=128, block_k=128, group_m=4)]
+        + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
+    )
 
 
 def swiglu_configs(rows):

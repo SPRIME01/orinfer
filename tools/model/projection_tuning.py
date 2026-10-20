@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import tempfile
 
-from tools.model.flash_next.decode_policy import (
+from tools.model.projection_policy import (
     q4_configs,
     e8p_q4_configs,
     w8_configs,
@@ -19,6 +19,11 @@ from tools.model.flash_next.decode_policy import (
     candidate_scores,
 )
 from tools.model.publication import write_json
+from tools.model.expert_tuning import (
+    EXACT_EXPERT_PASSES as EXACT_PASSES,
+    expert_configs,
+    expert_projection,
+)
 
 
 def atomic_json(path, value):
@@ -32,11 +37,6 @@ def atomic_json(path, value):
 
 
 TARGET = {"kind": "cuda", "arch": "sm_87"}
-EXACT_PASSES = {
-    "tl.disable_thread_storage_sync": True,
-    "tl.disable_shared_memory_reuse": True,
-    "tl.if_stmt_binding_inline_replayable_binds": False,
-}
 
 
 def profile_rows(capacity):
@@ -124,13 +124,15 @@ def make_prim(spec, config):
             block_m=config["block_m"],
         )
     elif spec["kind"] == "expert":
-        from kernels.model.e8p_exact import e8p_exact_grouped
-
-        assignments = rows * 10
-        tile = config["block_m"]
-        tiles = (assignments + tile - 1) // tile + min(spec["experts"], assignments)
-        fn = e8p_exact_grouped.__wrapped__(
-            assignments, spec["experts"], tiles, n, k, block_m=tile, dynamic_rows=dynamic
+        fn = expert_projection(
+            rows,
+            n,
+            k,
+            spec["experts"],
+            10,
+            codec="e8p_q2",
+            config=config,
+            dynamic_rows=dynamic,
         )
     else:
         raise ValueError("Unsupported decode tuning operator")
@@ -182,7 +184,7 @@ def profile_stream(kernel):
     return kernel
 
 
-class DecodeTuner:
+class ProjectionTuner:
     def __init__(self, output: Path, cache: Path | None = None):
         self.output = output
         self.output.mkdir(parents=True, exist_ok=True)
@@ -254,7 +256,7 @@ class DecodeTuner:
         elif kind == "swiglu":
             configs = swiglu_configs(rows)
         elif kind == "expert":
-            configs = [dict(block_m=m) for m in ((8, 16) if block_m is None else (block_m,))]
+            configs = expert_configs("e8p_q2", block_m=block_m)
         else:
             raise ValueError("Unsupported decode tuning operator")
         if candidate_configs is not None:
@@ -264,11 +266,12 @@ class DecodeTuner:
         samples = measurement_rows(rows, dynamic, measure_rows)
         sample = samples[0]
         source = hashlib.sha256()
-        for file in ("decode_tuning.py", "decode_policy.py"):
+        for file in ("projection_tuning.py", "projection_policy.py"):
             source.update(Path(__file__).with_name(file).read_bytes())
-        root = Path(__file__).resolve().parents[3]
+        root = Path(__file__).resolve().parents[2]
         source.update((root / "tools/model/row_selection.py").read_bytes())
         source.update((root / "tools/model/compile.py").read_bytes())
+        source.update((root / "tools/model/expert_tuning.py").read_bytes())
         # Include inlined components as well as public wrappers. A change to a
         # shared loader/mainloop/epilogue must invalidate every consumer's tile.
         for path in sorted((root / "kernels").rglob("*.py")):
@@ -565,6 +568,8 @@ class DecodeTuner:
             )
             args = [a, weight, book, ws, scales, out]
         elif kind == "w8":
+            from tools.model.compile import primitive
+
             weight = (
                 weights["W"]
                 if weights is not None
@@ -575,12 +580,26 @@ class DecodeTuner:
                 if weights is not None
                 else torch.full((n,), 0.001, device=device, dtype=torch.float16)
             )
-            base = int8_projection(live, n, k, output_dtype=spec["dtype"])
+            base = primitive(
+                int8_projection,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                k,
+                output_dtype=spec["dtype"],
+                dynamic_rows=spec["dynamic"],
+            )
             base.adapter.func(
-                a, weight, ws, scales, expected, stream=torch.cuda.current_stream().cuda_stream
+                a,
+                weight,
+                ws,
+                scales,
+                expected,
+                *([live] if spec["dynamic"] else []),
+                stream=torch.cuda.current_stream().cuda_stream,
             )
             args = [a, weight, ws, scales, out]
         elif kind == "swiglu":
+            from tools.model.compile import primitive
             from kernels.model.flash_next import swiglu
 
             gate = torch.empty_like(expected)
@@ -605,11 +624,24 @@ class DecodeTuner:
                 if weights is not None
                 else torch.full((n,), 0.0007, device=device, dtype=torch.float16)
             )
-            base = int8_projection(live, n, k)
+            base = primitive(
+                int8_projection,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                k,
+                dynamic_rows=spec["dynamic"],
+            )
             stream = torch.cuda.current_stream().cuda_stream
-            base.adapter.func(a, wg, gs, scales, gate, stream=stream)
-            base.adapter.func(a, wu, us, scales, up, stream=stream)
-            swiglu(live, n).adapter.func(gate, up, expected, stream=stream)
+            live_args = [live] if spec["dynamic"] else []
+            base.adapter.func(a, wg, gs, scales, gate, *live_args, stream=stream)
+            base.adapter.func(a, wu, us, scales, up, *live_args, stream=stream)
+            activation = primitive(
+                swiglu,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                dynamic_rows=spec["dynamic"],
+            )
+            activation.adapter.func(gate, up, expected, *live_args, stream=stream)
             args = [a, wg, wu, gs, us, scales, out]
         else:
             e = spec["experts"]
@@ -718,7 +750,7 @@ class DecodeTuner:
     def _validate(kernel, spec, config, live, weights=None):
         import torch
 
-        supply, _, check = DecodeTuner._inputs(spec, live, weights)
+        supply, _, check = ProjectionTuner._inputs(spec, live, weights)
         args = supply(kernel.get_profiler()._get_params(with_output=False))
         kernel.adapter.func(*args, stream=torch.cuda.current_stream().cuda_stream)
         torch.cuda.synchronize()

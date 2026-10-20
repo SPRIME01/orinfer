@@ -20,6 +20,7 @@ mod prefix;
 #[cfg(test)]
 mod reference_generation;
 pub(crate) mod requests;
+mod sampling;
 pub(crate) mod scoring;
 mod speculation;
 mod startup;
@@ -46,10 +47,7 @@ pub(crate) struct ModelRuntime {
     iteration_costs:
         std::collections::BTreeMap<(usize, usize, usize, usize), crate::scheduler::Estimate>,
     mtp_seconds_per_token: f64,
-    batch_speculation_costs:
-        std::collections::BTreeMap<(usize, usize, usize, usize), requests::SpeculationProfile>,
-    mixed_speculation_costs:
-        std::collections::BTreeMap<(usize, usize, usize, usize), requests::SpeculationProfile>,
+    dynamic_speculation: requests::speculation::control::Controller,
     prompt_lookup: bool,
     startup_costs: std::collections::BTreeMap<(usize, usize, bool), crate::scheduler::Estimate>,
     model_package: crate::model_package::ModelPackage,
@@ -132,8 +130,7 @@ impl ModelRuntime {
             decode_until: None,
             iteration_costs: Default::default(),
             mtp_seconds_per_token: 0.055,
-            batch_speculation_costs: Default::default(),
-            mixed_speculation_costs: Default::default(),
+            dynamic_speculation: Default::default(),
             prompt_lookup: options.prompt_lookup,
             startup_costs: Default::default(),
             model_package: prepared.execution_model,
@@ -184,6 +181,15 @@ impl ModelRuntime {
         } else {
             "target"
         };
+        self.prepare_sequence_program_inputs(slot, program, tokens, history)
+    }
+    fn prepare_sequence_program_inputs(
+        &mut self,
+        slot: usize,
+        program: &str,
+        tokens: &[u32],
+        history: &[u32],
+    ) -> Result<()> {
         let manifest = &self.manifest;
         let execution = &mut self.execution;
         self.model_package

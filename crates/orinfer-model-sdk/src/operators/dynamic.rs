@@ -2,7 +2,7 @@
 use crate::artifact::{Argument, Kernel, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RowExpression {
     Constant { value: u32 },
@@ -57,7 +57,7 @@ impl RowExpression {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct RowArgument {
     pub index: usize,
@@ -107,7 +107,8 @@ impl DynamicBatchKernel {
             .collect::<Result<Vec<_>>>()?;
         Ok(RowLaunch { grid, arguments })
     }
-    pub fn validate(&self, kernel: &Kernel) -> Result<()> {
+    /// Check this binding's ABI and capacity without enumerating runtime rows.
+    pub fn validate_binding(&self, kernel: &Kernel) -> Result<()> {
         let mut indices = std::collections::BTreeSet::new();
         if self.name != kernel.name
             || self.arguments.iter().any(|a| {
@@ -122,7 +123,14 @@ impl DynamicBatchKernel {
             !matches!(kernel.args[*index], Argument::I32 { value: v } if v == *value)) {
             return Err("Dynamic batch capacity binding differs from host ABI".into());
         }
-        for rows in 2..self.capacity {
+        Ok(())
+    }
+
+    /// Offline validation of the complete row domain, including single-token launches.
+    /// Each real launch retains its own checked expression evaluation.
+    pub fn validate_rows(&self) -> Result<()> {
+        self.launch(self.capacity)?;
+        for rows in 1..self.capacity {
             self.launch(rows)?;
         }
         Ok(())
@@ -132,8 +140,7 @@ impl DynamicBatchKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn dynamic_contract_cannot_replace_pointers_or_change_capacity_abi() {
+    fn fixture() -> (Kernel, DynamicBatchKernel) {
         let identity = serde_json::json!({"file":"kernel.cubin", "sha256":"0".repeat(64)});
         let kernel: Kernel = serde_json::from_value(serde_json::json!({
             "name":"batch_m128/layer0/k1", "module":identity, "source":identity,
@@ -142,7 +149,7 @@ mod tests {
             "args":[{"kind":"buffer","name":"Input"},{"kind":"i32","value":128}]
         }))
         .unwrap();
-        let mut template = DynamicBatchKernel {
+        let template = DynamicBatchKernel {
             name: kernel.name.clone(),
             capacity: 128,
             grid: [
@@ -155,7 +162,13 @@ mod tests {
                 value: RowExpression::Rows,
             }],
         };
-        template.validate(&kernel).unwrap();
+        (kernel, template)
+    }
+    #[test]
+    fn dynamic_contract_cannot_replace_pointers_or_change_capacity_abi() {
+        let (kernel, mut template) = fixture();
+        template.validate_binding(&kernel).unwrap();
+        template.validate_rows().unwrap();
         let launch = template.launch(33).unwrap();
         assert_eq!(launch.grid, [33, 1, 1]);
         assert_eq!(launch.arguments, [(1, 33)]);
@@ -163,13 +176,46 @@ mod tests {
         assert!(template.launch(0).is_err());
         assert!(template.launch(129).is_err());
         template.arguments[0].index = 0;
-        assert!(template.validate(&kernel).is_err());
+        assert!(template.validate_binding(&kernel).is_err());
         template.arguments[0].index = 1;
         template.arguments.push(template.arguments[0].clone());
-        assert!(template.validate(&kernel).is_err());
+        assert!(template.validate_binding(&kernel).is_err());
         template.arguments.pop();
         template.grid[0] = RowExpression::Constant { value: 64 };
-        assert!(template.validate(&kernel).is_err());
+        assert!(template.validate_binding(&kernel).is_err());
+    }
+    #[test]
+    fn offline_and_runtime_checks_reject_invalid_interior_rows() {
+        let (mut kernel, mut template) = fixture();
+        template.arguments[0].value = RowExpression::Divide {
+            lhs: Box::new(RowExpression::Rows),
+            rhs: Box::new(RowExpression::Remainder {
+                lhs: Box::new(RowExpression::Rows),
+                rhs: Box::new(RowExpression::Constant { value: 3 }),
+            }),
+        };
+        kernel.args[1] = Argument::I32 { value: 64 };
+        template.validate_binding(&kernel).unwrap();
+        assert!(template.launch(2).is_ok());
+        assert!(template.launch(3).is_err());
+        assert!(template.validate_rows().is_err());
+    }
+    #[test]
+    fn offline_validation_includes_single_token_and_invalid_capacities() {
+        let (mut kernel, mut template) = fixture();
+        template.grid[0] = RowExpression::Subtract {
+            lhs: Box::new(RowExpression::Rows),
+            rhs: Box::new(RowExpression::Constant { value: 1 }),
+        };
+        kernel.grid[0] = 127;
+        template.validate_binding(&kernel).unwrap();
+        assert!(template.launch(2).is_ok());
+        assert!(template.launch(1).is_err());
+        assert!(template.validate_rows().is_err());
+        for capacity in [0, 1, 32769] {
+            template.capacity = capacity;
+            assert!(template.validate_rows().is_err());
+        }
     }
     #[test]
     fn mixed_prefill_rows_are_independent_of_the_request_limit() {

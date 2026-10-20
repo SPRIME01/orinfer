@@ -64,7 +64,7 @@ def selector_check():
 
 def convolution_checks():
     results = []
-    for heads in (16, 48):
+    for heads in (16, 32, 48):
         channels = (32 + heads) * 128
         x = torch.randn((1, 1, channels), device="cuda", dtype=torch.float16)
         w = torch.randn((channels, 4), device="cuda", dtype=torch.float16) * 0.1

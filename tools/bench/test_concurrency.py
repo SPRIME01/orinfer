@@ -1,10 +1,32 @@
 import io
 import unittest
 from unittest.mock import patch
-from tools.bench.concurrency import counter_delta, events, request, percentile
+from tools.bench.concurrency import counter_delta, decode_window, events, request, percentile
 
 
 class StreamingTests(unittest.TestCase):
+    def test_decode_window_excludes_prefill_and_queueing_but_keeps_idle_samples(self):
+        def sample(at, prefill, tokens, active=4, queued=0):
+            return dict(
+                observed_at_s=at,
+                active_requests=active,
+                queued_requests=queued,
+                scheduler_statistics=dict(prefill_tokens=prefill, decode_tokens=tokens),
+            )
+
+        samples = [
+            sample(0, 100, 0, queued=1),
+            sample(1, 200, 10),
+            sample(2, 200, 10),
+            sample(3, 200, 18),
+            sample(4, 200, 22, active=3),
+        ]
+        self.assertEqual(
+            decode_window(samples, 200, 4),
+            dict(wall_s=2, committed_tokens=8, committed_tps=4),
+        )
+        self.assertIsNone(decode_window(samples[:1], 200, 4))
+
     def test_counter_delta_handles_new_histogram_keys_and_omits_maxima(self):
         self.assertEqual(
             counter_delta(

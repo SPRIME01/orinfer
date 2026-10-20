@@ -768,6 +768,17 @@ fn normalize_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
 mod tests {
     use super::*;
     #[test]
+    fn ollama_tool_history_vectors_preserve_text_and_call_identity() {
+        for case in crate::test_fixtures::ollama()["requests"]
+            .as_array()
+            .unwrap()
+        {
+            let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
+            let messages = normalize_messages(request.messages).unwrap();
+            assert_eq!(json!(messages), case["expected_messages"], "{}", case["id"]);
+        }
+    }
+    #[test]
     fn template_json_matches_python_separators_unicode_and_string_escaping() {
         let value = json!({"z":["世界", "a,b:c", "\"\\", "<>&'"],"a":{"b":true},"empty":[]});
         let result = template_json(minijinja::Value::from(Serde(&value))).unwrap();

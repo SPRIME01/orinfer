@@ -54,6 +54,238 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_expert_schedules_follow_selected_rows_and_assignment_multiplier(self):
+        from tools.model.qwen35 import moe
+
+        def kernel(*args, **kwargs):
+            return args, kwargs
+
+        buffers = {}
+
+        def fixed(name, dtype, shape):
+            buffers[name] = dict(dtype=dtype, shape=shape)
+
+        builder = SimpleNamespace(
+            weights=SimpleNamespace(buffers=buffers, fixed=fixed),
+            h=2048,
+            f=512,
+            book="book",
+            text=dict(num_experts=256, num_experts_per_tok=8),
+            moe_selection=dict(
+                configs=[
+                    dict(block_m=256, expand=False, cold_rows=32),
+                    dict(block_m=16, expand=False, folded=True, minimum_blocks=6, sparse_rows=True),
+                ],
+                default="0",
+                selections=[dict(min_rows=2, max_rows=128, implementation="1")],
+            ),
+            row_choices=Builder.row_choices,
+        )
+        launches = []
+        builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(
+            (name, build(), bindings, rows, options)
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.moe": SimpleNamespace(
+                        expert_offsets=kernel, expert_tiles=kernel, integer_experts=kernel
+                    ),
+                    "kernels.model.e8p_prefill": SimpleNamespace(
+                        split_prefill_a8=kernel,
+                        split_routed_prefill_a8=kernel,
+                        e8p_prefill_grouped=kernel,
+                    ),
+                    "kernels.model.expert_partition": SimpleNamespace(offsets=kernel, tiles=kernel),
+                    "kernels.operators.op30_activation_quantization": SimpleNamespace(
+                        _compile=lambda *args, **kwargs: None
+                    ),
+                },
+            ),
+            patch.object(moe, "primitive", side_effect=lambda fn, *args, **kw: (args, kw)),
+        ):
+            moe.projections(builder, "post", ("uw", "us"), ("dw", "ds"))
+        self.assertEqual(buffers["MoeLow"]["shape"], [32768 * 2048 // 2])
+        self.assertEqual(buffers["MoeSum"]["shape"], [32768])
+        folded = [x for x in launches if x[0] == "post/expert_up/rows/2-128"]
+        self.assertEqual(len(folded), 1)
+        _, (dimensions, compile_options), bindings, rows, options = folded[0]
+        self.assertEqual(dimensions, (4096, 1024, 2048, 256, 8))
+        from tools.model.expert_tuning import tile_capacity
+
+        self.assertEqual(tile_capacity(dimensions[0], dimensions[3], dimensions[4], 16), 2304)
+        self.assertEqual(rows, 32768)
+        self.assertEqual(options["row_multiplier"], 8)
+        self.assertTrue(compile_options["dynamic_rows"])
+        self.assertEqual(bindings["P"], "uw")
+        self.assertEqual(bindings["Sum"], "MoeSum")
+        names = {x[0] for x in launches}
+        for role in (
+            "expert_up_cold_planes",
+            "expert_up_cold",
+            "expert_down_cold_planes",
+            "expert_down_cold",
+        ):
+            self.assertIn("post/" + role, names)
+            self.assertIn("post/" + role + "/skip/2-128", names)
+        self.assertIn("MoeColdTileExpert", buffers)
+        for role in ("expert_up_planes", "expert_down_planes"):
+            self.assertIn("post/" + role, names)
+            self.assertIn("post/" + role + "/skip/1-1", names)
+            self.assertIn("post/" + role + "/skip/129-4096", names)
+
+    def test_four_billion_requires_tied_head_and_matching_attention(self):
+        candidate = config()
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            tie_word_embeddings=True,
+            layer_types=t["layer_types"][:32],
+        )
+        candidate["quantization_config"].update(
+            quant_method="orinfer_e8p_q4_int8",
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
+            embedding="e8p_q4",
+        )
+        self.assertEqual(configuration(candidate, 262144)["hidden_size"], 2560)
+        for key, value in (("tie_word_embeddings", False), ("num_key_value_heads", 2)):
+            with self.subTest(key=key), patch.dict(t, {key: value}):
+                with self.assertRaises(ValueError):
+                    configuration(candidate, 262144)
+
+    def test_expert_repack_and_assembled_banks_do_not_duplicate_unbound_weights(self):
+        from tools.model.safetensors_source import local_header
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            codes = np.arange(2 * 3 * 32, dtype=np.uint32).reshape(2, 3, 32)
+            shard = source / "experts.safetensors"
+            save_file(
+                {"Experts.packed": codes, "Unbound": np.ones((4, 4), np.float16)},
+                str(shard),
+                metadata={"orin.layout.Experts.packed": "e8p-q4-row-u32"},
+            )
+            before = hashlib.sha256(shard.read_bytes()).hexdigest()
+            index = dict(
+                metadata={"orinfer.sha256": {shard.name: before}},
+                weight_map={"Experts.packed": shard.name, "Unbound": shard.name},
+            )
+            (source / "model.safetensors.index.json").write_text(json.dumps(index))
+            weights = Weights(source, root / "model", packed_k=128)
+            weights.immutable("Experts.packed")
+            bank = weights.array("Experts.packed")
+            self.assertEqual(bank.shape, (2, 2, 3, 16))
+            np.testing.assert_array_equal(bank.transpose(0, 2, 1, 3).reshape(codes.shape), codes)
+            weights.constant("Assembled", np.ones((2, 4, 4), np.int8))
+            weights.finish()
+            _, header = local_header(root / "model/cache/weights" / shard.name)
+            self.assertEqual(set(header) - {"__metadata__"}, {"Experts.packed"})
+            self.assertEqual(hashlib.sha256(shard.read_bytes()).hexdigest(), before)
+
+    def test_moe_draft_accepts_a_jit_factory_without_a_name_attribute(self):
+        from tools.model.qwen35 import moe
+
+        def quantize(*args, **options):
+            return args, options
+
+        wrapped = SimpleNamespace(func=quantize)
+        names = (
+            "router_projection",
+            "router_topk",
+            "expert_histogram_local",
+            "expert_histogram_offsets",
+            "expert_histogram_finish",
+            "expert_offsets",
+            "expert_tiles",
+            "expert_dispatch",
+            "integer_experts",
+            "moe_combine",
+        )
+        kernels = SimpleNamespace(**{name: quantize for name in names})
+        builder = SimpleNamespace(
+            weights=SimpleNamespace(combined=lambda name, weights: name),
+            text=dict(num_experts=256, num_experts_per_tok=8),
+            h=2048,
+            f=512,
+            book="book",
+            projection=lambda *args, **kw: None,
+            lock=None,
+            moe_router_tuner=SimpleNamespace(
+                router=lambda *_: dict(configs=[{}], default="0", selections=[])
+            ),
+            row_choices=lambda *_: [("", {})],
+        )
+        launches = []
+
+        def emit(name, key, build, bindings, rows, **options):
+            launches.append((name, key, build(), rows, options))
+
+        builder.emit = emit
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.moe": kernels,
+                    "kernels.model.rotation_a8": SimpleNamespace(),
+                    "kernels.operators.op30_activation_quantization": SimpleNamespace(
+                        _compile=wrapped
+                    ),
+                },
+            ),
+            patch.object(moe, "workspace"),
+            patch.object(moe, "banks", return_value=[("up", "us"), ("down", "ds")]),
+            patch.object(moe, "primitive", side_effect=lambda fn, *a, **kw: (fn, a, kw)),
+        ):
+            moe.build(builder, "mtp", "mtp.layers.0.mlp", rows=512, draft=True)
+        quantizations = [
+            item for item in launches if item[0] in ("mtp/down_quant", "mtp/expert_rotate")
+        ]
+        self.assertEqual(len(quantizations), 2)
+        self.assertEqual([item[3] for item in quantizations], [512, 4096])
+        for _, key, (factory, args, options), _, _ in quantizations:
+            self.assertTrue(key.startswith("moe-quantize"))
+            self.assertIs(factory, wrapped)
+            self.assertEqual(args, (512, 512, False, True, 256))
+            self.assertNotIn("dynamic_rows", options)
+
+    def test_moe_geometry_keeps_shared_experts_and_router_explicit(self):
+        candidate = config()
+        candidate["model_type"] = "qwen3_5_moe"
+        t = candidate["text_config"]
+        t.update(
+            hidden_size=2048,
+            intermediate_size=512,
+            num_hidden_layers=40,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+            mlp_only_layers=[],
+            layer_types=t["layer_types"][:40],
+        )
+        self.assertEqual(configuration(candidate, 262144)["num_experts"], 256)
+        for key, value in (
+            ("num_experts_per_tok", 10),
+            ("shared_expert_intermediate_size", 640),
+            ("tie_word_embeddings", True),
+            ("mlp_only_layers", [0]),
+        ):
+            with self.subTest(key=key), patch.dict(t, {key: value}):
+                with self.assertRaises(ValueError):
+                    configuration(candidate, 262144)
+
     def test_medium_dense_geometry_requires_matching_gdn_and_gqa(self):
         candidate = config()
         t = candidate["text_config"]
@@ -205,6 +437,72 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(bindings["Lengths"], "length")
         self.assertNotIn("stages", launches[1][0])
         self.assertNotIn("live_k", launches[1][1])
+
+    def test_staged_attention_preserves_private_kv_and_obeys_measured_decoder_ranges(self):
+        first, merge, decoder = (lambda: None), (lambda: None), (lambda: None)
+        first.__name__, merge.__name__, decoder.__name__ = "attention", "merge", "decode"
+        baseline = dict(block_m=64, block_n=64, head_group=1, max_splits=8, threads=256, stages=1)
+        staged = dict(
+            block_m=128,
+            block_n=64,
+            head_group=2,
+            max_splits=1,
+            threads=512,
+            stages=1,
+            decoded_kv=True,
+        )
+        selection = dict(
+            configs=[baseline, staged],
+            default="1",
+            selections=[dict(min_rows=1, max_rows=73, multiple_of=1, implementation="0")],
+        )
+        builder = Builder.__new__(Builder)
+        builder.context, builder.lock, builder.qh, builder.kvh = 262144, None, 16, 2
+        builder.row_tuner = SimpleNamespace(
+            attention=lambda _: selection, staged_attention=lambda _, selection: selection
+        )
+        buffers = {}
+        builder.weights = SimpleNamespace(
+            buffers=buffers, fixed=lambda name, dtype, shape: buffers.update({name: (dtype, shape)})
+        )
+        launches = {}
+        builder.emit = lambda name, key, build, bindings, rows: launches.update(
+            {name: (build(), bindings, rows)}
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.attention_rows": SimpleNamespace(
+                        causal_attention_int8=first, merge_attention_int8=merge
+                    ),
+                    "kernels.model.kv_int8": SimpleNamespace(dequantize_attention_kv=decoder),
+                },
+            ),
+            patch("tools.model.qwen35.build.primitive", side_effect=lambda fn, *a, **k: k),
+        ):
+            builder.attention(
+                "layer3/private/attention",
+                q="query",
+                gate="gate",
+                position="pos",
+                length="length",
+                output="output",
+                prefix="L3_",
+                staging=True,
+            )
+        role = "layer3/private/attention"
+        self.assertIn(role + "_decode/skip/1-73", launches)
+        self.assertEqual(launches[role + "_decode"][1]["K"], "L3_KPages")
+        self.assertEqual(launches[role + "_decode"][1]["DK"], "AttentionDecodedK")
+        self.assertTrue(launches[role][0]["decoded_kv"])
+        self.assertEqual(launches[role][1]["live_k"], "AttentionDecodedK")
+        self.assertFalse(launches[role + "/rows/1-73"][0]["decoded_kv"])
+        self.assertEqual(launches[role + "/rows/1-73"][1]["K"], "L3_KPages")
+        self.assertEqual(
+            buffers,
+            {name: ("f16", [262144, 512]) for name in ("AttentionDecodedK", "AttentionDecodedV")},
+        )
 
     def test_projection_bounds_measured_choices_and_preserves_exact_aot(self):
         builder = Builder.__new__(Builder)
@@ -373,7 +671,7 @@ class BuildTests(unittest.TestCase):
             (np.uint8, (3, 16), "e8p-q4-row-u32"),
             (np.uint32, (3, 15), "e8p-q4-row-u32"),
             (np.uint32, (3, 16), "q4-row-packed-little-nibbles"),
-            (np.uint32, (1, 3, 16), "e8p-q4-row-u32"),
+            (np.uint32, (1, 2, 3, 16), "e8p-q4-row-u32"),
         ]:
             with (
                 self.subTest(dtype=dtype, shape=shape, layout=layout),

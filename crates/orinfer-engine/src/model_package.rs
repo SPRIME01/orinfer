@@ -66,6 +66,8 @@ pub(crate) struct ModelPackage {
     _library: Library,
     bindings: BindingCache,
     batch_plans: PlanCache,
+    batch_capabilities:
+        std::cell::RefCell<std::collections::VecDeque<(abi::BatchOperation, Vec<usize>, bool)>>,
     kernel_buffers: BTreeMap<String, Vec<String>>,
 }
 impl ModelPackage {
@@ -97,6 +99,7 @@ impl ModelPackage {
             _library: library,
             bindings: Default::default(),
             batch_plans: Default::default(),
+            batch_capabilities: Default::default(),
             kernel_buffers: Default::default(),
         })
     }
@@ -313,7 +316,7 @@ impl ModelPackage {
                         .get(k.dynamic)
                         .ok_or("Unknown dynamic launch definition")?
                         .bind(&name);
-                    template.validate(&binding)?;
+                    template.validate_binding(&binding)?;
                     metadata.dynamic_batch_kernels.insert(name, template);
                 }
                 metadata.kernels.push(binding);
@@ -484,6 +487,26 @@ impl ModelPackage {
     pub(crate) fn batch_plan(&self, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
         self.cached_batch(segments, abi::BatchOperation::Ordinary)
             .map(|(plan, _)| (*plan).clone())
+    }
+    pub(crate) fn supports_batch(
+        &self,
+        segments: &[BatchSegment],
+        operation: abi::BatchOperation,
+    ) -> bool {
+        let shape: Vec<_> = segments.iter().map(|s| s.tokens).collect();
+        let mut cache = self.batch_capabilities.borrow_mut();
+        if let Some((_, _, supported)) = cache
+            .iter()
+            .find(|(op, key, _)| *op == operation && *key == shape)
+        {
+            return *supported;
+        }
+        let supported = self.batch_operation(segments, operation, false).is_ok();
+        if cache.len() >= 128 {
+            cache.pop_front();
+        }
+        cache.push_back((operation, shape, supported));
+        supported
     }
     pub(crate) fn cached_batch(
         &self,

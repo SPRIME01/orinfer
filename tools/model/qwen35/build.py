@@ -1,4 +1,4 @@
-"""Build native dense Qwen3.5 data and a schema-1 Rust/TileLang package.
+"""Build native dense/MoE Qwen3.5 data and a schema-1 Rust/TileLang package.
 
 Consumes completed scalar or two-stage E8P Q4A8 checkpoints.
 Weight shards are linked or losslessly K-repacked; transforms, scales and the
@@ -26,11 +26,12 @@ from tools.model.compile import primitive
 ROOT = Path(__file__).resolve().parents[3]
 CAPACITY = 4096
 LANES = 128
+HEAD_ROWS = 512
 
 
 def configuration(config, context):
-    if config.get("model_type") != "qwen3_5":
-        raise ValueError("Expected dense Qwen3_5 checkpoint")
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe"):
+        raise ValueError("Expected Qwen3_5 checkpoint")
     t = config["text_config"]
     expected = dict(
         hidden_size=5120,
@@ -49,7 +50,21 @@ def configuration(config, context):
         hidden_act="silu",
         tie_word_embeddings=False,
     )
-    if t.get("hidden_size") == 2048:
+    if config["model_type"] == "qwen3_5_moe":
+        expected.update(
+            hidden_size=2048,
+            intermediate_size=512,
+            num_hidden_layers=40,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
+            num_key_value_heads=2,
+            num_experts=256,
+            num_experts_per_tok=8,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+            mlp_only_layers=[],
+        )
+    elif t.get("hidden_size") == 2048:
         expected.update(
             hidden_size=2048,
             intermediate_size=6144,
@@ -57,6 +72,15 @@ def configuration(config, context):
             linear_num_value_heads=16,
             num_attention_heads=8,
             num_key_value_heads=2,
+            tie_word_embeddings=True,
+        )
+    elif t.get("hidden_size") == 2560:
+        expected.update(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            linear_num_value_heads=32,
+            num_attention_heads=16,
             tie_word_embeddings=True,
         )
     elif t.get("hidden_size") == 4096:
@@ -73,7 +97,7 @@ def configuration(config, context):
         "full_attention" if i % 4 == 3 else "linear_attention"
         for i in range(expected["num_hidden_layers"])
     ]:
-        raise ValueError("Unsupported dense Qwen arithmetic geometry")
+        raise ValueError("Unsupported Qwen arithmetic geometry")
     rope = t["rope_parameters"]
     if any(
         rope.get(k) != v
@@ -156,6 +180,7 @@ class Builder:
         self.tied = t.get("tie_word_embeddings", False)
         self.h, self.v = t["hidden_size"], t["vocab_size"]
         self.f = t["intermediate_size"]
+        self.moe = self.config["model_type"] == "qwen3_5_moe"
         self.hk, self.hv = t["linear_num_key_heads"], t["linear_num_value_heads"]
         self.qh, self.kvh = t["num_attention_heads"], t["num_key_value_heads"]
         self.qkv, self.mixdim = (2 * self.hk + self.hv) * 128, self.hv * 128
@@ -177,6 +202,7 @@ class Builder:
         self.state = state
         self.context = context
         self.lock = lock
+        self.gdn_execution = dict(prefill="sequential", decode=dict(kind="dense"))
         self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
         prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
@@ -199,6 +225,12 @@ class Builder:
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
+        from tools.model.qwen35 import causal_parallel
+
+        causal_parallel.build(self)
+        from tools.model.qwen35 import commit
+
+        commit.build(self)
 
     def workspace(self):
         w = self.weights
@@ -235,14 +267,14 @@ class Builder:
             ("A8", "i8", [c * max(f, h, self.mixdim, 2 * h)]),
             ("AS", "f16", [c]),
             ("UnusedA8Mask", "u8", [max(f, h, self.mixdim, 2 * h)]),
-            ("HeadHidden", "f16", [LANES, h]),
-            ("HeadA8", "i8", [LANES, h]),
-            ("HeadAS", "f16", [LANES]),
-            ("HeadLogits", "f32", [LANES, v]),
-            ("GreedyValues", "f32", [LANES * math.ceil(v / 1024)]),
-            ("GreedyIndices", "i32", [LANES * math.ceil(v / 1024)]),
-            ("GreedyInvalid", "i32", [LANES * math.ceil(v / 1024)]),
-            ("Pairs", "i32", [LANES, 2]),
+            ("HeadHidden", "f16", [HEAD_ROWS, h]),
+            ("HeadA8", "i8", [HEAD_ROWS, h]),
+            ("HeadAS", "f16", [HEAD_ROWS]),
+            ("HeadLogits", "f32", [HEAD_ROWS, v]),
+            ("GreedyValues", "f32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("GreedyIndices", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("GreedyInvalid", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
+            ("Pairs", "i32", [HEAD_ROWS, 2]),
         ]:
             w.fixed(name, dtype, shape)
         for name, dtype, shape in [
@@ -320,7 +352,18 @@ class Builder:
                 raise ValueError("Q4 integer table differs from compiled decoder")
             w.constant("orinfer.q4.table", table)
 
-    def emit(self, name, key, build, bindings, rows=CAPACITY, *, dynamic=True, row_divisor=1):
+    def emit(
+        self,
+        name,
+        key,
+        build,
+        bindings,
+        rows=CAPACITY,
+        *,
+        dynamic=True,
+        row_divisor=1,
+        row_multiplier=1,
+    ):
         return self.aot.emit(
             "qwen_rows/" + name,
             key,
@@ -329,6 +372,7 @@ class Builder:
             rows,
             dynamic=dynamic,
             row_divisor=row_divisor,
+            row_multiplier=row_multiplier,
         )
 
     def embedding(self, name, input, output, rows=CAPACITY):
@@ -411,10 +455,15 @@ class Builder:
                         rows,
                     )
             return
+        with gpu_lock(self.lock):
+            selection = self.row_tuner.activation_rotation(k, swiglu)
+        config = selection["configs"][int(selection["default"])]
         self.emit(
             name,
-            f"rotation-{k}-{swiglu}-{rows}-{dynamic}",
-            lambda: primitive(rotate_activation_a8, rows, k, swiglu=swiglu, dynamic_rows=dynamic),
+            f"rotation-{k}-{swiglu}-{rows}-{dynamic}-{config}",
+            lambda: primitive(
+                rotate_activation_a8, rows, k, swiglu=swiglu, dynamic_rows=dynamic, **config
+            ),
             dict(
                 X=input,
                 Signs=self.signs[k],
@@ -431,12 +480,16 @@ class Builder:
 
         yield from choices(selection, capacity, fixed)
 
-    def attention(self, name, *, q, gate, position, length, output, prefix="", rows=CAPACITY):
+    def attention(
+        self, name, *, q, gate, position, length, output, prefix="", rows=CAPACITY, staging=False
+    ):
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
         from tools.model.row_tuning import ATTENTION_TARGET
 
         with gpu_lock(self.lock):
             selection = self.row_tuner.attention(self.context)
+            if staging:
+                selection = self.row_tuner.staged_attention(self.context, selection)
         partial = dict(
             Partial="AttentionPartial",
             Maximum="AttentionMaximum",
@@ -454,11 +507,38 @@ class Builder:
             Y=output,
             **partial,
         )
+        selected = list(self.row_choices(selection, rows))
+        if any(config.get("decoded_kv") for _, config in selected):
+            from kernels.model.kv_int8 import dequantize_attention_kv
+            from tools.model.row_selection import choices
+
+            for buffer in ("AttentionDecodedK", "AttentionDecodedV"):
+                if buffer not in self.weights.buffers:
+                    # Shared scratch, not request state or a prefix-cache entry.
+                    self.weights.fixed(buffer, "f16", [self.context, self.kvh * 256])
+            decode_bindings = {key: inputs[key] for key in ("K", "V", "KS", "VS", "Lengths")}
+            decode_bindings.update(DK="AttentionDecodedK", DV="AttentionDecodedV")
+
+            def emit_decode(suffix=""):
+                self.emit(
+                    name + "_decode" + suffix,
+                    f"gqa-stage-{self.context}-{self.kvh}",
+                    lambda: primitive(
+                        dequantize_attention_kv, CAPACITY, self.context, kv_heads=self.kvh
+                    ),
+                    decode_bindings,
+                    rows,
+                )
+
+            emit_decode()
+            for suffix, config in choices(selection, rows, bounded=True):
+                if not config.get("decoded_kv"):
+                    emit_decode(suffix.replace("/rows/", "/skip/"))
         for role, fn, args in [
             (name, causal_attention_int8, inputs),
             (name + "_merge", merge_attention_int8, dict(**partial, Gate=gate, Y=output)),
         ]:
-            for suffix, config in self.row_choices(selection, rows):
+            for suffix, config in selected:
                 bm, bn, group = config["block_m"], config["block_n"], config["head_group"]
                 threads, stages = config.get("threads", 128), config.get("stages", 0)
                 options = dict(
@@ -470,16 +550,26 @@ class Builder:
                     head_group=group,
                 )
                 if fn is causal_attention_int8:
-                    options.update(context=self.context, block_n=bn, threads=threads, stages=stages)
+                    options.update(
+                        context=self.context,
+                        block_n=bn,
+                        threads=threads,
+                        stages=stages,
+                        decoded_kv=config.get("decoded_kv", False),
+                    )
                 bindings = args
+                if fn is causal_attention_int8 and config.get("decoded_kv"):
+                    bindings = args | dict(K="AttentionDecodedK", V="AttentionDecodedV")
                 if fn is causal_attention_int8 and stages:
                     # The compiler names the shared-pointer KV views in its
                     # exported host ABI; both names refer to the same buffers.
-                    bindings = args | {f"live_{k.lower()}": args[k] for k in ("K", "V", "KS", "VS")}
+                    bindings = bindings | {
+                        f"live_{k.lower()}": bindings[k] for k in ("K", "V", "KS", "VS")
+                    }
                 self.emit(
                     role + suffix,
                     f"gqa-rows-{fn.__name__}-{self.context}-{bm}-{bn}-{group}-"
-                    f"{config['max_splits']}-{threads}-{stages}",
+                    f"{config['max_splits']}-{threads}-{stages}-decoded{config.get('decoded_kv', False)}",
                     lambda fn=fn, options=options: primitive(fn, CAPACITY, **options),
                     bindings,
                     rows,
@@ -560,7 +650,7 @@ class Builder:
         )
         if kind == "e8p_q4":
             bind["Book"] = self.book
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         shapes = [(rows, dynamic, name)]
         if dynamic:
@@ -605,7 +695,7 @@ class Builder:
         self, weight, kind, n, k, rows, dynamic, dtype, stride=None, *, select_rows=False
     ):
         import torch
-        from tools.model.flash_next.decode_tuning import DecodeTuner
+        from tools.model.projection_tuning import ProjectionTuner
         from tools.model.row_selection import samples
 
         w = self.weights
@@ -621,9 +711,9 @@ class Builder:
         identity = w.buffers[weight + suffix]["data"]["sha256"]
         if kind == "e8p_q4":
             identity += w.buffers[self.book]["data"]["sha256"]
-        tuner = DecodeTuner(self.output / "tuning", self.aot.cache.root / "tuning")
+        tuner = ProjectionTuner(self.output / "tuning", self.aot.cache.root / "tuning")
         compile = tuner.compile_choices if select_rows else tuner.compile
-        from tools.model.flash_next.decode_policy import SPECIALIZATIONS
+        from tools.model.projection_policy import SPECIALIZATIONS
 
         result = compile(
             kind,
@@ -753,6 +843,9 @@ class Builder:
                         ),
                         recurrent_bindings,
                     )
+                from tools.model.qwen35.gdn import prefill as gdn_prefill
+
+                gdn_prefill(self, private, i)
                 self.emit(
                     private + "/gated_norm",
                     "gdn-gated-norm",
@@ -819,6 +912,7 @@ class Builder:
                     length="SeqLength",
                     output="MixerIn",
                     prefix=f"L{i}_",
+                    staging=True,
                 )
             self.emit(
                 post + "/quantize",
@@ -835,20 +929,27 @@ class Builder:
                 kind="w8",
             )
             self.norm_rotation(post, "Mix", "R1", p + ".post_attention_layernorm.weight", "R0")
-            for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
-                self.projection(
-                    post + "/" + role,
-                    p + f".mlp.{role}_proj.weight",
-                    self.f,
-                    self.h,
-                    "GateUp",
-                    stride=self.f,
-                    offset=offset,
+            if self.moe:
+                from tools.model.qwen35.moe import build as moe_ffn
+
+                moe_ffn(self, post, p + ".mlp")
+            else:
+                for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
+                    self.projection(
+                        post + "/" + role,
+                        p + f".mlp.{role}_proj.weight",
+                        self.f,
+                        self.h,
+                        "GateUp",
+                        stride=self.f,
+                        offset=offset,
+                    )
+                self.rotation(
+                    post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
                 )
-            self.rotation(
-                post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
-            )
-            self.projection(post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden")
+                self.projection(
+                    post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden"
+                )
             print("BOUND layer", i, flush=True)
         self.emit(
             "end/advance",
@@ -875,7 +976,7 @@ class Builder:
                 Y="HeadHidden",
             ),
         )
-        for name, rows, dynamic in [("head", LANES, True), ("head_last", 1, False)]:
+        for name, rows, dynamic in [("head", HEAD_ROWS, True), ("head_last", 1, False)]:
             self.rotation(
                 name + "/rotate", self.h, "HeadHidden", rows=rows, dynamic=dynamic, head=True
             )
@@ -925,7 +1026,7 @@ class Builder:
         )
 
     def publish(self, engine):
-        from tools.model.frontend import prepare_tokenizer
+        from tools.model.frontend import prepare_generation_config, prepare_tokenizer
 
         w = self.weights
         total = w.finish()
@@ -935,13 +1036,13 @@ class Builder:
             "tokenizer.json",
             "tokenizer_config.json",
             "chat_template.jinja",
-            "generation_config.json",
             "merges.txt",
             "vocab.json",
         ]:
             if (self.source / name).is_file():
                 shutil.copyfile(self.source / name, self.root / name)
         prepare_tokenizer(self.source, self.root / "tokenizer.json")
+        prepare_generation_config(self.source, self.root / "generation_config.json")
         metadata = dict(
             schema_version=2,
             target="sm_87",
@@ -965,6 +1066,7 @@ class Builder:
             ),
             vision=self.vision,
             mtp=self.mtp,
+            gdn_execution=self.gdn_execution,
             batch_layout=dict(
                 layers=self.text["layer_types"],
                 row_strides={},
@@ -990,7 +1092,19 @@ class Builder:
             execution=execution_identity(
                 model_library(), engine, self.architecture, "int8_quality"
             ),
-            plan_kernel_contracts=[k["name"] for k in self.aot.kernels if "/rows/" in k["name"]],
+            plan_kernel_contracts=[
+                k["name"]
+                for k in self.aot.kernels
+                if "/rows/" in k["name"] or "/skip/" in k["name"]
+            ],
+        )
+        from tools.model.sampling import append as append_sampling
+
+        append_sampling(
+            dict(metadata=metadata, buffer_scopes=w.scopes),
+            package,
+            self.root / "cache",
+            self.output / "sampling",
         )
         digest = compact_package(self.root / "cache", package, self.root / "cache/packages")
         data = dict(
@@ -1012,7 +1126,7 @@ class Builder:
         if result.returncode:
             raise ValueError(f"Native plan validation failed: {result.stderr.strip()}")
         plan = json.loads(result.stdout)["manifest"]
-        if len(plan["kernels"]) != len(self.aot.kernels):
+        if len(plan["kernels"]) != len(package["kernels"]) or not plan.get("sampling"):
             raise ValueError("Native execution bindings were lost during publication")
         shutil.rmtree(self.root / "cache/shared-rows")
         write_json(

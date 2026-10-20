@@ -1,21 +1,21 @@
-# Images and multi-image inference
+# 图片与多图
 
-The 27B and Flash Next models share the ViT implementation in `kernels/vision/encoder.py`. Each text architecture declares its own merger output dimension, feature injection, and MRoPE state. The [27B native builder](../model/qwen35/README.md) creates a vision-enabled model, while the [Flash Next native rebuild](../model/flash_next/README.md) preserves the input model's vision contract.
+27B 与 Flash Next 使用 `kernels/vision/encoder.py` 的共享 ViT 实现，文本模型分别声明 merger 输出维度、特征注入和 MRoPE 状态。27B 通过 [原生构建器](../model/qwen35/README.md)生成包含视觉功能的模型；Flash Next [原生重建](../model/flash_next/README.md)保留输入模型的视觉契约。
 
-Rust handles online image preprocessing, position generation, request-private feature tables, and execution. Vision uses one dynamic patch template for single images and ordered multi-image inputs. **Video is not supported.** The default ceiling is 32,768 patches (8,192 visual tokens), subject to context and per-request memory budgets. See [Serving](../../docs/serving.md) for request examples.
+在线由 Rust 处理图片预处理、位置生成、请求私有特征表及模型执行。视觉使用一个动态 patch 模板，支持图片和有序多图，不支持视频。默认最大 32768 patches，即 8192 个视觉 tokens；实际输入还受上下文与请求内存预算限制。使用方式见[服务说明](../../docs/serving.md)。
 
-## Kernel and reference checks
+## 算子与参考
 
-Use the pinned compiler image and shared GPU lock. Output paths must not exist beforehand:
+GPU 验证使用固定编译镜像及共享 GPU 锁，输出目录必须不存在：
 
 ```bash
 bash tools/operators/run.sh tools/vision/validate_kernels.py artifacts/vision/kernels-check
 bash tools/operators/run.sh tools/vision/validate_mrope.py artifacts/vision/mrope-check
 ```
 
-`validate_mrope.py` checks query/KV/indexer rotation, unaligned compressed blocks, and CUDA Graph replay with changed feature inputs. `official_reference.py` uses the checkpoint's native Transformers vision model to export independent BF16 or FP16 features; always record the reference dtype.
+`validate_mrope.py` 检查查询/KV/indexer 旋转、非对齐压缩块和特征注入的改输入 Graph replay。`official_reference.py` 按 checkpoint 配置调用 Transformers 的原生视觉模型，导出独立 BF16 或 FP16 特征；须注明参考 dtype。
 
-`preprocess_reference.py` exports preprocessing fixtures for the current model, which are then checked by an ignored Rust test:
+`preprocess_reference.py` 为当前模型导出预处理夹具，再由 Rust ignored test 比对：
 
 ```bash
 bash tools/operators/run.sh tools/vision/preprocess_reference.py artifacts/vision/preprocessor-check \
@@ -24,11 +24,11 @@ ORINFER_IMAGE_REFERENCE="$PWD/artifacts/vision/preprocessor-check" \
   cargo test --offline checkpoint_image_processor_reference -- --ignored --nocapture
 ```
 
-The Rust `make check-gpu` acceptance suite checks full state, chunking, prefix restore, and isolation of text following images.
+完整状态、分块、prefix 恢复和图片后文本隔离通过 `make check-gpu` 的 Rust 模型验收检查。
 
-## API acceptance
+## API 验收
 
-Against a prepared, running server:
+在准备好的服务上运行：
 
 ```bash
 python3 tools/vision/smoke.py --output artifacts/vision/smoke.json
@@ -37,4 +37,4 @@ python3 tools/vision/limits.py --manifest /path/to/prepared-model \
   --output artifacts/vision/limits.json
 ```
 
-All tools accept `--base-url` and `--model`. Smoke tests cover one image, ordered multi-image input, SSE, and state isolation. Scenarios cover counting, multimodal history, function calling, and queuing. Capacity tests verify limit rejection, recovery after errors, and concurrent image queuing against the default 32,768-patch limit. Scenarios use seed 20261002 and record answers, usage, finish reasons, and latency. Task quality is assessed separately against the original BF16/FP8 model.
+工具支持 `--base-url` 与 `--model`。Smoke 覆盖单图、多图顺序、SSE 及状态隔离；场景覆盖计数、图文历史、函数调用和排队。容量验收检查超限拒绝、错误恢复与不同图片并发排队，要求默认 32768-patch 容量。场景使用 seed 20261002，记录回答、usage、停止原因与时延；任务质量另外与原始 BF16/FP8 对照。

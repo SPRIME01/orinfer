@@ -1,6 +1,6 @@
-# Serving guide
+# 服务使用指南
 
-## Startup and model loading
+## 启动与模型加载
 
 ```bash
 ./target/release/orinfer validate-model /path/to/prepared-model
@@ -8,76 +8,100 @@
   --model qwen3.8-27b --listen 0.0.0.0:8088 --cuda-graph decode_only
 ```
 
-The service loads the model once and processes requests through one GPU worker. The CPU uses `tokenizer.json`, `chat_template.jinja`, and `generation_config.json` from the model directory to render and tokenize requests. There is no online Python, quantization, or kernel JIT.
+服务加载一次模型，由单个 GPU worker 执行请求。CPU 使用模型目录中的 `tokenizer.json`、`chat_template.jinja` 和 `generation_config.json` 渲染模板及分词；线上不运行 Python、量化或 kernel JIT。
 
-Model weights are read in parallel into bounded pinned buffers while uploads run asynchronously. `--load-workers N` allows 1–32 readers; the default uses available CPU cores, capped at four. Staging memory is limited to 256 MiB and released after loading. `--verify-weights` performs more expensive full content checks at startup.
+权重加载采用并行读取和有界的 pinned 缓冲区，并与异步 GPU 上传重叠。`--load-workers N` 可设置 1–32 个读取线程；默认按可用 CPU 核心选择，最多 4 个。暂存内存最多 256 MiB，加载结束后释放。开启 `--verify-weights` 时使用完整校验路径，启动较慢。
 
-All execution-package kernel assets are still hash-verified. CUDA modules for ordinary text, configured MTP, vision, and small-batch plans are preloaded. Others are loaded on first use and bound before Graph capture, so uncommon shapes may have first-use overhead.
+执行包中的全部 kernel 资产仍校验 hash；普通文本、配置的 MTP、视觉及小 batch 计划预加载 CUDA 模块，其余计划在首次使用时加载，并在 CUDA Graph 捕获前完成绑定。未预加载的形状可能有额外的首次执行开销。
 
-During model preparation, frontend file SHA256 digests are pinned. If modifying them intentionally, confirm their token mapping and semantics match the checkpoint, then rerun `python3 tools/model/package.py pin-assets MODEL_DIR` (which does not change weights). Model files must remain unchanged while loading.
+模型准备时封存上述前端文件的 SHA256。需要有意修改时，先确认它们与 checkpoint 的 token 映射和语义一致，再执行 `python3 tools/model/package.py pin-assets MODEL_DIR` 重新封存；此命令不改权重。模型文件在加载期间必须保持不变。
 
-Execution packages are resolved first from the shared cache by digest, then from `cache/packages/<digest>` inside the model. Set `ORINFER_EXECUTION_CACHE` to override the default `$XDG_CACHE_HOME/orinfer/packages` (or `~/.cache/orinfer/packages` without XDG). A present but corrupt package is an error. Custom safetensors layouts retain `orin.layout.<tensor>` markers; the execution-package digest pins native logic and kernels.
+先查共享执行包缓存中的 `<digest>`，缺失时再查模型内的 `cache/packages/<digest>`。`ORINFER_EXECUTION_CACHE` 可覆盖共享缓存位置；默认目录是 `$XDG_CACHE_HOME/orinfer/packages`，未设置 XDG 时为 `~/.cache/orinfer/packages`。存在但损坏的包会报错。专用 safetensors 布局沿用 `orin.layout.<tensor>` 标识，执行包 digest 固定原生执行逻辑与 kernel。
 
-### Expert residency
+### 专家常驻容量
 
-`serve`, `run-model`, and `score-model` accept `--resident-experts full|N`, defaulting to `full`. In Flash Next, limited residency requires an execution package declaring expert paging. Older libraries must be reattached using matching native model tools; weights and cubins do not change.
+`serve`、`run-model` 和 `score-model` 提供 `--resident-experts full|N`，默认 `full`，保持专家权重全量常驻。Flash Next 的有限模式要求执行包包含专家分页声明；旧执行库需要通过模型工具重新附加匹配的原生执行库，权重及 cubin 不变。
 
-`N` is equivalent per-layer capacity. The 48 backbone layers share a global SLRU cache of up to `48 × N` experts without fixed per-layer quotas. Valid values are 1–512; 512 is effectively full residency. MTP experts remain fully resident. Missing experts are loaded on demand from compressed model-file weights/scales and mapped into stable CUDA virtual addresses; expanded INT8 weights are not permanently cached.
+`N` 是每层等效容量：48 层主干共享最多 `48 × N` 个专家的全局 SLRU 缓存，各层不固定分配配额；可指定 1–512，512 等效全量常驻。MTP 专家不进入此缓存，继续全量常驻。缺失专家的压缩权重和 scale 从模型文件按需读取，并映射到稳定的 CUDA 虚拟地址，不缓存完整展开的 INT8 权重。
 
 ```bash
 ./target/release/orinfer serve /path/to/prepared-flash-model \
   --model qwen-flash-next --resident-experts 256
 ```
 
-Limited mode performs CPU scheduling and SSD reads after routing and automatically selects `cuda_graph=off`. Full residency retains the chosen Graph mode. Capacity is counted in experts, not strict bytes; CUDA allocation granularity and shared pages add overhead. If one prefill or batch routes to more experts than the limit, extra experts are mapped temporarily and later released. Smaller caches increase I/O and may reduce throughput. Keep model files readable and unchanged throughout serving.
+有限模式在路由后执行 CPU 调度和 SSD 加载，自动使用 `cuda_graph=off`；`full` 保留所选 Graph 模式。容量限制按专家数量计算，实际物理内存还包含 CUDA 分配粒度和共享页开销。一轮 prefill 或 batch 路由的专家集合超过容量时，临时映射额外专家，随后释放，因此该参数不是严格的字节预算。较小容量会增加 I/O、降低吞吐；模型文件在整个服务期间必须保持可读且不变。
 
-### Default request parameters
+### 请求默认参数
 
-`--default-request-params` accepts a JSON object supplying Chat fields omitted by clients:
+`--default-request-params` 接受一个 JSON 对象，为本次部署填充客户端省略的 Chat 请求字段。例如，默认开启 thinking，同时设置采样温度：
 
 ```bash
 ./target/release/orinfer serve /path/to/prepared-model \
   --default-request-params '{"enable_thinking":true,"temperature":0.7}'
 ```
 
-Without this option, ordinary API defaults apply. Explicit request values—including `false`, empty arrays, and `null`—override deployment defaults. An explicit `null` clears the deployment default and then follows that field's normal null handling. Objects replace objects; there is no recursive merge. Clients must still supply `model` and `messages`, which cannot be deployment defaults. Default fields and combinations are validated before the GPU model loads.
+不传此选项时保留原有 API 默认值。显式请求字段优先，包括 `false`、空数组和 `null`；`null` 取消对应部署默认值，再按该字段原有空值语义处理。对象字段整体替换，不递归合并。`model` 和 `messages` 必须由客户端提供，不能配置为默认值。配置的字段类型、取值和组合在加载 GPU 模型前校验；默认值必须能组成有效请求。
 
-The pairs `enable_thinking`/`reasoning_effort` and `max_tokens`/`max_completion_tokens` override as groups: supplying either request field suppresses the group's deployment default. Therefore `enable_thinking=false` or `reasoning_effort=none` disables an enabled deployment default. Conflicts *within* the request return 400. Explicit `stream=false/null` suppresses default `stream_options`; explicit `logprobs=false/null` suppresses default `top_logprobs`. Inspect `/health.default_request_params`.
+`enable_thinking` 与 `reasoning_effort`、`max_tokens` 与 `max_completion_tokens` 分别按组覆盖：请求传入其中一项时，不再补入同组的部署默认值。因此，即使服务默认开启 thinking，请求仍可用 `enable_thinking=false` 或 `reasoning_effort=none` 关闭。请求自身的冲突仍返回 400。显式 `stream=false/null` 不继承默认 `stream_options`，显式 `logprobs=false/null` 不继承默认 `top_logprobs`。实际请求默认参数可在 `/health.default_request_params` 查看。
+
+## Ollama API
+
+无模型路径的 `orinfer serve` 同时提供 Ollama 原生接口，客户端地址为 `http://127.0.0.1:8088`：
+
+- `GET /api/version`、`GET /api/tags`、`POST /api/show`、`GET /api/ps`：版本、全部已注册模型、详情和已加载模型；发现接口只使用 CPU。
+- `POST /api/chat`、`POST /api/generate`：聊天与应用原生 chat template 的生成；默认 `stream=true`，输出 `application/x-ndjson`；`stream=false` 返回单个 JSON。
+- `POST /api/copy`、`DELETE /api/delete`：复制别名、移除注册。移除前等待活动请求结束；导入的权重文件由用户管理，保留原路径。
+
+```bash
+curl http://127.0.0.1:8088/api/chat -d '{"model":"index-translate-2b","messages":[{"role":"user","content":"Translate to English: 你好"}],"think":false,"options":{"num_predict":256},"keep_alive":"60s"}'
+```
+
+支持 `think` 布尔值/推理级别、消息中的 base64 PNG/JPEG/WebP 图片、工具及工具结果历史、`format="json"` 或 JSON Schema、`logprobs/top_logprobs`。`options` 支持 `temperature/top_p/top_k/seed/stop/presence_penalty/frequency_penalty/repeat_penalty` 与正数 `num_predict`。省略的参数继承部署默认值；显式 `think=false` 可以覆盖默认 thinking。工具参数返回 JSON 对象，流式时完整解析后发布；截断的无效参数返回错误。
+
+`keep_alive` 支持数字秒数、`"1h30m"` 等时长、负数永久保留和 `0` 请求结束后回收；空 messages/prompt 请求用于预加载，空请求加 `keep_alive=0` 用于卸载。未带 tag 的注册名也接受 `:latest`。两种协议共用准入、连续调度、prefix cache 和取消逻辑。
+
+模型内存预算充足时直接并发处理，不同模型也可并行冷启动，同一模型只启动一个 worker。加载或请求状态预算不足时，优先立即驱逐最近最少使用的空闲模型，`keep_alive=-1` 也不阻止内存压力回收；空间仍被活动请求或在途加载占用时才等待。不打断正在生成的请求。加载中的模型单独预留内存，避免重复承诺相同余量，预留在就绪或失败后释放。
+
+返回真实 token/cache 计数和请求总时长（纳秒）；不推算未单独测量的各阶段耗时或实际 VRAM 字节数。`/api/ps.estimated_load_bytes` 是内存准入估算。`ORINFER_API_KEY` 同时保护 `/api` 与 `/v1`。
+
+当前模型由 CLI 导入原生 orinfer 包；Ollama registry 的 pull/push/create、embedding 接口、raw prompt、suffix、Go template 覆盖、旧 token context 和自动截断/滑窗明确返回错误。上下文由模型执行包确定，`options.num_ctx` 可省略或使用该值。
 
 ## Chat API
 
-Available routes: `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions`. With `ORINFER_API_KEY` set, `/v1` requires `Authorization: Bearer <key>`.
+提供 `GET /health`、`GET /v1/models` 和 `POST /v1/chat/completions`。设置 `ORINFER_API_KEY` 后，`/v1` 请求需携带 `Authorization: Bearer <key>`。
 
 ```bash
 curl http://127.0.0.1:8088/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"What is 37×24 minus 19×13?"}],"temperature":0,"max_tokens":512,"enable_thinking":true,"stream":true,"stream_options":{"include_usage":true}}'
+  -d '{"model":"qwen3.8-27b","messages":[{"role":"user","content":"37×24−19×13等于多少？"}],"temperature":0,"max_tokens":512,"enable_thinking":true,"stream":true,"stream_options":{"include_usage":true}}'
 ```
 
-Supported sampling fields include `temperature`, `top_p`, `top_k`, presence/frequency/repetition penalties, signed 64-bit `seed`, `logit_bias`, EOS, and `stop`. Temperature, top-p, top-k, and repetition penalty default to the model's generation configuration; presence/frequency penalties default to zero. The default seed is 20261002. `logit_bias` keys are tokenizer token IDs and values range from -100 to 100.
+支持 `temperature`、`top_p`、`top_k`、presence/frequency/repetition penalties、有符号 64 位 `seed`、`logit_bias`、EOS 和 `stop`。temperature、top_p、top_k 和 repetition_penalty 默认采用模型的 generation config；presence/frequency penalties 默认 0。默认 seed 为 20261002。`logit_bias` 的 key 是 tokenizer 的 token ID，值范围为 −100 到 100。
 
-Thinking is off by default. `enable_thinking=true` or non-`none` `reasoning_effort` enables it; reasoning is returned in the extension field `reasoning_content`. `none` disables it, `minimal/low` map to the checkpoint's `low`, `medium` remains `medium`, and `high/xhigh/max` map to `xhigh`. Explicit `enable_thinking=false` disables thinking. Native model templates require a user message; place system/developer instructions first.
+默认关闭 thinking；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 开启后，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
-`thinking_token_budget` imposes a hard limit on the *initial* reasoning segment, including 0. At the limit, decoding forces `</think>` before continuing the answer or tool calls. That terminator counts as a completion token, not a reasoning token. The cap shrinks automatically to total output budget minus two, reserving the terminator and at least one response token. When thinking is enabled with this parameter, total output budget must be at least two. The limit does not apply when thinking is disabled. It is per-request state shared by MTP target and drafts. Unpenalized greedy requests without probability reporting may reuse GPU argmax under constraints; forced single-token termination needs no CPU logits download. Other constrained paths have CPU fallbacks, and sampling preserves the target distribution. Effort expresses model preference and is not a substitute for the hard cap.
+`thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记计入 completion，不计入 reasoning。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。关闭 thinking 时不应用此预算。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽的单一结束标记也无需下载 logits。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制模型倾向，不能替代这个硬上限。
 
-The default output budget is 8,192 tokens, reduced to fit remaining context. Specify **either** `max_tokens` or `max_completion_tokens`, never both. Prompt, history, images, reasoning, and output all count toward package context capacity. Explicit budgets beyond capacity return HTTP 400 before admission. Request bodies are limited to 32 MiB. Context overflow uses `error.code=context_length_exceeded` so clients can compact history and retry; other invalid parameters use `invalid_request`.
+默认输出预算为 8192 tokens，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 指定，二者不能同时传入。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限为 32 MiB。
 
-`stream` defaults to false. True streams SSE deltas followed by `[DONE]`; `stream=null` uses default behavior, and `tools=null` means no tools. With `stream_options.include_usage=true`, regular chunks have `usage:null` and a final `choices:[]` chunk carries complete usage, including reasoning and cached prompt tokens. Disconnects cancel generation. Error streams report errors; partial output is not presented as completed success.
+上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 
-`logprobs=true` reports content-token `token/logprob/bytes/top_logprobs` (0–20 alternatives). SSE attaches probabilities to content deltas. Probabilities come from the target model after penalties/bias/constraints but **before** top-k/top-p truncation. Greedy `temperature=0` probabilities use a T=1 softmax. `bytes` reconstruct UTF-8 characters spanning token boundaries. Reasoning, tool protocol markers, and tool arguments are excluded from content probabilities. Logprob reporting downloads logits to CPU and adds overhead.
+`stream` 默认 false；显式 true 使用 SSE deltas 和 `[DONE]`。`stream=null` 等同默认值，`tools=null` 等同无工具。请求 `stream_options.include_usage=true` 时，普通 chunk 包含 `usage:null`，结束前另发 `choices:[]` 的完整 usage。usage 包含 reasoning 和 prefix cache token 计数。客户端断连后取消生成。异常流返回 error，不将失败后的部分输出伪装为成功完成。
 
-Non-streaming logprobs reserve bounded CPU memory based on output budget and count against `--preprocess-memory-mib` until the HTTP body is complete. Excessively large single requests are rejected with 400 before preparation. Streaming sends probabilities incrementally; slow-client buffering remains bounded.
+`logprobs=true` 返回正文 token 的 `token/logprob/bytes/top_logprobs`，`top_logprobs` 支持 0–20；SSE 返回对应正文 delta 的概率。概率来自 target 模型，应用惩罚、bias 和约束后、top-k/top-p 截断前；temperature=0 的 greedy 请求以 T=1 softmax 报告概率。`bytes` 可用于还原跨 token 的 UTF-8 字符；thinking、工具协议标记和工具参数不计入正文概率。开启此选项需要将 logits 下载到 CPU，会增加开销。
 
-Invalid requests return HTTP 400 with `error.message/type/param/code` and `x-request-id`. `/health.chat_capabilities` reports current support. `store=false`, `metadata`, `safety_identifier`, and `service_tier=auto/default` are accepted without implementing cloud completion storage, moderation, or service-tier scheduling. `store=true`, `n>1`, audio, video, and unknown fields are rejected.
+非流式概率结果按输出预算预留 CPU 内存，计入 `--preprocess-memory-mib`，预算保持到 HTTP body 结束；过大的单请求在准备前返回 400。SSE 逐步发送概率，不累计完整概率响应，慢客户端的增量缓冲仍有上限。
 
-### JSON output
+参数错误返回 HTTP 400 及 `error.message/type/param/code`，响应带 `x-request-id`。`/health.chat_capabilities` 声明当前能力。`store=false`、`metadata`、`safety_identifier` 和 `service_tier=auto/default` 可传入，但本地服务不持久化 completion，也不提供云端审核或服务等级调度。`store=true`、`n>1`、音频、视频和未知参数会明确报错。
 
-`response_format.type` accepts `text`, `json_object`, or `json_schema`. JSON modes use Rust llguidance for token-level constraints. Supported schema features include nested objects/arrays, types, required properties, enum/const, and compilable local `$ref`. External references, excessive depth/size, and unguaranteeable constraints fail during request preparation with 400.
+### JSON 输出
+
+支持 `response_format.type=text/json_object/json_schema`。后两种使用 Rust llguidance 做逐 token 约束；JSON Schema 支持嵌套对象、数组、类型、required、enum/const 及本地 `$ref` 等可编译约束。外部引用、超大或过深 schema，以及编译器无法保证的约束在请求准备阶段返回 400。
 
 ```json
 {
   "model": "qwen3.8-27b",
-  "messages": [{"role": "user", "content": "Return the result of 2+3 as JSON"}],
+  "messages": [{"role": "user", "content": "用 JSON 返回 2+3 的结果"}],
   "response_format": {"type": "json_schema", "json_schema": {
     "name": "answer", "strict": true,
     "schema": {"type": "object", "properties": {"answer": {"type": "integer"}},
@@ -87,17 +111,17 @@ Invalid requests return HTTP 400 with `error.message/type/param/code` and `x-req
 }
 ```
 
-Thinking can be combined with JSON output; the answer remains constrained. MTP target and drafts share the parser constraints, and rejected drafts do not advance parser state. If the budget ends first, `finish_reason=length` may accompany incomplete JSON. Always inspect the finish reason. Constrained output does not allow `stop` because it could truncate JSON or tool arguments.
+thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draft 使用相同约束，拒绝的草稿不会改变解析器状态。达到输出预算会返回 `finish_reason=length`，正文可能尚未完成 JSON；调用方需检查 finish reason。约束输出不接受 `stop`，避免截断 JSON 或工具参数。
 
-### Images and multi-image input
+### 图片与多图
 
-The 27B model and Flash Next packages with vision encoders support images. User messages may interleave text with ordered images. Sources: PNG, JPEG, WebP, HTTP(S), or base64 data URIs. Images in history are re-encoded.
+27B 和附加视觉编码器的 Flash Next 均支持图片。用户消息可交错文本和多张图片，支持 PNG/JPEG/WebP、HTTP(S) URL 和 base64 data URI；历史消息中的图片也会重新编码。
 
 ```json
 {
   "model": "qwen3.8-27b",
   "messages": [{"role": "user", "content": [
-    {"type": "text", "text": "Compare these two images"},
+    {"type": "text", "text": "比较两张图片"},
     {"type": "image_url", "image_url": {"url": "https://example.com/first.png"}},
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
   ]}],
@@ -105,137 +129,139 @@ The 27B model and Flash Next packages with vision encoders support images. User 
 }
 ```
 
-`detail=low` uses roughly a 256×256 pixel budget; `auto/high` use the smaller of the checkpoint budget and package vision capacity. Preprocessing preserves aspect ratio and aligns dimensions to 32 pixels; each 32×32 region occupies one prompt token. Compressed images are capped at 24 MiB apiece; URL reads time out after 20 seconds. Patch, feature, or total-context overflow returns 400. Sending images to a text-only model also returns 400.
+`detail=low` 使用约 256×256 像素预算；`auto/high` 使用 checkpoint 预算与模型包视觉容量中的较小者。预处理保持宽高比并按 32 像素对齐，每 32×32 像素占一个提示 token。单张压缩图片上限 24 MiB，URL 读取超时 20 秒；patch、特征及总上下文超出模型包容量时返回 400。纯文本模型收到图片也返回 400。
 
-Each image runs separate bidirectional vision attention; merger output is injected at its image tokens. Text uses interleaved MRoPE. Vision encoding executes each time, even when the corresponding processed text prefix is cached. Video and audio are unsupported. See [Vision tools](../tools/vision/README.md).
+每张图片独立执行双向视觉 attention，merger 输出注入对应 image tokens；文本使用交错 MRoPE。视觉 encoder 每次仍执行，相同图片的预处理结果可命中文本主干 prefix cache。当前不支持视频或音频。构建与验证见[图文工具](../tools/vision/README.md)。
 
-### Tool calling
+### 工具调用
 
-Supports `tools`, `tool_choice`, and `parallel_tool_calls`. Native XML tool calls are converted to standard `tool_calls` with JSON-string arguments. Clients execute tools and send `role=tool` messages containing matching `tool_call_id` values and the conversation history.
+支持 `tools`、`tool_choice`、`parallel_tool_calls`。模型的 XML 工具调用转换为标准 `tool_calls`，arguments 为 JSON 字符串。客户端执行工具，再把带 `tool_call_id` 的 `role=tool` 消息连同历史发送回来。
 
-Streaming first emits index/id/type/name, then incremental `function.arguments`; clients concatenate arguments by index. `strict=true`, `tool_choice=required`, a named tool choice, or `parallel_tool_calls=false` enables constrained decoding for names, schemas, and call counts. Required forces at least one call, named choice allows only that tool, and disabled parallel calls permit at most one. Internally, constrained calls use a JSON envelope; public API and history remain standard `tool_calls`.
+流式调用先发 index/id/type/name，再增量发送 `function.arguments`；客户端按 index 拼接参数。`strict=true`、`tool_choice=required`、指定函数，或 `parallel_tool_calls=false` 时启用约束解码，限制函数名、参数 schema 和调用数；`required` 至少调用一次，指定函数仅能调用该函数，关闭 parallel 最多一次。内部约束调用使用 JSON envelope，API 和历史仍为标准 `tool_calls`。
 
-Unconstrained `auto` calls retain the native XML protocol. Unknown functions or missing/wrongly typed arguments are returned to the client as calls; the client validates them and can send an error via `role=tool` so the model may retry. The server never runs tools. XML argument values are converted using declared types; unconvertible values remain strings. Output too malformed to identify a function is an error. On output-budget exhaustion, `finish_reason=length` preserves the partial call prefix in streaming and non-streaming modes: **do not execute truncated calls**. When historical arguments are not valid JSON objects, the native template preserves the original string as `__orinfer_raw_arguments` instead of guessing corrections.
+未开启约束的普通 auto 调用沿用原生 XML 协议。未知函数、缺失参数或错误参数类型仍作为调用交给客户端，客户端应校验并返回 `role=tool` 错误结果，让模型重试；服务端不执行工具。XML 参数按声明类型转换，无法转换的值保留为字符串。语法损坏到无法辨认函数的输出仍报错。输出预算用尽时返回 `finish_reason=length` 并保留已生成的调用前缀，流式与非流式参数一致；不要直接执行截断调用。回传历史的参数不是有效 JSON 对象时，原始字符串在原生模板中以 `__orinfer_raw_arguments` 参数保留，不猜测或补齐内容。
 
-### OpenCode and Pi
+### OpenCode 与 Pi
 
-The [OpenCode example](../examples/opencode.json) uses `@ai-sdk/openai-compatible`, a default coding agent, automatic compaction, image/tool/thinking support, and `reasoning_content` history passthrough without an agent-step limit. Copy to project `opencode.json` and use the model ID configured with `--model`:
+[OpenCode 配置](../examples/opencode.json)使用 `@ai-sdk/openai-compatible` 和默认编码 agent，启用自动压缩，声明图片、工具、thinking 及 `reasoning_content` 历史回传；不限制 agent 步数。将其复制为项目中的 `opencode.json`，按服务的 `--model` 选择对应模型：
 
 ```bash
-opencode run --model orinfer/qwen-flash-next 'Inspect and fix failing tests in this project'
-opencode run --model orinfer/qwen-flash-next --variant low 'Inspect and fix failing tests in this project'
+opencode run --model orinfer/qwen-flash-next '检查并修复当前项目的测试失败'
+opencode run --model orinfer/qwen-flash-next --variant low '检查并修复当前项目的测试失败'
 ```
 
-Thinking defaults off; low/medium/high impose 512/1024/2048 reasoning-token caps within an 8,192-token total output cap. Tool permissions retain OpenCode defaults.
+默认关闭 thinking；low/medium/high 分别使用 512/1024/2048 思考 token 上限，总输出上限为 8192。工具权限沿用 OpenCode 默认设置。
 
-The [Pi example](../examples/pi-models.json) targets `earendil-works/pi`. Merge the provider into Pi's `models.json` (default `~/.pi/agent`). It uses `openai-completions` and allows model/thinking selection with `/model` and `/thinking`:
+[Pi 配置](../examples/pi-models.json)对应 `earendil-works/pi`。将 provider 合并到 Pi agent 目录中的 `models.json`，默认目录为 `~/.pi/agent`；配置使用 `openai-completions`，可通过 `/model` 和 `/thinking` 切换模型与思考级别：
 
 ```bash
 pi --provider orinfer --model qwen-flash-next --thinking low
 ```
 
-`orinfer-local` in the example is a placeholder API key for an unauthenticated local server; replace it with the real secret or environment reference if authentication is enabled. Pi sends its thinking budget via `thinking_token_budget`; adjust `thinkingBudgets` in Pi settings. Examples do not claim a fixed cache lifetime or enable long retention. User attachments and client read tools supply images. Model IDs, context windows, and output limits must match the actual served package.
+配置中的 `orinfer-local` 是无鉴权本地服务的占位 key，使模型在 Pi 中可选；启用服务鉴权后用实际凭据或环境引用替换。Pi 的 thinking budgets 通过 `thinking_token_budget` 发送；可在 Pi 设置中调整 `thinkingBudgets`。示例不声明固定缓存寿命，也不启用 long cache retention。图片和多图由用户附件或客户端 read 工具送入 messages。两端的模型 ID 必须与正在服务的模型一致，contextWindow/context 与输出上限应按实际模型包填写。
 
-## Execution and caching
+## 执行与缓存
 
 ### CUDA Graph
 
-`serve`, `run-model`, and `score-model` support `--cuda-graph decode_only|full|off`:
+`serve`、`run-model` 和 `score-model` 支持 `--cuda-graph decode_only|full|off`。
 
-- `decode_only` (default): Graphs for ordinary decode, MTP drafting/verification/restoration, and short refreshes; text prefill, vision encoding, and initial MTP warmup launch directly.
-- `full`: capture and use Graphs for all execution plans.
-- `off`: submit equivalent kernels, copies, and memset operations directly.
+- `decode_only`：默认模式。普通 decode、MTP 草稿、验证、恢复和短步刷新使用 Graph；文本 prefill、视觉编码和 MTP 首次预热直接提交。
+- `full`：捕获并使用全部执行计划。
+- `off`：按相同计划直接提交 kernel、copy 和 memset。
 
-Prefill tails do not use Graphs in `decode_only`, even if they reuse a decode plan. Address/workspace changes invalidate or recapture affected Graphs.
+prefill 尾部即使复用 decode 计划，在 `decode_only` 模式下也不使用 Graph。地址及 workspace 变化会使相关 Graph 失效或重新捕获。
 
-Per-request Graphs are captured on first program use, not eagerly at model load. Batch Graphs are captured after member configurations recur; common power-of-two batch sizes are cached with count/node limits. Transient batches and plans exceeding node budgets run directly. Under admission memory pressure, idle Graphs are evicted before idle request state. First capture time belongs to request warmup.
+单请求 Graph 在程序首次执行时按需捕获，加载时不预先捕获未使用的程序。batch Graph 在成员组合重复出现后捕获，缓存常见的 2 的幂次批次，同时限制条数和总操作节点数；过渡批次及超出节点预算的计划直接提交；内存准入紧张时先淘汰空闲 Graph，再回收空闲请求状态。首次执行的捕获耗时计入请求预热。
 
-After a short request, each KV buffer may retain up to one CUDA allocation-granularity page, cleared for reuse in that slot. Larger mappings are released; idle pages are also freed under pressure. Admission charges only newly needed KV pages; an idle slot's pages do not offset future memory needs of other active requests. New requests prefer idle slots requiring the least new allocation, and admission is recalculated after reclamation. With no active requests, transient memory shortages retry in the queue for up to two seconds; continued shortages return 503 `service_unavailable` without blocking other admissible work.
+短请求结束后，每个 KV 缓冲区最多保留一个 CUDA 分配粒度的页，清零后供同一槽位复用；较大映射释放，内存紧张时空闲页也释放。准入只计入需要新增的 KV 页，空闲槽位的页不会抵扣其他活跃请求的未来预算。
 
-Flash Next supports 2,048/4,096-token base-model prefill blocks and 512-token MTP warmup blocks; `full` can Graph both. Indexing and temporary scoring advance with active context; maximum cache context remains 256K and Graph virtual addresses remain stable.
+新请求优先选择新增分配最少的空闲槽位。回收后重新计算准入预算；没有活跃请求时，临时内存不足会排队重试最多两秒，持续不足返回 503 `service_unavailable`，服务继续处理能够准入的请求。
 
-### Multi-token prediction (MTP)
+Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512 token 分块；使用 `full` 可同时对这两条 prefill 路径启用 Graph。索引计算和临时评分缓冲区按当前有效上下文推进，缓存容量仍为 256K，Graph 使用的虚拟地址保持稳定。
 
-Packages with native `mtp` plans enable MTP automatically for supported text, image, thinking, tools, and sampling requests. Unpenalized greedy decoding uses GPU top-1. Random sampling uses the same target/draft sampling transformations, accepts with `min(1,p/q)`, and samples from the normalized positive residual `(p-q)+` on rejection to preserve the target-model distribution.
+### MTP
 
-Optional `--prompt-lookup` (off by default) drafts continuations from the request's own token history. It may help code editing with large preserved inputs or repeated templates but can slow ordinary generation. It is considered only for unpenalized greedy output without requested logprobs; every candidate is verified by the target. Bounded lookup windows, draft limits, and other requests' time budgets control verification width. Prolonged low acceptance temporarily returns to model drafts. Random sampling uses native MTP.
+包含原生 `mtp` 计划的模型自动启用 MTP，适用于文本、图片、多图、thinking、工具调用和支持的采样参数。无惩罚 greedy 使用 GPU top-1；随机采样对 target/draft 应用相同的采样处理，接受概率为 `min(1,p/q)`，拒绝后从归一化的 `(p-q)+` 分布采样，以保持主模型分布。
 
-`--mtp-drafts 0` excludes draft/verification plans and their exclusive weights at load time while retaining base-model, vision, and batch state machinery. Re-enabling MTP loads the unchanged model's draft weights normally.
+`--prompt-lookup` 可选开启本请求 token 历史的续写草稿，默认关闭。它适合保留大量输入原文的代码修改或重复模板；普通生成可能因候选拒绝或验证批次选择而变慢。仅在无惩罚 greedy 且未请求 logprobs 时尝试，所有候选仍由主模型验证。查找窗口有界，较长的匹配可在 `--mtp-drafts` 上限和其他请求的时限内扩大验证批次，连续低接受率后暂时退回模型草稿；随机采样继续使用原生 MTP。
 
-On rejection, per-request GDN, convolution, positions, and live KV state are restored. A fixed seed controls the sampling random stream, but adaptive verification length follows measured costs, so output is **not guaranteed to match token-by-token** across MTP versus ordinary decode. Both preserve the target distribution. When fewer output tokens remain than a verification block, ordinary decode handles the tail.
+`--mtp-drafts 0` 移除草稿和验证执行计划，加载时跳过它们独占的权重；主模型、视觉及 batch 所需的目标状态捕获仍保留。模型文件不变，重新启用 MTP 时正常加载草稿权重。
 
-Batch-capable Flash packages let 2–8 decoders share draft projection, target verification, accepted-state commit, and grouped warmup of shifted tokens over real causal segments. Each request drafts again only at its own endpoint; convolution, GDN, QSA, positions, sampling, and constraint parsers remain private. Other concurrency, mixed prefill, and output tails use ordinary target batching. Packages without batch MTP continue per-request selection.
+拒绝时恢复私有 GDN、卷积、位置和有效 KV 状态。固定 seed 控制采样随机流；自适应验证长度受实测耗时影响，不保证随机输出逐 token 复现。随机 MTP 与普通 decode 保持相同目标分布，不要求同 seed 下逐 token 相同。输出尾部不足一个验证块时执行普通 decode。
 
-Draft width is selected within the CLI limit using measured whole-iteration cost and committed tokens, including draft, verify, commit, and warmup. Multi-request scheduling first measures ordinary target-batch cost. Low-benefit conclusions carry across context ranges and are periodically re-probed; warmup/capture/module-load costs are excluded from stable estimates. Exploration is bounded by other requests' decode budgets. Benefits depend on acceptance and concurrency; short requests may finish before tuning stabilizes. See [Model tools](../tools/model/README.md).
+单请求使用 MTP；包含批量草稿/验证能力的 Flash 包支持 2–8 个 decoder 共享草稿投影、主模型验证与接受状态提交，接受后的移位 token 按真实因果段成组预热，各请求只在自己的端点产生下一轮草稿。卷积、GDN、QSA、位置、采样与约束解析器保持私有。其他并发、混合 prefill 或输出尾部使用普通 target batch；缺少批量 MTP 能力的包保留逐请求选择。
+
+草稿长度在 CLI 上限内按整轮耗时和实际提交量选择，包含草稿、验证、提交和预热。多请求先测普通 target batch 的成本，再判断 MTP 是否更快；跨上下文档位保留低收益结论，通过同一个有界探测周期复测，避免反复重新探索。各档先采集预热与稳定样本，CUDA 模块加载、Graph 捕获不进入稳定估计；低收益时退回普通 batch，按已提交 token 数定期复测。探索仍受其他请求的 decode 时间预算约束。收益取决于接受率与并发规模，短请求可能尚未完成调优。构建方法见[模型工具](../tools/model/README.md)。
 
 ### Prefix cache
 
-`--prefix-cache-mib` defaults to 12,288 MiB; zero disables reuse. The cache grows on demand rather than allocating its budget at startup. Checkpoints preserve complete KV, FP32 GDN, convolution, positions, and MTP state. A Rust radix tree matches exact token/image identity and selects reusable endpoints by measured prefill and restore costs.
+`--prefix-cache-mib` 默认 12288，单位 MiB，0 关闭复用；按需分配，不在加载时预占。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。
 
-KV intervals are immutable and shared by reference; recurrent state is stored separately. Fully aligned KV intervals share physical memory via CUDA VMM while preserving each request's virtual Graph addresses. Boundary fragments and GDN/convolution/PLE/incomplete compression state are copied per request. Shared intervals are read-only and copy-on-write; shared mappings are removed before arena reuse. Creating a checkpoint still saves prefix data. Short prefixes can be skipped if they interfere with large-block execution.
+KV 区间不可变并按引用共享，持续状态单独保存。完整对齐的 KV 区间通过 CUDA VMM 共享物理内存，恢复后保留各请求的 Graph 虚拟地址；边界片段和 GDN、卷积、PLE、未完成压缩块等状态仍逐请求复制。共享区间只读，写入前复制为请求私有内存，复用 arena 前解除共享映射。创建新检查点仍需保存一份前缀数据。短前缀妨碍大块执行时可能跳过。保存最终提示、周期及按成本准入的分叉检查点；生成结束也可保存已计算的输出前缀。保存输出前缀时保留它所属的最长可复用提示；预算不足则跳过这次输出快照。正常内存回收仍可驱逐提示。模型重载后缓存清空。
 
-Final prompts, periodic and cost-qualified branch checkpoints, and completed-generation prefixes may be saved. A generated-output prefix retains its longest reusable prompt; if budget is inadequate, its snapshot is skipped. Normal eviction may still remove prompts. Reloading a model clears the cache.
+命中免除对应文本主干计算，视觉编码、剩余提示和生成继续执行。`usage.prompt_tokens_details.cached_tokens` 报告实际恢复长度，SSE 需请求 usage。VMM 映射无需把完整对齐区间复制到每个请求，但仍需恢复边界和持续状态；不保证接近满上下文时命中完整提示，内存不足会驱逐或跳过保存。
 
-Hits skip corresponding text-backbone compute; vision encoding, uncached prompt tails, and generation still run. `usage.prompt_tokens_details.cached_tokens` reports actual restored tokens (request SSE usage to see it). VMM avoids copying aligned portions but still requires boundary/recurrent restoration. Full-prompt hits near maximum context are not guaranteed; memory pressure can evict or skip snapshots.
+接受 1–64 字符的 `prompt_cache_key` 和 `prompt_cache_retention=in-memory|24h` 作为路由、保留偏好。当前单 worker 不需要路由，缓存仍按精确 token 和图片身份匹配，key 不划分缓存或改变模型输出。缓存是可驱逐的内存缓存，`24h` 不预留容量、不写 SSD，也不保证 24 小时命中；`/health.chat_capabilities.prompt_cache` 声明这些限制。未传这些字段也自动复用前缀。
 
-`prompt_cache_key` (1–64 characters) and `prompt_cache_retention=in-memory|24h` are accepted as routing/retention preferences. With one worker, the key neither partitions the exact-identity cache nor changes output. This is an evictable **memory cache**, not guaranteed 24-hour retention or SSD persistence; inspect `/health.chat_capabilities.prompt_cache`. Automatic reuse also works without these request fields.
+## 并发、上下文与资源
 
-## Concurrency, context, and resources
+支持批处理的算子包启用连续 batching；未包含相应算子时串行执行，`/health.continuous_batching` 报告实际模式。每个请求拥有独立 KV、GDN、卷积、位置、视觉和采样状态，权重及执行 workspace 共享。
 
-Continuous batching is active when the package supplies the required operators; otherwise requests execute serially. Check `/health.continuous_batching`. Requests own isolated KV, GDN, convolution, position, vision, and sampling state, while weights and execution workspaces are shared.
+单请求冷 prefill 使用大块计划；兼容的多个短请求可联合执行。与 decode 混合时，按预测耗时选择小块 prefill。常见 batch 可使用固定形状 kernel，其余 2–128 行可由支持动态行数的 AOT 包执行，线上不编译。请求按迭代加入和结束；不为凑 batch 额外等待。
 
-Cold single-request prefill uses large blocks. Compatible short requests may combine prefill. With active decoders, smaller chunks are selected by predicted cost. Packages may specialize common batch sizes; dynamic AOT rows support other real sizes from 2–128 without online compilation or padding fake requests. Requests enter/leave at iteration boundaries, without waiting solely to fill a batch.
+Flash Next 的 batch 包共享投影、MoE 路由、专家和输出头计算，GDN、卷积、PLE、QSA/KV/index/pending 与 MTP 状态按请求隔离。提供 2/4/8/16/32/64/128 档；支持动态行数的包让其他数量复用邻近容量的 AOT 算子，按真实行数执行。包含混合执行能力的包会把 decode 行和真实 prefill 片段拼接，共享 HC、投影与专家计算；单 token decoder 子组继续使用批量 GDN/QSA，较长因果段各自推进。独立长 prefill 保留大块路径。
 
-Flash Next batching shares projections, MoE routing/experts, and output head; GDN, convolution, PLE, QSA/KV/index/pending, and MTP remain request-private. Common capacities are 2/4/8/16/32/64/128, with dynamic shapes for other sizes. Mixed-capable packages combine real decode rows with prefill fragments for shared HC/projection/expert computation, using batched GDN/QSA for one-token decoder subgroups and private causal advancement for longer segments. Independent long prefills retain the large-block path.
+有 decoder 时，选择能容纳完整混合迭代的最大已编译 prefill 块；预测包含输入准备、MTP 预热、缓存检查点和首 token 收尾。耗时估计按上下文建立单调上界，并采用滚动 P95 正向误差和 EWMA 误差余量。冷启动、长上下文和检查点仍可能超出软预算；最小有效块保证 prefill 进展，尾部只处理真实 token。视觉编码器独立执行。`prefill_chunk_histogram`、`max_bounded_prefill_s`、`decode_budget_overruns` 可用于核对实际行为。构建入口见[Flash 模型工具](../tools/model/flash_next/README.md)。
 
-With decoders present, the scheduler chooses the largest compiled prefill block fitting the predicted *whole mixed iteration*, including input preparation, MTP warmup, cache snapshots, and first-token finishing. Bounds incorporate context-dependent monotonic estimates, rolling P95 positive errors, and EWMA margins. Cold start, long context, and checkpoints can still exceed the soft budget. A minimum effective chunk guarantees progress, using only real tail tokens. Vision encoding runs independently. Check `prefill_chunk_histogram`, `max_bounded_prefill_s`, and `decode_budget_overruns`.
+包含私有地址表的 Flash 包在每层用一套 GDN/QSA kernel 并行处理全部请求，包含临时缓冲区的隔离和批量卷积历史提交。请求地址在 Graph 重放前更新，补零行的地址为空；单请求仍走 M1 程序。
 
-Flash packages with private address tables run one set of GDN/QSA kernels per layer for all requests, isolating temporary buffers and committing convolution history in batches. Graph replay refreshes request addresses; padded rows have null bindings. A lone request uses M1 programs.
+请求的 KV 和 MTP hidden ring 按总 token 预算分配，长请求仍可使用完整容量。槽位复用时收缩过大的私有分配；显存准入受阻时保留一个空闲槽位并回收其余空闲槽位的普通缓冲区，下次准入前重新分配。实际活跃数取决于请求预算和可用显存，超过准入容量的请求排队。
 
-KV and MTP hidden rings allocate according to total token budgets. Oversized private allocations are shrunk on slot reuse; under memory pressure one idle slot may be retained while other idle buffers are reclaimed. Actual active request counts depend on memory and per-request budgets; requests exceeding admission capacity queue.
+默认最多 32 个活跃请求、128 个待处理请求，队列满时返回 429。活跃数还受每请求上下文/输出预算、workspace 和可用内存约束。准入检查 CUDA 可用内存和 Linux `MemAvailable`，保留系统余量；不足时先收缩 prefix cache，再排队。等待队列按初始化、图片编码、有效缓存恢复和剩余 prefill 成本排序，等待时间平滑提升优先级，30 秒后优先处理最老请求。图片身份在队列描述中只计算一次，缓存匹配随 checkpoint 更新。大于每轮 token 预算的冷 prefill 通常最多提前准入两个，短请求可成批准入；可有效复用的共同 prefix 由一个请求先计算，其余暂留 CPU 队列。等待 30 秒仍因内存不足无法准入的请求会阻止新增工作，直到已有请求结束、腾出空间；取消或超时会解除此保护。统计见 `/health`。
 
-Defaults: **32 active requests**, **128 queued requests**; full queues return 429. Admission checks CUDA free memory and Linux `MemAvailable` with system reserve, shrinks prefix cache first, then queues. Queue order considers initialization, image encoding, reusable cache endpoints, and remaining prefill cost, with waiting-time priority smoothing. After 30 seconds, oldest jobs receive preference. Image identity is computed once and cache matching tracks checkpoint updates. Large cold prefills ordinarily admit at most two early, while short requests can admit together. Shared-prefix requests may wait for the first to compute the common prefix. A request blocked by insufficient memory after 30 seconds temporarily prevents new admissions until space frees or it is canceled/times out.
+prefill 按实际耗时扣减执行额度，较慢的大块不会仅因轮次少而获得更多服务。有 decoder 时根据距上次提交 token 的时间决定下一轮工作；至少定期推进一个 prefill token，目标不可满足时计入 `prefill_progress_overrides`。`--target-tpot-ms` 是软目标，不限制客户端输出预算，不保证视觉编码、缓存保存或冷启动期间的最大流式间隔。`max_decode_gap_s` 和 `decode_budget_overruns` 记录引擎提交 token 的间隔，HTTP chunk 间隔需另行测量。
 
-Measured elapsed prefill cost is charged against scheduling quotas. With active decoders, time since last committed token influences the next work choice; at least one prefill token advances periodically, incrementing `prefill_progress_overrides` if the soft target cannot be met. `--target-tpot-ms` is a soft engine-token-commit target, **not** a hard HTTP streaming latency guarantee. `max_decode_gap_s` and `decode_budget_overruns` measure engine gaps; HTTP chunk gaps must be measured separately.
+实际活跃数还结合已测量的相邻 batch 耗时与吞吐决定，未知档位允许探索。Graph 首次遇到新成员组合时直接执行，重复出现且仍有输出预算时捕获；已有图可用于最后几步。共享计算段还可按算子、行数、视图和实际地址复用 Graph，私有状态段按请求执行，换成员前更新地址表。整批与共享段共用 12288 个操作节点的缓存预算；CPU 执行计划有独立的有界缓存，并只保留各算子实际使用的缓冲视图。`batch_execution.shared_graph_hits` 与 `shared_graph_captures` 报告共享段复用。`decode_only` 仍只在 decode/MTP 阶段使用 Graph，混合 prefill 的图需要 `full`。
 
-Active batch size also adapts to measured neighboring batch costs and throughput, probing unknown sizes. Graphs for new member combinations execute directly first, capture on recurrence, and may be replayed for final steps. Shared segments can reuse Graphs by operator, rows, views, and addresses; private state remains per request, with address tables updated between member changes. Whole-batch and shared Graphs have a joint budget of 12,288 operation nodes. A separate bounded CPU plan cache retains only actual operator buffer views. `batch_execution.shared_graph_hits` and `shared_graph_captures` report reuse. `decode_only` still applies only to decode/MTP; Graphs for mixed prefill require `full`.
+模型包决定实际上下文容量，上限可配置为 262144 tokens。长提示分块计算，首次 dense attention 的复杂度不变。INT8 group-64 KV 包含 FP16 scale，CUDA VMM 按已执行位置映射物理页，同时保持 Graph 地址稳定；prefill 的单层 FP16 临时 KV workspace 可共享并按需增长。持续 GDN 状态保持 FP32。上下文扩展、KV 优化和验证见[模型构建](../tools/model/README.md)。
 
-Context capacity is set by the package, up to 262,144 tokens. Long prompts prefill in chunks; dense first-pass attention complexity is unchanged. Group-64 INT8 KV retains FP16 scales; CUDA VMM maps physical pages to executed positions while keeping Graph addresses stable. Single-layer FP16 temporary prefill KV workspace is shared and grows on demand. Recurrent GDN state stays FP32.
-
-### Server options
-
-| Option | Default | Behavior |
+| 参数 | 默认值 | 行为 |
 | --- | --- | --- |
-| `--listen` | `0.0.0.0:8088` | HTTP listen address |
-| `--model` | `qwen3.8-27b` | API model ID |
-| `--default-request-params` | `{}` | JSON defaults; explicit request wins |
-| `--scheduler-policy` | `latency` | Online latency priority; `throughput` optimizes whole-job completion |
-| `--cuda-graph` | `decode_only` | Graph policy |
-| `--resident-experts` | `full` | Per-layer-equivalent backbone expert residency; global limited cache; MTP fully resident |
-| `--verify-weights` | off | Full loaded-weight/CPU-table content checks at startup |
-| `--prefix-cache-mib` | `12288` | GPU prefix-cache budget in MiB; 0 disables |
-| `--max-active-requests` | `32` | 1–128 active requests |
-| `--max-batch-tokens` | `128` | 1–128 decode/verification rows; mixed prefill may use package capacity |
-| `--prefill-budget-ms` | `200` | Soft predicted-cost bound on latency-policy mixed chunks |
-| `--target-tpot-ms` | `400` | Soft time-between-engine-token-commits target in latency mode |
-| `--memory-reserve-mib` | `1024` | Admission reserve beyond system headroom |
-| `--preprocess-workers` | `2` | Parallel image/template/tokenizer CPU tasks |
-| `--preprocess-memory-mib` | `2048` | Preprocessing and queued-image memory budget |
-| `--queue-timeout-ms` | `0` | Queue wait deadline; 0 means unlimited, not a compute deadline |
-| `--output-timeout-ms` | `60000` | Terminate when output channel cannot advance (excludes prefill) |
-| `--drain-timeout-ms` | `30000` | HTTP drain period after SIGINT/SIGTERM |
-| `--gpu-lock` | `artifacts/gpu-experiment.lock` | Shared GPU worker lock |
+| `--listen` | `0.0.0.0:8088` | HTTP 监听地址 |
+| `--model` | `qwen3.8-27b` | API 模型 ID |
+| `--default-request-params` | `{}` | JSON 请求默认值，显式请求优先 |
+| `--scheduler-policy` | `latency` | 在线延迟优先；`throughput` 以整批吞吐为目标 |
+| `--cuda-graph` | `decode_only` | Graph 模式 |
+| `--resident-experts` | `full` | 主干专家每层等效常驻容量；有限模式全局缓存，MTP 全量常驻 |
+| `--verify-weights` | 关闭 | 启动时完整校验已加载权重和 CPU 表内容 |
+| `--prefix-cache-mib` | `12288` | GPU 缓存字节预算，0 关闭 |
+| `--max-active-requests` | `32` | 活跃请求上限，1–128 |
+| `--max-batch-tokens` | `128` | decode/验证行预算，1–128；混合 prefill 可使用执行包的行容量 |
+| `--prefill-budget-ms` | `200` | `latency` 混合块的预测耗时上限，非严格延迟上限 |
+| `--target-tpot-ms` | `400` | `latency` 引擎提交 token 的软间隔目标 |
+| `--memory-reserve-mib` | `1024` | 系统余量以外的准入保留内存 |
+| `--preprocess-workers` | `2` | 同时执行图片/模板/tokenizer CPU 任务数 |
+| `--preprocess-memory-mib` | `2048` | 预处理和排队图片张量预算 |
+| `--queue-timeout-ms` | `0` | 排队期限，0 不限制等待；不限制已开始计算 |
+| `--output-timeout-ms` | `60000` | 输出通道无进展时终止，prefill 不计入 |
+| `--drain-timeout-ms` | `30000` | SIGINT/SIGTERM 后 HTTP 排空期限 |
+| `--gpu-lock` | `artifacts/gpu-experiment.lock` | GPU worker 使用的共享锁 |
 
-The default `latency` policy chooses combined or independent prefill by measured whole-iteration cost. Multiple cold requests do not automatically force long inputs into small blocks; unknown combined shapes do not supersede valid native large blocks. Mixed batches and independent prefill share a decode time budget; prompt work is followed by bounded decode bursts (including MTP) while long-waiting prefills still progress. `throughput` removes time quotas and cold-prefill count restrictions and can probe unknown combined shapes, retaining memory admission and isolation; see [Offline batch jobs](batch.md). Compare `/health` counters `independent_prefill_choices`, `joint_prefill_choices`, and `decode_burst_iterations`. Logs report queue time, engine-side TTFT since model-queue admission, generation time, and reasoning tokens. Engine token commit can precede complete client-visible text.
+默认 `latency` 策略按完整迭代成本选择联合或独立 prefill。多个冷请求不会自动把长请求降为小块；尚未测量的联合路径不会覆盖可用的原生大块。混合 batch 与独立 prefill 共用 decode 时间预算，执行 prompt 工作后会留出受 `--prefill-budget-ms` 和 `--target-tpot-ms` 限制的连续 decode 时间，期间允许 MTP；等待过久的 prefill 保留推进机会。`throughput` 策略放开时间配额和冷 prefill 数限制，允许探测未知联合形状，仍保留内存准入与请求隔离，适合[离线任务](batch.md)。`/health` 的 `independent_prefill_choices`、`joint_prefill_choices` 和 `decode_burst_iterations` 可核对实际选择。请求日志分别记录排队、从进入模型队列起的首 token 时延、生成总时长和 thinking token 数；首 token 指引擎提交，可能早于客户端可见的完整文本。
 
-`/health` reports starting/ready/draining/failed plus scheduling, admission, cache restore, and Graph counters. GPU worker failures yield 503; CUDA or internal state faults require restart. See [Benchmark tools](../tools/bench/README.md) for measurements.
+`/health` 显示 starting/ready/draining/failed，并提供调度、准入、缓存恢复和 Graph 统计。GPU worker 故障时返回 503；CUDA 或内部状态故障后需要重启服务。统计和真实 API 性能测量见[性能工具](../tools/bench/README.md)。
 
-Startup always checks configuration, execution-library and kernel identity, and the structure/dtype/shape/layout/offsets of weights and CPU-table safetensors, but normally skips SHA256 scans of large weights. Add `--verify-weights` to `serve`, `run-model`, or `score-model` for full content verification. `validate-model` always checks all weight contents. Default structural verification cannot detect corruption that changes only tensor values.
+启动默认校验配置、执行库、kernel 身份，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，跳过大体积权重的 SHA256 扫描。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。默认模式无法发现仅修改数值、但不改变结构的损坏。
 
-## Diagnostic CLI
+HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对前端 hash 与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中，不能重复相加。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
 
-`plan-model` loads the package's native library on CPU and prints generated plans. `validate-model` verifies model, native library, kernels, and tensor hashes; neither initializes the GPU. See [Execution packages](model-packages.md) for ABI and migration guidance.
+已加载的只读权重共享一次 CUDA arena 分配，保留各张量的对齐和布局，padding 计入权重与显存统计；请求私有状态、KV 和按需加载的专家保持独立管理。读取线程复用分片文件描述符，按文件偏移调度读取，并与多块异步上传重叠；缓冲区在对应 DMA 完成后复用。启动失败时先完成 CUDA 清理，再释放 GPU 锁。
 
-`run-model MODEL_DIR REQUESTS.json` takes token-ID requests for fixed-block, ordinary-decode diagnostic benchmarking and resets per-request state. Input length must be divisible by a declared prefill plan; this is **not** a benchmark for arbitrary-length Chat, MTP, or caching. For those, use the Chat API or Rust `Model::generate`.
+## 诊断 CLI
 
-`score-model` scores frozen token histories. See [API validation](../tools/api/README.md) for fixed scenario tests and [Quality evaluation](../tools/eval/README.md) for BF16/FP8 references.
+`plan-model` 在 CPU 加载模型包原生库并输出其生成的计划，`validate-model` 校验模型、执行库、kernel 和张量 hash；两者不初始化 GPU。执行包接口与旧数据迁移见[模型执行包](model-packages.md)。
+
+`run-model MODEL_DIR REQUESTS.json` 接收 token-ID 请求，用于固定块、普通 decode 的诊断基准，逐请求重置状态。输入长度须能由声明的 prefill 计划整除；它不代表 API 的任意长度提示、MTP 和缓存路径。任意长度和多请求生成通过 Chat API 或 Rust `Model::generate` 执行。
+
+`score-model` 对冻结 token 历史评分，服务的固定场景检查见[API 验证](../tools/api/README.md)，BF16/FP8 质量对照见[质量评测](../tools/eval/README.md)。

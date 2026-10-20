@@ -339,13 +339,7 @@ impl<'a> Active<'a> {
                 return Ok(());
             }
         }
-        let reason = if exhausted || self.parser.incomplete_call {
-            "length"
-        } else if !self.parser.calls.is_empty() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
+        let reason = self.parser.finish_reason(exhausted);
         let job = &self.mailbox.job;
         let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":self.count,
             "total_tokens":job.prepared.input.len()+self.count,
@@ -721,8 +715,22 @@ pub(super) fn worker(
             break;
         }
         if !active.is_empty() {
-            let mut requests: Vec<_> = active.iter_mut().map(|a| &mut a.request).collect();
-            match model.advance_requests(&mut requests, &options) {
+            let (mut requests, mut mailboxes): (Vec<_>, Vec<_>) = active
+                .iter_mut()
+                .map(|a| (&mut a.request, &mut a.mailbox))
+                .unzip();
+            // No CUDA/model state enters this callback. Queue expiry and bounded
+            // output draining overlap the current packet, before its readback.
+            let result = model.advance_requests_with(&mut requests, &options, || {
+                completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
+                receive_waiting(&mut waiting, &mut jobs);
+                for mailbox in &mut mailboxes {
+                    mailbox.flush();
+                }
+            });
+            drop(requests);
+            drop(mailboxes);
+            match result {
                 Ok(outputs) => {
                     for output in outputs {
                         active[output.request].consume(&output.tokens, codec, model_id);

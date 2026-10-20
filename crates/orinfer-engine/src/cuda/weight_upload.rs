@@ -2,11 +2,13 @@
 use super::{Session, check, sys};
 use crate::{artifact::Result, weights::TensorSource};
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs::{File, OpenOptions},
     io::ErrorKind,
     os::unix::fs::{FileExt, OpenOptionsExt},
     ptr,
     sync::{Arc, Mutex, mpsc},
+    time::Instant,
 };
 
 const ALIGNMENT: usize = 4096;
@@ -16,6 +18,23 @@ const PAYLOAD_BYTES: usize = SLOT_BYTES - ALIGNMENT;
 pub(super) struct Upload {
     pub source: TensorSource,
     pub destination: u64,
+}
+
+#[derive(Default)]
+pub(super) struct Statistics {
+    pub read_wait_s: f64,
+    pub dma_wait_s: f64,
+    pub chunks: usize,
+}
+
+struct ReadFile {
+    buffered: File,
+    direct: Option<File>,
+    size: usize,
+}
+#[derive(Default)]
+struct Reader {
+    files: BTreeMap<std::path::PathBuf, ReadFile>,
 }
 
 struct Slot {
@@ -112,87 +131,114 @@ fn unsupported_direct(error: &std::io::Error) -> bool {
     )
 }
 
-/// Read exactly this payload, accepting an EOF tail on a sector-aligned direct read.
-fn read_chunk(
-    source: &TensorSource,
-    offset: usize,
-    bytes: usize,
-    target: &mut [u8],
-) -> Result<usize> {
-    let absolute = source
-        .offset
-        .checked_add(offset)
-        .ok_or("Weight offset overflow")?;
-    if bytes == 0
-        || offset
-            .checked_add(bytes)
-            .is_none_or(|end| end > source.bytes)
-    {
-        return Err("Weight chunk exceeds tensor".into());
-    }
-    let aligned = absolute / ALIGNMENT * ALIGNMENT;
-    let skip = absolute - aligned;
-    let extent = (skip + bytes).next_multiple_of(ALIGNMENT);
-    if extent > target.len() {
-        return Err("Weight chunk exceeds staging slot".into());
-    }
-    let direct = (target.as_ptr() as usize).is_multiple_of(ALIGNMENT);
-    let opened = if direct {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&source.path)
-    } else {
-        File::open(&source.path)
-    };
-    let (file, direct) = match opened {
-        Ok(file) => (file, direct),
-        Err(error) if direct && unsupported_direct(&error) => {
-            (File::open(&source.path).map_err(|e| e.to_string())?, false)
+impl Reader {
+    /// Reuse shard descriptors and accept EOF tails on sector-aligned direct reads.
+    fn read(
+        &mut self,
+        source: &TensorSource,
+        offset: usize,
+        bytes: usize,
+        target: &mut [u8],
+    ) -> Result<usize> {
+        let absolute = source
+            .offset
+            .checked_add(offset)
+            .ok_or("Weight offset overflow")?;
+        if bytes == 0
+            || bytes > PAYLOAD_BYTES
+            || offset
+                .checked_add(bytes)
+                .is_none_or(|end| end > source.bytes)
+        {
+            return Err("Weight chunk exceeds tensor".into());
         }
-        Err(error) => return Err(format!("{}: {error}", source.path.display())),
-    };
-    let size = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
-        .map_err(|_| "Weight shard length overflow")?;
-    if absolute.checked_add(bytes).is_none_or(|end| end > size) {
-        return Err(format!(
-            "{}: truncated weight payload",
-            source.path.display()
-        ));
-    }
-    if direct {
-        let read = loop {
-            match file.read_at(&mut target[..extent], aligned as u64) {
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                result => break result,
+        let aligned = absolute / ALIGNMENT * ALIGNMENT;
+        let skip = absolute - aligned;
+        let extent = (skip + bytes).next_multiple_of(ALIGNMENT);
+        if extent > target.len() {
+            return Err("Weight chunk exceeds staging slot".into());
+        }
+        let file = match self.files.entry(source.path.clone()) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let buffered = File::open(&source.path)
+                    .map_err(|e| format!("{}: {e}", source.path.display()))?;
+                let size = usize::try_from(buffered.metadata().map_err(|e| e.to_string())?.len())
+                    .map_err(|_| "Weight shard length overflow")?;
+                let direct = match OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&source.path)
+                {
+                    Ok(file) => Some(file),
+                    Err(error) if unsupported_direct(&error) => None,
+                    Err(error) => return Err(format!("{}: {error}", source.path.display())),
+                };
+                entry.insert(ReadFile {
+                    buffered,
+                    direct,
+                    size,
+                })
             }
         };
-        match read {
-            Ok(n) if n == extent.min(size - aligned) => return Ok(skip),
-            Ok(_) => {
-                return Err(format!(
-                    "{}: short direct weight read",
-                    source.path.display()
-                ));
-            }
-            Err(error) if unsupported_direct(&error) => {}
-            Err(error) => return Err(format!("{}: {error}", source.path.display())),
+        if absolute
+            .checked_add(bytes)
+            .is_none_or(|end| end > file.size)
+        {
+            return Err(format!(
+                "{}: truncated weight payload",
+                source.path.display()
+            ));
         }
+        if (target.as_ptr() as usize).is_multiple_of(ALIGNMENT)
+            && let Some(direct) = &file.direct
+        {
+            let read = loop {
+                match direct.read_at(&mut target[..extent], aligned as u64) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    result => break result,
+                }
+            };
+            match read {
+                Ok(n) if n == extent.min(file.size - aligned) => return Ok(skip),
+                Ok(_) => {
+                    return Err(format!(
+                        "{}: short direct weight read",
+                        source.path.display()
+                    ));
+                }
+                Err(error) if unsupported_direct(&error) => {
+                    file.direct = None;
+                }
+                Err(error) => return Err(format!("{}: {error}", source.path.display())),
+            }
+        }
+        file.buffered
+            .read_exact_at(&mut target[..bytes], absolute as u64)
+            .map_err(|e| format!("{}: {e}", source.path.display()))?;
+        Ok(0)
     }
-    let file = if direct {
-        File::open(&source.path).map_err(|e| e.to_string())?
-    } else {
-        file
-    };
-    file.read_exact_at(&mut target[..bytes], absolute as u64)
-        .map_err(|e| format!("{}: {e}", source.path.display()))?;
-    Ok(0)
 }
 
-pub(super) fn upload(session: &Session, uploads: Vec<Upload>, workers: usize) -> Result<()> {
-    if uploads.is_empty() {
-        return Ok(());
+pub(super) fn upload(
+    session: &Session,
+    mut uploads: Vec<Upload>,
+    workers: usize,
+) -> Result<Statistics> {
+    if !(1..=32).contains(&workers) {
+        return Err("Weight reader count must be 1..32".into());
     }
+    if uploads.is_empty() {
+        return Ok(Statistics::default());
+    }
+    for upload in &uploads {
+        upload
+            .destination
+            .checked_add(upload.source.bytes as u64)
+            .ok_or("Weight upload address overflow")?;
+    }
+    uploads
+        .sort_by(|a, b| (&a.source.path, a.source.offset).cmp(&(&b.source.path, b.source.offset)));
     let pool = Staging::new(session, (workers * 2).min(32))?;
     let mut pending = uploads.into_iter().flat_map(|upload| {
         let source = Arc::new(upload.source);
@@ -215,6 +261,7 @@ pub(super) fn upload(session: &Session, uploads: Vec<Upload>, workers: usize) ->
             let jobs = Arc::clone(&jobs_rx);
             let done = done_tx.clone();
             scope.spawn(move || {
+                let mut reader = Reader::default();
                 loop {
                     let Ok(job) = jobs.lock().unwrap().recv() else {
                         break;
@@ -224,7 +271,7 @@ pub(super) fn upload(session: &Session, uploads: Vec<Upload>, workers: usize) ->
                     let target = unsafe {
                         std::slice::from_raw_parts_mut(job.pointer as *mut u8, SLOT_BYTES)
                     };
-                    let result = read_chunk(&job.source, job.offset, job.bytes, target);
+                    let result = reader.read(&job.source, job.offset, job.bytes, target);
                     if done.send((job, result)).is_err() {
                         break;
                     }
@@ -253,11 +300,49 @@ pub(super) fn upload(session: &Session, uploads: Vec<Upload>, workers: usize) ->
             };
         let result = (|| {
             let mut active = 0;
+            let mut reading = 0;
+            let mut in_flight = VecDeque::new();
+            let mut statistics = Statistics::default();
             for slot in 0..pool.slots.len() {
-                active += usize::from(enqueue(slot, &mut pending)?);
+                reading += usize::from(enqueue(slot, &mut pending)?);
             }
+            active += reading;
             while active != 0 {
+                while let Some(&index) = in_flight.front() {
+                    let slot: &Slot = &pool.slots[index];
+                    // SAFETY: Only the CUDA owner queries events. A completed
+                    // event releases this slot for a new CPU read, never sooner.
+                    unsafe {
+                        let status = sys::cuEventQuery(slot.event);
+                        if status == sys::CUresult::CUDA_ERROR_NOT_READY {
+                            if reading != 0 {
+                                break;
+                            }
+                            let at = Instant::now();
+                            check(
+                                sys::cuEventSynchronize(slot.event),
+                                "weight upload completion",
+                            )?;
+                            statistics.dma_wait_s += at.elapsed().as_secs_f64();
+                        } else {
+                            check(status, "weight upload completion query")?;
+                        }
+                    }
+                    in_flight.pop_front();
+                    if enqueue(index, &mut pending)? {
+                        reading += 1;
+                    } else {
+                        active -= 1;
+                    }
+                }
+                if active == 0 {
+                    break;
+                }
+                debug_assert_ne!(reading, 0);
+                let at = Instant::now();
                 let (job, result) = done_rx.recv().map_err(|_| "Weight readers stopped")?;
+                statistics.read_wait_s += at.elapsed().as_secs_f64();
+                reading -= 1;
                 let skip = result?;
                 let slot = &pool.slots[job.slot];
                 // SAFETY: CPU read completed; GPU allocation covers this chunk.
@@ -276,16 +361,11 @@ pub(super) fn upload(session: &Session, uploads: Vec<Upload>, workers: usize) ->
                         sys::cuEventRecord(slot.event, session.stream),
                         "weight upload event",
                     )?;
-                    check(
-                        sys::cuEventSynchronize(slot.event),
-                        "weight upload completion",
-                    )?;
                 }
-                if !enqueue(job.slot, &mut pending)? {
-                    active -= 1;
-                }
+                in_flight.push_back(job.slot);
+                statistics.chunks += 1;
             }
-            Ok(())
+            Ok(statistics)
         })();
         // Unblock every reader on success and failure before scope joins them.
         drop(jobs_tx);
@@ -318,17 +398,22 @@ mod tests {
             bytes: data.len() - 173,
         };
         let mut staging = memmap2::MmapMut::map_anon(SLOT_BYTES).unwrap();
+        let mut reader = Reader::default();
         for offset in (0..source.bytes).step_by(PAYLOAD_BYTES) {
             let bytes = (source.bytes - offset).min(PAYLOAD_BYTES);
-            let skip = read_chunk(&source, offset, bytes, &mut staging).unwrap();
+            let skip = reader.read(&source, offset, bytes, &mut staging).unwrap();
             assert_eq!(
                 &staging[skip..skip + bytes],
                 &data[source.offset + offset..source.offset + offset + bytes]
             );
         }
-        assert!(read_chunk(&source, source.bytes - 1, 2, &mut staging).is_err());
+        assert!(
+            reader
+                .read(&source, source.bytes - 1, 2, &mut staging)
+                .is_err()
+        );
         fs::write(&path, &data[..100]).unwrap();
-        assert!(read_chunk(&source, 0, 100, &mut staging).is_err());
+        assert!(reader.read(&source, 0, 100, &mut staging).is_err());
         fs::remove_file(path).unwrap();
     }
 }
@@ -422,6 +507,32 @@ mod gpu_tests {
                 .unwrap();
             }
             assert_eq!(readback, data[173..]);
+            // More jobs than staging slots, intentionally reversed in file
+            // order, exercise descriptor reuse and event-gated slot recycling.
+            let pieces = (0..97)
+                .rev()
+                .map(|i| Upload {
+                    source: TensorSource {
+                        path: path.clone(),
+                        offset: 173 + i * 137,
+                        bytes: 137,
+                    },
+                    destination: destination + (i * 137) as u64,
+                })
+                .collect();
+            let stats = upload(&session, pieces, workers).unwrap();
+            assert_eq!(stats.chunks, 97);
+            let mut compact = vec![0u8; 97 * 137];
+            // SAFETY: The complete upload drained all slot events and the
+            // registered destination covers this compact readback extent.
+            unsafe {
+                check(
+                    sys::cuMemcpyDtoH_v2(compact.as_mut_ptr().cast(), destination, compact.len()),
+                    "test scattered readback",
+                )
+                .unwrap();
+            }
+            assert_eq!(compact, data[173..173 + 97 * 137]);
         }
         std::fs::remove_file(path).unwrap();
     }

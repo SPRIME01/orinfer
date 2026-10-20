@@ -1,238 +1,346 @@
-# Performance reference
+# 性能参考
 
-Measured results on **Jetson AGX Orin 64GB / CUDA SM87**, with dates given below. On October 12, 2026, the device ran in MAXN at a GPU frequency of 1300.5 MHz; tests did not alter global power or frequency settings. Measurements use the Rust release CLI and matching optimized execution packages. Changes to native libraries, kernels, or ABI require rebuilding the execution package; CPU-only scheduler changes may reuse it.
+本页记录 Jetson AGX Orin 64GB / CUDA SM87 上的实测参考，各节注明测量日期。2026-10-12 的机器为 MAXN 模式、GPU 频率 1300.5 MHz；测试未修改全局功耗或频率设置。结果对应 Rust release CLI 和匹配的优化执行包；执行库、kernel 或 ABI 变化时需重建执行包，单独更新 CPU 调度可复用原执行包。表中的 tokens/s 均按实际 token 数计算。
 
-**Read the measurement boundary before comparing numbers.** Execution-layer prefill, fixed-length decode, HTTP end-to-end TPS, TTFT, total JSONL job TPS, and GPU-only kernel times are different metrics. Token rates use actual token counts. Full-prefix-hit results are warm-cache upper bounds, not cold-request performance.
+## GPU随机采样（2026-10-20）
 
-## Index-Translate-9B (2026-10-18)
+共享TileLang采样程序在GPU执行惩罚、bias、grammar mask、top-k和top-p，保留原计数器seed。普通随机请求仅回读token及状态；greedy、logprobs和MTP p/q校正沿用原路径。两种模型正式构建器均发布相同采样组件。
 
-Source: official [IndexTeam/Index-Translate-9B](https://huggingface.co/IndexTeam/Index-Translate-9B), revision `4e06279e62352dab96bbeb6fa0579bca5e822d75`. Reuses Qwen3_5 dynamic-row, GDN/GQA, FFN, vision, MTP, and state components with 32 layers, hidden size 4096, and separate embedding/output heads.
+Index-Translate-2B使用Rust release JSONL入口，8条独立段落翻译，temperature=0.8、top_p=0.9、top_k=0、seed=20261002，关闭MTP及prefix cache。全部自然结束、共618个输出tokens，CPU/GPU采样的正文、usage及停止原因一致。完整调用包括加载、前端、排队与落盘：
 
-Backbone, embeddings, output head, and large vision matrices use signed-block128 rotation and two-stage E8P Q4A8 (`[4,1]`, beam-8). Sensitive outputs/MTP use W8, with floating-point small matrices/norms. There is no activation calibration. Quantized payload including scales/codebooks and precision exceptions: **5,440,207,936 bytes / 4.509 bits per weight**. Deployed read-only data including derived RoPE constants: 5,473,766,976 bytes. KV is INT8, recurrent GDN FP32. Context is configured to 256K but measured here only to 8K.
+| 并发 | CPU采样总输出TPS | GPU采样总输出TPS |
+| --- | ---: | ---: |
+| 1 | 41.80 | 77.25 |
+| 4 | 55.08 | 140.68 |
 
-Rust release `run-model`, MTP disabled, `decode_only`; two consecutive runs per input, taking the second, with 65 generated tokens. Prefill excludes the output head; decode times the subsequent 64 tokens. This is *not* naturally ending HTTP throughput.
+此前交替顺序的两轮，单流为39.64–40.19 → 71.85–71.95 TPS，四并发为51.81–52.19 → 122.75–123.09 TPS；绝对值受运行条件影响。
 
-| Input tokens | Prefill tokens/s | Decode tokens/s | First-token time (s) |
-| ---: | ---: | ---: | ---: |
-| 512 | 2,152.6 | 33.42 | 0.241 |
-| 2,048 | 2,219.6 | 32.62 | 0.926 |
-| 8,192 | 1,956.4 | 29.82 | 4.190 |
+Flash Next另测一条相同参数的自然翻译请求，125个输入、95个输出tokens，关闭MTP/prefix。完整生成耗时（含prefill、排除加载）由5.038降至4.592秒，即18.86 → 20.69 TPS，正文、usage和停止原因相同。GPU路径首输出0.515秒；本项仅测一对请求，不包含并发收益。加载分别耗时43.099和18.209秒，前者权重读取等待34.023秒，不能用两次完整进程耗时估算采样加速。
 
-Ready-after-load time was **4.65 s** with warm filesystem cache; a full `validate-model` weight check took **6.93 s** separately. Neither establishes disk-cold startup performance.
+最终release二进制对同一翻译输入各执行一次预热和三次完整请求，prefix保持关闭，三次生成耗时中位数为4.861 → 3.777秒，即19.54 → 25.15 TPS（约1.29倍）。各次均自然输出95 tokens，正文、usage和停止原因一致。该结果衡量随机翻译；代码生成的greedy/MTP性能按下文独立口径比较。
 
-Against same-source BF16 at seed 20261002 and identical teacher-forced histories: 8 text translation cases / 130 positions had target NLL **+0.02370 nats/token**, **96.15%** matching top-1, all choices within BF16 top-3, and no changes at 110 high-confidence positions. At 2K/8K (26 positions), NLL difference was **-0.07549**, 96.15% top-1 agreement, all in top-3. One 8K difference was equivalent phrasing ("load compressed model" versus "load a compressed model"). Across notification-image and ordered red/blue two-image cases (17 positions), NLL was **+0.08327**, 94.12% top-1 agreement, all within BF16 top-3.
+27B、Flash Next及2B各自的三组64-token固定seed采样与完整提交状态一致；MTP verification/mixed、partial-prefix恢复检查通过。独立采样算子覆盖非对齐vocab、mask/惩罚/bias和改变输入后的Graph replay，Compute Sanitizer无错误。
 
-Actual Chat API checks covered MTP off/up to three drafts, SSE, full-prefix hits, eight-way concurrency, terminology, preserved JSON, one image, and two images. Requests used greedy decoding, thinking off, 256-token output budgets, and natural stopping. MTP produced equivalent but not always identical Chinese renderings of "the model only needs loading once"; cold and three subsequent full-cache-hit single-stream responses used the same wording. Simple image translation and red/blue ordering worked; double-image responses could produce redundant labels, and complex images were not accepted for quality.
+### Flash Next完整代码生成复测
 
-Ordinary 2/3/4/5/8/32-way batches plus 24 matched-history verification/mixed cases (width 2/4/8 × requests 1/2/4/8) had zero KL and selected-token NLL differences. Cancellation/slot reuse and partial 32/512-token prefix restoration preserved target/draft KV, GDN, convolution, and positions. A 16-record translation JSONL job completed naturally with resume avoiding duplicate writes. Full validation, `make check`, and `make check-offline` passed. These are limited state and quality checks, **not a comprehensive benchmark or 256K validation**.
+最终release另复用下文完整代码生成的512-token原始Chat请求：greedy、seed=20261002、medium thinking、总输出与思考上限各16384、MTP最多3草稿、decode_only、专家全量常驻、prefix预算1024 MiB、单并发。冷、热请求均自然输出8265 tokens（其中思考3574），两次正文与思考完全一致；热请求命中512-token前缀。
 
-## Index-Translate-2B (2026-10-18)
+| 请求 | 完整HTTP耗时（s） | TTFT（s） | 完整decode TPS |
+| --- | ---: | ---: | ---: |
+| 冷请求 | 189.909 | 1.443 | 43.85 |
+| 前缀命中 | 165.741 | 0.0164 | 49.87 |
 
-Source: official [IndexTeam/Index-Translate-2B](https://huggingface.co/IndexTeam/Index-Translate-2B), revision `9bc08445315723eb9b77d1b93505915eb03c3f01`. Two-stage E8P Q4A8 covers backbone, tied embedding/output head, and large vision matrices without activation calibration; sensitive output/MTP use W8. Quantized payload: **1,228,931,712 bytes / 4.323 bits per weight**; deployed read-only data with RoPE etc.: 1,262,497,024 bytes. INT8 KV, FP32 GDN, configured 256K context, tested here to 8K.
+Decode沿用`(completion_tokens-1)/(HTTP耗时-TTFT)`，包含思考、代码和SSE收尾。本次热态高于历史44.99 TPS，未观察到该场景的性能回退；历史请求输出6276 tokens，因此不能将两次吞吐差直接归因为某一项优化。生成代码可编译，自带17项测试有16项通过，另1项错误地断言收到最后一个payload字节后仍没有完整帧；保留原始生成结果，不算作全部任务测试通过。
 
-The adapter reuses 27B dynamic-row, private state, vision, and MTP components. Offline attention tuning includes 8/16-way splits (16 selected for short rows), keeping existing large-prefill pipelines. Private single-row convolution commits history in place without a separate copy; parity correction is folded into the final E8P XOR. Conversion acceptance measured reference warm Graphs at 512/8K in **8.72/10.03 ms**, excluding host-request overhead.
+## Index-Translate-35B共享路径清理（2026-10-20）
 
-### Fixed-length CLI execution
+Index-Translate-35B-A3B-preview复用Qwen3_5路径。Attention将INT8读取与临时FP16 KV暂存的解码、attention和merge一起测量，覆盖1–4096行、非对齐尾部与两种上下文长度，离线生成选择区间；移除固定128行切换。此次测量在21–64行及129–193行选择同一暂存tile，其他区间按各自实测结果发布，区间不写入源码。
 
-Rust release `run-model` with MTP and prefix caching disabled, `decode_only`, 65 forced output tokens, two runs per input, taking the second. Measurements alternated baseline/optimized/optimized packages. Prefill excludes the head; decode measures the subsequent 64 tokens.
+GDN显式声明chunked prefill与容量4的deferred decode，原生适配器校验声明、状态形状和MTP契约的一致性。公共编译、缓存、投影调优及行数合并工具移至`tools/model/`，删除无调用的旧单行专家kernel。新包的1888个buffer契约及权重身份、8997个非attention绑定与修改前一致。
 
-| Input tokens | Baseline prefill TPS | Optimized prefill TPS | Baseline decode TPS | Optimized decode TPS |
-| ---: | ---: | ---: | ---: | ---: |
-| 512 | 7,680 | 7,630 | 106.15 | 108.41 |
-| 2,048 | 7,988 | 7,908 | 103.03 | 105.09 |
-| 8,192 | 6,564 | 6,537 | 92.77 | 94.37 |
+相同权重、Rust release、`decode_only`，每档两个完整65-token请求，取第二个请求；六次输出token ID全部相同：
 
-Relative to a baseline already incorporating attention tuning, decode improved ~1.7–2.1% while prefill moved by less than 1%. Warm-filesystem load-to-ready changed 2.72 → 2.77 s; it is not a cold-start comparison.
+| 输入tokens | Prefill TPS（前 → 后） | Decode TPS（前 → 后） |
+| --- | ---: | ---: |
+| 512 | 2362.97 → 2361.93 | 53.90 → 53.78 |
+| 2048 | 3529.98 → 3533.67 | 52.53 → 52.57 |
+| 8192 | 3502.99 → 3499.41 | 48.07 → 48.02 |
 
-### Ordinary greedy decode concurrency
+另以四条独立段落翻译验证JSONL自然完成，greedy、seed=20261002、关闭thinking/prefix cache。普通单／四并发各交替两轮，单并发MTP最多3草稿交替三轮，每种配置各取中位数：
 
-Rust request-path cohort benchmark, MTP/prefix disabled. All requests complete independent prefill first, followed by four warmup decode steps and 16 measured steps; 512 inputs were repeated twice and averaged, 2K/8K once per concurrency setting. Timings include request state, input preparation, and result commit, but exclude prefill, HTTP, and queues. No EOS logit bias is added. This differs from the `run-model` conversion-reference path above.
+| 配置 | 就绪后整批TPS（前 → 后） |
+| --- | ---: |
+| 单并发，无MTP | 44.57 → 44.70 |
+| 四并发，无MTP | 76.43 → 76.87 |
+| 单并发，MTP最多3草稿 | 43.96 → 44.15 |
 
-| Active requests | Aggregate TPS, 512 input | Per-request TPS | Gain over earlier implementation |
-| ---: | ---: | ---: | ---: |
+上述整批指标按实际输出tokens除以CLI完整耗时减worker就绪时间，包含排队、完整生成、落盘和退出收尾。每轮全部自然停止，MTP配置实际执行38轮验证；有少量措辞差异，维护时间、标识符及请求隔离等任务信息保持。新进程完整调用另包含加载：本次出现约3.36–33秒的权重读取等待，两版均出现长等待，单并发MTP整进程TPS中位数为20.03 → 12.17；不能将该加载波动归为算子收益，也不据此声称启动性能改善。
+
+固定teacher-forced历史共173位置：短文本130位置相对原始BF16的target NLL差为−0.01124 → −0.00570 nats/token，首选一致率97.69% → 98.46%；26个长上下文和17个图文位置的概率记录与修改前相同，全部场景无高置信首选变化。该质量记录为小样本路径回归。
+
+动态分块尾部、2/8路decode、混合MTP验证、图文owner顺序与取消复用通过。32/512-token分支恢复在Graph开启及关闭时逐字节校验target/draft KV、GDN/卷积、位置及120个deferred日志buffer，均一致。`make check`、`make check-offline`及最终模型完整权重校验通过。
+
+## 部署启动（2026-10-19）
+
+通过 [startup 基准](../tools/bench/README.md) 启动真实 Rust release CLI，等待 HTTP 就绪后发送首个流式翻译请求。相同模型、权重和执行包，比较前端串行准备、逐张量分配的实现，与前端并行准备、只读权重 arena、分片读取和 DMA 流水线的实现；两者均已将动态行数穷举检查移至离线验证。每项取三个新进程的中位数，保留文件缓存，计时排除共享 GPU 锁等待和进程退出。
+
+| 模型 | API 就绪：修改前 → 后（s） | 首输出：修改前 → 后（s） | 首请求完成：修改前 → 后（s） |
+| --- | ---: | ---: | ---: |
+| Index-Translate-2B | 2.041 → 0.931 | 2.127 → 1.009 | 2.233 → 1.113 |
+| Index-Translate-9B | 3.348 → 2.261 | 3.461 → 2.380 | 3.794 → 2.714 |
+
+配置为 `decode_only`、关闭 MTP 和 prefix cache，固定 seed `20261002`、greedy、关闭 thinking；请求为 34 个输入 tokens、12 个自然结束的输出 tokens，修改前后正文、usage 与停止原因一致。首输出按首个非空 SSE 正文计时，片段可能包含多个 tokens。这是新进程部署到首个完整请求的测量，文件缓存未清理；重启设备或完全冷盘加载需另测。
+
+CUDA 分配数在 2B 上由 1063 降为 209，9B 由 1272 降为 245；arena 分别增加 6912／11456 bytes 的对齐开销。512／2K／8K 输入、每项 65 个输出 tokens 的固定长度完整执行回归，两个模型的输出 token 均与修改前相同，prefill/decode TPS 差异在约 2% 以内。开启最多 3 个 MTP 草稿时，2B 单图和双图请求的正文、usage 与停止原因同样保持一致。
+
+## Qwen3.5-4B（2026-10-19）
+
+来源为官方 [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B)，固定 revision `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`。32 层、2560 hidden、9216 FFN，复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求私有状态；tied embedding/输出头共享同一份压缩 bank。
+
+主干、embedding/输出头和视觉大矩阵使用 signed-block128 旋转、两级 E8P Q4A8，系数 `[4,1]`、beam8；敏感输出/MTP 投影保留 W8，小张量保留浮点。量化 payload 共 **2,575,068,160 bytes，平均 4.421 bit**；部署只读数据另含派生常量，共 2,608,622,592 bytes。使用 INT8 KV、FP32 GDN 状态，上下文配置为 256K，实际输入测到 8K。
+
+Rust release CLI `run-model`，关闭 MTP、`decode_only`，每个输入连续测两次，每次固定生成 65 tokens，取第二次。Prefill 计时到输出头之前，decode 计时覆盖后续 64 步：
+
+| 输入 tokens | Prefill TPS | Decode TPS | 首 token 时延（s） |
+| --- | ---: | ---: | ---: |
+| 512 | 3278.9 | 54.45 | 0.158 |
+| 2048 | 3401.2 | 52.34 | 0.604 |
+| 8192 | 2797.7 | 45.68 | 2.930 |
+
+同次 release 进程加载到就绪 **3.18 s**，保留已有文件缓存；完整 `validate-model` 权重校验另测 4.54 s。此处为执行层固定长度基准，HTTP 自然完成吞吐应按具体请求另测。
+
+固定 seed `20261002`，与原始 BF16 使用相同 teacher-forced 历史：
+
+| 场景 | 位置数 | 目标 NLL 差（nats/token） | 首选一致率 | 所选 token 位于 BF16 top3 |
+| --- | ---: | ---: | ---: | ---: |
+| 文本 | 118 | −0.01596 | 86.44% | 96.61% |
+| 2K/8K 长输入 | 26 | +0.16662 | 88.46% | 100% |
+| 简单图片/双图 | 17 | −0.02180 | 94.12% | 100% |
+
+三组分别有 77/16/10 个高置信位置，首选均与 BF16 一致。目标答案为固定有效续写，NLL 差允许为负；这些小样本用于量化诊断，任务正确性另看自由生成。开放问答中，原始 BF16 和量化模型均会对无领域提示的 prefix caching 问题给出内存地址位解释，因此这类知识性回答应与量化误差分开评估。
+
+普通 2/3/4/5/8/32 路请求，以及验证宽度 2/4/8 × 请求数 1/2/4/8 × verification/mixed 的 24 组同历史检查通过，KL 与所选 token NLL 差均为 0。32/512-token 部分前缀恢复覆盖 target/draft KV、GDN、卷积和位置状态；JSONL 16 条请求自然结束，续跑保持完整结果及唯一 custom_id。
+
+Chat API 在关闭 MTP 和最多 3 草稿下均完成单流、SSE、完整 prefix 命中、8 并发、图片和双图检查。普通请求使用 greedy、固定 seed `20261002`，关闭 MTP 时，重复 prefix/SSE 及并发正文在本组场景一致；最多 3 草稿时存在措辞差异，状态与同历史概率检查仍通过。Thinking 算术使用官方通用任务建议：temperature=1.0、top_p=0.95、top_k=20、presence_penalty=1.5、repetition_penalty=1.0，思考预算 512、总输出预算 4096；关闭/开启 MTP 分别生成 1010/740 tokens，并自然结束，结果均为 391。该采样配置仅用于验收请求，服务默认值保持原配置。
+
+Greedy 的同一算术在 1024/2048 总预算下出现截断；原始 BF16 在思考预算 512 下也生成了 2272 tokens 才结束。强制闭合思考标记后，原始 BF16 和量化模型都可能继续在正文中推导，因此标签内思考预算与完整回答预算应分别评估。
+
+## Index-Translate-9B（2026-10-18）
+
+来源为官方 [IndexTeam/Index-Translate-9B](https://huggingface.co/IndexTeam/Index-Translate-9B)，固定 revision `4e06279e62352dab96bbeb6fa0579bca5e822d75`。复用 Qwen3_5 的动态行、GDN/GQA、FFN、视觉、MTP 和请求状态组件，按配置使用 32 层、4096 hidden 和独立 embedding/输出头，不复制执行流程。
+
+主干、embedding、输出头及视觉大矩阵采用 signed-block128 旋转、两级 E8P Q4A8，系数 `[4,1]`、beam8；敏感输出投影与 MTP 保留 W8，小矩阵及 norm 等保留浮点。未做激活校准。包含 scale、码表及混合精度例外的量化 payload 为 **5,440,207,936 bytes，平均 4.509 bit**；部署只读数据另含 RoPE 等常量，共 5,473,766,976 bytes。使用 INT8 KV、FP32 GDN 状态；上下文配置 256K，本节实际测到 8K。
+
+Rust release CLI `run-model`，关闭 MTP、`decode_only`，每个输入连续测两次、每次固定生成 65 tokens，取第二次。Prefill 不含输出头，decode 为后续 64 tokens 的完整执行时间；这是执行层固定长度测量，不能代替自然完成的 HTTP 吞吐。
+
+| 输入 tokens | Prefill TPS | Decode TPS | 首 token 时延（s） |
+| --- | ---: | ---: | ---: |
+| 512 | 2152.6 | 33.42 | 0.241 |
+| 2048 | 2219.6 | 32.62 | 0.926 |
+| 8192 | 1956.4 | 29.82 | 4.190 |
+
+同次 release 进程加载到就绪 **4.65 s**，未清文件缓存，不能视为磁盘冷启动结论。完整 `validate-model` 权重校验另测 6.93 s，不包含在默认加载时间内。
+
+固定 seed `20261002`，对照同源原始 BF16，使用相同 teacher-forced 历史。8 个文本翻译场景共 130 位置，目标 NLL 增加 **0.02370 nats/token**，首选 token 与 BF16 一致率 **96.15%**、全部位于 BF16 top3，110 个高置信位置无首选变化。2K/8K 共 26 位置的 NLL 差为 **−0.07549**，首选一致率 96.15%，全部位于 BF16 top3；8K 的一处变化为“加载压缩模型”与“加载一个压缩模型”。通知图片与红/蓝双图的 17 个位置，NLL 增加 **0.08327**，首选一致率 94.12%，全部位于 BF16 top3。上述小样本不替代完整翻译 benchmark、复杂图文或 256K 质量评测。
+
+真实 Chat API 覆盖无 MTP／最多 3 草稿、SSE、完整 prefix 命中、8 并发、术语约束、JSON 保留、图片和双图。请求均关闭 thinking、greedy、总输出预算 256 tokens，并自然结束。MTP 的英译中在单流与并发时分别使用“只需加载模型一次”与“会加载模型一次”，均保留原意；单流冷请求与连续三次缓存命中的措辞相同。对应同历史位置的“会／只需”都在 BF16 top3，不能把措辞差异直接判作翻译失败，也不保证不同调度下逐 token 相同。简单图片翻译正确，双图红/蓝顺序正确但出现“红色：红色”式冗余标签，复杂图文尚未验收。
+
+普通 2/3/4/5/8/32 路请求，以及验证宽度 2/4/8 × 请求数 1/2/4/8 × verification/mixed 的 24 组同历史检查，KL 与所选 token NLL 差均为 0。取消复用、32/512-token 部分前缀恢复的 target/draft KV、GDN、卷积及位置一致；这是状态与执行一致性检查，不代表 256K 压测。JSONL 的 16 条翻译全部自然结束，断点续跑未重复写入。完整模型校验、`make check` 和 `make check-offline` 通过。
+
+## Index-Translate-2B（2026-10-18）
+
+来源为官方 [IndexTeam/Index-Translate-2B](https://huggingface.co/IndexTeam/Index-Translate-2B)，固定 revision `9bc08445315723eb9b77d1b93505915eb03c3f01`。主干、共享 embedding/输出头和视觉大矩阵采用未使用激活校准的两级 E8P Q4A8；敏感输出/MTP 矩阵保留 W8。量化 payload 含 scale 等共 **1,228,931,712 bytes，平均 4.323 bit**；部署的只读数据另含 RoPE 等派生常量，共 1,262,497,024 bytes。文本使用 INT8 KV、FP32 GDN 状态，最长上下文配置为 256K；本节实际测到 8K。
+
+复用 27B 的动态行、私有状态、视觉及 MTP 组件。Attention 将 8/16 splits 纳入同一离线调优，短行选中 16 splits；大 prefill 保留原流水 tile 与线程配置。请求私有单行卷积保留原归约顺序，原地提交历史，移除单独的历史复制；其他行数由同一卷积体离线选择时间 tile。E8P 解码将 parity 修正合入最终 XOR，保留原码字和完整 A8 计算。转换验收阶段的 512/8K 参考热态 Graph 分别为 **8.72/10.03 ms**，该 CUDA 诊断排除主机请求开销。
+
+并发优化前的参考验收使用 Rust release CLI `run-model`、关闭 MTP/prefix、`decode_only`，每个输入生成固定 65 tokens。每档两次，取第二次；按对照包、优化包、优化包顺序复测。下表取对照包和最后一次优化包的暖态结果，prefill 不含 head，decode 为后续 64 tokens 的完整执行时间。
+
+| 输入 tokens | 对照 prefill TPS | 优化后 prefill TPS | 对照 decode TPS | 优化后 decode TPS |
+| --- | ---: | ---: | ---: | ---: |
+| 512 | 7680 | 7630 | 106.15 | 108.41 |
+| 2048 | 7988 | 7908 | 103.03 | 105.09 |
+| 8192 | 6564 | 6537 | 92.77 | 94.37 |
+
+该次对照已包含 attention 优化，decode 再提升约 **1.7–2.1%**，prefill 变化约 -1% 以内。热文件缓存下加载到就绪为 2.72 → 2.77 s，不能作为冷启动结论。
+
+普通 greedy 的固定 cohort 解码使用 Rust 请求路径：关闭 MTP/prefix，所有请求先完成独立 prefill，每档预热 4 步、测量 16 步；512 输入重复两轮取平均，2K/8K 的四个档位各一轮。计时排除 prefill、HTTP 和排队，保留请求状态、输入准备和结果提交；不添加 EOS logit bias。上表 `run-model` 是转换验收阶段的参考 forward，对应前一执行包，不能与在线 packet 程序混为同一测量路径。
+
+| 活跃并发 | 512 输入总 TPS | 每请求 TPS | 相对优化前 |
+| --- | ---: | ---: | ---: |
 | 1 | 113.2 | 113.2 | +0.7% |
 | 2 | 215.1 | 107.5 | +4.0% |
 | 4 | 390.1 | 97.5 | +7.4% |
 | 8 | 636.4 | 79.5 | +12.1% |
 | 16 | 835.7 | 52.2 | +16.4% |
-| 32 | 1,125.1 | 35.2 | +24.1% |
-| 64 | 1,358.5 | 21.2 | +42.1% |
-| 128 | 1,469.2 | 11.5 | +39.9% |
+| 32 | 1125.1 | 35.2 | +24.1% |
+| 64 | 1358.5 | 21.2 | +42.1% |
+| 128 | 1469.2 | 11.5 | +39.9% |
 
-| Active requests | Aggregate TPS, 2K input | Aggregate TPS, 8K input |
-| ---: | ---: | ---: |
+| 活跃并发 | 2K 输入总 TPS | 8K 输入总 TPS |
+| --- | ---: | ---: |
 | 1 | 109.5 | 98.7 |
 | 8 | 541.7 | 347.8 |
 | 32 | 855.7 | 450.5 |
-| 128 | 1,036.8 | 501.1 |
+| 128 | 1036.8 | 501.1 |
 
-Actual 128-way decode executed at all three lengths without reaching GPU memory limits in this test. The server/execution active-request ceiling is 128; default server cap remains 32. With 512 inputs, per-request speed stays within 10%/20% of single-stream speed at roughly 2/5 active requests.
+当前包在三个长度均执行了真实 128 路 decode；128 是服务和执行包的活跃上限，本轮未触及显存容量限制。实测档位中，512 输入每请求速度相对单流下降不超过 10%/20% 时，分别约为 2/5 路。
 
-Optimizations batch ownership-based token/position/state readback; upload stable private input asynchronously; avoid arena switches for already mapped writable KV; and cache immutable role bindings in the native model library. Dynamic projection fallback handles actual row counts rather than padding or enumerating variants; exact AOT sizes remain 1/2/3/4/8/16/32.
+普通 greedy 的位置、状态和 token 按 owner 批量读回；稳定私有输入直接上传，KV 已映射且可写时跳过 arena 切换，仅扩容/COW 使用同步慢路径。原生模型库预先缓存不变的状态角色。整数投影保留一个全容量动态 fallback 与 1/2/3/4/8/16/32 精确 AOT；128 行内的其他行数从同一计算体离线选择有界动态配置，传递真实行数，按矩阵几何复用调优结果。
 
-For irregular 512-input batch sizes 5/12/24/31/33/65, aggregate TPS was **463/709/1015/1127/1100/1285**, versus earlier **264/502/657** at 5/12/24. The 65-row case still loses about 5% against 64 due to a tile boundary; tuning is measured, not manually switched.
+512 输入的非整齐 batch，5/12/24/31/33/65 路分别为 463/709/1015/1127/1100/1285 TPS。原先 5/12/24 路为 264/502/657 TPS；5 路吞吐已高于 4 路。65 路相对 64 路仍有约 5% 的 tile 边界损失，选择来自测量，没有手写 batch 分界。
 
-At 128 active 512-input requests, step time fell **121.9 → 87.1 ms**, with Graph execution accounting **85.6 → 79.0 ms** and overhead outside that interval **36.3 → 8.1 ms**. That interval also contains input prep, control transfers, and commit—not solely CPU arithmetic. Updating only the shared executor yielded about 30% more throughput at 128; updating the execution package raised it to ~40%. At 2K/8K, 128-way gains were ~28%/14%; private long-context attention remained limiting.
+128 路、512 输入每步从 121.9 降至 87.1 ms，Graph 执行统计约 85.6 → 79.0 ms，区间之外约 36.3 → 8.1 ms。该差额包含输入准备、控制传输和提交，不能全部解释为 CPU 算术。仅更新公共执行器、保留旧执行包时，128 路已有约 30% 吞吐提升；加上新执行包后约 40%。2K/8K 的 128 路分别提升约 28%/14%，长输入的私有 attention 仍限制扩展。**关闭 MTP、单流 decode 150 TPS 的目标尚未达到**；当前 512 输入单流约 113 TPS，目标每步需不超过 6.67 ms。
 
-**The target of 150 TPS single-stream decode without MTP has not been reached.** Current ordinary request-path 512-token-input single-stream decode is ~113 TPS; 150 requires no more than 6.67 ms per step.
+并发 Chat API 使用下文同一固定翻译请求，221-token 输入、183-token 自然结束输出，关闭 thinking/MTP，seed `20261002`；服务显式设置 `--max-active-requests 128 --max-batch-tokens 128`、`decode_only`，每档重复两轮取平均。下表为实际 usage 总输出 / 整轮 HTTP 时间，包含 prefill、排队、Graph 捕获和 SSE；完全相同 prompt 的完整 prefix 命中是缓存复用上界，不代表不同翻译输入的常态。
 
-### HTTP Chat concurrency
+| 同时到达请求 | Prefix 关闭总 TPS（前 → 后） | 完整命中总 TPS（前 → 后） | 当前关闭 TTFT P95（s） | 当前命中 TTFT P95（s） |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 628.0 → 750.2 | 894.0 → 1089.6 | 2.49 | 0.15 |
+| 64 | 639.8 → 813.0 | 894.3 → 1234.2 | 5.50 | 0.94 |
+| 128 | 625.6 → 791.2 | 934.7 → 1268.5 | 14.30 | 2.98 |
 
-A fixed translation request used 221 input tokens and naturally produced 183 tokens, with thinking/MTP disabled, seed 20261002, and `--max-active-requests 128 --max-batch-tokens 128 --cuda-graph decode_only`. Each setting was repeated twice. Throughput is real usage output over complete HTTP time, including prefill, queues, Graph capture, and SSE. Identical prompts hitting the full prefix are an *upper bound on caching*, not representative of varied translation requests.
+各档均观察到对应峰值活跃请求及实际 batch；128 路使用显式配置，服务默认活跃上限仍为 32。完整命中 128 路的 HTTP 完成时间 P50 从 24.32 降至 17.86 s，直接取请求耗时分位数。1064 条真实翻译请求全部自然停止、输出 183 tokens，正文与优化前的单流基线一致。API 的 prefill、准入、Graph 捕获和尾部 batch 会限制收益，不能直接套用固定 cohort 的 TPS。
 
-| Arriving requests | No prefix cache TPS (before → after) | Full-hit TPS (before → after) | Current no-cache TTFT P95 (s) | Current full-hit TTFT P95 (s) |
-| ---: | ---: | ---: | ---: | ---: |
-| 32 | 628.0 → 750.2 | 894.0 → 1,089.6 | 2.49 | 0.15 |
-| 64 | 639.8 → 813.0 | 894.3 → 1,234.2 | 5.50 | 0.94 |
-| 128 | 625.6 → 791.2 | 934.7 → 1,268.5 | 14.30 | 2.98 |
+5/8/12/16/24/32/33/64/128 路各使用 512/2K 两类输入，与同量化模型的单流基线逐 owner、同历史比较四个位置，共 1288 个位置的最大 KL、目标 NLL 差均为 0，选择全部位于参考 top3。取消、arena 复用及状态回收检查通过；该检查验证 batch 路径的一致性，官方 BF16 量化质量另见下文。
 
-Peak active counts and real batches matched configured levels. For full-cache-hit 128-way HTTP requests, completion P50 dropped **24.32 → 17.86 s**. Across 1,064 actual translation calls, all naturally ended at 183 output tokens with content matching the earlier single-stream baseline. API overhead, admission, capture, and small tail batches constrain gains relative to fixed cohorts.
+本轮并发优化前的单流 SSE 验收使用 [固定请求](../fixtures/translation-benchmark.json)，关闭 thinking、greedy、seed `20261002`、总输出预算 512、prefix cache 512 MiB。三个不同段落涉及组件、请求隔离及测试时间/标识符，每种 MTP 配置预热一次，再测三次完整前缀命中，输出均自然结束。HTTP 总输出吞吐中位数为 **112.97 TPS（MTP 关闭，183 tokens）**；另测最多 1/2/3 草稿，分别为 **152.46/153.33/148.77 TPS**。这些数包含恢复、调度、传输和 SSE 收尾，不等于 GPU 纯 decode；各配置的措辞有差异，时间、标识符及三个段落的信息均保留。MTP 数据不计入上述 150 TPS 目标。
 
-Matched-history owner-by-owner checks across 5/8/12/16/24/32/33/64/128 requests with 512/2K inputs yielded 1,288 positions with zero maximum KL and target NLL difference; all selections were within reference top-3. Cancellation, reuse, and reclamation passed. These compare the **same quantized model**, not original BF16.
+固定历史对照官方原始 BF16，seed `20261002`：8 个文本任务共 130 位置，目标 NLL 增加 **0.03385 nats/token**，首选 token 的 **96.92%** 与 BF16 相同，全部位于 BF16 top3，96 个高置信位置没有首选变化。2K/8K 术语场景共 30 位置，NLL 增加 0.13515；均能完成最终句子的翻译。本轮卷积与 E8P 解码优化前后，文本、长上下文和图片共 177 个固定历史位置的目标概率、首选 token 完全一致。24 组同历史 MTP verification/mixed packet 的最大 KL、所选 token NLL 差均为 0；32/512-token 部分 prefix 恢复的 target/draft KV、GDN 和卷积状态一致。78 组 attention 检查、全部 65,536 个 E8P 码字、卷积分块与改变输入后的 Graph 检查通过。
 
-Earlier single-stream SSE acceptance used [fixed translation prompts](../fixtures/translation-benchmark.json), thinking off, greedy, seed 20261002, 512 output budget, and 512 MiB prefix cache. With one warmup and three identical full-prefix-hit runs per setting, complete-HTTP median output rates were **112.97 TPS without MTP (183 tokens)** and **152.46/153.33/148.77 TPS** with up to 1/2/3 drafts. Time, identifiers, and three paragraphs were preserved despite wording changes. MTP figures do **not** meet the separate 150-TPS-without-MTP goal.
+图文质量仍有限制：标准 API 的通知图片和红/蓝双图通过；带额外换行的双图、菜单时间/价格和复杂多图出现重复或识别错误，原始 BF16 在菜单请求中也有失败。将视觉 merger 单独恢复 FP16 没有稳定解决这些问题，保留既定 Q4 方案。图像的 17 个固定历史位置 NLL 增加 0.24353，首选落入 BF16 top3 的比例为 94.12%，不能视为正式图像质量验收通过。BF16 图像参考显式传入 modality IDs 以计算 MRoPE；部署 tokenizer 已合并 HF added-token 配置，并通过文字、单图和多图的 token ID 对照。上述小样本不能替代完整翻译 benchmark。
 
-Against original same-source BF16: eight text cases / 130 teacher-forced positions had **+0.03385 nats/token** target NLL, **96.92%** top-1 agreement, all choices within BF16 top-3, and 96 unchanged high-confidence positions. A 2K/8K terminology subset / 30 positions had +0.13515 NLL and correctly completed the target translations. Convolution/E8P decode optimization preserved probabilities/top choices at 177 text, context, and vision positions; 24 MTP verification/mixed scenarios had zero KL/NLL differences. Partial 32/512-token prefix state and 78 attention cases, all 65,536 E8P codewords, convolution tails, and changed-input Graph replay passed.
+`make check`、`make check-offline` 通过。执行包仅发布被选中的配置与动态行选择表，实验权重路径不进入在线分派。
 
-Vision remains limited. Simple notification and red/blue image tests passed, while extra-newline two-image, menu time/price, and complex multi-image cases produced duplication/recognition errors. Original BF16 also failed some menu cases. Returning the vision merger alone to FP16 did not reliably fix them; the selected Q4 policy remains. Across 17 image-history positions, NLL was **+0.24353**, with 94.12% of top choices inside BF16 top-3. This is **not a passed comprehensive vision-quality evaluation**. BF16 image references supply modality IDs for MRoPE; tokenization was checked against original HF added tokens.
+### JSONL 整批耗时
 
-### Whole-file JSONL jobs
+Rust release CLI `batch` 对照 `--scheduler-policy latency/throughput`，使用相同权重与执行包，64 个活跃请求、decode/验证行预算 128、`decode_only`，关闭 MTP/prefix/thinking，greedy、seed `20261002`，每条输出预算 256。每种配置启动独立进程，交替测三轮、取中位数；文件缓存已热，未清系统缓存。下表采用 CLI 的完整调用耗时，包含扫描、加载、预处理、排队、生成和落盘；TPS 为实际总输出除以完整耗时。
 
-Comparison of `batch --scheduler-policy latency` versus `throughput` on identical 2B weights/package, 64 active requests, 128 decode rows, `decode_only`, MTP/prefix/thinking disabled, greedy seed 20261002, and 256 output budget per request. Three separate-process runs were alternated; warm filesystem caches were not cleared. Values include scan/load/preprocess/queue/generation/write time. TPS is actual total output over *complete CLI duration*.
-
-| File | Input tokens per record | Latency-policy duration | Throughput-policy duration | Speedup | Aggregate TPS (latency → throughput) |
+| 文件 | 输入 tokens/条 | Latency 总耗时 | Throughput 总耗时 | 完成时间加速 | 总输出 TPS（前 → 后） |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 200 distinct short translations | 88–90 | 24.02 s | 18.89 s | 1.27× | 564.6 → 717.0 |
-| 96 mixed-length translations | 86–2,327 | 23.14 s | 16.97 s | 1.36× | 163.2 → 222.0 |
+| 200 条不同短翻译 | 88–90 | 24.02 s | 18.89 s | 1.27× | 564.6 → 717.0 |
+| 96 条长短混合翻译 | 86–2327 | 23.14 s | 16.97 s | 1.36× | 163.2 → 222.0 |
 
-The mixed file had 48 short requests and 16 each around 227/647/2,327 input tokens. All runs ended without errors, truncation, or duplicate IDs; short jobs produced ~13.5K output tokens and mixed jobs ~3.8K. Short-file ranges were latency 23.89–24.03 s and throughput 18.82–18.91 s; mixed-throughput 16.95–16.99 s. One mixed-latency run had a model-load storage I/O timeout and took 52.93 s; it remained in the median, but its wait is not a scheduling improvement.
+混合文件包含 48 条短请求及各 16 条约 227/647/2327-token 的请求，长输入增加背景、仍翻译末尾段落。该工作负载用于比较调度，不代表所有翻译长度分布。每轮均全部自然结束，无错误、截断或重复 ID，保留原文标识符。短文件约生成 13.5K tokens，混合文件约 3.8K；不同形状有少量措辞或空格差异。三轮短文件耗时范围为 latency 23.89–24.03 s、throughput 18.82–18.91 s；混合文件的吞吐策略为 16.95–16.99 s。混合文件的一轮 latency 在模型加载时遇到存储 I/O 超时，总耗时 52.93 s；该样本保留在三轮中位数计算中，不能将其额外等待解释为调度收益。
 
-Throughput mode relaxes latency admission quotas and mandatory decode time, probes unknown joint shapes, and selects by full measured cost. Explicit 64-way concurrency exceeds the CLI default of 32; higher concurrency is not always faster and per-request TTFT/ITL may worsen. These comparisons predate global prefix planning and output-length estimation.
+吞吐策略继续使用公共动态 packet 和原生 prefill，放开在线准入时间限制及强制 decode 配额，探测未知联合形状后按完整成本选择。表中 64 路需显式指定，CLI 默认仍为 32；更高并发不保证整批更快。该策略不保证改善每条请求的首 token 或输出间隔。这组对照早于全文件前缀规划与输出长度估计。
 
-Ten joint-prefill matched-history cases at 512/2K and 2/8 requests differed from serial quantized references by at most **0.000154 mean KL** and **+0.001832 mean target NLL**; all choices were within top-3. Full-hit dual requests had zero differences. Cold prefill, deterministic-seed reorder, cancellation, slot reuse, and private state passed. JSONL failure/truncation handling, interrupted 200-record resume, HTTP/SSE comparison, and two-draft MTP translation/sampling/JSON-schema/stop passed. These checks are not original BF16 quantization acceptance.
+512/2K 输入、2/8 路联合 prefill 的 10 组同历史回归，相对同量化包串行参考的最大平均 KL 为 0.000154、最大平均目标 NLL 增加 0.001832 nats/token，选择全部位于参考 top3。完整 prefix 命中的双路对照 KL/NLL 差为 0，冷 prefill、固定 seed 重排、取消、槽位复用与全部私有状态隔离检查通过。这是调度路径回归，官方 BF16 量化质量仍以上文独立验收为准。
 
-### Ten thousand real translation requests
+JSONL 错误隔离、截断统计、200 条任务中断续跑、HTTP/SSE 对照及正常关闭通过；开启两枚 MTP 草稿的翻译、采样 top3 概率、JSON schema 和 stop 请求全部自然结束，并确认实际执行投机轮次。`make check` 通过。
 
-Used official [OPUS-100 English–Chinese corpus](https://opus.nlpl.eu/opus-100.php), deduplicated with fixed seed 20261002 into disjoint sets of 1,024 tuning and 10,000 acceptance records. Each sentence was translated independently with greedy decoding, thinking off, up to 2,048 output tokens, and natural stopping. Input length P50/P90/P99/max was **41/77/135/731 tokens**; output **15/45/95/765**. This is a short-sentence-dominated workload, not long-document translation.
+### 万条真实翻译请求
 
-Same 2B weights/package, 64 active, throughput policy, `decode_only`, MTP/prefix off. Prior baseline commit `1999fc3` already included throughput scheduling. New changes added budget-bounded whole-file token-prefix planning, long-request priority and observed completion lengths, branch snapshot selection, asynchronous bounded result persistence, and 4 MiB pinned-pool chunked uploads for large inputs. HTTP default behavior and the package were not changed.
+使用 [OPUS-100](https://opus.nlpl.eu/opus-100.php) 官方英中语料，固定 seed `20261002` 抽取、去重，1024 条调优与 10000 条验收互不重复。各条独立翻译，未拼接为一个 prompt；greedy、关闭 thinking、每条输出上限 2048，保留长请求并全部自然结束。实际输入 P50/P90/P99/最大为 **41/77/135/731 tokens**，输出为 **15/45/95/765 tokens**；这是短句为主的工作负载，不代表长篇翻译。
 
-| 10,000-record metric | Previous offline mode | Revised offline mode |
+同一 Index-Translate-2B 权重与执行包，64 活跃请求、`throughput`、`decode_only`、MTP/prefix 关闭。对照为 `1999fc3`，已包含上一节的吞吐调度。本轮增加有界全文件 token 前缀规划、长任务优先及自然完成长度统计、共享分支快照选择、有界异步结果写入；大输入统一经固定 4 MiB pinned 池分块异步上传，不再因超过 256 KiB 使用全 context 同步。HTTP 默认调度和执行包保持原配置。
+
+| 万条请求指标 | 上一版离线模式 | 当前离线模式 |
 | --- | ---: | ---: |
-| Total CLI invocation | 358.81 s | **314.78 s** |
-| Ready-to-last-completion | 324.30 s | **309.67 s** |
-| Actual generated tokens | 217,193 | 217,196 |
-| Full-invocation output TPS | 605.3 | **690.0** |
-| Post-ready output TPS | 669.7 | **701.4** |
+| 完整 CLI 调用 | 358.81 s | **314.78 s** |
+| 模型就绪至末条完成 | 324.30 s | **309.67 s** |
+| 实际输出 tokens | 217193 | 217196 |
+| 完整调用输出 TPS | 605.3 | **690.0** |
+| 就绪后输出 TPS | 669.7 | **701.4** |
 
-The previous startup had about 30 seconds of storage I/O wait, absent in the new run. Thus the full-call 1.14× speedup is **not entirely an optimization gain**; ready-to-completion speedup is **1.047×**. One complete 10K run per version was measured. Separate 1,024-record tuning favored 64 over 128 active requests and no MTP over two drafts. For similar short-sentence workloads, try `--max-active-requests 64 --mtp-drafts 0 --prefix-cache-mib 0`; the CLI default remains 32.
+对照加载时有约 30 秒存储 I/O 等待，当前没有；因此完整调用的 1.14× 不能全部归因于优化，排除加载后的完成时间加速为 **1.047×**。本轮完整万条对照各测一次；独立的 1024 条调优中，64 路优于 128 路，关闭 MTP 优于两枚草稿。推荐短句批处理显式使用 `--max-active-requests 64 --mtp-drafts 0 --prefix-cache-mib 0`，CLI 默认活跃上限仍为 32。
 
-Whole-job iterations fell **4,108 → 3,402**, including one-active-request tail iterations **577 → 1**. Execution-plan preparation fell **37.11 → 31.51 s**. Full dynamic packet compute and host preparation still dominate independent short sentences.
+全批迭代从 4108 降至 3402，其中只剩一个活跃请求的迭代从 577 降至 1；规划减少了长尾空转。执行计划准备累计从 37.11 降到 31.51 s，完整动态 packet 的计算和主机准备仍是独立短句的主要成本。
 
-With the same current binary, same 10K inputs, and unchanged other settings, switching to `latency` produced **535.89 s / 405.3 TPS**, 217,206 generated tokens, all naturally finished. Compared against that *current* latency-policy baseline, current throughput mode completes the job **1.70× faster**. This must not be confused with the 1.047× post-ready improvement over the previous throughput implementation. Both use local CLI; HTTP overhead is absent.
+同一当前二进制、同一万条输入及全部资源/采样参数，另切换为 `--scheduler-policy latency` 对照在线调度规则，完整调用为 **535.89 s / 405.3 TPS**，全部自然结束，实际输出 217206 tokens。当前离线吞吐模式的整批完成时间为其 **1.70×** 加速；该对照也使用本地 CLI，未增加 HTTP 客户端开销，不能与上表“相对上一版离线模式”的 1.047× 混用。
 
-Of the 10K translations, **9,999 were exactly identical**; chrF++ changed **23.2760 → 23.2758**, Chinese-tokenized BLEU **33.3474 → 33.3474**. This is a same-weight scheduler regression check, not new BF16 quantization acceptance. Noisy multi-genre OPUS absolute scores do not substitute for domain evaluation.
+万条译文中 **9999 条完全相同**，一条有少量词语增减；chrF++ 为 **23.2760 → 23.2758**，中文分词 BLEU 为 **33.3474 → 33.3474**。这是同量化权重的调度回归，不是新的 BF16 量化质量验收；语料包含噪声及多种文体，绝对分数也不能代替独立领域评估。
 
-A separate 1,024-sentence test built 32 document groups, each with the same artificial 301-word translation guide, then shuffled them. Sentences were not repeated. With 64 active, 128 MiB prefix cache, MTP off, `decode_only`, global prefix planning reduced total invocation **100.63 → 63.85 s (1.58×)** and ready-to-completion **96.15 → 58.81 s (1.63×)**. Cache-hit requests increased **19 → 707/1,024**; actual prefill fell **436,414 → 192,593 tokens**, median restore ~**0.70 ms**. Both runs completed naturally; output totals were 21,016/20,965.
+另以 1024 条真实源句构造 32 组文档请求，每组加入相同的 301-word 翻译指南，打乱输入顺序。指南为人为设置的共享背景；源句未重复。双方均使用 64 活跃请求、128 MiB prefix cache、MTP 关闭及 `decode_only`。全局前缀规划使完整调用从 **100.63 → 63.85 s（1.58×）**，就绪后从 **96.15 → 58.81 s（1.63×）**；命中请求 **19 → 707 / 1024**，实际 prefill **436414 → 192593 tokens**，命中恢复中位数约 **0.70 ms**。两版全部自然结束，实际输出分别为 21016/20965 tokens。
 
-With shared-prefix planning, 790/1,024 translations were identical, chrF++ **22.9454 → 22.8491**, BLEU **33.1588 → 33.0351**. A 1,000-sample paired bootstrap at seed 20261002 found BLEU/chrF++ p-values **0.129/0.139**, not a statistically detected metric change in this sample—not proof of exact equivalence. Changed checkpoints/chunks can alter rounding and subsequent wording. Partial checkpoint restoration at 32/384/394/400/401 tokens matched same-chunk cold execution for subsequent tokens and all FP32 GDN, convolution, target/draft KV, and positions.
+共享前缀组有 790/1024 条译文完全相同，chrF++ **22.9454 → 22.8491**、BLEU **33.1588 → 33.0351**。固定 seed `20261002`、1000 次 paired bootstrap，BLEU/chrF++ 的 p 值分别为 **0.129/0.139**，这组样本未检出显著指标变化，不等于证明完全无损。改变部分 checkpoint 与 prefill 分块会产生数值及后续措辞差异，不能将命中缓存视为逐 token 相同的承诺；该组的指标变化与独立万条结果分开记录。
 
-Tests also covered uploads over 256 KiB with caller buffer release/overwrite and staging reuse; cancellation/isolation, fixed-history probabilities, asynchronous writer errors, resume without loading GPU when complete, interrupted/corrupt-tail resume, HTTP/SSE, and MTP/schema/logprobs/stop. A separate shared-workspace KV-growth fix for Flash Next passed dual-request 512/2K matched-history KL/NLL 0, with 27B and Flash variants naturally completing. A final 1,024-record release-binary run generated 21,144 tokens in **35.40 s**, with ready-state processing ~31.0 s versus ~31.3 s previously.
+32/384/394/400/401-token checkpoint 的恢复与相同分块冷执行对照，后续 tokens、FP32 GDN、卷积、target/draft KV 及位置逐项相同。大于 256 KiB 的上传覆盖调用者提前释放、覆盖源内存与 staging 池环回；请求隔离、取消复用、固定历史概率检查通过。异步写入错误传播、完成后续跑免 GPU 加载、200 条中断/损坏尾行续跑无重复、错误与截断隔离、HTTP/SSE 对照及 MTP 的 schema/logprobs/stop 验收通过，`make check` 通过。
 
-## CPU sampling preprocessing (2026-10-17)
+跨模型检查还修复了 Flash Next 原有的 KV 准备错误：增长列表中的共享 workspace 从会话映射查找，私有 KV 继续按 owner 查找。复用相同执行包，512/2K 双请求与串行参考的同历史 KL/NLL 差均为 0，请求隔离检查通过。27B、正式 Flash Next 及其 E8P 候选权重的双请求 CLI 检查全部自然结束。最终 release 二进制另复测 1024 条独立调优请求，21144 个输出 tokens、**35.40 s**，无错误或截断；本次就绪后处理约 31.0 s，与前次约 31.3 s 接近。
 
-Without penalties or logit bias, CPU preprocessing now converts FP32→FP64 with addition of zero to preserve signed-zero semantics; full-input finiteness and grammar masking remain. The full sampling CDF, bitwise scores, and seeded selections matched the generic path. GPU kernels/weights/native package were unchanged. On synthetic 248,320-logit top-20 sampling with 8K history, CPU median fell **1.585 → 1.276 ms (-19.5%)**.
+## CPU 采样预处理（2026-10-17）
 
-Real Rust SSE requests: 617 input tokens, 64 output budget, max three MTP drafts, medium thinking with 32-token cap, temperature 0.7/top-k 20/top-p 0.8/seed 20261002, `decode_only`, full expert residency; one warmup, three full-prefix-hit runs per case. These are whole-HTTP TPS medians.
+无 penalty 和 logit bias 时，将通用处理简化为 FP32 到 FP64 的转换，保留加零以维持 signed-zero 语义；有限值校验与 grammar mask 仍覆盖完整输入。逐位分数、完整 CDF 和固定 seed 选择与通用处理对照相同，GPU kernel、权重及原生执行库保持原版本。248,320 维合成 logits、8K 历史的 top-20 CPU 采样中位数为 1.585 → 1.276 ms（约 -19.5%）。
 
-| Case | Before TPS | After TPS | Change |
+真实 Rust release SSE 请求采用 617-token 输入、64-token 输出预算、MTP 草稿上限 3、`medium` thinking 且思考上限 32 tokens、温度 0.7、top-k 20、top-p 0.8、seed 20261002、`decode_only`、专家全量常驻。每档预热一轮后测三轮完整 prefix 命中请求，以下为 HTTP 总输出 TPS 中位数。
+
+| 模型／场景 | 改动前总 TPS | 改动后总 TPS | 变化 |
 | --- | ---: | ---: | ---: |
-| Flash Next, no logprobs | 37.14 | 37.63 | +1.32% |
-| Flash Next, top-three logprobs | 33.83 | 33.68 | -0.46% |
-| 27B, no logprobs | 23.73 | 23.96 | +1.00% |
-| 27B, top-three logprobs | 22.11 | 22.31 | +0.90% |
+| Flash Next，无 logprobs | 37.14 | 37.63 | +1.32% |
+| Flash Next，top-3 logprobs | 33.83 | 33.68 | -0.46% |
+| 27B，无 logprobs | 23.73 | 23.96 | +1.00% |
+| 27B，top-3 logprobs | 22.11 | 22.31 | +0.90% |
 
-End-to-end effects were ~1%; CPU microbench speedup is **not** decode speedup. All 16 paired API responses matched content, reasoning, usage, and finish reason; penalty/JSON schema checks and `make check` passed.
+端到端收益约 1%，带 logprobs 的变化不足 1%，不能将 CPU 微测收益直接当成 decode 加速比。16 对 API 响应的正文、思考、usage 和停止原因一致；两模型的 penalty 与 JSON schema 约束请求通过。`make check` 通过。
 
-## Rust Graph hits and probability reporting (2026-10-17)
+## Rust Graph 命中与概率报告（2026-10-17）
 
-Batch Graph hits now reuse bound kernel modules without redundant address-plan expansion/registration checks. COW, live-workspace saves, arena invalidation, and indirect Graph address validation still occur. Ordinary, verify, draft, warm, and mixed use the shared executor. Both sides compared identical weights/native libraries/cubins.
+完整 batch Graph 命中后复用已有绑定与 kernel 模块，跳过执行计划的地址展开和重复注册检查；COW、live workspace 保存、请求 arena 失效及间接 Graph 的地址校验仍先执行。普通、验证、draft、warm 和 mixed 使用公共执行器，不增加模型或 batch 专用程序；本节对照双方使用相同权重、原生执行库与 cubin。
 
-Logprob reporting shares history/penalty/bias/grammar preprocessing with sampling; a linear top-N selection sorts only N values and normalizes over the full vocabulary. Sampling CDF, randomness, and MTP acceptance remain unchanged. Tiny but nonzero tail probabilities no longer disappear merely through cumulative rounding; genuinely underflowed or masked probabilities keep documented floors.
+logprobs 与实际采样共用一次 history／penalty／bias／grammar 处理，通过线性选择取得前 N 个概率，只排序 N 项，按完整词表归一化。实际采样 CDF、随机数与 MTP 接受判定保持原有契约。概率报告不再因累计质量的舍入而丢弃极小但非零的尾部概率；指数真正下溢或被 mask 的概率仍按原有下限报告。
 
-Rust SSE request setup: 617 input tokens, max three drafts, medium/32-token reasoning cap, seed 20261002, `decode_only`, fully resident experts, one warmup and three full-prefix-hit runs. Greedy output budget 128, non-greedy temperature 0.7/top-k 20/top-p 0.8 and budget 64. The figures are HTTP TPS medians.
+Rust release CLI 的真实 SSE 请求，617-token 输入、MTP 草稿上限 3、`medium` thinking 且思考上限 32 tokens、seed 20261002、`decode_only`、专家全量常驻。每档预热一轮后测三轮完整 prefix 命中请求，取实际输出 tokens / HTTP 总耗时的中位数；这不是 GPU-only decode TPS。普通 greedy 输出预算 128 tokens；非贪心单流为温度 0.7、top-k 20、top-p 0.8、64-token 输出预算。
 
-| Case | Before TPS | After TPS | Change |
+| 模型／场景 | 改动前总 TPS | 改动后总 TPS | 变化 |
 | --- | ---: | ---: | ---: |
-| Flash Next greedy, 1 request | 46.92 | 47.73 | +1.72% |
-| Flash Next greedy, 4 requests | 75.25 | 74.20 | -1.40% |
-| Flash Next greedy, 8 requests | 112.68 | 114.76 | +1.85% |
-| Flash Next stochastic, no logprobs | 36.24 | 37.63 | +3.84% |
-| Flash Next stochastic, top-three logprobs | 22.84 | 33.69 | +47.50% |
-| 27B greedy, 1 request | 26.03 | 26.15 | +0.48% |
-| 27B greedy, 4 requests | 58.60 | 58.99 | +0.67% |
-| 27B greedy, 8 requests | 80.41 | 80.19 | -0.27% |
-| 27B stochastic, no logprobs | 23.49 | 23.67 | +0.78% |
-| 27B stochastic, top-three logprobs | 17.81 | 22.07 | +23.89% |
+| Flash Next，greedy，1 并发 | 46.92 | 47.73 | +1.72% |
+| Flash Next，greedy，4 并发 | 75.25 | 74.20 | -1.40% |
+| Flash Next，greedy，8 并发 | 112.68 | 114.76 | +1.85% |
+| Flash Next，非贪心，无 logprobs | 36.24 | 37.63 | +3.84% |
+| Flash Next，非贪心，top-3 logprobs | 22.84 | 33.69 | +47.50% |
+| 27B，greedy，1 并发 | 26.03 | 26.15 | +0.48% |
+| 27B，greedy，4 并发 | 58.60 | 58.99 | +0.67% |
+| 27B，greedy，8 并发 | 80.41 | 80.19 | -0.27% |
+| 27B，非贪心，无 logprobs | 23.49 | 23.67 | +0.78% |
+| 27B，非贪心，top-3 logprobs | 17.81 | 22.07 | +23.89% |
 
-Ordinary greedy MTP varied by about ±2%, not evidence of a general decode gain. Gains concentrated on probability reporting. In a separate 248,320-logit/8K-history CPU test, top-20 sample plus top-three logprobs improved **18.75 → 4.80 ms (-74%)**; not model TPS.
+普通 greedy MTP 的变化在约 ±2% 内，不能据此宣称普遍提高 decode 性能；主要收益集中在请求概率报告。独立 CPU 微测使用固定 seed 的 248,320 维合成 logits、8K 历史，top-20 采样加 top-3 logprobs 从 18.75 ms 降到 4.80 ms（约 -74%）；该数字不是模型推理吞吐。
 
-Four-way MTP Nsight Systems trace (last 100 synchronized packet Graphs, excluding shared-fragment/direct-kernel intervals) found host gaps from previous stream synchronization to Graph submission at median **1.051 → 0.856 ms**, P95 **1.160 → 1.189 ms**. For packets with at least 10 ms GPU time, host gap improved only **1.083 → 1.022 ms**. These host gaps include prep and control transfers; they are not GPU acceleration measurements.
+独立 Nsight Systems 四并发 MTP trace 取末尾 100 次紧接 stream 同步的完整 packet Graph，排除共享 Graph 片段与 direct kernel 串联区间。上一 stream 同步返回至 Graph 提交的 host 间隔中位数为 1.051 → 0.856 ms，P95 为 1.160 → 1.189 ms；其中 GPU 执行至少 10 ms 的较大 packet，host 间隔中位数仅从 1.083 降至 1.022 ms。该诊断包含 CPU 准备和小传输 API 工作，不能作为 GPU 执行加速或端到端吞吐结论。
 
-All 90 warm paired API responses matched content/reasoning/usage/finish reason out of 120 pairs; five cold pairs differed in content under nondeterministic scheduling while other fields matched. Fixed-history 27B (24 cases) and Flash Next (16 cases) target/mixed comparisons had zero KL and selected-token NLL changes. Additional complete-state recovery, direct/capture/warm-replay, draft/commit, penalty/mask/bias/tie/top-k tests passed. Graph off/full prefix, sampling, MTP, logprobs, JSON, image, and multi-image checks passed; Rust format, Clippy, and tests passed.
+120 对 API 响应中，全部 90 对热态请求的正文、思考、usage 和停止原因相同；5 对冷请求的正文有复现差异，分布在 Flash Next 单流非贪心及 27B 四／八并发，其他字段相同。动态调度的冷请求全程输出不保证逐 token 复现，不能以此替代固定历史概率与状态检查。
 
-## Rust input transfers and control readback (2026-10-17)
+27B 的 24 组、Flash Next 的 16 组固定历史 target／mixed 对照，最大 KL 与所选 token NLL 差异均为 0；各增加一组完整私有状态恢复后的直接执行、捕获和热回放检查。两模型各 4 组 draft／commit 对照的最大 KL 同样为 0，位置与清理检查通过。采样单测覆盖 mask、惩罚、bias、概率并列及 top-k 0／1／20／1024，报告前后的完整采样 CDF 和固定 seed 选择相同。 两模型的 Graph `off/full` 下 prefix 恢复、惩罚采样、非贪心 MTP、logprobs、JSON 约束、图片及多图 API 检查通过；`make check` 与最终 Rust fmt／clippy／测试通过。
 
-Small inputs are uploaded asynchronously from session-owned bounded pinned slabs, consumed in stream order. Slots cannot be reused until DMA completes; KV growth, copy-on-write, and request switching retain synchronization. Control values are read back in batches; Flash Next CPU embedding/PLE returns immutable shared rows. Pinned-pool capacity is about 4 MiB on demand; this test version retained bounded synchronous transfers for inputs above 256 KiB (a later JSONL improvement chunks larger transfers as described above). Rebuilt Flash Next native library used unchanged weights, kernels, and exported plan.
+## Rust 输入传输与控制回读（2026-10-17）
 
-Real SSE: 617 input tokens, 96 output budget, medium thinking/32-token cap, greedy, seed 20261002, `decode_only`, fully resident experts. Each concurrency setting had one warmup and two full-prefix-hit runs, taking the median of complete HTTP output TPS.
+小输入由会话持有的 pinned 缓冲池异步上传，按 stream 顺序消费；槽位复用等待对应 DMA 完成，KV 增长、COW 和请求切换仍保留必要依赖。控制量成组回读，Flash Next 的 CPU embedding/PLE 缓存返回不可变共享行。缓冲池按需分配，上限约 4 MiB；大于 256 KiB 的单次输入保留原有有界同步传输。Flash Next 执行库已重建，权重、GPU kernel 和完整导出执行计划不变。
 
-| Model | Maximum MTP drafts | 1 request (before → after) | 2 | 4 | 8 |
+Rust release CLI 的真实 SSE 请求，617-token 输入、96-token 输出预算、`medium` thinking 且思考上限 32 tokens、greedy、seed 20261002、`decode_only`、专家全量常驻。每个并发档预热一轮，再取两轮完整前缀命中的中位数。下表为每轮实际输出 tokens / HTTP 总耗时，包含恢复、调度与传输；各格为改动前 → 改动后，不能与完整代码生成的纯 decode TPS 混用。
+
+| 模型 | MTP 草稿上限 | 1 并发 | 2 并发 | 4 并发 | 8 并发 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Flash Next | 0 | 27.12 → 26.90 | 46.32 → 46.93 | 77.64 → 79.04 | 120.67 → 123.32 |
 | Flash Next | 3 | 46.92 → 47.56 | 43.54 → 44.40 | 74.49 → 75.98 | 110.73 → 112.95 |
 | 27B | 0 | 10.89 → 10.93 | 20.40 → 20.57 | 37.43 → 37.66 | 60.86 → 63.68 |
 | 27B | 3 | 24.64 → 24.78 | 44.88 → 46.40 | 55.00 → 52.92 | 80.62 → 83.00 |
 
-Longer 256-token reverse-order comparisons found Flash Next 1-request no-MTP **27.15 → 27.11 TPS (-0.14%)**, and 27B four-way MTP **60.17 → 61.96 TPS (+2.98%)**, showing that short-run dips could be measurement noise. Single-stream no-MTP Nsight warm Graph host gaps fell **0.977 → 0.751 ms**; 128 CLI output tokens matched, but the trace is not an end-to-end TPS result.
+针对短测中的单流和四并发波动，另以 256-token 输出预算反向运行新旧版本，每版预热一轮后测三轮。Flash Next 单流无 MTP 为 27.15 → 27.11 TPS（-0.14%）；27B 四并发 MTP 为 60.17 → 61.96 TPS（+2.98%）。短测的四并发回退未在这组更长测量中复现，单流收益接近测量波动。
 
-Of 180 paired 96-token API responses, all 120 warm pairs matched; two cold 27B eight-way responses differed. Cold/warm 256-token 27B concurrency also differed on the old baseline itself, so whole-output reproduction under changing schedules is not guaranteed. Fixed-history target/verify/mixed comparisons (27B 24, Flash Next 16) had zero maximum KL and selected-token NLL difference. Graph off/full prefix, penalties, non-greedy MTP, logprobs, JSON, and image cases passed.
+独立 Nsight Systems 单流无 MTP trace 中，热态 Graph 间隔中位数由 0.977 ms 降到 0.751 ms，稳态小输入不再使用 context 全局同步；trace 中 128 个 CLI 输出 token 与对照逐项相同。该 trace 的时间不作为端到端吞吐验收值。
 
-## 27B layer-wise prefill and batched MTP (2026-10-17)
+96-token 对照的 180 对 API 响应中，全部 120 对热态请求的正文、思考、usage 和停止原因一致；两条 27B 八并发冷请求的正文存在差异。256-token 的 27B 并发生成在冷、热请求中也有正文复现差异，旧基线自身的冷、热输出同样不完全一致。动态调度下的全程输出复现仍需单独定位。固定历史的单／多路 target、verification 和 mixed 对照覆盖 27B 的 24 组、Flash Next 的 16 组，最大 KL 与所选 token NLL 差异均为 0；Flash Next 包声明的 mixed 验证宽度为 2。`off/full` Graph 的 prefix、惩罚、非贪心 MTP、logprobs、JSON 约束、图片和多图请求通过。
 
-27B and Flash Next share layer registration, dynamic rows, private address bindings, and runtime scheduling. Prefill pauses at model-declared layer boundaries without changing real block size; adjacent layers use measured costs and remaining budget rather than fixed group counts. Independent 1–128-request GDN/attention wraps one-row compute in address tables. Ordinary/verification/mixed packets reuse shared target compute and explicit role/state ownership. Batch draft, commit, and warm use existing components.
+## 27B 分层 prefill 与批量 MTP（2026-10-17）
 
-Compared same official beam-8 E8P Q4A8 weights on Rust release `serve`/real SSE Chat, max four MTP drafts, `decode_only`, thinking off, greedy seed 20261002. Fixed code tasks were padded to 512/2K/8K inputs with 128-token output budget. Two full-HTTP rounds per case include queues/prefill/generation. Cold = prefix cache disabled; hit = full input prefix restored, **not cold/warm service startup**. Baseline had the `ff8ca0e` KV-prefetch package and prerefactor scheduler.
+27B 与 Flash Next 共用分层注册、动态行调用、私有地址绑定及运行时调度。Prefill 保持原 token 块，在模型声明的层边界暂停；相邻层按剩余时间预算及实测层成本连续执行，不固定每组层数。普通 decode 的私有 GDN／attention 从原单行计算体包装成动态 1–128 请求 kernel。批量 target 验证、draft、commit、warm 和混合 prefill／verification 共用原有计算体及显式请求角色，分别绑定请求状态。
 
-| Scenario | Baseline aggregate TPS | Current aggregate TPS |
+同一份官方 beam8 两级 E8P Q4A8 权重，Rust release CLI `serve` 和真实 SSE Chat API；MTP 草稿上限 4、`decode_only`、thinking 关闭、greedy、seed 20261002。固定代码任务填充至 512／2K／8K 输入，输出预算 128 tokens。下表每组重复两轮，统计完整一轮的总输出 TPS，包含排队、prefill 和生成，不等同于纯 decode TPS。“冷”表示 prefix cache 关闭；“命中”表示输入前缀完整命中，并非服务启动冷热。对照为 `ff8ca0e` 的 KV 预取执行包与本轮重构前的运行时。
+
+| 场景 | 对照总 TPS | 当前总 TPS |
 | --- | ---: | ---: |
-| Cold 2 requests, 512 + 8K | 9.07–9.21 | **9.81–9.97** |
-| Cold 4, 2×512 + 2K + 8K | 11.37–11.76 | **14.63–15.03** |
-| Cold 8, 2×512 + 3×2K + 3×8K | 9.78–10.07 | **11.51–11.79** |
-| Full hit 4, same 4-request pattern | 32.77–33.87 | **58.91–64.67** |
-| Full hit 8, same 8-request pattern | 49.21–50.09 | **69.31–90.81** |
+| 冷 2 并发，512 + 8K | 9.07–9.21 | **9.81–9.97** |
+| 冷 4 并发，2×512 + 2K + 8K | 11.37–11.76 | **14.63–15.03** |
+| 冷 8 并发，2×512 + 3×2K + 3×8K | 9.78–10.07 | **11.51–11.79** |
+| 全命中 4 并发，同上 4 路输入 | 32.77–33.87 | **58.91–64.67** |
+| 全命中 8 并发，同上 8 路输入 | 49.21–50.09 | **69.31–90.81** |
 
-Worst cold-request TTFT dropped **38.17–39.87 → 28.82–29.27 s** at four-way and **91.84–95.38 → 77.59–80.51 s** at eight-way. With an 8K cold prompt arriving 200 ms before a 512-token prompt, short-request queue/init wait fell **6.176 → 0.022 s** and TTFT **6.947 → 1.616 s**. If the 8K prompt was fully cached, short cold TTFT was **2.293 s** versus 2.374 s. SSE chunks may combine MTP tokens; chunk gaps are not per-token ITL.
+冷 4 路最长首 token 等待由 38.17–39.87 s 降到 28.82–29.27 s，冷 8 路由 91.84–95.38 s 降到 77.59–80.51 s。8K 冷请求先到、512-token 请求晚到 200 ms 时，短请求的排队／初始化时间从 6.176 s 降到 0.022 s，首 token 等待从 6.947 s 降到 **1.616 s**。缓存命中的 8K 请求与晚到的 512-token 冷请求交错时，短请求首 token 等待为 **2.293 s**，对照 2.374 s。SSE chunk 可能包含多个 MTP token，这些 chunk 间隔不能当作单 token ITL。
 
-A separate 16-way cold test (8×512 + 8×2K) **regressed** from **21.35 → 20.67 TPS**, and worst TTFT worsened **64.86 → 78.75 s**. Existing cold-admission restrictions were unchanged; the refactor does not universally improve concurrency.
+16 路冷请求另测一轮 8×512 + 8×2K：总 TPS 从 21.35 变为 **20.67**，最长首 token 等待从 64.86 s 增至 **78.75 s**。该场景仍有回退和明显调度长尾；本轮没有修改既有冷请求准入限制，不能据此宣称任意并发都改善。
 
-The package grew from 173 to **181 distinct cubins** (eight added private-state dynamic implementations), not per-batch enumerations. 409 logical programs and 5,326 local bindings include shared segments, layer args, and 64 prefill stages; they are not distinct cubins. Each request adds 2,208,512 bytes of private scratch; the global address table adds 917,504 bytes, without resident expanded weights.
+执行包从 173 增至 **181 个不同 cubin**，增加的是 8 个动态私有状态实现，没有枚举 batch 大小。409 个逻辑程序、5326 个局部绑定包含共享片段、逐层参数及 64 个 prefill 阶段，均不等于独立 cubin。每请求增加 2,208,512 bytes 私有临时区，全局地址表增加 917,504 bytes；没有展开权重常驻副本。
 
-Adjacent-process `run-model` comparisons with MTP/prefix off, warmup then two single-token runs, found prefill **678.00/689.51/618.11 → 678.94/689.63/617.53 TPS** at 512/2K/8K (within 0.15%). Normal 64-token decode averaged **10.74 TPS**; four-draft MTP fixed-prefix fixtures ~**24.8 TPS**. These forced-length checks are not natural coding throughput.
+另用 `run-model` 相邻进程对照，关闭 MTP/prefix、每档预热一次后测两次单 token 输出，512／2K／8K 主干 prefill 从 678.00／689.51／618.11 变为 **678.94／689.63／617.53 TPS**，差异均在 0.15% 内。固定 64 输出的普通 decode 两次均值为 **10.74 TPS**。4 草稿 MTP 固定前缀夹具约 **24.8 TPS**，此项为强制长度的状态与性能对照，不代表自然代码生成吞吐。
 
-Ordinary B2/B3/B4/B8 and 24 matched-history verification/mixed cases (width 2/4/8 × requests 1/2/4/8) had zero KL and selected-token NLL differences. Layer pause at 4K, time-budget continuation, workspace alternation, cancellation/reuse, and partial prefix restoration preserved all recurrent state. Rebuilt Flash Next contracts matched the original package; `make check` and `make check-offline` passed. **Whole-model Compute Sanitizer was unavailable because GPU debugging was disabled; no memcheck pass is claimed.** Final packaged-model validation/load and 166 teacher-forced probability points matched the earlier quantized path; BF16 top-1 agreement stayed **98.19%**, all choices in BF16 top-3, all **150/150** high-confidence points matching.
+普通 B2/B3/B4/B8，以及验证宽度 2/4/8 × 请求数 1/2/4/8 × 纯验证/混合 prefill 的 24 组同历史对照，最大 KL 与所选 token NLL 差异均为 0。4K 分层暂停、按预算连续执行多层、交替覆盖 workspace、取消复用及部分前缀恢复后的持久状态一致。Flash Next 重建后的执行契约与原包完全相同，真实 GPU 分层恢复检查通过。`make check` 和 `make check-offline` 通过。本轮整模型 Compute Sanitizer 因设备禁用 GPU debugging 未能执行，不能视为 memcheck 通过。
 
-## Flash Next short-request regression (2026-10-15)
+本机当前模型目录已更新到重建后的执行包，并通过完整文件校验和实际加载。从最终目录重跑的 166 个 teacher-forced 概率记录与原量化执行路径逐项相同；官方 BF16 top1 一致率保持 **98.19%**，选择全部位于 BF16 top3，高置信位置一致 **150/150**。
 
-Under full expert residency, group-64 INT8 KV, and `decode_only`, the shared dynamic-row ordinary-decode template delivered aggregate TPS at 1/2/4/8/33 concurrent requests of **26.08/43.33/73.82/112.51/167.14**, each within 1% of the preceding package. Two MTP code-generation cases measured **39.09/51.76 TPS** before and **39.04/51.83** after, with identical generated token counts; the first three MTP iterations were excluded.
 
-Three warm 512-token CLI prefills averaged **987.6 TPS** before and **986.3 TPS** after. Consecutive-process load-to-ready was **18.29 versus 18.16 s** without clearing filesystem caches. Template interpretation occurs during loading/planning, not during Graph replay; no measurable inference regression was observed.
+## Flash Next 短请求回归（2026-10-15）
 
-## Flash Next full code generation
+普通 decode 使用同一动态行模板，专家全量常驻、INT8 KV、`decode_only`；数据为固定长度夹具的完整 Rust 请求回归。
 
-Text-only model built from an official checkpoint with integer E8P Q2A8 experts, Q4A8 input/output-head projections, W8 output projections/shared FFN, and BF16/FP16/FP32 where precision sensitive. Fully resident experts, group-64 INT8 KV, FP32 recurrent GDN. No images, other concurrent requests, or history-based prompt-lookup drafts.
+相同 Rust release 请求链连续复测，普通 decode 并发 1／2／4／8／33 为 26.08／43.33／73.82／112.51／167.14 TPS，与上一包的差异均不到 1%。两组代码生成 MTP，原包为 39.09／51.76 TPS，新包为 39.04／51.83 TPS，输出 token 相同。MTP 统计排除最初三个迭代。
 
-Full code generation used the Rust `orinfer serve` streaming Chat API, including actual chat template, scheduling, state restoration, MTP, CUDA work, and SSE transfer. Python was a client/timer only.
+Rust release CLI 三个热态 512-token 请求合计 prefill 原包 987.6 TPS、新包 986.3 TPS；加载到就绪分别 18.29 s、18.16 s。加载为连续进程复测，未清理系统缓存，不作为冷启动加速结论。模板仅参与加载和计划生成，Graph replay 不解释模板，未观察到推理性能回退。
+
+## Flash Next 完整生成
+
+使用官方 checkpoint 构建的文本模型：自有整数 E8P Q2A8 专家、Q4A8 输入投影与输出头、W8 输出投影与共享 FFN，精度敏感路径保留 BF16/FP16/FP32。专家全量常驻，KV 为 group-64 INT8，GDN 持续状态为 FP32。测试不含图片、其他并发请求或历史续写草稿。
+
+完整代码生成通过 `orinfer serve` 的流式 Chat Completions API 执行，覆盖实际 chat template、请求调度、状态恢复、MTP 和 CUDA 计算。Python 客户端只发请求、接收 SSE 和计时。服务配置：
 
 ```bash
 ./target/release/orinfer serve /path/to/optimized-flash-next \
@@ -241,20 +349,24 @@ Full code generation used the Rust `orinfer serve` streaming Chat API, including
   --prefix-cache-mib 1024 --memory-reserve-mib 512
 ```
 
-MTP-off used the same package/settings with `--mtp-drafts 0`. Draft widths were selected adaptively per request, not forced. Requests: `enable_thinking=true`, `reasoning_effort=medium`, `temperature=0`, `seed=20261002`, `thinking_token_budget=16384`, `max_completion_tokens=16384`. Reasoning and code share the 16K budget, with space reserved for reasoning termination and at least one response token.
+关闭 MTP 的对照使用相同执行包和配置，只将 `--mtp-drafts` 改为 `0`。草稿长度使用正常的请求级自适应策略，没有固定验证宽度。
 
-The task was to implement a safe Rust streaming frame decoder from scratch with a big-endian u32 length prefix, arbitrary input fragments, maximum-frame check, reset, and stdlib unit tests. Unrelated repository helper text varied prompts to 512/2048/8191 input tokens.
+请求参数为 `enable_thinking=true`、`reasoning_effort=medium`、`temperature=0`、`seed=20261002`、`thinking_token_budget=16384`、`max_completion_tokens=16384`。思考和代码共享 16K 总输出上限；API 为思考结束标记和至少一个答案 token 预留空间。
 
-For each length/MTP configuration, one initial and one identical full-prefix-hit request were run. Table values are the **single warm full-request run** per cell. Outputs were 6,176–7,598 tokens including thinking and code, all naturally ended with `finish_reason=stop`.
+场景要求从零实现安全 Rust 流式帧解码器：大端 u32 长度头、任意碎片输入、最大帧限制、复位和标准库单元测试。提示包含与实现无关的仓库参考 helper，以构造不同输入长度。完整请求测试的输入分别为 512、2048、8191 tokens。
 
-| Input tokens | Generated tokens | MTP-off decode TPS | MTP-on decode TPS | Speedup | MTP reasoning-stage TPS | MTP code-stage TPS | Draft acceptance |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 512 | 6,276 | 29.72 | 44.99 | 1.51× | 41.46 | 49.37 | 74.8% |
-| 2,048 | 6,176 | 29.64 | 45.21 | 1.53× | 44.02 | 46.62 | 76.4% |
-| 8,191 | 7,598 | 29.49 | 45.82 | 1.55× | 43.14 | 49.30 | 77.4% |
+### 完整代码生成
 
-Decode TPS is `(completion_tokens - 1) / (total HTTP time - TTFT)`, including Rust scheduling, token transfers, synchronization, and SSE tail handling; only **committed** output tokens count, including thinking—not rejected drafts. TTFT starts with request submission and ends at the first valid reasoning/content fragment. SSE fragments may combine tokens. Stage TPS is approximate using API usage and reasoning/body timing boundaries; it does not treat chunk count as token count.
+每种输入、每个 MTP 配置各运行一次首请求和一次相同提示的完整 prefix 命中请求。下表采用后者的暖态数据，每格为一次完整请求的测量值。生成 6176–7598 tokens，包含思考和代码；所有请求均自然结束，`finish_reason=stop`。
 
-Full-request decode measured approximately **45 TPS**; code-only stage measured **46.62–49.37 TPS**. This **does not reach 50 TPS for complete generation**, and the code-only rate must not replace the reasoning-inclusive decode measure.
+| 输入 tokens | 实际输出 tokens | MTP 关闭 decode TPS | MTP 开启 decode TPS | 加速比 | MTP 思考阶段 TPS | MTP 代码阶段 TPS | 草稿接受率 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 512 | 6276 | 29.72 | 44.99 | 1.51× | 41.46 | 49.37 | 74.8% |
+| 2048 | 6176 | 29.64 | 45.21 | 1.53× | 44.02 | 46.62 | 76.4% |
+| 8191 | 7598 | 29.49 | 45.82 | 1.55× | 43.14 | 49.30 | 77.4% |
 
-MTP-on and MTP-off matched reasoning, code, token counts, and finish reasons for every corresponding request. Generated code compiled in all three cases. Generated unit tests passed for 512 and 8,191-token prompts. The 2,048-token case had one flawed generated test repeating the first frame-header byte (10 passing, 1 failing); correcting only that test input while leaving the decoder unchanged yielded 11 passes. These are MTP-toggle consistency checks, not independent BF16/FP8 quality acceptance.
+Decode TPS 为 `(completion_tokens - 1) / (完整 HTTP 请求耗时 - TTFT)`，包含 Rust 调度、token 传输、同步与 SSE 尾部处理；只统计提交的 tokens，包含思考，不统计被拒绝的草稿。TTFT 从发请求计时，到收到首个有效思考或正文片段。SSE 片段可能合并多个 tokens；阶段 TPS 按 API usage 和思考/正文片段时间边界近似计算，不将片段数当作 token 数。
+
+完整请求的 decode 为约 45 TPS，代码阶段为 46.62–49.37 TPS；这些结果没有达到完整请求 50 TPS，不能用代码阶段吞吐替代包含思考的完整 decode。
+
+两种 MTP 配置下，全部请求的思考文本、代码、token 数和停止原因一致。三个输入长度生成的代码均可编译；512 与 8191-token 场景的生成单元测试全部通过。2048-token 场景有一个生成测试重复输入首个帧头字节，原始结果为 10 通过、1 失败；仅修正该测试输入、保持生成的解码器实现不变后，11 项通过。这验证了本次 MTP 开关的一致性，不替代独立 BF16/FP8 量化质量评估。

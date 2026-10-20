@@ -22,6 +22,7 @@ lint:
 check: lint
 	cargo check --workspace --locked --offline
 	cargo test --workspace --locked --offline
+	$(PYTHON) -m unittest discover -s tools/api -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/eval -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/bench -p 'test_*.py' -v
 	$(PYTHON) -m unittest discover -s tools/operators -p 'test_abi.py' -v

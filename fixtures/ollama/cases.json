@@ -1,0 +1,364 @@
+{
+  "upstream": {
+    "repository": "https://github.com/ollama/ollama",
+    "revision": "36a6e994d2f6c4ab94b3555185154d069e5dba87",
+    "license": "MIT",
+    "adaptations": [
+      "Request histories include an initial user message required by the native chat contract.",
+      "Ollama structured thinking and tool responses are rendered as Qwen tags for the native incremental parser.",
+      "Assertions compare semantic content and call arguments, not transport chunk boundaries or generated identifiers.",
+      "Ollama-specific unload reasons, model formats and unsupported endpoints are excluded.",
+      "Black-box comparisons use fixed seed 20261002; the manager suite translates upstream scheduler scenarios to Unix-socket subprocesses and Orin unified-memory limits."
+    ]
+  },
+  "requests": [
+    {
+      "id": "tool_result_text_parts",
+      "source": "openai/openai_test.go#TestFromChatRequest_ToolMessageArrayContent",
+      "request": {
+        "model": "test-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is the weather?"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [
+              {
+                "type": "text",
+                "text": "sunny [img]"
+              },
+              {
+                "type": "text",
+                "text": ", 72F [img-99]"
+              }
+            ]
+          }
+        ]
+      },
+      "expected_messages": [
+        {
+          "role": "user",
+          "content": "What is the weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {}
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": "sunny [img], 72F [img-99]"
+        }
+      ]
+    },
+    {
+      "id": "tool_result_empty_parts",
+      "source": "openai/openai_test.go#TestFromChatRequest_ToolMessageEmptyArrayContent",
+      "request": {
+        "model": "test-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "What is the weather?"
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": []
+          }
+        ]
+      },
+      "expected_messages": [
+        {
+          "role": "user",
+          "content": "What is the weather?"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_1",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {}
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_1",
+          "content": ""
+        }
+      ]
+    },
+    {
+      "id": "openai_tool_route_history",
+      "source": "integration/tools_routes_test.go#runOpenAIChatToolRoute",
+      "request": {
+        "model": "test-model",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Tool protocol compatibility test."
+          },
+          {
+            "role": "developer",
+            "content": "When the user asks for weather, call get_weather. Return only the tool call and do not answer in text."
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Call get_weather for Paris."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "call_previous",
+                "type": "function",
+                "function": {
+                  "name": "get_weather",
+                  "arguments": "{\"location\":\"Paris\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_previous",
+            "content": [
+              {
+                "type": "text",
+                "text": "{\"condition\":\"sunny\"}"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "Now call get_weather with location exactly Boston. Return only the tool call."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "description": "Get the current weather for a location",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "location": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ]
+              }
+            }
+          }
+        ],
+        "temperature": 0,
+        "max_tokens": 256,
+        "reasoning_effort": "none"
+      },
+      "expected_messages": [
+        {
+          "role": "system",
+          "content": "Tool protocol compatibility test.\n\nWhen the user asks for weather, call get_weather. Return only the tool call and do not answer in text."
+        },
+        {
+          "role": "user",
+          "content": "Call get_weather for Paris."
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_previous",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": {
+                  "location": "Paris"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "tool_call_id": "call_previous",
+          "content": "{\"condition\":\"sunny\"}"
+        },
+        {
+          "role": "user",
+          "content": "Now call get_weather with location exactly Boston. Return only the tool call."
+        }
+      ],
+      "expected_calls": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "location": "Boston"
+          }
+        }
+      ]
+    }
+  ],
+  "output": [
+    {
+      "id": "thinking_and_content",
+      "source": "openai/openai_test.go#TestToStreamChunks_SplitsThinkingAndContent",
+      "raw": "<think>step-by-step</think>final answer",
+      "reasoning": "step-by-step",
+      "content": "final answer",
+      "calls": []
+    },
+    {
+      "id": "thinking_and_tool",
+      "source": "openai/openai_test.go#TestToStreamChunks_SplitsThinkingAndToolCalls",
+      "raw": "<think>need a tool</think><tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Seattle\"}}</tool_call>",
+      "reasoning": "need a tool",
+      "content": "",
+      "calls": [
+        {
+          "name": "get_weather",
+          "arguments": {
+            "location": "Seattle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "thinking_only",
+      "source": "openai/openai_test.go#TestToStreamChunks_SingleChunkForNonMixedResponses",
+      "raw": "<think>pondering",
+      "reasoning": "pondering",
+      "content": "",
+      "calls": []
+    },
+    {
+      "id": "content_only",
+      "source": "openai/openai_test.go#TestToStreamChunks_SingleChunkForNonMixedResponses",
+      "raw": "hello",
+      "reasoning": "",
+      "content": "hello",
+      "calls": []
+    },
+    {
+      "id": "tool_only",
+      "source": "openai/openai_test.go#TestToStreamChunks_SingleChunkForNonMixedResponses",
+      "raw": "<tool_call>{\"name\":\"get_time\",\"arguments\":{\"timezone\":\"UTC\"}}</tool_call>",
+      "reasoning": "",
+      "content": "",
+      "calls": [
+        {
+          "name": "get_time",
+          "arguments": {
+            "timezone": "UTC"
+          }
+        }
+      ]
+    },
+    {
+      "id": "empty_completion",
+      "source": "middleware/openai_test.go#TestChatWriter_StreamEmptyCompletionStillEmitsRoleChunk",
+      "raw": "",
+      "reasoning": "",
+      "content": "",
+      "calls": []
+    }
+  ],
+  "finish": {
+    "source": "openai/openai_test.go#TestFinishChunk",
+    "cases": [
+      {
+        "id": "stop",
+        "exhausted": false,
+        "has_tool": false,
+        "expected": "stop"
+      },
+      {
+        "id": "length",
+        "exhausted": true,
+        "has_tool": false,
+        "expected": "length"
+      },
+      {
+        "id": "tool_calls",
+        "exhausted": false,
+        "has_tool": true,
+        "expected": "tool_calls"
+      },
+      {
+        "id": "length_with_tool_calls",
+        "exhausted": true,
+        "has_tool": true,
+        "expected": "length"
+      }
+    ]
+  },
+  "lifecycle": {
+    "source": "server/sched_test.go",
+    "scenarios": [
+      "TestSchedRequestsSameModelSameRequest",
+      "TestSchedRequestsMultipleLoadedModels",
+      "TestSchedPrematureExpired",
+      "TestSchedNeedsReload",
+      "TestSchedAlreadyCanceled",
+      "TestSchedLoadCrashTriggersEvictAllAndRetry",
+      "TestRunnerCanBeEvicted"
+    ]
+  }
+}

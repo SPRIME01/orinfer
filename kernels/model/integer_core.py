@@ -37,7 +37,7 @@ def tile_coordinates(pid, rows, columns, group_m):
     return pid % rows, pid // rows
 
 
-def tensor_core_tiles(m, n, k, bm, bn, bk, *, tail_m=0, **options):
+def tensor_core_tiles(m, n, k, bm, bn, bk, *, tail_m=0, grouped=False, **options):
     """Use the same full-K arithmetic for large full tiles and smaller tails."""
     if (
         type(tail_m) is not int
@@ -45,10 +45,24 @@ def tensor_core_tiles(m, n, k, bm, bn, bk, *, tail_m=0, **options):
         or (tail_m and (tail_m >= bm or bm % tail_m))
     ):
         raise ValueError("Invalid integer projection tail tile")
-    bulk = tensor_core(m, n, k, bm, bn, bk, **options)
+    bulk = tensor_core(m, n, k, bm, bn, bk, grouped=grouped, **options)
     if tail_m:
-        tail = tensor_core(m, n, k, tail_m, bn, bk, **options)
+        tail = tensor_core(m, n, k, tail_m, bn, bk, grouped=grouped, **options)
     tiles = T.ceildiv(m, bm)
+
+    if grouped:
+
+        @T.macro
+        def grouped_project(A, W, U, WS, US, AS, Out, by, bx, expert, first, count):
+            if tail_m:
+                if count <= tail_m:
+                    tail(A, W, U, WS, US, AS, Out, 0, bx, expert, first, count)
+                else:
+                    bulk(A, W, U, WS, US, AS, Out, 0, bx, expert, first, count)
+            else:
+                bulk(A, W, U, WS, US, AS, Out, by, bx, expert, first, count)
+
+        return tiles, grouped_project
 
     @T.macro
     def project(A, W, U, WS, US, AS, Out, by, bx):
@@ -72,14 +86,17 @@ def prepare_e8p_book(source, book):
         book[i + 256, 0] = T.call_pure_extern("uint32", "e8p_q4_flags", T.cast(i, T.uint32))
 
 
-def weight_loader(codec, n, bn, bk, source, *, packed_k=0):
+def weight_loader(codec, n, bn, bk, source, *, packed_k=0, grouped=False, wait_for_encoded=True):
     if codec not in ("w8", "q4", "e8p_q4"):
         raise ValueError("Unsupported integer weight codec")
 
     @T.macro
-    def load(W, Book, tile, bx, kg):
+    def load(W, Book, tile, bx, kg, expert):
         if codec == "w8":
-            T.copy(W[bx * bn, kg * bk], tile)
+            if grouped:
+                T.copy(W[expert, bx * bn, kg * bk], tile)
+            else:
+                T.copy(W[bx * bn, kg * bk], tile)
         elif codec == "q4":
             T.import_source(source)
             decoded = T.alloc_fragment((bn, bk // 4), T.uint32)
@@ -99,10 +116,21 @@ def weight_loader(codec, n, bn, bk, source, *, packed_k=0):
                 # the resident weight representation remains compressed.
                 encoded = T.alloc_shared((bk // 128, bn, 16), T.uint32)
                 for part in T.unroll(bk // 128):
-                    T.copy(
-                        W[kg * (bk // 128) + part, bx * bn : bx * bn + bn, 0:16],
-                        encoded[part, :, :],
-                    )
+                    if grouped:
+                        T.copy(
+                            W[expert, kg * (bk // 128) + part, bx * bn : bx * bn + bn, 0:16],
+                            encoded[part, :, :],
+                        )
+                    else:
+                        T.copy(
+                            W[kg * (bk // 128) + part, bx * bn : bx * bn + bn, 0:16],
+                            encoded[part, :, :],
+                        )
+                if wait_for_encoded:
+                    # A's multi-stage wait may leave this newest copy pending
+                    # when the scalar decoder starts consuming the slab.
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
             decoded = T.alloc_fragment((bn, bk // 4), T.uint32)
             for j, k in T.Parallel(bn, bk // 4):
                 decoded[j, k] = 0
@@ -129,15 +157,44 @@ def weight_loader(codec, n, bn, bk, source, *, packed_k=0):
     return load
 
 
-def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=False, packed_k=0):
+def tensor_core(
+    m,
+    n,
+    k,
+    bm,
+    bn,
+    bk,
+    *,
+    stages=2,
+    codec="w8",
+    source="",
+    dual=False,
+    packed_k=0,
+    grouped=False,
+):
     if codec == "e8p_q4" and dual:
         raise ValueError("E8P-Q4 reserves the secondary operand for its shared basis")
-    load = weight_loader(codec, n, bn, bk, source, packed_k=packed_k)
+    if grouped and (
+        codec not in ("w8", "e8p_q4") or (codec == "e8p_q4" and packed_k != 128) or dual
+    ):
+        raise ValueError("Unsupported grouped integer operands")
+    # A single-stage pipeline already waits for every copy. Preserve that
+    # schedule instead of adding another wait/barrier to its hot K loop.
+    load = weight_loader(
+        codec,
+        n,
+        bn,
+        bk,
+        source,
+        packed_k=packed_k,
+        grouped=grouped,
+        wait_for_encoded=stages > 1,
+    )
     # Keep Q4's weight-left MMA orientation and W8's activation-left layout.
     left = codec != "w8"
 
     @T.macro
-    def project(A, W, U, WS, US, AS, Out, by, bx):
+    def core(A, W, U, WS, US, AS, Out, by, bx, expert, first, m):
         a = T.alloc_shared((bm, bk), T.int8)
         w = T.alloc_shared((bn, bk), T.int8)
         acc = T.alloc_fragment((bn, bm) if left else (bm, bn), T.int32)
@@ -151,13 +208,13 @@ def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=Fa
             prepare_e8p_book(U, book)
         T.clear(acc)
         for kg in T.Pipelined(k // bk, num_stages=stages):
-            T.copy(A[by * bm, kg * bk], a)
+            T.copy(A[first + by * bm, kg * bk], a)
             if codec == "e8p_q4":
-                load(W, book, w, bx, kg)
+                load(W, book, w, bx, kg, expert)
             else:
-                load(W, W, w, bx, kg)
+                load(W, W, w, bx, kg, expert)
             if dual:
-                load(U, U, u, bx, kg)
+                load(U, U, u, bx, kg, expert)
             if left:
                 T.gemm(w, a, acc, transpose_B=True)
             else:
@@ -169,16 +226,21 @@ def tensor_core(m, n, k, bm, bn, bk, *, stages=2, codec="w8", source="", dual=Fa
                     T.gemm(a, u, up, transpose_B=True)
         for i, j in T.Parallel(bm, bn):
             if by * bm + i < m and bx * bn + j < n:
-                value = rescale(acc[j, i] if left else acc[i, j], WS[bx * bn + j], AS[by * bm + i])
+                scale = WS[expert, bx * bn + j] if grouped else WS[bx * bn + j]
+                value = rescale(acc[j, i] if left else acc[i, j], scale, AS[first + by * bm + i])
                 if dual:
                     other = rescale(
                         up[j, i] if left else up[i, j], US[bx * bn + j], AS[by * bm + i]
                     )
-                    Out[by * bm + i, bx * bn + j] = swiglu(value, other)
+                    Out[first + by * bm + i, bx * bn + j] = swiglu(value, other)
                 else:
-                    Out[by * bm + i, bx * bn + j] = value
+                    Out[first + by * bm + i, bx * bn + j] = value
 
-    return project
+    @T.macro
+    def project(A, W, U, WS, US, AS, Out, by, bx):
+        core(A, W, U, WS, US, AS, Out, by, bx, 0, 0, m)
+
+    return core if grouped else project
 
 
 def dp4a(m, n, k, bm, bn, *, codec="w8", source="", dual=False, packed_k=0):

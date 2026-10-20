@@ -4,6 +4,59 @@ import math
 from collections import Counter
 
 
+def project(selection, keys):
+    """Coalesce a pipeline choice after restricting it to one component's knobs."""
+    configs, indices, names = [], {}, {}
+    for name in [selection["default"], *(r["implementation"] for r in selection["selections"])]:
+        config = {key: selection["configs"][int(name)][key] for key in keys}
+        signature = tuple(config.items())
+        if signature not in indices:
+            indices[signature] = str(len(configs))
+            configs.append(config)
+        names[name] = indices[signature]
+    default = names[selection["default"]]
+    intervals = []
+    for row in selection["selections"]:
+        name = names[row["implementation"]]
+        if name == default:
+            continue
+        item = dict(row, implementation=name)
+        if (
+            intervals
+            and intervals[-1]["implementation"] == name
+            and intervals[-1]["max_rows"] + 1 == item["min_rows"]
+            and intervals[-1].get("multiple_of", 1) == item.get("multiple_of", 1)
+        ):
+            intervals[-1]["max_rows"] = item["max_rows"]
+        else:
+            intervals.append(item)
+    return dict(configs=configs, default=default, selections=intervals)
+
+
+def prefill_fallback(selection, default, capacity=128):
+    """Keep bounded decode choices around one measured prefill configuration."""
+    live = [selection["default"]] * capacity
+    for choice in selection["selections"]:
+        for row in range(choice["min_rows"], min(choice["max_rows"], capacity) + 1):
+            if row % choice.get("multiple_of", 1) == 0:
+                live[row - 1] = choice["implementation"]
+    intervals = []
+    for row, name in enumerate(live, 1):
+        if name == default:
+            continue
+        if (
+            intervals
+            and intervals[-1]["implementation"] == name
+            and intervals[-1]["max_rows"] + 1 == row
+        ):
+            intervals[-1]["max_rows"] = row
+        else:
+            intervals.append(dict(min_rows=row, max_rows=row, multiple_of=1, implementation=name))
+    return dict(
+        selection, default=default, selections=intervals, used=sorted(set(live) | {default})
+    )
+
+
 def ranges(records, capacity=4096):
     """Nearest measured length selects a legal implementation, then coalesce."""
     names = sorted({name for row in records for name in row["times"]})
