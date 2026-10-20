@@ -568,6 +568,8 @@ class DecodeTuner:
             )
             args = [a, weight, book, ws, scales, out]
         elif kind == "w8":
+            from tools.model.compile import primitive
+
             weight = (
                 weights["W"]
                 if weights is not None
@@ -578,12 +580,26 @@ class DecodeTuner:
                 if weights is not None
                 else torch.full((n,), 0.001, device=device, dtype=torch.float16)
             )
-            base = int8_projection(live, n, k, output_dtype=spec["dtype"])
+            base = primitive(
+                int8_projection,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                k,
+                output_dtype=spec["dtype"],
+                dynamic_rows=spec["dynamic"],
+            )
             base.adapter.func(
-                a, weight, ws, scales, expected, stream=torch.cuda.current_stream().cuda_stream
+                a,
+                weight,
+                ws,
+                scales,
+                expected,
+                *([live] if spec["dynamic"] else []),
+                stream=torch.cuda.current_stream().cuda_stream,
             )
             args = [a, weight, ws, scales, out]
         elif kind == "swiglu":
+            from tools.model.compile import primitive
             from kernels.model.flash_next import swiglu
 
             gate = torch.empty_like(expected)
@@ -608,11 +624,24 @@ class DecodeTuner:
                 if weights is not None
                 else torch.full((n,), 0.0007, device=device, dtype=torch.float16)
             )
-            base = int8_projection(live, n, k)
+            base = primitive(
+                int8_projection,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                k,
+                dynamic_rows=spec["dynamic"],
+            )
             stream = torch.cuda.current_stream().cuda_stream
-            base.adapter.func(a, wg, gs, scales, gate, stream=stream)
-            base.adapter.func(a, wu, us, scales, up, stream=stream)
-            swiglu(live, n).adapter.func(gate, up, expected, stream=stream)
+            live_args = [live] if spec["dynamic"] else []
+            base.adapter.func(a, wg, gs, scales, gate, *live_args, stream=stream)
+            base.adapter.func(a, wu, us, scales, up, *live_args, stream=stream)
+            activation = primitive(
+                swiglu,
+                spec["rows"] if spec["dynamic"] else live,
+                n,
+                dynamic_rows=spec["dynamic"],
+            )
+            activation.adapter.func(gate, up, expected, *live_args, stream=stream)
             args = [a, wg, wu, gs, us, scales, out]
         else:
             e = spec["experts"]

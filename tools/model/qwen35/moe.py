@@ -99,6 +99,7 @@ def selection(b, banks):
                 b.text["num_experts_per_tok"],
                 actual,
                 [w.buffers[name]["data"]["sha256"] for bank in banks for name in bank],
+                routing_samples=getattr(b, "moe_routing", None),
             )
     return b.moe_selection
 
@@ -132,7 +133,12 @@ def emitter(b, section, rows):
 
 def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
     from kernels.model import moe
-    from tools.model.expert_tuning import expert_projection, expert_passes
+    from tools.model.expert_tuning import (
+        expert_projection,
+        expert_passes,
+        cold_expert_config,
+        tile_capacity,
+    )
 
     w, h, f = b.weights, b.h, b.f
     e, top = b.text["num_experts"], b.text["num_experts_per_tok"]
@@ -147,16 +153,81 @@ def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
     if expanded and "MoeExpanded" not in w.buffers:
         w.fixed("MoeExpanded", "i8", [e * 2 * f * h])
     planes = any(config.get("folded") for _, config in selected)
-    if planes and "MoeLow" not in w.buffers:
+    cold = any(config.get("cold_rows") for _, config in selected)
+    cold_config = cold_expert_config()
+    if (planes or cold) and "MoeLow" not in w.buffers:
         for name in ("MoeLow", "MoeHigh"):
             w.fixed(name, "i8", [4096 * top * max(h, f) // 2])
         w.fixed("MoeSum", "i32", [4096 * top])
+    if cold and "MoeColdTileCount" not in w.buffers:
+        capacity = tile_capacity(4096, e, top, cold_config["block_m"])
+        for name, shape in [
+            ("Offsets", [e]),
+            ("Expert", [capacity]),
+            ("Row", [capacity]),
+            ("Count", [1]),
+        ]:
+            w.fixed("MoeColdTile" + name, "i32", shape)
 
     from tools.model.row_selection import project
 
-    routing = selected if draft else b.row_choices(project(b.moe_selection, ("block_m",)), rows)
+    routing_selection = (
+        dict(
+            b.moe_selection,
+            configs=[dict(c, cold_rows=c.get("cold_rows", 0)) for c in b.moe_selection["configs"]],
+        )
+        if not draft
+        else None
+    )
+    routing = (
+        selected
+        if draft
+        else b.row_choices(project(routing_selection, ("block_m", "cold_rows")), rows)
+    )
     for suffix, config in routing:
         tile = config["block_m"]
+        if config.get("cold_rows"):
+            from kernels.model import expert_partition
+
+            bindings = dict(
+                Counts="MoeCounts",
+                RowOffsets="MoeOffsets",
+                TileOffsets="MoeTileOffsets",
+                TileCount="MoeTileCount",
+                ColdOffsets="MoeColdTileOffsets",
+                ColdCount="MoeColdTileCount",
+            )
+            b.emit(
+                section + "/offsets" + suffix,
+                f"moe-partition-offsets-{e}-{tile}-{config['cold_rows']}",
+                lambda tile=tile, limit=config["cold_rows"]: primitive(
+                    expert_partition.offsets, e, tile, cold_config["block_m"], limit
+                ),
+                bindings,
+                rows,
+                dynamic=False,
+            )
+            emit(
+                "tiles",
+                expert_partition.tiles,
+                dict(
+                    Counts="MoeCounts",
+                    TileOffsets="MoeTileOffsets",
+                    TileExpert="MoeTileExpert",
+                    TileRow="MoeTileRow",
+                    ColdOffsets="MoeColdTileOffsets",
+                    ColdExpert="MoeColdTileExpert",
+                    ColdRow="MoeColdTileRow",
+                ),
+                rows,
+                e,
+                top,
+                tile,
+                cold_config["block_m"],
+                config["cold_rows"],
+                suffix=suffix,
+            )
+            continue
         b.emit(
             section + "/offsets" + suffix,
             f"moe-offsets-{e}-{tile}",
@@ -203,6 +274,65 @@ def projections(b, section, bank_up, bank_down, *, rows=4096, draft=False):
                 construct(suffix.replace("/rows/", "/skip/"))
 
     def expert(role, n, k, bank, activation, scale, output):
+        if cold:
+            from kernels.model.e8p_prefill import split_routed_prefill_a8
+
+            def cold_planes(suffix=""):
+                emit(
+                    role + "_cold_planes",
+                    split_routed_prefill_a8,
+                    dict(
+                        A=activation,
+                        Counts="MoeCounts",
+                        Offsets="MoeOffsets",
+                        TE="MoeColdTileExpert",
+                        TR="MoeColdTileRow",
+                        TC="MoeColdTileCount",
+                        Low="MoeLow",
+                        High="MoeHigh",
+                        Sum="MoeSum",
+                    ),
+                    rows * top,
+                    k,
+                    e,
+                    cold_config["block_m"],
+                    multiplier=top,
+                    suffix=suffix,
+                )
+
+            def cold_product(suffix=""):
+                emit(
+                    role + "_cold",
+                    expert_projection,
+                    dict(
+                        Low="MoeLow",
+                        High="MoeHigh",
+                        Sum="MoeSum",
+                        P=bank[0],
+                        Book=b.book,
+                        WS=bank[1],
+                        AS=scale,
+                        Counts="MoeCounts",
+                        Offsets="MoeOffsets",
+                        TE="MoeColdTileExpert",
+                        TR="MoeColdTileRow",
+                        TC="MoeColdTileCount",
+                        Out=output,
+                    ),
+                    rows,
+                    n,
+                    k,
+                    e,
+                    top,
+                    multiplier=top,
+                    suffix=suffix,
+                    codec="e8p_q4",
+                    config=cold_config,
+                    compiler_options=expert_passes("e8p_q4", cold_config),
+                )
+
+            conditional_step(cold_planes, lambda c: bool(c.get("cold_rows")))
+            conditional_step(cold_product, lambda c: bool(c.get("cold_rows")))
         if expanded:
 
             def expand(suffix=""):
@@ -306,14 +436,24 @@ def build(b, section, prefix, *, rows=4096, draft=False):
     router = w.combined(
         prefix + ".router", [prefix + ".gate.weight", prefix + ".shared_expert_gate.weight"]
     )
-    emit(
-        "router",
-        moe.router_projection,
-        dict(X=norm, W=router, Logits="MoeLogits", SharedGate="MoeGate"),
-        rows,
-        h,
-        e,
-    )
+    from tools.model.expert_tuning import MoeTuner
+    from tools.model.qwen35.build import gpu_lock
+
+    if not hasattr(b, "moe_router_tuner"):
+        b.moe_router_tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)
+    with gpu_lock(b.lock):
+        router_selection = b.moe_router_tuner.router(h, e)
+    for suffix, config in b.row_choices(router_selection, rows):
+        emit(
+            "router",
+            moe.router_projection,
+            dict(X=norm, W=router, Logits="MoeLogits", SharedGate="MoeGate"),
+            rows,
+            h,
+            e,
+            suffix=suffix,
+            **config,
+        )
     emit(
         "topk",
         moe.router_topk,
@@ -412,6 +552,9 @@ def build(b, section, prefix, *, rows=4096, draft=False):
             multiplier=top,
         )
     else:
+        with gpu_lock(b.lock):
+            rotation = b.row_tuner.activation_rotation(f, True, multiplier=top)
+        rotation_config = rotation["configs"][int(rotation["default"])]
         emit(
             "expert_rotate",
             rotation_a8.rotate_activation_a8,
@@ -420,6 +563,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
             f,
             True,
             multiplier=top,
+            **rotation_config,
         )
     projections(b, section, bank_up, bank_down, rows=rows, draft=draft)
     emit(

@@ -12,6 +12,12 @@ from tools.operators.common import orin_jit
 CHANNELS, KEY_HEADS, VALUE_HEADS, DIM = 10240, 16, 48, 128
 Q_SCALE = 1.0
 
+VECTOR_LOAD_SOURCE = """
+__device__ __forceinline__ void orinfer_conv_load128(const void* source, void* destination) {
+    *reinterpret_cast<uint4*>(destination) = *reinterpret_cast<const uint4*>(source);
+}
+"""
+
 
 @orin_jit
 def gdn_conv_prep(
@@ -71,6 +77,13 @@ def gdn_conv_prep(
     time = T.dynamic("m") if dynamic_tokens else T.dynamic("tokens") if tokens is None else tokens
     threads = min(128, tile_tokens * 16)
 
+    lanes_per_token = DIM // 8
+    token_slots = tile_tokens // (threads // lanes_per_token)
+    # Each lane owns eight adjacent coordinates. Load complete 16-byte vectors
+    # before the scalar tap arithmetic, preserving its FP16 product rounding.
+    weight_coordinates = 2 if weight_dtype == "float16" else 1
+    weight_vector_elements = 4 * weight_coordinates
+
     @T.macro
     def body(X, W, HI, lengths, positions, Q, K, V, HO, positions_out):
         with T.Kernel(
@@ -79,6 +92,34 @@ def gdn_conv_prep(
             batch,
             threads=threads,
         ) as (bt, head, b):
+            T.import_source(VECTOR_LOAD_SOURCE)
+            metadata = T.alloc_local((2,), T.int32)
+            metadata[0] = lengths[b]
+            metadata[1] = positions[b]
+            input_words = T.alloc_local((token_slots, 8), T.float16)
+            weight_words = T.alloc_local((8, 4), weight_dtype)
+            for vector in T.unroll(8 // weight_coordinates):
+                T.evaluate(
+                    T.call_extern(
+                        "void",
+                        "orinfer_conv_load128",
+                        T.access_ptr(
+                            W[
+                                head * DIM
+                                + (T.get_thread_binding() % lanes_per_token) * 8
+                                + vector * weight_coordinates,
+                                0,
+                            ],
+                            "r",
+                            weight_vector_elements,
+                        ),
+                        T.access_ptr(
+                            weight_words[vector * weight_coordinates, 0],
+                            "w",
+                            weight_vector_elements,
+                        ),
+                    )
+                )
             acc = T.alloc_fragment((tile_tokens, DIM), T.float32)
             raw = T.alloc_fragment((tile_tokens, DIM), T.float32)
             activated = T.alloc_fragment((tile_tokens, DIM), T.float16)
@@ -121,22 +162,47 @@ def gdn_conv_prep(
                     tail[i, d] = HI[b, i + 1, head * DIM + d]
             T.clear(acc)
             for tap in T.unroll(4):
-                for ti, d in T.Parallel(tile_tokens, DIM):
-                    raw[ti, d] = 0.0
-                    if bt * tile_tokens + ti < lengths[b]:
-                        if bt * tile_tokens + ti + tap >= 3:
-                            raw[ti, d] = T.cast(
-                                X[b, bt * tile_tokens + ti + tap - 3, head * DIM + d], T.float32
+                for i in T.unroll(token_slots):
+                    ti = (
+                        bt * tile_tokens
+                        + i * (threads // lanes_per_token)
+                        + T.get_thread_binding() // lanes_per_token
+                    )
+                    col = head * DIM + (T.get_thread_binding() % lanes_per_token) * 8
+                    for j in T.unroll(8):
+                        input_words[i, j] = 0
+                    if ti < metadata[0]:
+                        if ti + tap >= 3:
+                            T.evaluate(
+                                T.call_extern(
+                                    "void",
+                                    "orinfer_conv_load128",
+                                    T.access_ptr(X[b, ti + tap - 3, col], "r", 8),
+                                    T.access_ptr(input_words[i, 0], "w", 8),
+                                )
                             )
-                        elif positions[b] + bt * tile_tokens + ti + tap >= 3:
-                            raw[ti, d] = T.cast(
-                                HI[b, bt * tile_tokens + ti + tap, head * DIM + d], T.float32
+                        elif metadata[1] + ti + tap >= 3:
+                            T.evaluate(
+                                T.call_extern(
+                                    "void",
+                                    "orinfer_conv_load128",
+                                    T.access_ptr(HI[b, ti + tap, col], "r", 8),
+                                    T.access_ptr(input_words[i, 0], "w", 8),
+                                )
                             )
-                    if conv_product_round_fp16:
-                        product[ti, d] = raw[ti, d] * T.cast(W[head * DIM + d, tap], T.float32)
-                        acc[ti, d] += T.cast(product[ti, d], T.float32)
-                    else:
-                        acc[ti, d] += raw[ti, d] * T.cast(W[head * DIM + d, tap], T.float32)
+                for i in T.unroll(token_slots):
+                    for j in T.unroll(8):
+                        ti = (
+                            i * (threads // lanes_per_token)
+                            + T.get_thread_binding() // lanes_per_token
+                        )
+                        d = (T.get_thread_binding() % lanes_per_token) * 8 + j
+                        raw[ti, d] = T.cast(input_words[i, j], T.float32)
+                        if conv_product_round_fp16:
+                            product[ti, d] = raw[ti, d] * T.cast(weight_words[j, tap], T.float32)
+                            acc[ti, d] += T.cast(product[ti, d], T.float32)
+                        else:
+                            acc[ti, d] += raw[ti, d] * T.cast(weight_words[j, tap], T.float32)
             for ti, d in T.Parallel(tile_tokens, DIM):
                 activated[ti, d] = acc[ti, d] / (1.0 + T.exp(-acc[ti, d]))
                 value[ti, d] = T.cast(activated[ti, d], T.float32)
@@ -162,19 +228,19 @@ def gdn_conv_prep(
             # Q/K are represented once, so shared value heads never race here.
             if bt == 0:
                 for i, d in T.Parallel(3, DIM):
-                    if lengths[b] == 0:
+                    if metadata[0] == 0:
                         HO[b, i, head * DIM + d] = HI[b, i, head * DIM + d]
-                    elif lengths[b] + i >= 3:
-                        HO[b, i, head * DIM + d] = X[b, lengths[b] + i - 3, head * DIM + d]
-                    elif positions[b] + lengths[b] + i >= 3:
+                    elif metadata[0] + i >= 3:
+                        HO[b, i, head * DIM + d] = X[b, metadata[0] + i - 3, head * DIM + d]
+                    elif metadata[1] + metadata[0] + i >= 3:
                         if inplace_history:
                             HO[b, i, head * DIM + d] = tail[T.min(i, 1), d]
                         else:
-                            HO[b, i, head * DIM + d] = HI[b, lengths[b] + i, head * DIM + d]
+                            HO[b, i, head * DIM + d] = HI[b, metadata[0] + i, head * DIM + d]
                     else:
                         HO[b, i, head * DIM + d] = 0.0
                 if head == 0:
-                    positions_out[b] = positions[b] + lengths[b]
+                    positions_out[b] = metadata[1] + metadata[0]
 
     if inplace_history:
 

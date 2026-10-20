@@ -13,14 +13,21 @@ from kernels.model.rows import row_count
 
 
 @orin_jit
-def router_projection(M, H, E, dynamic_rows=False):
+def router_projection(M, H, E, dynamic_rows=False, block_m=16, block_n=32, block_k=128, stages=2):
     """One floating projection for the router and the shared expert's gate."""
     from kernels.model.floating_core import mma_loop
 
-    if min(M, H, E) <= 0 or H % 128:
+    if (
+        min(M, H, E) <= 0
+        or block_m not in (16, 32, 64, 128)
+        or block_n not in (32, 64, 128)
+        or block_k not in (128, 256)
+        or H % block_k
+        or stages not in (1, 2)
+    ):
         raise ValueError("Invalid floating router geometry")
     m = row_count(M, dynamic_rows)
-    product = mma_loop(m, H, 16, 32, 128, dtype="float16", stages=2)
+    product = mma_loop(m, H, block_m, block_n, block_k, dtype="float16", stages=stages)
 
     @T.prim_func
     def main(
@@ -29,15 +36,15 @@ def router_projection(M, H, E, dynamic_rows=False):
         Logits: T.Tensor((m, E), T.float32),
         SharedGate: T.Tensor((m,), T.float16),
     ):
-        with T.Kernel(T.ceildiv(m, 16), T.ceildiv(E + 1, 32), threads=128) as (by, bx):
-            acc = T.alloc_fragment((16, 32), T.float32)
+        with T.Kernel(T.ceildiv(m, block_m), T.ceildiv(E + 1, block_n), threads=128) as (by, bx):
+            acc = T.alloc_fragment((block_m, block_n), T.float32)
             product(X, W, acc, by, bx, 0)
-            for i, j in T.Parallel(16, 32):
-                if by * 16 + i < m:
-                    if bx * 32 + j < E:
-                        Logits[by * 16 + i, bx * 32 + j] = acc[i, j]
-                    elif bx * 32 + j == E:
-                        SharedGate[by * 16 + i] = acc[i, j]
+            for i, j in T.Parallel(block_m, block_n):
+                if by * block_m + i < m:
+                    if bx * block_n + j < E:
+                        Logits[by * block_m + i, bx * block_n + j] = acc[i, j]
+                    elif bx * block_n + j == E:
+                        SharedGate[by * block_m + i] = acc[i, j]
 
     return main
 
@@ -57,6 +64,7 @@ def integer_experts(
     stages=2,
     dynamic_rows=False,
     tail_m=0,
+    minimum_blocks=1,
 ):
     """Routed bank/row views around the shared dense integer MMA computation."""
     from kernels.model.integer_core import tensor_core, tensor_core_tiles
@@ -66,13 +74,15 @@ def integer_experts(
         min(M, N, K, E, top_k) <= 0
         or top_k > E
         or K % 128
-        or block_m not in (8, 16, 32)
+        or block_m not in (8, 16, 32, 64, 128, 256)
         or block_n not in (32, 64, 128)
         or codec not in ("w8", "e8p_q4")
         or (codec == "w8" and (block_m == 8 or block_n == 32))
         or block_k not in (128, 256)
         or K % block_k
         or stages not in (1, 2)
+        or type(minimum_blocks) is not int
+        or minimum_blocks <= 0
     ):
         raise ValueError("Invalid grouped integer projection geometry")
     tiles = (M * top_k + block_m - 1) // block_m + min(E, M * top_k)
@@ -117,8 +127,9 @@ def integer_experts(
         Out: T.Tensor((rows, N), T.float16),
     ):
         with T.Kernel(
-            T.ceildiv(rows, block_m) + T.min(E, rows), T.ceildiv(N, block_n), threads=threads
-        ) as (tile, bx):
+            T.ceildiv(N, block_n), T.ceildiv(rows, block_m) + T.min(E, rows), threads=threads
+        ) as (bx, tile):
+            T.annotate_min_blocks_per_sm(minimum_blocks)
             metadata = T.alloc_local((3,), T.int32)
             if tile < TileCount[0]:
                 # Routing is immutable for this launch. Materialize these loads
@@ -202,7 +213,7 @@ def expert_histogram(M: int, E: int = 512, top_k: int = 10, dynamic_rows: bool =
 @orin_jit
 def expert_offsets(E: int = 512, block_m: int = 16):
     """Build (Counts, RowOffsets[E], TileOffsets[E], TileCount[1]), INT32."""
-    if type(E) is not int or E <= 0 or block_m not in (8, 16, 32, 64):
+    if type(E) is not int or E <= 0 or block_m not in (8, 16, 32, 64, 128, 256):
         raise ValueError("Invalid MoE expert prefix dimensions")
     width = 1 << (E - 1).bit_length()
 
@@ -240,7 +251,14 @@ def expert_tiles(M: int, E: int = 512, top_k: int = 10, block_m: int = 16, dynam
     Output capacity ceil(M*top_k/block_m)+min(E,M*top_k) bounds all distributions.
     Only the prefix indicated by expert_offsets.TileCount is initialized/read.
     """
-    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (8, 16, 32, 64):
+    if any(type(x) is not int or x <= 0 for x in (M, E, top_k)) or block_m not in (
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+    ):
         raise ValueError("Invalid MoE tile dimensions")
     assignments = M * top_k
     capacity = (assignments + block_m - 1) // block_m + min(E, assignments)

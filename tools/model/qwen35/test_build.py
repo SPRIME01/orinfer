@@ -54,7 +54,7 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
-    def test_folded_expert_planes_follow_selected_rows_and_assignment_multiplier(self):
+    def test_expert_schedules_follow_selected_rows_and_assignment_multiplier(self):
         from tools.model.qwen35 import moe
 
         def kernel(*args, **kwargs):
@@ -73,7 +73,7 @@ class BuildTests(unittest.TestCase):
             text=dict(num_experts=256, num_experts_per_tok=8),
             moe_selection=dict(
                 configs=[
-                    dict(block_m=32, expand=False),
+                    dict(block_m=256, expand=False, cold_rows=32),
                     dict(block_m=16, expand=False, folded=True, minimum_blocks=6, sparse_rows=True),
                 ],
                 default="0",
@@ -93,8 +93,11 @@ class BuildTests(unittest.TestCase):
                         expert_offsets=kernel, expert_tiles=kernel, integer_experts=kernel
                     ),
                     "kernels.model.e8p_prefill": SimpleNamespace(
-                        split_prefill_a8=kernel, e8p_prefill_grouped=kernel
+                        split_prefill_a8=kernel,
+                        split_routed_prefill_a8=kernel,
+                        e8p_prefill_grouped=kernel,
                     ),
+                    "kernels.model.expert_partition": SimpleNamespace(offsets=kernel, tiles=kernel),
                     "kernels.operators.op30_activation_quantization": SimpleNamespace(
                         _compile=lambda *args, **kwargs: None
                     ),
@@ -118,6 +121,15 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(bindings["P"], "uw")
         self.assertEqual(bindings["Sum"], "MoeSum")
         names = {x[0] for x in launches}
+        for role in (
+            "expert_up_cold_planes",
+            "expert_up_cold",
+            "expert_down_cold_planes",
+            "expert_down_cold",
+        ):
+            self.assertIn("post/" + role, names)
+            self.assertIn("post/" + role + "/skip/2-128", names)
+        self.assertIn("MoeColdTileExpert", buffers)
         for role in ("expert_up_planes", "expert_down_planes"):
             self.assertIn("post/" + role, names)
             self.assertIn("post/" + role + "/skip/1-1", names)
@@ -206,6 +218,11 @@ class BuildTests(unittest.TestCase):
             f=512,
             book="book",
             projection=lambda *args, **kw: None,
+            lock=None,
+            moe_router_tuner=SimpleNamespace(
+                router=lambda *_: dict(configs=[{}], default="0", selections=[])
+            ),
+            row_choices=lambda *_: [("", {})],
         )
         launches = []
 
@@ -420,6 +437,72 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(bindings["Lengths"], "length")
         self.assertNotIn("stages", launches[1][0])
         self.assertNotIn("live_k", launches[1][1])
+
+    def test_staged_attention_preserves_private_kv_and_skips_small_rows(self):
+        first, merge, decoder = (lambda: None), (lambda: None), (lambda: None)
+        first.__name__, merge.__name__, decoder.__name__ = "attention", "merge", "decode"
+        baseline = dict(block_m=64, block_n=64, head_group=1, max_splits=8, threads=256, stages=1)
+        staged = dict(
+            block_m=128,
+            block_n=64,
+            head_group=2,
+            max_splits=1,
+            threads=512,
+            stages=1,
+            decoded_kv=True,
+        )
+        selection = dict(
+            configs=[baseline, staged],
+            default="1",
+            selections=[dict(min_rows=1, max_rows=128, multiple_of=1, implementation="0")],
+        )
+        builder = Builder.__new__(Builder)
+        builder.context, builder.lock, builder.qh, builder.kvh = 262144, None, 16, 2
+        builder.row_tuner = SimpleNamespace(
+            attention=lambda _: selection, staged_attention=lambda _, selection: selection
+        )
+        buffers = {}
+        builder.weights = SimpleNamespace(
+            buffers=buffers, fixed=lambda name, dtype, shape: buffers.update({name: (dtype, shape)})
+        )
+        launches = {}
+        builder.emit = lambda name, key, build, bindings, rows: launches.update(
+            {name: (build(), bindings, rows)}
+        )
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.attention_rows": SimpleNamespace(
+                        causal_attention_int8=first, merge_attention_int8=merge
+                    ),
+                    "kernels.model.kv_int8": SimpleNamespace(dequantize_attention_kv=decoder),
+                },
+            ),
+            patch("tools.model.qwen35.build.primitive", side_effect=lambda fn, *a, **k: k),
+        ):
+            builder.attention(
+                "layer3/private/attention",
+                q="query",
+                gate="gate",
+                position="pos",
+                length="length",
+                output="output",
+                prefix="L3_",
+                staging=True,
+            )
+        role = "layer3/private/attention"
+        self.assertIn(role + "_decode/skip/1-128", launches)
+        self.assertEqual(launches[role + "_decode"][1]["K"], "L3_KPages")
+        self.assertEqual(launches[role + "_decode"][1]["DK"], "AttentionDecodedK")
+        self.assertTrue(launches[role][0]["decoded_kv"])
+        self.assertEqual(launches[role][1]["live_k"], "AttentionDecodedK")
+        self.assertFalse(launches[role + "/rows/1-128"][0]["decoded_kv"])
+        self.assertEqual(launches[role + "/rows/1-128"][1]["K"], "L3_KPages")
+        self.assertEqual(
+            buffers,
+            {name: ("f16", [262144, 512]) for name in ("AttentionDecodedK", "AttentionDecodedV")},
+        )
 
     def test_projection_bounds_measured_choices_and_preserves_exact_aot(self):
         builder = Builder.__new__(Builder)

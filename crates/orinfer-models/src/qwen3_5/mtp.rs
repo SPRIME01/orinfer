@@ -46,7 +46,7 @@ pub(super) fn register(m: &mut Manifest, moe: bool) -> Result<()> {
             "post_quant",
         ],
     );
-    let ffn = ffn_names(moe, true, false, false);
+    let ffn = ffn_names(moe, true, false, false, false);
     warm.extend(kernels("qwen_rows/mtp", &ffn));
     warm.extend(kernels("qwen_rows/mtp", &["advance"]));
     let mut head = kernels(

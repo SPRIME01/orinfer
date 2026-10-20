@@ -52,8 +52,17 @@ const DEFERRED_COLUMNS: &[&str] = &["GdnLogCount", "GdnLogDelta", "GdnLogGate", 
 fn deferred_gdn(m: &Manifest) -> bool {
     m.buffers.iter().any(|b| b.name.ends_with("_GdnLogCount"))
 }
+fn chunked_gdn(m: &Manifest) -> bool {
+    m.buffers.iter().any(|b| b.name == "GdnChunkW")
+}
 const PRIVATE_ATTN: &[&str] = &["prepare", "attention", "attention_merge"];
-fn ffn_names(moe: bool, draft: bool, expanded: bool, planes: bool) -> Vec<&'static str> {
+fn ffn_names(
+    moe: bool,
+    draft: bool,
+    expanded: bool,
+    planes: bool,
+    cold: bool,
+) -> Vec<&'static str> {
     let mut names = Vec::new();
     if moe {
         names.extend([
@@ -75,6 +84,9 @@ fn ffn_names(moe: bool, draft: bool, expanded: bool, planes: bool) -> Vec<&'stat
     });
     names.push("down");
     if moe {
+        if cold {
+            names.extend(["expert_up_cold_planes", "expert_up_cold"]);
+        }
         if expanded {
             names.push("expert_up_expand");
         }
@@ -82,6 +94,9 @@ fn ffn_names(moe: bool, draft: bool, expanded: bool, planes: bool) -> Vec<&'stat
             names.push("expert_up_planes");
         }
         names.extend(["expert_up", "expert_rotate"]);
+        if cold {
+            names.extend(["expert_down_cold_planes", "expert_down_cold"]);
+        }
         if expanded {
             names.push("expert_down_expand");
         }
@@ -137,6 +152,56 @@ fn validate_weights(
 ) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
+    let staged = ["AttentionDecodedK", "AttentionDecodedV"];
+    if staged.iter().any(|name| map.contains_key(name)) {
+        for name in staged {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != Dtype::F16
+                    || b.shape != [m.max_context, t.num_key_value_heads * t.head_dim]
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+                    || m.reset_buffers.iter().any(|reset| reset == name)
+                    || m.kv_cache
+                        .as_ref()
+                        .is_some_and(|kv| kv.buffers.contains_key(name))
+            }) {
+                return Err(format!("Invalid temporary attention workspace: {name}"));
+            }
+        }
+    }
+    if chunked_gdn(m) {
+        for (name, dtype, shape) in [
+            (
+                "GdnChunkW",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 128],
+            ),
+            (
+                "GdnChunkU",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 128],
+            ),
+            (
+                "GdnChunkD",
+                Dtype::F16,
+                vec![t.linear_num_value_heads, CAPACITY, 32],
+            ),
+            (
+                "GdnChunkG",
+                Dtype::F32,
+                vec![t.linear_num_value_heads, CAPACITY, 2],
+            ),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != dtype
+                    || b.shape != shape
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid chunkwise GDN workspace: {name}"));
+            }
+        }
+    }
     if deferred_gdn(m) {
         for (layer, kind) in t.layer_types.iter().enumerate() {
             if kind != "linear_attention" {
@@ -212,6 +277,42 @@ fn validate_weights(
                     || b.access != Access::ReadWrite
             }) {
                 return Err(format!("Invalid E8P expert plane workspace: {name}"));
+            }
+        }
+    }
+    let cold_names = [
+        "MoeColdTileOffsets",
+        "MoeColdTileCount",
+        "MoeColdTileExpert",
+        "MoeColdTileRow",
+    ];
+    if cold_names.iter().any(|name| map.contains_key(name)) {
+        if t.num_experts == 0 || !map.contains_key("MoeLow") {
+            return Err("Expert partition requires routed E8P planes".into());
+        }
+        let slots = CAPACITY * t.num_experts_per_tok;
+        let expert = map
+            .get("MoeColdTileExpert")
+            .ok_or("Missing cold expert tiles")?;
+        if expert.shape.len() != 1
+            || expert.shape[0] < slots.min(t.num_experts)
+            || expert.shape[0] > slots + t.num_experts
+        {
+            return Err("Invalid cold expert tile capacity".into());
+        }
+        for (name, shape) in [
+            (cold_names[0], vec![t.num_experts]),
+            (cold_names[1], vec![1]),
+            (cold_names[2], expert.shape.clone()),
+            (cold_names[3], expert.shape.clone()),
+        ] {
+            if map.get(name).is_none_or(|b| {
+                b.dtype != Dtype::I32
+                    || b.shape != shape
+                    || b.data.is_some()
+                    || b.access != Access::ReadWrite
+            }) {
+                return Err(format!("Invalid expert partition workspace: {name}"));
             }
         }
     }
@@ -488,8 +589,19 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             if gdn { PRE_GDN } else { PRE_ATTN },
         ));
         let mut private_names = if gdn { PRIVATE_GDN } else { PRIVATE_ATTN }.to_vec();
+        if !gdn && m.buffers.iter().any(|b| b.name == "AttentionDecodedK") {
+            private_names.insert(1, "attention_decode");
+        }
         if gdn && deferred_gdn(m) {
             private_names.insert(3, "recurrent_materialize");
+        }
+        if gdn && chunked_gdn(m) {
+            let index = private_names
+                .iter()
+                .position(|name| *name == "recurrent")
+                .unwrap();
+            private_names[index] = "recurrent_chunk";
+            private_names.insert(index, "recurrent_prepare");
         }
         let mut private = section(m, &format!("layer{layer}/private"), &private_names);
         if gdn {
@@ -509,6 +621,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             false,
             m.buffers.iter().any(|b| b.name == "MoeExpanded"),
             m.buffers.iter().any(|b| b.name == "MoeLow"),
+            m.buffers.iter().any(|b| b.name == "MoeColdTileCount"),
         ));
         forward.extend(section(m, &format!("layer{layer}/post"), &post));
         layer_ends.push(forward.len());
@@ -533,7 +646,17 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         destination: m.input.clone(),
         bytes: 4,
     }];
-    decode.extend(forward);
+    decode.extend(forward.into_iter().filter_map(|mut operation| {
+        if let Operation::Kernel { name } = &mut operation {
+            if name.ends_with("/private/recurrent_prepare") {
+                return None;
+            }
+            if let Some(prefix) = name.strip_suffix("/private/recurrent_chunk") {
+                *name = format!("{prefix}/private/recurrent");
+            }
+        }
+        Some(operation)
+    }));
     decode.extend(m.programs["head"].clone());
     m.programs.insert("decode".into(), decode);
     m.prefill_plans = vec![PrefillPlan {
@@ -639,26 +762,41 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     });
     let slots = m
         .programs
-        .values()
-        .flatten()
-        .filter_map(|op| match op {
-            Operation::Kernel { name } => Some(name.as_str()),
-            _ => None,
+        .iter()
+        .flat_map(|(program, operations)| {
+            let capacity = m.row_execution.as_ref().unwrap().program_capacity(program);
+            operations.iter().filter_map(move |op| match op {
+                Operation::Kernel { name } => Some((name.as_str(), capacity)),
+                _ => None,
+            })
         })
-        .collect::<BTreeSet<_>>();
+        .fold(
+            BTreeMap::<_, usize>::new(),
+            |mut slots, (name, capacity)| {
+                slots
+                    .entry(name)
+                    .and_modify(|bound| *bound = (*bound).max(capacity))
+                    .or_insert(capacity);
+                slots
+            },
+        );
     let rows = m
         .row_execution
         .as_mut()
         .ok_or("Missing Qwen dynamic rows")?;
     for kernel in &request.kernel_contracts {
-        let Some((slot, choice)) =
+        let Some((slot, mut choice)) =
             orinfer_model_sdk::operators::rows::specialization(&kernel.name, CAPACITY)?
         else {
             continue;
         };
-        if !slots.contains(slot) {
-            return Err("Qwen local row choice has no computation slot".into());
+        let capacity = *slots
+            .get(slot)
+            .ok_or("Qwen local row choice has no computation slot")?;
+        if choice.min_rows > capacity {
+            continue;
         }
+        choice.max_rows = choice.max_rows.min(capacity);
         rows.variants.entry(slot.into()).or_default().push(choice);
     }
     for choices in rows.variants.values_mut() {
@@ -1259,6 +1397,117 @@ mod tests {
     }
 
     #[test]
+    fn attention_staging_is_shared_scratch_with_request_owned_inputs() {
+        let staged = || {
+            let mut request = request_geometry(true);
+            for name in ["AttentionDecodedK", "AttentionDecodedV"] {
+                request.metadata.buffers.push(
+                    serde_json::from_value(json!({
+                        "name":name,"dtype":"f16","shape":[request.metadata.max_context,512],
+                        "layout":"native_contiguous","alignment":256,"access":"read_write"
+                    }))
+                    .unwrap(),
+                );
+            }
+            request
+        };
+        let (_, plan) = create(staged(), Policy::Int8Quality).unwrap();
+        let private = &plan.metadata.programs["qwen_rows/layer3/private"];
+        let roles = private
+            .iter()
+            .filter_map(|op| match op {
+                Operation::Kernel { name } => name.rsplit('/').next(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            [
+                "prepare",
+                "attention_decode",
+                "attention",
+                "attention_merge"
+            ]
+        );
+        assert!(
+            !plan.metadata.programs["qwen_rows/state/layer3"].iter().any(
+                |op| matches!(op,Operation::Kernel{name} if name.ends_with("attention_decode"))
+            )
+        );
+        let mut missing = staged();
+        missing
+            .metadata
+            .buffers
+            .retain(|b| b.name != "AttentionDecodedV");
+        assert!(create(missing, Policy::Int8Quality).is_err());
+        let mut request = staged();
+        request
+            .metadata
+            .reset_buffers
+            .push("AttentionDecodedK".into());
+        assert!(create(request, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn chunked_gdn_prefill_preserves_sequential_decode_and_verification() {
+        let mut request = with_mtp(dense_request((2048, 6144, 24, 16, 8, 2, true), true));
+        for (name, dtype, width) in [
+            ("GdnChunkW", "f16", 128),
+            ("GdnChunkU", "f16", 128),
+            ("GdnChunkD", "f16", 32),
+            ("GdnChunkG", "f32", 2),
+        ] {
+            request.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":dtype,"shape":[16,4096,width],
+                    "layout":"native_contiguous","alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let mut invalid: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        invalid.metadata.buffers.retain(|b| b.name != "GdnChunkG");
+        assert!(create(invalid, Policy::Int8Quality).is_err());
+        let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
+        let names = |program: &str| {
+            plan.metadata.programs[program]
+                .iter()
+                .filter_map(|op| match op {
+                    Operation::Kernel { name } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let prefill = names("prefill");
+        assert_eq!(
+            prefill
+                .iter()
+                .filter(|n| n.ends_with("/recurrent_prepare"))
+                .count(),
+            18
+        );
+        assert_eq!(
+            prefill
+                .iter()
+                .filter(|n| n.ends_with("/recurrent_chunk"))
+                .count(),
+            18
+        );
+        for program in ["decode", "verify"] {
+            let calls = names(program);
+            assert!(calls.iter().all(|n| !n.ends_with("/recurrent_prepare") && !n.ends_with("/recurrent_chunk")));
+        }
+        let (calls, _) = adapter
+            .batch(&[BatchSegment { slot: 0, tokens: 1 }], false)
+            .unwrap();
+        assert!(calls.iter().all(|call| match &call.operation {
+            Operation::Kernel { name } => !name.ends_with("/recurrent_chunk"),
+            _ => true,
+        }));
+    }
+
+    #[test]
     fn four_billion_reuses_tied_dense_row_and_mtp_programs() {
         let request = with_mtp(dense_request((2560, 9216, 32, 32, 16, 4, true), true));
         let (adapter, plan) = create(request, Policy::Int8Quality).unwrap();
@@ -1503,6 +1752,44 @@ mod tests {
                 .iter()
                 .all(|op| { !matches!(op,Operation::Kernel{name} if name.ends_with("_planes")) })
         );
+        let mut partition: CreateRequest =
+            serde_json::from_value(serde_json::to_value(&planes).unwrap()).unwrap();
+        for (name, size) in [
+            ("MoeColdTileOffsets", 256),
+            ("MoeColdTileCount", 1),
+            ("MoeColdTileExpert", 1280),
+            ("MoeColdTileRow", 1280),
+        ] {
+            partition.metadata.buffers.push(
+                serde_json::from_value(json!({
+                    "name":name,"dtype":"i32","shape":[size],"layout":"native_contiguous",
+                    "alignment":256,"access":"read_write"
+                }))
+                .unwrap(),
+            );
+        }
+        let copied = serde_json::from_value(serde_json::to_value(&partition).unwrap()).unwrap();
+        let (_, plan) = create(with_mtp(copied), Policy::Int8Quality).unwrap();
+        let post = &plan.metadata.programs["qwen_rows/layer0/post"];
+        for role in ["expert_up", "expert_down"] {
+            let index = |suffix: &str| {
+                post.iter()
+                    .position(|op| matches!(op,Operation::Kernel{name} if name.ends_with(suffix)))
+                    .unwrap()
+            };
+            assert!(index(&format!("/{role}_cold_planes")) < index(&format!("/{role}_cold")));
+            assert!(index(&format!("/{role}_cold")) < index(&format!("/{role}")));
+        }
+        assert!(
+            plan.metadata.programs["mtp_post"]
+                .iter()
+                .all(|op| { !matches!(op,Operation::Kernel{name} if name.contains("_cold")) })
+        );
+        partition
+            .metadata
+            .buffers
+            .retain(|b| b.name != "MoeColdTileRow");
+        assert!(create(partition, Policy::Int8Quality).is_err());
         planes.metadata.buffers.retain(|b| b.name != "MoeSum");
         assert!(create(planes, Policy::Int8Quality).is_err());
         request

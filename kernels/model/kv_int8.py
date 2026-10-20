@@ -617,3 +617,44 @@ def dequant_prefill_kv(context: int, pad_to: int = 1):
                             VO[token, d * 4 + c] = 0.0
 
     return kernel
+
+
+@orin_jit
+def dequantize_attention_kv(capacity, context, kv_heads=2, dimension=256, block_n=32, programs=128):
+    from kernels.model.rows import row_count, explicit_rows
+
+    if min(capacity, context, kv_heads, programs) <= 0 or dimension % 64:
+        raise ValueError("Invalid attention staging geometry")
+    # One temporary bank is reused across layers and owners; only committed
+    # KV is read. A bounded grid avoids launching for unused context capacity.
+    m = row_count(capacity, True)
+    load = int8_kv_tile(block_n, dimension, 128)
+    workers = T.min(programs, m)
+
+    @T.prim_func
+    def decode(
+        K: T.Tensor((1, context, kv_heads * dimension // 4), T.uint32),
+        V: T.Tensor((1, context, kv_heads * dimension // 4), T.uint32),
+        KS: T.Tensor((1, context, kv_heads * dimension // 64), T.float16),
+        VS: T.Tensor((1, context, kv_heads * dimension // 64), T.float16),
+        Lengths: T.Tensor((1,), T.int32),
+        DK: T.Tensor((1, context, kv_heads * dimension), T.float16),
+        DV: T.Tensor((1, context, kv_heads * dimension), T.float16),
+    ):
+        with T.Kernel(workers, kv_heads, threads=128) as (b, h):
+            T.import_source(HALF2_SOURCE)
+            k = T.alloc_shared((block_n, dimension), T.float16)
+            v = T.alloc_shared((block_n, dimension), T.float16)
+            end = T.min(context, Lengths[0])
+            for stripe in T.serial(T.ceildiv(end, block_n * workers)):
+                base = (stripe * workers + b) * block_n
+                if base < end:
+                    load(K, V, KS, VS, k, v, 0, h, base, end)
+                    T.sync_threads()
+                    for i, d in T.Parallel(block_n, dimension):
+                        if base + i < end:
+                            DK[0, base + i, h * dimension + d] = k[i, d]
+                            DV[0, base + i, h * dimension + d] = v[i, d]
+                    T.sync_threads()
+
+    return explicit_rows(decode)

@@ -6,6 +6,123 @@ from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
 
 
+REGISTER_ROTATION_SOURCE = """
+__device__ __forceinline__ void orinfer_fht128(float* values, int size) {
+    #pragma unroll
+    for (int stage = 0; stage < 5; ++stage) {
+        #pragma unroll
+        for (int i = 0; i < size; ++i) {
+            values[i] = __shfl_xor_sync(0xffffffff, values[i], 1 << stage)
+                      + values[i] * (1 - 2 * ((int(threadIdx.x) >> stage) & 1));
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < size; i += 4) {
+        float x0 = values[i], x1 = values[i+1], x2 = values[i+2], x3 = values[i+3];
+        float a = x1 + x0, b = x0 - x1, c = x3 + x2, d = x2 - x3;
+        values[i] = c + a;
+        values[i+1] = d + b;
+        values[i+2] = a - c;
+        values[i+3] = b - d;
+    }
+}
+__device__ __forceinline__ float orinfer_rotation_max(const float* values, int size) {
+    float result = 0;
+    #pragma unroll
+    for (int i = 0; i < size; ++i) result = fmaxf(result, fabsf(values[i]));
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        result = fmaxf(result, __shfl_xor_sync(0xffffffff, result, mask));
+    return result;
+}
+"""
+
+
+def _register_rotation_a8(capacity, inputs, swiglu, reciprocal, dynamic_rows):
+    """Keep complete block128 butterflies in each warp's registers.
+
+    Coordinates 0/32/64/96 of each butterfly belong to one thread. The first
+    five stages use shuffles; the last two use its four local values. Padding
+    completes the last warp's block without changing the row-wide A8 scale.
+    """
+    m = row_count(capacity, dynamic_rows)
+    threads = 128
+    width = ((inputs + threads * 4 - 1) // (threads * 4)) * threads * 4
+    local_width = width // threads
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((m, inputs * (2 if swiglu else 1)), T.float16),
+        Signs: T.Tensor((inputs,), T.int8),
+        Q: T.Tensor((m, inputs), T.int8),
+        S: T.Tensor((m, 1), T.float16),
+    ):
+        with T.Kernel(m, threads=threads) as row:
+            T.import_source(REGISTER_ROTATION_SOURCE)
+            values = T.alloc_local((local_width,), T.float32)
+            maxima = T.alloc_shared((threads // 32,), T.float32)
+            maximum = T.alloc_local((1,), T.float32)
+            scale = T.alloc_local((1,), T.float16)
+            inv = T.alloc_local((1,), T.float32)
+            lane = T.get_thread_binding()
+            for i in T.unroll(local_width):
+                k = (i // 4) * (threads * 4) + (lane // 32) * 128 + (i % 4) * 32 + lane % 32
+                values[i] = 0
+                if k < inputs:
+                    if swiglu:
+                        gate = T.cast(X[row, k], T.float32)
+                        e = T.exp(-T.abs(gate))
+                        sigmoid = T.if_then_else(gate >= 0, 1 / (1 + e), e / (1 + e))
+                        value = T.cast(
+                            T.cast(
+                                (gate * sigmoid) * T.cast(X[row, k + inputs], T.float32), T.float16
+                            ),
+                            T.float32,
+                        )
+                        values[i] = value * T.cast(Signs[k], T.float32)
+                    else:
+                        values[i] = T.cast(X[row, k], T.float32) * T.cast(Signs[k], T.float32)
+            T.evaluate(
+                T.call_extern(
+                    "void",
+                    "orinfer_fht128",
+                    T.access_ptr(values[0], "rw", local_width),
+                    local_width,
+                )
+            )
+            for i in T.unroll(local_width):
+                values[i] = T.cast(T.cast(values[i] * 0.08838834764831845, T.float16), T.float32)
+            maximum[0] = T.call_pure_extern(
+                "float32",
+                "orinfer_rotation_max",
+                T.access_ptr(values[0], "r", local_width),
+                local_width,
+            )
+            if lane % 32 == 0:
+                maxima[lane // 32] = maximum[0]
+            T.sync_threads()
+            maximum[0] = maxima[0]
+            for i in T.unroll(1, threads // 32):
+                maximum[0] = T.max(maximum[0], maxima[i])
+            scale[0] = _rotation_scale(maximum[0])
+            if lane == 0:
+                S[row, 0] = scale[0]
+            if reciprocal:
+                inv[0] = T.call_extern("float32", "__fdiv_rn", 1.0, T.cast(scale[0], T.float32))
+            for i in T.unroll(local_width):
+                k = (i // 4) * (threads * 4) + (lane // 32) * 128 + (i % 4) * 32 + lane % 32
+                if k < inputs:
+                    if reciprocal:
+                        Q[row, k] = T.cast(_rotation_code(values[i], scale[0], inv[0]), T.int8)
+                    else:
+                        ratio = T.call_extern(
+                            "float32", "__fdiv_rn", values[i], T.cast(scale[0], T.float32)
+                        )
+                        Q[row, k] = T.cast(T.max(-127.0, T.min(127.0, T.round(ratio))), T.int8)
+
+    return main
+
+
 def _rotation_scale(maximum):
     return T.if_then_else(
         maximum > 0,
@@ -185,11 +302,16 @@ def rotate_activation_a8(
     reciprocal=True,
     dynamic_rows: bool = False,
     output_layout: str = "a8",
+    registers: bool = False,
 ):
     if type(M) is not int or M <= 0 or type(K) is not int or K <= 0 or K % 128:
         raise ValueError("Invalid rotation dimensions")
     if output_layout not in ("a8", "e8p", "e8p_dispatch", "e8p_rows", "e8p_scatter"):
         raise ValueError("Invalid activation output layout")
+    if type(registers) is not bool or (registers and output_layout != "a8"):
+        raise ValueError("Register rotation requires the A8 output layout")
+    if registers:
+        return _register_rotation_a8(M, K, swiglu, reciprocal, dynamic_rows)
     exact = output_layout != "a8"
     scatter = output_layout == "e8p_scatter"
     dispatch = output_layout in ("e8p_dispatch", "e8p_scatter")

@@ -18,18 +18,27 @@ def q4_pipeline_checks(rng):
     """Check both INT8 pipelines and direct INT4 against independent integer dots."""
     from kernels.model.e8p_prefill import e8p_prefill_grouped, split_prefill_a8
 
-    capacity, experts, tile = 128, 2, 16
-    tiles = (capacity + tile - 1) // tile + experts
+    capacity, experts = 256, 2
     grid = basis()
     book = torch.from_numpy(e8p_selector_table(grid)).cuda()
     reports = []
-    for counts, n, k in [
-        ([1, 0], 129, 128),
-        ([7, 8], 160, 640),
-        ([8, 9], 160, 256),
-        ([17, 16], 257, 2560),
-        ([33, 32], 160, 512),
+    for counts, n, k, tile in [
+        ([1, 0], 129, 128, 16),
+        ([7, 8], 160, 640, 16),
+        ([8, 9], 160, 256, 16),
+        ([17, 16], 257, 2560, 16),
+        ([33, 32], 160, 512, 16),
+        ([1, 0], 129, 128, 32),
+        ([15, 16], 160, 640, 32),
+        ([31, 32], 257, 256, 32),
+        ([33, 32], 160, 2560, 32),
+        ([1, 0], 129, 128, 64),
+        ([63, 64], 257, 640, 64),
+        ([127, 128], 257, 640, 128),
+        ([193, 62], 129, 640, 256),
+        ([63, 64], 257, 128, 256),
     ]:
+        tiles = (capacity + tile - 1) // tile + experts
         rows = sum(counts)
         offsets = np.cumsum(counts, dtype=np.int32) - counts
         items = [(e, r) for e, count in enumerate(counts) for r in range(0, count, tile)]
@@ -50,7 +59,8 @@ def q4_pipeline_checks(rng):
         high = torch.empty_like(low)
         sums = torch.empty(rows, device="cuda", dtype=torch.int32)
         storage = [
-            torch.full((rows + 1, n), 91, device="cuda", dtype=torch.float16) for _ in range(4)
+            torch.full((rows + 1, n), 91, device="cuda", dtype=torch.float16)
+            for _ in range(2 if tile >= 64 else 4)
         ]
         outputs = [value[:-1] for value in storage]
         integer = [
@@ -62,8 +72,14 @@ def q4_pipeline_checks(rng):
                 experts,
                 1,
                 block_m=tile,
+                block_n=32 if tile == 128 else 64,
                 stages=stages,
                 dynamic_rows=True,
+                minimum_blocks=3 if tile == 256 and stages == 1 else 1,
+                tail_m=64 if tile == 256 else 0,
+                compiler_options=(
+                    {"tl.enable_aggressive_shared_memory_merge": True} if tile == 256 else {}
+                ),
             )
             for stages in (1, 2)
         ]
@@ -79,14 +95,15 @@ def q4_pipeline_checks(rng):
                 dynamic_rows=True,
                 sparse_rows=sparse,
                 codec="e8p_q4",
-                minimum_blocks=6,
+                minimum_blocks=6 if tile == 16 else 4,
+                block_m=tile,
                 compiler_options={
                     "tl.disable_thread_storage_sync": True,
                     "tl.disable_shared_memory_reuse": True,
                     "tl.if_stmt_binding_inline_replayable_binds": False,
                 },
             )
-            for sparse in (False, True)
+            for sparse in ((False, True) if tile < 64 else ())
         ]
 
         def run():
@@ -125,7 +142,182 @@ def q4_pipeline_checks(rng):
                 w.view(torch.int32).bitwise_xor_(-1)
             graph.replay()
             check()
-        reports.append(dict(counts=counts, n=n, k=k, exact=True, changed_input_replay=True))
+        reports.append(
+            dict(counts=counts, n=n, k=k, tile=tile, exact=True, changed_input_replay=True)
+        )
+    return reports
+
+
+def partition_checks(rng):
+    """Independent dots after captured route/weight changes, including empty partitions."""
+    from kernels.model import expert_partition
+    from kernels.model.e8p_prefill import split_routed_prefill_a8
+    from tools.model.expert_tuning import (
+        cold_expert_config,
+        expert_projection,
+        expert_passes,
+        tile_capacity,
+    )
+
+    capacity, experts, n, k, limit = 512, 32, 129, 640, 32
+    grid = basis()
+    book = torch.from_numpy(e8p_selector_table(grid)).cuda()
+    cold = cold_expert_config()
+    hot = dict(
+        block_m=256,
+        block_n=64,
+        block_k=128,
+        stages=1,
+        tail_m=64,
+        expand=False,
+        minimum_blocks=3,
+        reuse_shared=True,
+    )
+    prefix = primitive(expert_partition.offsets, experts, hot["block_m"], cold["block_m"], limit)
+    tiles = primitive(
+        expert_partition.tiles,
+        capacity,
+        experts,
+        1,
+        hot["block_m"],
+        cold["block_m"],
+        limit,
+        dynamic_rows=True,
+    )
+    pack = primitive(
+        split_routed_prefill_a8, capacity, k, experts, cold["block_m"], dynamic_rows=True
+    )
+    products = [
+        primitive(
+            expert_projection,
+            capacity,
+            n,
+            k,
+            experts,
+            1,
+            codec="e8p_q4",
+            config=c,
+            dynamic_rows=True,
+            compiler_options=expert_passes("e8p_q4", c),
+        )
+        for c in (cold, hot)
+    ]
+    w = torch.from_numpy(rng.integers(0, 2**32, (experts, k // 128, n, 16), dtype=np.uint32)).cuda()
+    ws = torch.full((experts, n), 0.001, device="cuda", dtype=torch.float16)
+    reports = []
+    for values in ([1] + [0] * 31, [0, 1, 16, 32, 33, 64, 128, 193] + [0] * 24):
+        rows = sum(values)
+        counts = torch.tensor(values, device="cuda", dtype=torch.int32)
+        offsets = torch.empty_like(counts)
+        to = [torch.empty_like(counts) for _ in range(2)]
+        tc = [torch.full((2,), 91, device="cuda", dtype=torch.int32) for _ in range(2)]
+        meta = []
+        for c in (cold, hot):
+            cap = tile_capacity(capacity, experts, 1, c["block_m"])
+            meta.append(
+                [torch.full((cap + 1,), 91, device="cuda", dtype=torch.int32) for _ in range(2)]
+            )
+        a = torch.from_numpy(rng.integers(-128, 128, (rows, k), dtype=np.int8)).cuda()
+        a[:, :4] = torch.tensor([-128, -1, 0, 127], device="cuda", dtype=torch.int8)
+        scale = torch.full((rows,), 0.002, device="cuda", dtype=torch.float16)
+        planes = [torch.empty(rows * k // 2, device="cuda", dtype=torch.int8) for _ in range(2)]
+        sums = torch.empty(rows, device="cuda", dtype=torch.int32)
+        storage = torch.full((rows + 1, n), 91, device="cuda", dtype=torch.float16)
+        out = storage[:-1]
+
+        def run():
+            launch(prefix, counts, offsets, to[1], tc[1][:1], to[0], tc[0][:1])
+            launch(
+                tiles,
+                counts,
+                to[1],
+                *[x[:-1] for x in meta[1]],
+                to[0],
+                *[x[:-1] for x in meta[0]],
+                rows,
+            )
+            launch(
+                pack, a, counts, offsets, *[x[:-1] for x in meta[0]], tc[0][:1], *planes, sums, rows
+            )
+            launch(
+                products[0],
+                *planes,
+                sums,
+                w,
+                book,
+                ws,
+                scale,
+                counts,
+                offsets,
+                *[x[:-1] for x in meta[0]],
+                tc[0][:1],
+                out,
+                rows,
+            )
+            launch(
+                products[1],
+                a,
+                w,
+                book,
+                ws,
+                scale,
+                counts,
+                offsets,
+                *[x[:-1] for x in meta[1]],
+                tc[1][:1],
+                out,
+                rows,
+            )
+
+        def check():
+            c = counts.cpu().numpy()
+            first = np.cumsum(c) - c
+            np.testing.assert_array_equal(offsets.cpu().numpy(), first)
+            for i, config in enumerate((cold, hot)):
+                expected = [
+                    (e, row)
+                    for e, count in enumerate(c)
+                    if (count <= limit) == (i == 0)
+                    for row in range(0, int(count), config["block_m"])
+                ]
+                assert tc[i][0].item() == len(expected) and tc[i][1].item() == 91
+                for col, table in enumerate(meta[i]):
+                    np.testing.assert_array_equal(
+                        table[: len(expected)].cpu().numpy(), [v[col] for v in expected]
+                    )
+                    assert table[-1].item() == 91
+            raw = w.cpu().numpy().transpose(0, 2, 1, 3).reshape(experts, n, k // 8)
+            weight = (
+                4 * e8p_decode(raw.astype(np.uint16), grid).astype(np.int64)
+                + e8p_decode((raw >> 16).astype(np.uint16), grid).astype(np.int64)
+            ).reshape(experts, n, k)
+            av = a.cpu().numpy().astype(np.int64)
+            expected = np.empty((rows, n), np.float16)
+            for e, count in enumerate(c):
+                start, stop = int(first[e]), int(first[e] + count)
+                expected[start:stop] = (
+                    (av[start:stop] @ weight[e].T).astype(np.float32) * ws[e].float().cpu().numpy()
+                ) * scale[start:stop].float().cpu().numpy()[:, None]
+            np.testing.assert_array_equal(out.cpu().numpy(), expected)
+            assert bool(torch.all(storage[-1] == 91))
+
+        run()
+        check()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        distributions = [values[::-1], [rows] + [0] * 31]
+        if rows >= experts:
+            distributions.append([rows // experts + (i < rows % experts) for i in range(experts)])
+        for distribution in distributions:
+            counts.copy_(torch.tensor(distribution, device="cuda", dtype=torch.int32))
+            a.neg_()
+            w.view(torch.int32).bitwise_xor_(-1)
+            graph.replay()
+            check()
+        reports.append(
+            dict(rows=rows, exact=True, changed_routes_graph=True, changed_weights_graph=True)
+        )
     return reports
 
 
@@ -347,7 +539,13 @@ def main():
     tails = q4_pipeline_checks(rng)
     write_json(
         args.output / "result.json",
-        dict(checks=reports, routing=routing, projection_tails=tails, complete=True),
+        dict(
+            checks=reports,
+            routing=routing,
+            projection_tails=tails,
+            partition=partition_checks(rng),
+            complete=True,
+        ),
     )
 
 

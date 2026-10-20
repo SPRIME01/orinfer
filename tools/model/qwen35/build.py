@@ -454,10 +454,15 @@ class Builder:
                         rows,
                     )
             return
+        with gpu_lock(self.lock):
+            selection = self.row_tuner.activation_rotation(k, swiglu)
+        config = selection["configs"][int(selection["default"])]
         self.emit(
             name,
-            f"rotation-{k}-{swiglu}-{rows}-{dynamic}",
-            lambda: primitive(rotate_activation_a8, rows, k, swiglu=swiglu, dynamic_rows=dynamic),
+            f"rotation-{k}-{swiglu}-{rows}-{dynamic}-{config}",
+            lambda: primitive(
+                rotate_activation_a8, rows, k, swiglu=swiglu, dynamic_rows=dynamic, **config
+            ),
             dict(
                 X=input,
                 Signs=self.signs[k],
@@ -474,12 +479,16 @@ class Builder:
 
         yield from choices(selection, capacity, fixed)
 
-    def attention(self, name, *, q, gate, position, length, output, prefix="", rows=CAPACITY):
+    def attention(
+        self, name, *, q, gate, position, length, output, prefix="", rows=CAPACITY, staging=False
+    ):
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
         from tools.model.row_tuning import ATTENTION_TARGET
 
         with gpu_lock(self.lock):
             selection = self.row_tuner.attention(self.context)
+            if staging:
+                selection = self.row_tuner.staged_attention(self.context, selection)
         partial = dict(
             Partial="AttentionPartial",
             Maximum="AttentionMaximum",
@@ -497,11 +506,38 @@ class Builder:
             Y=output,
             **partial,
         )
+        selected = list(self.row_choices(selection, rows))
+        if any(config.get("decoded_kv") for _, config in selected):
+            from kernels.model.kv_int8 import dequantize_attention_kv
+            from tools.model.row_selection import choices
+
+            for buffer in ("AttentionDecodedK", "AttentionDecodedV"):
+                if buffer not in self.weights.buffers:
+                    # Shared scratch, not request state or a prefix-cache entry.
+                    self.weights.fixed(buffer, "f16", [self.context, self.kvh * 256])
+            decode_bindings = {key: inputs[key] for key in ("K", "V", "KS", "VS", "Lengths")}
+            decode_bindings.update(DK="AttentionDecodedK", DV="AttentionDecodedV")
+
+            def emit_decode(suffix=""):
+                self.emit(
+                    name + "_decode" + suffix,
+                    f"gqa-stage-{self.context}-{self.kvh}",
+                    lambda: primitive(
+                        dequantize_attention_kv, CAPACITY, self.context, kv_heads=self.kvh
+                    ),
+                    decode_bindings,
+                    rows,
+                )
+
+            emit_decode()
+            for suffix, config in choices(selection, rows, bounded=True):
+                if not config.get("decoded_kv"):
+                    emit_decode(suffix.replace("/rows/", "/skip/"))
         for role, fn, args in [
             (name, causal_attention_int8, inputs),
             (name + "_merge", merge_attention_int8, dict(**partial, Gate=gate, Y=output)),
         ]:
-            for suffix, config in self.row_choices(selection, rows):
+            for suffix, config in selected:
                 bm, bn, group = config["block_m"], config["block_n"], config["head_group"]
                 threads, stages = config.get("threads", 128), config.get("stages", 0)
                 options = dict(
@@ -513,16 +549,26 @@ class Builder:
                     head_group=group,
                 )
                 if fn is causal_attention_int8:
-                    options.update(context=self.context, block_n=bn, threads=threads, stages=stages)
+                    options.update(
+                        context=self.context,
+                        block_n=bn,
+                        threads=threads,
+                        stages=stages,
+                        decoded_kv=config.get("decoded_kv", False),
+                    )
                 bindings = args
+                if fn is causal_attention_int8 and config.get("decoded_kv"):
+                    bindings = args | dict(K="AttentionDecodedK", V="AttentionDecodedV")
                 if fn is causal_attention_int8 and stages:
                     # The compiler names the shared-pointer KV views in its
                     # exported host ABI; both names refer to the same buffers.
-                    bindings = args | {f"live_{k.lower()}": args[k] for k in ("K", "V", "KS", "VS")}
+                    bindings = bindings | {
+                        f"live_{k.lower()}": bindings[k] for k in ("K", "V", "KS", "VS")
+                    }
                 self.emit(
                     role + suffix,
                     f"gqa-rows-{fn.__name__}-{self.context}-{bm}-{bn}-{group}-"
-                    f"{config['max_splits']}-{threads}-{stages}",
+                    f"{config['max_splits']}-{threads}-{stages}-decoded{config.get('decoded_kv', False)}",
                     lambda fn=fn, options=options: primitive(fn, CAPACITY, **options),
                     bindings,
                     rows,
@@ -796,6 +842,9 @@ class Builder:
                         ),
                         recurrent_bindings,
                     )
+                from tools.model.qwen35.gdn import prefill as gdn_prefill
+
+                gdn_prefill(self, private, i)
                 self.emit(
                     private + "/gated_norm",
                     "gdn-gated-norm",
@@ -862,6 +911,7 @@ class Builder:
                     length="SeqLength",
                     output="MixerIn",
                     prefix=f"L{i}_",
+                    staging=True,
                 )
             self.emit(
                 post + "/quantize",

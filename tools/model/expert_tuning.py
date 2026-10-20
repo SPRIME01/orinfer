@@ -23,6 +23,10 @@ def tile_capacity(rows, experts, top_k, block_m):
     return (slots + block_m - 1) // block_m + min(experts, slots)
 
 
+def cold_expert_config():
+    return dict(block_m=32, expand=False, folded=True, minimum_blocks=4, sparse_rows=True)
+
+
 def expert_configs(codec, *, block_m=None, direct=False):
     if codec == "e8p_q2":
         return [dict(block_m=m) for m in ((8, 16) if block_m is None else (block_m,))]
@@ -31,6 +35,36 @@ def expert_configs(codec, *, block_m=None, direct=False):
     configs = [
         dict(block_m=16, block_n=64, block_k=128, stages=2, tail_m=0, expand=False),
         dict(block_m=32, block_n=64, block_k=128, stages=1, tail_m=8, expand=False),
+        dict(block_m=64, block_n=64, block_k=128, stages=1, tail_m=0, expand=False),
+        dict(
+            block_m=64,
+            block_n=64,
+            block_k=128,
+            stages=1,
+            tail_m=0,
+            expand=False,
+            minimum_blocks=6,
+        ),
+        dict(block_m=128, block_n=32, block_k=128, stages=1, tail_m=0, expand=False),
+        dict(
+            block_m=128,
+            block_n=64,
+            block_k=128,
+            stages=1,
+            tail_m=0,
+            expand=False,
+            minimum_blocks=4,
+        ),
+        dict(
+            block_m=256,
+            block_n=64,
+            block_k=128,
+            stages=1,
+            tail_m=64,
+            expand=False,
+            minimum_blocks=3,
+            reuse_shared=True,
+        ),
         dict(block_m=32, block_n=128, block_k=128, stages=1, tail_m=8, expand=False),
         dict(block_m=32, block_n=64, block_k=128, stages=1, tail_m=0, expand=True),
         dict(block_m=16, block_n=64, block_k=128, stages=2, tail_m=0, expand=True),
@@ -40,9 +74,11 @@ def expert_configs(codec, *, block_m=None, direct=False):
     ]
     if direct:
         configs += [
-            dict(block_m=16, expand=False, folded=True, minimum_blocks=6, sparse_rows=sparse)
+            dict(block_m=m, expand=False, folded=True, minimum_blocks=blocks, sparse_rows=sparse)
+            for m, blocks in ((16, 6), (32, 4))
             for sparse in (False, True)
         ]
+        configs += [dict(configs[6], cold_rows=n) for n in (16, 32, 64, 128)]
     return configs
 
 
@@ -78,10 +114,15 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
             sparse_rows=config["sparse_rows"],
             codec=codec,
             minimum_blocks=config["minimum_blocks"],
+            block_m=tile,
         )
     from kernels.model.moe import integer_experts
 
-    options = {k: v for k, v in config.items() if k not in ("expand", "reuse_shared", "folded")}
+    options = {
+        k: v
+        for k, v in config.items()
+        if k not in ("expand", "reuse_shared", "folded", "cold_rows")
+    }
     return inspect.unwrap(integer_experts)(
         rows,
         outputs,
@@ -95,10 +136,78 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
 
 
 class MoeTuner(RowTuner):
-    def routed(self, hidden, intermediate, experts, top_k, weights, weight_identity):
+    def router(self, hidden, experts):
+        """Tune the FP32 router result without changing its K16 MMA reduction."""
+        import torch
+        from kernels.model.moe import router_projection
+        from tools.model.row_selection import prefill_fallback
+
+        spec = dict(kind="router", hidden=hidden, experts=experts)
+        key = str(spec)
+        if key in self.records:
+            return self.records[key]
+        configs = [dict(block_m=16, block_n=32, block_k=128, stages=2)] + [
+            dict(block_m=m, block_n=n, block_k=128, stages=s)
+            for m, n, s in [(32, 64, 2), (64, 64, 2), (64, 128, 2), (128, 64, 1), (64, 128, 1)]
+        ]
+
+        def build(config):
+            return primitive(router_projection, 4096, hidden, experts, dynamic_rows=True, **config)
+
+        reference = build(configs[0])
+
+        def inputs(rows):
+            x = torch.randn((rows, hidden), device="cuda", dtype=torch.float16) * 0.1
+            weights = torch.randn((experts + 1, hidden), device="cuda", dtype=torch.float16) * 0.01
+            expected = torch.empty((rows, experts), device="cuda")
+            gate_expected = torch.empty(rows, device="cuda", dtype=torch.float16)
+
+            def fixture(kernel, config):
+                logits = torch.full((rows + 1, experts), 91, device="cuda", dtype=torch.float32)
+                gate = torch.full((rows + 1,), 91, device="cuda", dtype=torch.float16)
+
+                def run():
+                    launch(kernel, x, weights, logits[:rows], gate[:rows], rows)
+
+                def check():
+                    launch(reference, x, weights, expected, gate_expected, rows)
+                    assert torch.equal(logits[:rows], expected) and torch.equal(
+                        gate[:rows], gate_expected
+                    )
+                    assert bool(torch.all(logits[rows:] == 91)) and bool(
+                        torch.all(gate[rows:] == 91)
+                    )
+
+                return run, check, lambda: x.neg_()
+
+            yield fixture
+
+        result = self.select(
+            spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
+        )
+        costs = {
+            str(i): sum(row["times"][str(i)] for row in result["measurements"])
+            for i in range(len(configs))
+        }
+        result = prefill_fallback(result, min(costs, key=costs.get))
+        self.records[key] = result
+        return result
+
+    def routed(
+        self,
+        hidden,
+        intermediate,
+        experts,
+        top_k,
+        weights,
+        weight_identity,
+        *,
+        routing_samples=None,
+    ):
         import torch
         from kernels.model import moe
-        from kernels.model.e8p_prefill import split_prefill_a8
+        from kernels.model.e8p_prefill import split_prefill_a8, split_routed_prefill_a8
+        from kernels.model import expert_partition
         from tools.quantization.vq import e8p_selector_supports_parity_xor
 
         spec = dict(
@@ -111,6 +220,24 @@ class MoeTuner(RowTuner):
             timed_routing=["independent"],
             validation_routing=["four", "hot"],
         )
+        routing_samples = routing_samples or {}
+        for rows, samples in routing_samples.items():
+            if (
+                type(rows) is not int
+                or not 1 <= rows <= 4096
+                or not samples
+                or any(
+                    len(counts) != experts
+                    or sum(counts) != rows * top_k
+                    or any(type(n) is not int or n < 0 for n in counts)
+                    for counts in samples
+                )
+            ):
+                raise ValueError("Invalid measured MoE routing histogram")
+        if routing_samples:
+            spec["routing_samples"] = {
+                str(rows): samples for rows, samples in sorted(routing_samples.items())
+            }
         configs = expert_configs(
             "e8p_q4", direct=e8p_selector_supports_parity_xor(weights["book"].cpu().numpy())
         )
@@ -123,6 +250,46 @@ class MoeTuner(RowTuner):
                     moe.expert_tiles, 4096, experts, top_k, config["block_m"], dynamic_rows=True
                 ),
             )
+            if config.get("cold_rows"):
+                cold = cold_expert_config()
+                args = (experts, config["block_m"], cold["block_m"], config["cold_rows"])
+                result["offsets"] = primitive(expert_partition.offsets, *args)
+                result["tiles"] = primitive(
+                    expert_partition.tiles,
+                    4096,
+                    experts,
+                    top_k,
+                    config["block_m"],
+                    cold["block_m"],
+                    config["cold_rows"],
+                    dynamic_rows=True,
+                )
+                result["cold_packs"] = [
+                    primitive(
+                        split_routed_prefill_a8,
+                        4096 * top_k,
+                        k,
+                        experts,
+                        cold["block_m"],
+                        dynamic_rows=True,
+                    )
+                    for _, k in dimensions
+                ]
+                result["cold_products"] = [
+                    primitive(
+                        expert_projection,
+                        4096,
+                        n,
+                        k,
+                        experts,
+                        top_k,
+                        codec="e8p_q4",
+                        config=cold,
+                        dynamic_rows=True,
+                        compiler_options=expert_passes("e8p_q4", cold),
+                    )
+                    for n, k in dimensions
+                ]
             if config.get("folded"):
                 slots = 4096 * top_k
                 result["packs"] = [
@@ -151,14 +318,21 @@ class MoeTuner(RowTuner):
 
         reference = build(configs[0])
 
-        def inputs(rows, patterns=("independent",)):
+        def routing_counts(rows, patterns):
             for pattern in patterns:
+                if pattern == "measured":
+                    for counts in routing_samples[rows]:
+                        yield torch.tensor(counts, device="cuda", dtype=torch.int32)
+                    continue
                 choices = (
                     rows if pattern == "independent" else min(rows, 4 if pattern == "four" else 1)
                 )
                 ids = torch.stack([torch.randperm(experts)[:top_k] for _ in range(choices)])
                 ids = ids[torch.arange(rows) % choices].flatten()
-                counts = torch.bincount(ids, minlength=experts).int().cuda()
+                yield torch.bincount(ids, minlength=experts).int().cuda()
+
+        def inputs(rows, patterns=("independent",)):
+            for counts in routing_counts(rows, patterns):
                 data = [
                     torch.randint(-100, 101, (rows * top_k, k), device="cuda", dtype=torch.int8)
                     for _, k in dimensions
@@ -191,16 +365,80 @@ class MoeTuner(RowTuner):
                             )
                             for _ in range(2)
                         ]
-                        if config.get("folded")
+                        if config.get("folded") or config.get("cold_rows")
                         else []
                     )
                     sums = torch.empty(rows * top_k, device="cuda", dtype=torch.int32)
+                    cold = None
+                    if config.get("cold_rows"):
+                        capacity = tile_capacity(
+                            4096, experts, top_k, cold_expert_config()["block_m"]
+                        )
+                        cold = dict(
+                            offsets=torch.empty_like(offsets),
+                            count=torch.empty_like(tile_count),
+                            expert=torch.empty(capacity, device="cuda", dtype=torch.int32),
+                            row=torch.empty(capacity, device="cuda", dtype=torch.int32),
+                        )
 
                     def run():
-                        launch(kernels["offsets"], counts, offsets, tile_offsets, tile_count)
-                        launch(kernels["tiles"], counts, tile_offsets, tile_expert, tile_row, rows)
+                        if cold is not None:
+                            launch(
+                                kernels["offsets"],
+                                counts,
+                                offsets,
+                                tile_offsets,
+                                tile_count,
+                                cold["offsets"],
+                                cold["count"],
+                            )
+                            launch(
+                                kernels["tiles"],
+                                counts,
+                                tile_offsets,
+                                tile_expert,
+                                tile_row,
+                                cold["offsets"],
+                                cold["expert"],
+                                cold["row"],
+                                rows,
+                            )
+                        else:
+                            launch(kernels["offsets"], counts, offsets, tile_offsets, tile_count)
+                            launch(
+                                kernels["tiles"], counts, tile_offsets, tile_expert, tile_row, rows
+                            )
                         for i, product in enumerate(kernels["products"]):
                             w = weights["banks"][i][0]
+                            if cold is not None:
+                                launch(
+                                    kernels["cold_packs"][i],
+                                    data[i],
+                                    counts,
+                                    offsets,
+                                    cold["expert"],
+                                    cold["row"],
+                                    cold["count"],
+                                    *planes,
+                                    sums,
+                                    rows * top_k,
+                                )
+                                launch(
+                                    kernels["cold_products"][i],
+                                    *planes,
+                                    sums,
+                                    w,
+                                    weights["book"],
+                                    weights["banks"][i][1],
+                                    scale,
+                                    counts,
+                                    offsets,
+                                    cold["expert"],
+                                    cold["row"],
+                                    cold["count"],
+                                    outputs[i],
+                                    rows * top_k,
+                                )
                             if config.get("folded"):
                                 launch(kernels["packs"][i], data[i], *planes, sums, rows * top_k)
                                 launch(
@@ -266,15 +504,26 @@ class MoeTuner(RowTuner):
 
                 yield fixture
 
-        return self.select(
+        result = self.select(
             spec,
             configs,
             build,
-            inputs,
-            measure_rows=[1, 2, 3, 4, 8, 17, 32, 64, 128, 512, 4096],
-            # Independent routes determine the general serving cost, as in
-            # vLLM's random gating benchmark. Duplicated-route extremes still
+            lambda rows: inputs(
+                rows, ("measured",) if rows in routing_samples else ("independent",)
+            ),
+            measure_rows=sorted(
+                {1, 2, 3, 4, 8, 17, 32, 64, 128, 512, 2048, 4096} | routing_samples.keys()
+            ),
+            # Captured routes determine cost at supplied extents; otherwise
+            # use independent gating. Duplicated-route extremes still
             # undergo exact/tail and changed-input graph checks, but are not
             # assumed to occupy two thirds of real decode iterations.
             validation_inputs=lambda rows: inputs(rows, ("four", "hot")),
         )
+        from tools.model.row_selection import prefill_fallback
+
+        costs = {
+            str(i): sum(row["times"][str(i)] for row in result["measurements"] if row["rows"] > 128)
+            for i in range(len(configs))
+        }
+        return prefill_fallback(result, min(costs, key=costs.get))

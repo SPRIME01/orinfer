@@ -111,7 +111,9 @@ class RowTuner:
                 times={k: math.exp(sum(map(math.log, v)) / len(v)) for k, v in times.items()},
             )
             records.append(record)
-            print("ROW TUNING", spec, record, flush=True)
+            # The cache record retains the full fixture identity, including
+            # measured routing histograms. Keep progress output bounded.
+            print("ROW TUNING", spec.get("kind", "pipeline"), key, record, flush=True)
         decisions = records
         if relative_tolerance:
             preferred = min(
@@ -133,6 +135,68 @@ class RowTuner:
         chosen = ranges(decisions, capacity=4096)
         result = dict(identity=identity, configs=configs, measurements=records, **chosen)
         write_json(path, result)
+        return result
+
+    def activation_rotation(self, k, swiglu, *, multiplier=1):
+        """Choose one exact row transform across the full prefill extent."""
+        import torch
+        from kernels.model.rotation_a8 import rotate_activation_a8
+
+        if type(multiplier) is not int or multiplier <= 0:
+            raise ValueError("Invalid activation row multiplier")
+        spec = dict(kind="activation_rotation", k=k, swiglu=swiglu, multiplier=multiplier)
+        key = str(spec)
+        if key in self.records:
+            return self.records[key]
+        configs = [dict(registers=value) for value in (False, True)]
+
+        def build(config):
+            return primitive(
+                rotate_activation_a8,
+                4096 * multiplier,
+                k,
+                swiglu=swiglu,
+                dynamic_rows=True,
+                **config,
+            )
+
+        reference = build(configs[0])
+
+        def inputs(rows):
+            live = rows * multiplier
+            x = torch.randn((live, k * (2 if swiglu else 1)), device="cuda", dtype=torch.float16)
+            signs = torch.randint(0, 2, (k,), device="cuda", dtype=torch.int8) * 2 - 1
+            eq = torch.empty((live, k), device="cuda", dtype=torch.int8)
+            es = torch.empty(live, device="cuda", dtype=torch.float16)
+
+            def fixture(kernel, config):
+                storage = torch.full((live + 1, k), 91, device="cuda", dtype=torch.int8)
+                scales = torch.full((live + 1,), 91, device="cuda", dtype=torch.float16)
+                q, s = storage[:live], scales[:live]
+
+                def run():
+                    launch(kernel, x, signs, q, s, live)
+
+                def check():
+                    launch(reference, x, signs, eq, es, live)
+                    assert torch.equal(q, eq) and torch.equal(s, es)
+                    assert bool(torch.all(storage[live:] == 91)) and bool(
+                        torch.all(scales[live:] == 91)
+                    )
+
+                return run, check, lambda: x.neg_()
+
+            yield fixture
+
+        result = self.select(
+            spec, configs, build, inputs, measure_rows=[1, 17, 128, 512, 2048, 4096]
+        )
+        default = min(
+            result["used"],
+            key=lambda name: sum(row["times"][name] for row in result["measurements"]),
+        )
+        result = dict(result, default=default, selections=[], used=[default])
+        self.records[key] = result
         return result
 
     def rotation(self, k, swiglu, *, plane_rows=0):
@@ -207,10 +271,6 @@ class RowTuner:
         return result
 
     def attention(self, context):
-        from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
-        from kernels.model.kv_int8 import attention_prefill_int8
-        import torch
-
         spec = dict(
             kind="attention",
             context=context,
@@ -231,6 +291,61 @@ class RowTuner:
         # Include the unsplit reference geometry in the same computation body.
         # This removes split bookkeeping at compile time, without a row cutoff.
         configs.append(dict(head_group=1, block_m=32, block_n=32, max_splits=1))
+        result = self._measure_attention(context, spec, configs)
+        self.records[str(spec)] = result
+        return result
+
+    def staged_attention(self, context, selection):
+        """Choose one prefill pipeline including the cost of temporary KV decoding."""
+        from tools.model.row_selection import prefill_fallback
+
+        baseline = selection["configs"][int(selection["default"])]
+        spec = dict(
+            kind="staged_attention",
+            context=context,
+            query_heads=self.qh,
+            kv_heads=self.kvh,
+            baseline=baseline,
+        )
+        if str(spec) in self.records:
+            return self.records[str(spec)]
+        configs = [
+            baseline,
+            *[
+                dict(
+                    block_m=m,
+                    block_n=64,
+                    head_group=g,
+                    threads=t,
+                    stages=1,
+                    max_splits=1,
+                    decoded_kv=True,
+                )
+                for m, g, t in [(64, 1, 256), (128, 2, 512)]
+                if (self.qh // self.kvh) % g == 0
+            ],
+        ]
+        measured = self._measure_attention(
+            context, spec, configs, measure_rows=[129, 512, 2048, 4096]
+        )
+        winner = min(
+            range(len(configs)),
+            key=lambda i: sum(row["times"][str(i)] for row in measured["measurements"]),
+        )
+        result = selection
+        if winner:
+            result = prefill_fallback(
+                dict(selection, configs=[*selection["configs"], configs[winner]]),
+                str(len(selection["configs"])),
+            )
+        self.records[str(spec)] = result
+        return result
+
+    def _measure_attention(self, context, spec, configs, *, measure_rows=None):
+        from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
+        from kernels.model.kv_int8 import attention_prefill_int8, dequantize_attention_kv
+        import torch
+
         reference = primitive(
             attention_prefill_int8,
             1,
@@ -256,6 +371,7 @@ class RowTuner:
                     kv_heads=self.kvh,
                     threads=c.get("threads", 128),
                     stages=c.get("stages", 0),
+                    decoded_kv=c.get("decoded_kv", False),
                 ),
                 primitive(
                     merge_attention_int8,
@@ -267,6 +383,9 @@ class RowTuner:
                     query_heads=self.qh,
                     kv_heads=self.kvh,
                 ),
+                primitive(dequantize_attention_kv, 4096, context, kv_heads=self.kvh)
+                if c.get("decoded_kv")
+                else None,
             )
 
         def inputs(rows):
@@ -300,7 +419,7 @@ class RowTuner:
                     lengths=lengths,
                     expected=expected,
                 ):
-                    first, second = pair
+                    first, second, decoder = pair
                     bm = c["block_m"]
                     heads = self.qh // c["head_group"]
                     partial = torch.empty((heads, 2 * ATTENTION_TARGET, bm, 256), device="cuda")
@@ -310,12 +429,24 @@ class RowTuner:
                         (rows + 1, self.qh, 256), 91, device="cuda", dtype=torch.float16
                     )
                     out = storage[:rows]
+                    decoded = (
+                        [
+                            torch.empty(
+                                (1, context, self.kvh * 256), device="cuda", dtype=torch.float16
+                            )
+                            for _ in range(2)
+                        ]
+                        if decoder
+                        else []
+                    )
 
                     def run():
+                        if decoder:
+                            launch(decoder, *kv, *scales, lengths, *decoded, rows)
                         launch(
                             first,
                             q,
-                            *kv,
+                            *(decoded if decoder else kv),
                             *scales,
                             gate,
                             pos,
@@ -333,13 +464,15 @@ class RowTuner:
                         torch.testing.assert_close(out, expected, atol=4e-5, rtol=0.005)
                         assert bool(torch.all(storage[rows:] == 91))
 
-                    return run, check, lambda: q.neg_()
+                    def change():
+                        q.neg_()
+                        kv[1].neg_()
+
+                    return run, check, change
 
                 yield fixture
 
-        result = self.select(spec, configs, build, inputs)
-        self.records[str(spec)] = result
-        return result
+        return self.select(spec, configs, build, inputs, measure_rows=measure_rows)
 
     def gdn_ab(self):
         """Tune CTA coverage while preserving the FP16 MMA K accumulation order."""

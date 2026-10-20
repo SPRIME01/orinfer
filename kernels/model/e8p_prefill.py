@@ -33,13 +33,45 @@ __device__ __forceinline__ unsigned nib_prefill(unsigned c,unsigned b){unsigned 
 )
 
 
+def _split_a8_block(K):
+    width = max(32, 1 << ((K // 8 - 1).bit_length()))
+
+    @T.macro
+    def pack(A, Low, High, Sum, first, count):
+        T.import_source(SOURCE)
+        sums = T.alloc_fragment((4, width), T.int32)
+        total = T.alloc_fragment((4,), T.int32)
+        T.annotate_layout(
+            {
+                sums: tilelang.Fragment(
+                    (4, width),
+                    forward_thread_fn=lambda i, j: i * 32 + j % 32,
+                    forward_index_fn=lambda i, j: j // 32,
+                )
+            }
+        )
+        for i, j in T.Parallel(4, width):
+            sums[i, j] = 0
+            if i < count and j < K // 8:
+                x = T.ldg32(A[first + i, j * 8])
+                y = T.ldg32(A[first + i, j * 8 + 4])
+                Low[j // 8, first + i, j % 8] = low_plane(x, y)
+                High[j // 8, first + i, j % 8] = high_plane(x, y)
+                sums[i, j] = T.call_pure_extern("int32", "nib_sum", x, y)
+        T.reduce_sum(sums, total, dim=1)
+        for i in T.Parallel(4):
+            if i < count:
+                Sum[first + i] = total[i]
+
+    return pack
+
+
 @orin_jit
 def split_prefill_a8(rows, K, dynamic_rows=False):
     if any(type(x) is not int or x <= 0 for x in (rows, K)) or K % 128:
         raise ValueError("Invalid K64-major A8 geometry")
-    W = max(32, 1 << ((K // 8 - 1).bit_length()))
-    BM = 4
     rows = row_count(rows, dynamic_rows)
+    pack = _split_a8_block(K)
 
     @T.prim_func
     def pack_exact_a8(
@@ -48,33 +80,53 @@ def split_prefill_a8(rows, K, dynamic_rows=False):
         High: T.Tensor((K // 64, rows, 8), T.uint32),
         Sum: T.Tensor((rows,), T.int32),
     ):
-        with T.Kernel(T.ceildiv(rows, BM), threads=128) as by:
-            T.import_source(SOURCE)
-            sums = T.alloc_fragment((BM, W), T.int32)
-            total = T.alloc_fragment((BM,), T.int32)
-            T.annotate_layout(
-                {
-                    sums: tilelang.Fragment(
-                        (BM, W),
-                        forward_thread_fn=lambda i, j: i * 32 + j % 32,
-                        forward_index_fn=lambda i, j: j // 32,
-                    )
-                }
-            )
-            for i, j in T.Parallel(BM, W):
-                sums[i, j] = 0
-                if by * BM + i < rows and j < K // 8:
-                    x = T.ldg32(A[by * BM + i, j * 8])
-                    y = T.ldg32(A[by * BM + i, j * 8 + 4])
-                    Low[j // 8, by * BM + i, j % 8] = low_plane(x, y)
-                    High[j // 8, by * BM + i, j % 8] = high_plane(x, y)
-                    sums[i, j] = T.call_pure_extern("int32", "nib_sum", x, y)
-            T.reduce_sum(sums, total, dim=1)
-            for i in T.Parallel(BM):
-                if by * BM + i < rows:
-                    Sum[by * BM + i] = total[i]
+        with T.Kernel(T.ceildiv(rows, 4), threads=128) as by:
+            pack(A, Low, High, Sum, by * 4, T.min(4, rows - by * 4))
 
     return pack_exact_a8
+
+
+@orin_jit
+def split_routed_prefill_a8(rows, K, experts, block_m, dynamic_rows=False):
+    if (
+        any(type(x) is not int or x <= 0 for x in (rows, K, experts, block_m))
+        or K % 128
+        or block_m % 4
+    ):
+        raise ValueError("Invalid routed A8 plane geometry")
+    capacity = (rows + block_m - 1) // block_m + min(experts, rows)
+    rows = row_count(rows, dynamic_rows)
+    pack = _split_a8_block(K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, K), T.int8),
+        Counts: T.Tensor((experts,), T.int32),
+        Offsets: T.Tensor((experts,), T.int32),
+        TE: T.Tensor((capacity,), T.int32),
+        TR: T.Tensor((capacity,), T.int32),
+        TC: T.Tensor((1,), T.int32),
+        Low: T.Tensor((K // 64, rows, 8), T.uint32),
+        High: T.Tensor((K // 64, rows, 8), T.uint32),
+        Sum: T.Tensor((rows,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(rows, block_m) + T.min(experts, rows), threads=128) as tile:
+            metadata = T.alloc_local((3,), T.int32)
+            if tile < TC[0]:
+                metadata[0] = TE[tile]
+                metadata[1] = Offsets[metadata[0]] + TR[tile]
+                metadata[2] = T.min(block_m, Counts[metadata[0]] - TR[tile])
+                for group in T.serial(block_m // 4):
+                    pack(
+                        A,
+                        Low,
+                        High,
+                        Sum,
+                        metadata[1] + group * 4,
+                        T.min(4, metadata[2] - group * 4),
+                    )
+
+    return main
 
 
 @orin_jit(
@@ -95,12 +147,13 @@ def e8p_prefill_grouped(
     row_major=False,
     codec="e8p_q2",
     minimum_blocks=1,
+    block_m=16,
 ):
     """One routed-tile mainloop; optionally predicate empty MMA row stripes.
 
-    Routing always uses sixteen-row tiles. Sparse candidates mask complete
-    hardware M8 stripes inside this body instead of instantiating a second
-    eight-row implementation. Offline tuning selects whether masking pays off.
+    Routing and computation share the selected row tile. Sparse candidates
+    mask complete hardware M8 stripes inside this body. Offline tuning selects
+    both row reuse and whether masking pays off.
     """
     if (
         any(type(x) is not int or x <= 0 for x in (rows, E, tiles, N, K))
@@ -109,11 +162,13 @@ def e8p_prefill_grouped(
         or codec not in ("e8p_q2", "e8p_q4")
         or type(minimum_blocks) is not int
         or not 1 <= minimum_blocks <= 16
+        or block_m not in (16, 32)
+        or (codec == "e8p_q2" and block_m != 16)
         or K % 128
         or K * 128 * 128 > 2**31 - 1
     ):
         raise ValueError("Invalid exact E8P geometry")
-    BM, BN, BK = 16, 128, 64
+    BM, BN, BK = block_m, 128, 64
     q4 = codec == "e8p_q4"
     packed_k, packed_dtype = (128, T.uint32) if q4 else (64, T.uint16)
     # Matching swizzle for sixteen-byte activation halves and ldmatrix reads.

@@ -17,6 +17,25 @@ __device__ __forceinline__ int attn_split_count(int rows,int groups,int bm,int t
     int tiles=((rows*groups+bm-1)/bm)*instances;
     return min(maximum,(target+tiles-1)/tiles);
 }
+__device__ __forceinline__ int attn_max_position(const int* positions, int rows, int qb, int bm, int groups) {
+    __shared__ int warp_maximum[32];
+    int value=-1;
+    for(int i=threadIdx.x; i<bm; i+=blockDim.x) {
+        int token=(qb*bm+i)/groups;
+        if(token<rows) value=max(value,positions[token]);
+    }
+    for(int delta=16;delta>0;delta>>=1) value=max(value,__shfl_xor_sync(0xffffffff,value,delta));
+    if((threadIdx.x&31)==0) warp_maximum[threadIdx.x>>5]=value;
+    __syncthreads();
+    value=(threadIdx.x<blockDim.x/32)?warp_maximum[threadIdx.x]:-1;
+    if(threadIdx.x<32) {
+        for(int delta=16;delta>0;delta>>=1) value=max(value,__shfl_xor_sync(0xffffffff,value,delta));
+        if(threadIdx.x==0) warp_maximum[0]=value;
+    }
+    __syncthreads();
+    return warp_maximum[0];
+}
+
 """
 
 
@@ -47,15 +66,18 @@ def causal_attention_int8(
     threads=128,
     stages=0,
     parallel_instances=False,
+    decoded_kv=False,
 ):
     groups = query_heads // kv_heads if head_group is None else head_group
     if (
         min(capacity, context, target_tiles) <= 0
         or query_heads % kv_heads
+        or type(decoded_kv) is not bool
+        or (decoded_kv and parallel_instances)
         or dimension % 64
-        or block_m not in (16, 32, 64)
+        or block_m not in (16, 32, 64, 128)
         or block_n not in (32, 64)
-        or threads not in (128, 256)
+        or threads not in (128, 256, 512)
         or stages not in (0, 1)
         or max_splits not in (1, 2, 4, 8, 16)
         or groups <= 0
@@ -70,12 +92,14 @@ def causal_attention_int8(
     # splits > 1 implies tiles < target_tiles, and tiles*splits < 2*target_tiles.
     workspace_tiles = 2 * target_tiles
     load_kv = int8_kv_tile(block_n, dimension, threads)
+    storage_width = kv_heads * dimension // (1 if decoded_kv else 4)
+    storage_dtype = T.float16 if decoded_kv else T.uint32
 
     @T.prim_func
     def main(
         Q: T.Tensor((m, query_heads, dimension), T.float16),
-        K: T.Tensor((1, context, kv_heads * dimension // 4), T.uint32),
-        V: T.Tensor((1, context, kv_heads * dimension // 4), T.uint32),
+        K: T.Tensor((1, context, storage_width), storage_dtype),
+        V: T.Tensor((1, context, storage_width), storage_dtype),
         KS: T.Tensor((1, context, kv_heads * dimension // 64), T.float16),
         VS: T.Tensor((1, context, kv_heads * dimension // 64), T.float16),
         Gate: T.Tensor((m, query_heads, dimension), T.float16),
@@ -96,7 +120,7 @@ def causal_attention_int8(
             k = T.alloc_shared((block_n, dimension), T.float16)
             v = T.alloc_shared((block_n, dimension), T.float16)
             p = T.alloc_shared((block_m, block_n), T.float16)
-            if stages:
+            if stages and not decoded_kv:
                 packed_k = T.alloc_shared((1, block_n, dimension // 4), T.uint32)
                 packed_v = T.alloc_shared((1, block_n, dimension // 4), T.uint32)
                 scale_k = T.alloc_shared((1, block_n, dimension // 64), T.float16)
@@ -109,20 +133,38 @@ def causal_attention_int8(
             rowsum = T.alloc_fragment((block_m,), T.float32)
             correction = T.alloc_fragment((block_m,), T.float32)
             pos = T.alloc_fragment((block_m,), T.int32)
-            maxpos = T.alloc_fragment((1,), T.int32)
+            maxpos = (
+                T.alloc_local((1,), T.int32) if block_m == 128 else T.alloc_fragment((1,), T.int32)
+            )
             T.clear(out)
             T.clear(denom)
             T.fill(maximum, -1e30)
             for i in T.Parallel(block_m):
                 token = (qb * block_m + i) // groups
                 pos[i] = T.if_then_else(token < m, Positions[token], -1)
-            T.reduce_max(pos, maxpos, dim=0)
+            if block_m == 128:
+                # Keep the CTA-wide position reduction independent of the MMA
+                # fragment's row layout for larger query tiles.
+                maxpos[0] = T.call_extern(
+                    "int32",
+                    "attn_max_position",
+                    T.access_ptr(Positions[0], "r", m),
+                    m,
+                    qb,
+                    block_m,
+                    groups,
+                )
+            else:
+                T.reduce_max(pos, maxpos, dim=0)
             valid = T.max(0, T.min(T.min(Lengths[0], context), maxpos[0] + 1))
             width = T.alloc_local((1,), T.int32)
             width[0] = T.truncdiv(valid + split_count[0] - 1, split_count[0])
             start = split * width[0]
             end = T.min(start + width[0], valid)
-            if stages:
+            if decoded_kv:
+                live_k = T.decl_buffer((1, end, storage_width), storage_dtype, data=K.data)
+                live_v = T.decl_buffer((1, end, storage_width), storage_dtype, data=V.data)
+            elif stages:
                 # Restrict the copy's source view to committed KV. Capacity may
                 # reserve uncommitted virtual pages beyond the live sequence.
                 live_k = T.decl_buffer((1, end, kv_heads * dimension // 4), T.uint32, data=K.data)
@@ -140,7 +182,10 @@ def causal_attention_int8(
                     q[i, d] = Q[token, kh * groups + (qb * block_m + i) % groups, d]
             for tile in T.Pipelined(T.ceildiv(T.max(0, end - start), block_n), num_stages=stages):
                 base = start + tile * block_n
-                if stages:
+                if decoded_kv:
+                    T.copy(live_k[0, base, (kh // heads_per_kv) * dimension], k)
+                    T.copy(live_v[0, base, (kh // heads_per_kv) * dimension], v)
+                elif stages:
                     # Prefetch compressed operands, rather than double-buffering
                     # the larger decoded FP16 tiles. T.copy guards the physical
                     # source boundary; load_kv also zeroes the live KV tail.
@@ -153,7 +198,9 @@ def causal_attention_int8(
                     load_kv(K, V, KS, VS, k, v, 0, kh // heads_per_kv, base, end)
                 T.sync_threads()
                 T.clear(score)
-                T.gemm(q, k, score, transpose_B=True)
+                # Keep more query rows in each warp. QK and PV use the same
+                # row distribution, reducing cross-warp softmax reductions.
+                T.gemm(q, k, score, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for i in T.Parallel(block_m):
                     previous[i] = maximum[i]
                 for i, j in T.Parallel(block_m, block_n):
@@ -176,7 +223,7 @@ def causal_attention_int8(
                     denom[i] = denom[i] * correction[i] + rowsum[i]
                 for i, d in T.Parallel(block_m, dimension):
                     out[i, d] *= correction[i]
-                T.gemm(p, v, out)
+                T.gemm(p, v, out, policy=T.GemmWarpPolicy.FullRow)
             if split_count[0] > 1:
                 for i, d in T.Parallel(block_m, dimension):
                     Partial[kh, qb * split_count[0] + split, i, d] = out[i, d]

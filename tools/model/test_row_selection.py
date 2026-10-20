@@ -5,7 +5,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 from tools.model.row_selection import ranges
-from tools.model.row_selection import choices, project, samples, split_fixed
+from tools.model.row_selection import choices, prefill_fallback, project, samples, split_fixed
 from tools.model.row_tuning import RowTuner
 
 
@@ -73,6 +73,61 @@ class ValidationOnlyTuningTests(unittest.TestCase):
 
 
 class PrefillTuningTests(unittest.TestCase):
+    def test_single_prefill_fallback_preserves_implicit_and_strided_short_choices(self):
+        original = dict(
+            configs=[dict(tile=16), dict(tile=32), dict(tile=64)],
+            default="0",
+            selections=[
+                dict(min_rows=1, max_rows=3, implementation="1"),
+                dict(min_rows=8, max_rows=256, multiple_of=8, implementation="1"),
+            ],
+        )
+        selected = prefill_fallback(original, "2", 16)
+        self.assertTrue(all(c["max_rows"] <= 16 for c in selected["selections"]))
+        published = list(choices(selected, 4096))
+        self.assertEqual(published[0], ("", dict(tile=64)))
+        for row in range(1, 4097):
+            actual = selected["default"]
+            for choice in selected["selections"]:
+                if choice["min_rows"] <= row <= choice["max_rows"]:
+                    actual = choice["implementation"]
+            expected = "2" if row > 16 else "1" if row <= 3 or row % 8 == 0 else "0"
+            self.assertEqual(actual, expected)
+
+    def test_attention_staging_uses_aggregate_cost_and_preserves_bounded_choices(self):
+        original = dict(
+            configs=[
+                dict(block_m=64, block_n=64, head_group=1, max_splits=8),
+                dict(block_m=16, block_n=32, head_group=8, max_splits=16),
+            ],
+            default="0",
+            selections=[dict(min_rows=1, max_rows=32, implementation="1")],
+        )
+        with tempfile.TemporaryDirectory() as output:
+            tuner = RowTuner(output, {}, dict(num_attention_heads=16, num_key_value_heads=2))
+            with patch.object(
+                tuner,
+                "_measure_attention",
+                return_value=dict(
+                    measurements=[
+                        dict(rows=129, times={"0": 1.0, "1": 0.1, "2": 0.4}),
+                        dict(rows=4096, times={"0": 10.0, "1": 6.0, "2": 4.0}),
+                    ]
+                ),
+            ):
+                result = tuner.staged_attention(262144, original)
+        self.assertEqual(result["configs"][int(result["default"])]["block_m"], 128)
+        self.assertTrue(result["configs"][int(result["default"])]["decoded_kv"])
+        published = list(choices(result, 4096, bounded=True))
+        for suffix, config in published:
+            first, last = map(int, suffix.removeprefix("/rows/").split("-"))
+            if first > 128:
+                self.assertEqual(last, 4096)
+                self.assertTrue(config["decoded_kv"])
+            else:
+                self.assertLessEqual(last, 128)
+                self.assertEqual(config, original["configs"][1 if first <= 32 else 0])
+
     def test_one_winner_has_no_other_runtime_implementation(self):
         result = ranges([dict(rows=n, times=dict(a=2.0, b=1.0)) for n in [1, 17, 257, 512]], 512)
         self.assertEqual(result["used"], ["b"])

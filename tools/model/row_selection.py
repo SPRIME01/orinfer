@@ -33,6 +33,30 @@ def project(selection, keys):
     return dict(configs=configs, default=default, selections=intervals)
 
 
+def prefill_fallback(selection, default, capacity=128):
+    """Keep bounded decode choices around one measured prefill configuration."""
+    live = [selection["default"]] * capacity
+    for choice in selection["selections"]:
+        for row in range(choice["min_rows"], min(choice["max_rows"], capacity) + 1):
+            if row % choice.get("multiple_of", 1) == 0:
+                live[row - 1] = choice["implementation"]
+    intervals = []
+    for row, name in enumerate(live, 1):
+        if name == default:
+            continue
+        if (
+            intervals
+            and intervals[-1]["implementation"] == name
+            and intervals[-1]["max_rows"] + 1 == row
+        ):
+            intervals[-1]["max_rows"] = row
+        else:
+            intervals.append(dict(min_rows=row, max_rows=row, multiple_of=1, implementation=name))
+    return dict(
+        selection, default=default, selections=intervals, used=sorted(set(live) | {default})
+    )
+
+
 def ranges(records, capacity=4096):
     """Nearest measured length selects a legal implementation, then coalesce."""
     names = sorted({name for row in records for name in row["times"]})
