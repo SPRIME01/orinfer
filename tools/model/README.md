@@ -1,15 +1,15 @@
-# 离线模型构建
+# Offline model builds
 
-Python 用于权重准备、TileLang 编译、调优和验证；在线加载、执行与服务由 Rust 完成。
+Python is used for weight preparation, TileLang compilation, tuning, and validation. Rust handles online model loading, execution, and serving.
 
-## 支持的构建入口
+## Supported build entry points
 
-| 模型 | 输入 | 构建入口 |
+| Model | Input | Build entry point |
 | --- | --- | --- |
-| Qwen3.8-27B | 完成量化的自有码表 Q4A8 checkpoint | [qwen35/build.py](qwen35/README.md) |
-| Qwen3.8-Flash-Next | 当前 schema-1 模型及其匹配执行包 | [flash_next/build.py](flash_next/README.md) |
+| Qwen3.8-27B | Fully quantized, custom-codebook Q4A8 checkpoint | [qwen35/build.py](qwen35/README.md) |
+| Qwen3.8-Flash-Next | Current schema-1 model and matching execution package | [flash_next/build.py](flash_next/README.md) |
 
-27B 的当前部署方案为两级整数 E8P Q4A8。Flash Next 使用 E8P Q2A8 专家及质量优先的混合精度。量化组件与存储约定见[量化说明](../quantization/README.md)。
+The current 27B deployment uses two-stage integer E8P Q4A8. Flash Next uses E8P Q2A8 experts with quality-oriented mixed precision. See [Quantization](../quantization/README.md) for the storage and encoding contracts.
 
 ```bash
 make python-env
@@ -21,21 +21,21 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
   --model /path/to/native-flash-model --model-output artifacts/models/flash-ready
 ```
 
-编译环境固定为 `orinfer-compiler:0.1.2`，配方和挂载方式见[编译说明](../build/README.md)。外部输入通过 `ORINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
+The compiler environment is pinned to `orinfer-compiler:0.1.2`. See [Build and release](../build/README.md) for the image recipe and mount rules. External inputs are mounted read-only through `ORINFER_CHECKPOINT_DIR`. All GPU work shares `artifacts/gpu-experiment.lock`. Use new output directories; published artifacts must remain immutable.
 
-## 产物与公共组件
+## Artifacts and shared components
 
-模型目录保留 HF 配置、tokenizer、chat template、标准 safetensors 分片和 `cache/model.json`。数据描述通过 digest 绑定独立执行包，包内包含 Rust 模型库、去重的 cubin、源码及 host ABI；格式与 C ABI 均为版本 1。在线模型不接受裸 AOT manifest。
+Prepared model directories retain the HF configuration, tokenizer, chat template, standard safetensors shards, and `cache/model.json`. A digest binds the model descriptor to a standalone execution package containing the Rust model library, deduplicated cubins, sources, and host ABI. Both the data format and C ABI are version 1. The online engine does not accept a bare AOT manifest.
 
-- `compile.py`、`row_contract.py`、`row_selection.py`：动态行工厂、host ABI 合同与离线选择规则。
-- `catalog.py`、`binding_templates.py`：共享编译定义和原生参数模板。
-- `publication.py`、`compact.py`：不可变资产复用、safetensors 合并及原子发布。
-- `package.py`：离线执行包校验、XZ 归档、发布工具内部安装及前端资源固定；部署使用 Rust 的 `orinfer package install`。
-- `attach_execution.py`：为匹配的数据目录安装执行包。
+- `compile.py`, `row_contract.py`, `row_selection.py`: dynamic-row factories, host ABI contracts, and offline selection.
+- `catalog.py`, `binding_templates.py`: shared compile definitions and native parameter templates.
+- `publication.py`, `compact.py`: immutable asset reuse, safetensors merging, and atomic publication.
+- `package.py`: offline execution-package verification, XZ packaging, internal installer, and frontend asset binding. For deployment, use Rust's `orinfer package install`.
+- `attach_execution.py`: attach a matching execution package to a model data directory.
 
-更新执行包须核对完整程序、参数、动态 launch、状态及 buffer 契约。权重布局改变时重新准备权重；仅重新编译相同计算时可复用匹配的权重分片。
+Rebuilt execution packages must be checked for program coverage, parameters, dynamic launches, state, and buffer contracts. Changed weight layouts require preparing weights again; recompiling the same computation may reuse compatible shards.
 
-## 验证与测量
+## Validation and measurement
 
 ```bash
 ./target/release/orinfer validate-model /path/to/prepared-model
@@ -46,6 +46,6 @@ make check-offline
 make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 ```
 
-`validate-model` 完整校验文件与 payload，`plan-model` 只生成 CPU 执行计划。GPU 验收覆盖动态 batch、请求隔离、prefix 恢复、MTP 和图片输入；量化质量另外与同模型 BF16/FP8 固定历史对照。详细口径见[评测说明](../eval/README.md)。
+`validate-model` fully verifies files and payloads; `plan-model` produces a CPU-only execution plan. GPU acceptance covers dynamic batching, request isolation, prefix restoration, MTP, and image input. Quantization quality is checked separately against same-model BF16/FP8 fixed-history references. See [Quality evaluation](../eval/README.md).
 
-`run.sh` 记录完整 Rust 请求和机器状态；`profile.sh` 与 `profile_summary.py` 用于 Nsight 分析。算子微测、短输出 profile 和完整请求吞吐分别记录，性能参考见[性能文档](../../docs/performance.md)。
+`run.sh` records complete Rust requests and machine state; `profile.sh` and `profile_summary.py` support Nsight profiling. Operator microbenchmarks, short-output profiles, and end-to-end request throughput should be reported separately; see [Performance](../../docs/performance.md).
