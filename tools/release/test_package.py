@@ -5,7 +5,7 @@ import tempfile
 import tarfile
 import unittest
 from unittest.mock import patch
-from tools.release.package import archive, execution_assets, verify
+from tools.release.package import archive, execution_asset_identity, execution_assets, verify
 
 
 class ReleaseTests(unittest.TestCase):
@@ -44,11 +44,28 @@ class ExecutionAssetsTests(unittest.TestCase):
                 library=dict(file="lib/model.so", sha256=hashlib.sha256(header).hexdigest()),
             )
             archives = []
-            for index, architecture in enumerate(("qwen3_5", "flash_next", "qwen3_5")):
+            for index, architecture in enumerate(("qwen3_5", "flash_next", "qwen3_5", "qwen3_5")):
                 manifest = dict(
                     schema_version=1,
                     runtime_abi=1,
                     architecture=architecture,
+                    config_signature=dict(
+                        text=(
+                            dict(
+                                hidden_size=2560,
+                                num_hidden_layers=48,
+                                num_experts=512,
+                                moe_intermediate_size=640,
+                                num_experts_per_tok=10,
+                            )
+                            if architecture == "flash_next"
+                            else dict(
+                                hidden_size=2048 if index == 0 else 2560,
+                                intermediate_size=6144 if index == 0 else 9216,
+                                num_hidden_layers=24 if index == 0 else 32,
+                            )
+                        )
+                    ),
                     compute_policy="int8_quality",
                     target="sm_87",
                     catalog=dict(
@@ -72,10 +89,17 @@ class ExecutionAssetsTests(unittest.TestCase):
                     archive_package(package, path)
                 archives.append(path)
             with patch("tools.release.package.execution_identity", return_value=identity):
-                assets = execution_assets(archives, root / "cache", Path("/bin/true"), "v0.1.2")
+                assets = execution_assets(archives[:3], root / "cache", Path("/bin/true"), "v0.1.2")
                 names = [a["metadata"]["file"] for a in assets]
                 self.assertEqual(len(set(names)), 3)
-                self.assertIn("flash_next", names[1])
+                self.assertEqual(
+                    names,
+                    [
+                        "orinfer-exec-qwen35-2b-a8-sm87-v0.1.2.tar.xz",
+                        "orinfer-exec-flash-next-a8-sm87-v0.1.2.tar.xz",
+                        "orinfer-exec-qwen35-4b-a8-sm87-v0.1.2.tar.xz",
+                    ],
+                )
                 self.assertNotIn("27b", names[1])
                 self.assertEqual(
                     [a["metadata"]["architecture"] for a in assets],
@@ -91,9 +115,21 @@ class ExecutionAssetsTests(unittest.TestCase):
                     self.assertEqual(
                         install(output, root / "reinstalled"), asset["metadata"]["digest"]
                     )
+            with patch("tools.release.package.execution_identity", return_value=identity):
+                with self.assertRaisesRegex(ValueError, "Duplicate"):
+                    execution_assets(
+                        archives, root / "collision-cache", Path("/bin/true"), "v0.1.2"
+                    )
             with patch(
                 "tools.release.package.execution_identity",
                 return_value=dict(identity, version="wrong"),
             ):
                 with self.assertRaisesRegex(ValueError, "differs from package"):
                     execution_assets(archives, root / "bad-cache", Path("/bin/true"), "v0.1.2")
+
+    def test_unknown_specification_and_unsafe_tag_are_rejected(self):
+        package = dict(architecture="qwen3_5", compute_policy="int8_quality", target="sm_87")
+        with self.assertRaisesRegex(ValueError, "Register one"):
+            execution_asset_identity(package, "v0.2.0")
+        with self.assertRaisesRegex(ValueError, "Unsafe release tag"):
+            execution_asset_identity(package, "../../v0.2.0")

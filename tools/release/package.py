@@ -67,6 +67,34 @@ def notices(metadata):
     return "".join(text)
 
 
+def execution_asset_identity(package, tag):
+    """Resolve a readable architecture specification from the package contract."""
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.-]+)?", tag):
+        raise ValueError("Unsafe release tag")
+    fields = [package[k] for k in ("architecture", "compute_policy", "target")]
+    if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
+        raise ValueError("Unsafe execution package asset identity")
+    architecture, policy, target = fields
+    families = json.loads((ROOT / "configs/architecture-contract.json").read_text())["families"]
+    variants = families.get(architecture, {}).get("release_variants", {})
+    text = package.get("config_signature", {}).get("text", {})
+    matches = [
+        name
+        for name, selector in variants.items()
+        if all(text.get(key) == value for key, value in selector.items())
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Register one release architecture specification for {architecture}")
+    specification = matches[0]
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", specification):
+        raise ValueError("Unsafe release architecture specification")
+    compute = "a8" if policy == "int8_quality" else policy.replace("_", "-")
+    return (
+        f"orinfer-exec-{specification}-{compute}-{target.replace('_', '')}-{tag}.tar.xz",
+        specification,
+    )
+
+
 def execution_assets(archives, cache, binary, tag):
     """Validate each package independently and name assets from their actual contract."""
     assets = []
@@ -84,11 +112,7 @@ def execution_assets(archives, cache, binary, tag):
         )
         if identity != package["execution"]:
             raise ValueError("Native execution identity differs from package manifest")
-        fields = [package[k] for k in ("architecture", "compute_policy", "target")]
-        if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
-            raise ValueError("Unsafe execution package asset identity")
-        architecture, policy, target = fields
-        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-{digest[:12]}-execution.tar.xz"
+        name, specification = execution_asset_identity(package, tag)
         if name in names:
             raise ValueError("Duplicate execution package asset in release")
         names.add(name)
@@ -98,9 +122,10 @@ def execution_assets(archives, cache, binary, tag):
                 metadata=dict(
                     file=name,
                     digest=digest,
-                    architecture=architecture,
-                    compute_policy=policy,
-                    target=target,
+                    architecture=package["architecture"],
+                    architecture_id=specification,
+                    compute_policy=package["compute_policy"],
+                    target=package["target"],
                     execution=identity,
                 ),
             )
