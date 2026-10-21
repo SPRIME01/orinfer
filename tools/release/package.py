@@ -139,7 +139,16 @@ def build(args):
         bundle = Path(temp) / f"orinfer-{tag}-linux-aarch64"
         (bundle / "bin").mkdir(parents=True)
         shutil.copy2(binary, bundle / "bin/orinfer")
-        for name in ("README.md", "LICENSE", "COPYING", "COPYING.LESSER", "THIRD_PARTY_NOTICES.md"):
+        for name in (
+            "README.md",
+            "README.zh-CN.md",
+            "README.ja.md",
+            "README.ko.md",
+            "LICENSE",
+            "COPYING",
+            "COPYING.LESSER",
+            "THIRD_PARTY_NOTICES.md",
+        ):
             if (ROOT / name).exists():
                 shutil.copyfile(ROOT / name, bundle / name)
         # Ship complete offline tools and their imports; only tracked files are included.

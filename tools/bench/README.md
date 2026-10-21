@@ -1,6 +1,6 @@
 # 性能工具
 
-当前 Flash Next 的 Rust CLI / Chat API 实测与 27B 历史参考见[性能参考](../../docs/performance.md)。该文档分别列出执行层 prefill、输入 tokens / API TTFT、排除 TTFT 的 decode，以及完整 prefix 命中时延；本目录工具分别按对应口径报告结果，比较时应使用相同指标。
+六模型统一基准、2B/4B/9B 完整网格及 Rust CLI / Chat API 实测见[性能参考](../../docs/performance.md)。该文档分别列出执行层 prefill、输入 tokens / API TTFT、排除 TTFT 的 decode、冷进程启动及完整 prefix 命中时延；本目录工具分别按对应口径报告结果，比较时应使用相同指标。
 
 `reference_bench.py` 测量兼容 OpenAI SSE 接口的 prefill/TTFT 与 decode 时间；`test_reference_bench.py` 检查 token chunk 和计时间隔。
 
@@ -81,3 +81,19 @@ ORINFER_BATCH_FIXTURE=/absolute/path/to/flash-fixture.json \
 `profile_vision_stages` 是默认跳过的真实模型诊断，使用 `ORINFER_BATCH_FIXTURE` 中的 `model`、新 `output` 路径和带 `images` 的 `GenerationInput` cases。它按实际图片网格绑定视觉程序，记录整段热 Graph 与逐算子 GPU 时延；`ncu: true` 对实际 launch 添加 NVTX 区间。该计时覆盖 GPU 视觉程序；图片解码、resize、特征复制和文本生成的完整耗时通过 Chat API 另测。通过同一个 GPU 锁运行 `cargo test --release -p orinfer-engine profile_vision_stages -- --ignored --nocapture --test-threads=1`。
 
 冷启动端到端测量使用 `python -m tools.bench.startup --model MODEL_DIR --request REQUEST.json --output artifacts/startup --server-args --mtp-drafts 0 --cuda-graph decode_only`。每轮启动独立 Rust CLI，通过 HTTP 等待就绪并提交首条流式 Chat 请求；记录进程启动到 ready、首个非空文本／thinking／工具片段及请求完成的耗时、usage 和原始输出，默认三轮并报告中位数。计时从进程启动开始，到请求完成结束；GPU 锁等待和退出清理另计，文件缓存保持原状。该结果衡量保留系统缓存的新进程启动，冷盘读取需在对应条件下另测。工具在子进程退出前持有共享 GPU 锁；`--gpu-lock-timeout 60` 可等待当前 GPU 工作结束。
+
+## 固定工作量与并发 prefill
+
+`runtime::requests::tests::benchmark::benchmark_fixed_requests` 通过真实请求状态机测量固定工作量。`ORINFER_BATCH_FIXTURE` 指定 JSON 夹具，包含 `model`、新 `output` 路径、`repetitions`、`cuda_graph` 和 `cases`。每个 case 包含 `name`、`prompts`（原生模板展开后的 token-ID 数组）、`output_tokens` 及可选的 `concurrent_prefill`。
+
+单流 prefill 设置 `output_tokens=1`；decode 设置 65，首输出完成后再计时后续 64 个提交 tokens。并发 prefill 设置 `concurrent_prefill=true`、`output_tokens=1`，同时推进全部等待请求，按最后一个首输出完成时刻计算吞吐。并发 decode 采用首输出屏障，随后计量固定活跃请求集合。每组先预热一次，再测 `repetitions` 轮；汇总采用热态中位数。该诊断固定忽略 EOS、关闭 MTP/prefix cache，greedy 与 seed `20261002` 保持一致。
+
+```bash
+ORINFER_BATCH_FIXTURE=/absolute/path/to/fixed-requests.json \
+  flock artifacts/gpu-experiment.lock \
+  cargo test --release --locked --offline -p orinfer-engine \
+    runtime::requests::tests::benchmark::benchmark_fixed_requests \
+    -- --ignored --exact --nocapture --test-threads=1
+```
+
+输出保存完整 token 序列与各轮首输出、decode 和墙钟计时。自然完成的翻译、代码质量及 HTTP 排队性能分别使用上方 Chat API 工具验收。最新测量表及执行包身份见[性能参考](../../docs/performance.md)。
