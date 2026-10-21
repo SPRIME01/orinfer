@@ -7,7 +7,7 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 ## 功能
 
 - OpenAI Chat Completions 与 Ollama 原生聊天/生成 API，支持流式输出、thinking、采样、严格函数调用、JSON Schema 约束和 token 概率。
-- [JSONL 离线推理](docs/batch.md)：连续批处理、逐条落盘和断点续跑，无需 HTTP 服务。
+- [JSONL 离线推理](docs/batch.md)：直接处理本地文件，支持连续批处理、逐条落盘和断点续跑。
 - 27B、4B 与 Index-Translate-2B/9B 使用两级 E8P Q4/W8 混合权重；Flash Next 使用自有 E8P Q2 专家和 Q4/W8 混合投影。以 INT8 混合精度计算，关键路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态、prefix cache、原生 MTP 和连续批处理，内存不足时排队。MTP 根据并发、上下文、执行耗时和逐深度接受情况自动选择投机深度，也可回退普通 decode。`--mtp-drafts 1..7` 设置草稿上限，`0` 关闭，`auto` 使用执行包的上限。
 - 混合架构 prefix cache、INT8 KV 和按需映射内存；模型包可配置最长 256K 上下文。
@@ -15,9 +15,9 @@ LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang
 
 ## 快速开始
 
-部署需要 aarch64 Linux 和 NVIDIA CUDA Driver，**不需要 Python、PyTorch、TileLang 或 Rust 编译器**。
+部署环境为 **aarch64 Linux 和 NVIDIA CUDA Driver**，使用已编译的 Rust 引擎和 GPU 执行包。
 
-从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎发行包、模型匹配的执行包和 `SHA256SUMS`，校验下载文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。模型目录单独下载，包含配置、tokenizer、chat template 和原生量化 safetensors；模型描述中的 `execution_package` 必须与执行包 digest 一致。发行包不附带权重，**当前不能直接加载任意 HF、AWQ 或 GGUF 目录**。
+从 [Releases](https://github.com/iMMIQ/orinfer/releases) 下载引擎发行包、模型匹配的执行包和 `SHA256SUMS`，校验下载文件后解压引擎，将 `bin/orinfer` 加入 `PATH`。模型目录单独下载，包含配置、tokenizer、chat template 和原生量化 safetensors；模型描述中的 `execution_package` 必须与执行包 digest 一致。权重通过模型仓库单独下载。**当前加载原生量化模型目录及其匹配执行包**；HF、AWQ 或 GGUF 来源需先完成适配和转换。
 
 从 v0.1.4 起，发行包统一使用 `.tar.xz`，执行包通过 `package install` 安装；该命令也接受旧 `.tar.gz`。v0.1.3 的安装方式见[旧版安装说明](docs/model-packages.md#安装已发布的-v013)。
 
@@ -60,13 +60,13 @@ Jetson AGX Orin 64GB、当前开发版本及匹配的 Flash Next 优化执行包
 
 详细 prefill、API 首 token 时延、代码阶段吞吐、prefix cache 命中及 27B 测量结果见[性能参考](docs/performance.md)。数据对应重建后的执行包，测试配置、预热次数和计时口径均在该文档中说明。
 
-Index-Translate-2B 的量化权重约 **1.23 GB / 4.32 bit**。开发版 Rust CLI 固定长度基准中，512／2K／8K prefill 约 **7.6K／7.9K／6.5K tokens/s**，关闭 MTP 的 decode 约 **108／105／94 tokens/s**；普通请求路径约 **113／109／98 tokens/s**。关闭 MTP 的 150 TPS 目标尚未达到。测量口径、文本快速评测和图片质量限制见[同页记录](docs/performance.md#index-translate-2b2026-10-18)。
+Index-Translate-2B 的量化权重约 **1.23 GB / 4.32 bit**。开发版 Rust CLI 固定长度基准中，512／2K／8K prefill 约 **7.6K／7.9K／6.5K tokens/s**，关闭 MTP 的 decode 约 **108／105／94 tokens/s**；普通请求路径约 **113／109／98 tokens/s**。关闭 MTP 的单流优化目标为 150 TPS。测量口径、文本快速评测和图片质量限制见[同页记录](docs/performance.md#index-translate-2b2026-10-18)。
 
 Index-Translate-9B 的量化权重约 **5.44 GB / 4.51 bit**，复用相同执行组件并保留独立 embedding/输出头。Rust CLI 固定长度基准中，512／2K／8K prefill 约 **2153／2220／1956 tokens/s**，关闭 MTP 的 decode 约 **33.4／32.6／29.8 tokens/s**。测试范围与 BF16 快速质量对照见[9B 测量](docs/performance.md#index-translate-9b2026-10-18)。
 
 Qwen3.5-4B 的量化权重约 **2.58 GB / 4.42 bit**，复用相同动态执行组件和共享 embedding/输出头。Rust CLI 固定长度基准中，512／2K／8K prefill 约 **3279／3401／2798 tokens/s**，关闭 MTP 的 decode 约 **54.45／52.34／45.68 tokens/s**。测量口径与小样本 BF16 对照见[4B 测量](docs/performance.md#qwen35-4b2026-10-19)。
 
-目前只支持上述硬件和架构，不支持视频、音频、`n>1` 或云端存储接口。JSON Schema 支持范围见[服务使用指南](docs/serving.md)。量化质量使用同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测尚未覆盖，见[质量评测](tools/eval/README.md)。
+当前支持范围为上述硬件、架构及文本、图片、多图输入，每次请求返回一个候选。本地服务采用内存处理，API 能力与 JSON Schema 范围见[服务使用指南](docs/serving.md)。现有量化评测覆盖同源 BF16/FP8 的固定场景和同历史概率对照；完整 LLM benchmark 和独立 BF16 256K 质量评测列为后续验收项，见[质量评测](tools/eval/README.md)。
 
 ## 开发与文档
 

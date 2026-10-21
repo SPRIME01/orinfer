@@ -25,7 +25,7 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 
 ## 产物与公共组件
 
-模型目录保留 HF 配置、tokenizer、chat template、标准 safetensors 分片和 `cache/model.json`。数据描述通过 digest 绑定独立执行包，包内包含 Rust 模型库、去重的 cubin、源码及 host ABI；格式与 C ABI 均为版本 1。在线模型不接受裸 AOT manifest。
+模型目录保留 HF 配置、tokenizer、chat template、标准 safetensors 分片和 `cache/model.json`。数据描述通过 digest 绑定独立执行包，包内包含 Rust 模型库、去重的 cubin、源码及 host ABI；在线使用版本 1 的原生模型数据和 C ABI；AOT manifest 用于离线构建。
 
 - `compile.py`、`row_contract.py`、`row_selection.py`：动态行工厂、host ABI 合同与离线选择规则。
 - `host_compiler.py`、`build_cache.py`：公共 host ABI 生成与内容缓存；`projection_policy.py`、`projection_tuning.py`：共享整数投影候选与离线测量；`row_convergence.py`：动态 launch 表达式及相邻选择合并。
@@ -53,7 +53,7 @@ make check-gpu MODEL=/path/to/prepared-model OUTPUT=artifacts/check-gpu/new-run
 
 `run.sh` 记录完整 Rust 请求和机器状态；`profile.sh` 与 `profile_summary.py` 用于 Nsight 分析。算子微测、短输出 profile 和完整请求吞吐分别记录，性能参考见[性能文档](../../docs/performance.md)。
 
-共享GPU采样由Qwen3_5与Flash Next正式构建器发布，也可只重建现有原生包的采样部分，保持权重与前端资源：
+共享 GPU 采样由 Qwen3_5 与 Flash Next 正式构建器发布，也可只重建现有原生包的采样部分，保持权重与前端资源：
 
 ```bash
 bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
@@ -61,8 +61,8 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
   --model-output artifacts/models/model-with-gpu-sampling
 ```
 
-该入口重建Rust绑定库并原子发布当前schema-1模型，沿用完整程序与ABI检查。新包仍需完整请求、状态隔离及prefix/MTP验收。GPU采样不改变greedy路径；需要top_logprobs或MTP p/q分布的调用保留CPU路径。
+该入口重建 Rust 绑定库并原子发布当前 schema-1 模型，沿用完整程序与 ABI 检查。新包仍需完整请求、状态隔离及 prefix/MTP 验收。greedy 沿用原有路径；需要 top_logprobs 或 MTP p/q 分布的调用保留 CPU 路径。
 
-Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器校验所声明策略的全部状态和工作区，不通过 buffer 名称推断策略。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，覆盖小行数、非对齐尾部和大 prefill，不设置固定行数分界。
+Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器依据显式契约校验策略及其全部状态和工作区。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，以小行数、非对齐尾部和大 prefill 的实测结果决定选择区间。
 
-`auxiliary_tuning.py`可为已有原生包测量并发布MoE top-k、QSA选择和FP16 PLE norm/gate融合，参数为`--model`、`--model-output`和`--output`；`--families router`只处理共享MoE路由。Flash Next正式`build.py`包含该步骤，Qwen3_5构建器复用同一MoE调优器。几何来自checkpoint签名及物理buffer视图，支持展开或扁平workspace；数值、尾部和Graph检查通过后才参与选择。QSA与PLE汇总多长度测量选择一个配置，Rust适配器验证完整生产者链后应用融合，不发布Python执行顺序。
+`auxiliary_tuning.py` 可为已有原生包测量并发布 MoE top-k、QSA 选择和 FP16 PLE norm/gate 融合，参数为 `--model`、`--model-output` 和 `--output`；`--families router` 只处理共享 MoE 路由。Flash Next 正式 `build.py` 包含该步骤，Qwen3_5 构建器复用同一 MoE 调优器。几何来自 checkpoint 签名及物理 buffer 视图，支持展开或扁平 workspace；数值、尾部和 Graph 检查通过后才参与选择。QSA 与 PLE 汇总多长度测量选择一个配置，Rust 适配器验证完整生产者链后应用融合并生成执行顺序。

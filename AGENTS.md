@@ -4,60 +4,72 @@
 
 ## 范围
 
-- 硬件固定本机Jetson AGX Orin 64GB，aarch64/CUDA SM87。
-- 支持Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和Index-Translate-2B/9B（Qwen3_5）的文本、图片和多图输入；不包含视频。
-- 在线运行时用Rust，生产GPU kernel以TileLang为源；Python只用于离线转换、编译、参考和验证。
-- 模型实现、公共执行组件、TileLang kernel和离线构建工具在统一workspace维护；不按模型×精度强制拆仓。orinfer-models分别注册模型适配器与计算策略，部署包内Rust cdylib通过版本化C ABI生成执行程序、动态batch和状态绑定，匹配的TileLang cubin与库同包发布。公共CUDA执行器不硬编码模型族、层数、维度或层序；新增架构不增加核心分派枚举。
-- 第一阶段包含prefix cache与多请求batching；缓存恢复和batch调度必须保持完整KV/GDN/卷积/MTP状态及请求隔离。
-- 项目许可证为LGPL-3.0-or-later，保留第三方版权和许可证声明。
+- 硬件固定本机 Jetson AGX Orin 64GB，aarch64/CUDA SM87。
+- 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B（Qwen3_5）的文本、图片和多图输入。
+- 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。
+- 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护，共享架构与计算策略组件。orinfer-models 分别注册模型适配器与计算策略，部署包内 Rust cdylib 通过版本化 C ABI 生成执行程序、动态 batch 和状态绑定，匹配的 TileLang cubin 与库同包发布。公共 CUDA 执行器从模型契约读取模型族、层数、维度和层序；新增架构通过适配器注册接入。
+- 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。
+- 项目许可证为 LGPL-3.0-or-later，保留第三方版权和许可证声明。
 
 ## 实现
 
-- 按真实checkpoint配置核对GDN、GQA、RoPE、zero-centered RMSNorm、embedding和head语义。
-- GDN持续状态为FP32；KV、卷积、GDN和位置状态均属于请求私有状态。
-- Index-Translate-2B/9B复用27B的动态GDN/GQA、FFN、视觉、MTP和请求状态组件，按配置传递头数与维度，不复制模型执行流程。主干、embedding/共享输出头和视觉大矩阵使用两级E8P Q4A8，敏感输出/MTP投影保留W8；2B的tied embedding与输出头共享同一份K128压缩bank；9B按官方配置分别保留embedding与输出头bank，embedding按需解码并逆旋转选中行，输出头使用旋转A8输入，不重复存储或常驻展开大权重。
-- Qwen3.5-4B复用相同动态行与请求状态组件，按官方配置使用2560 hidden、9216 FFN、32层、32个GDN value heads和16/4个GQA heads；tied embedding/head共享E8P Q4 bank。缺少generation_config.json时，构建器从本模型配置和tokenizer固定EOS与padding；显式提供的生成配置保持原始字节。
-- 改变prefill/decode、恢复或分支行为时校验全部状态，不只校验KV。
-- KV增长契约可以同时引用请求私有KV和按上下文增长的共享workspace；私有映射按owner查找，共享映射从会话查找，不能假定增长列表全部属于请求arena。
-- 单份常驻W4；scale、zero、LUT、padding和持久重复表示计入权重平均bits。临时W8不作永久权重缓存。
-- Flash Next扩展采用Q2A8和质量优先的混合精度；其QSA长上下文KV使用group-64对称INT8及FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家bank与路由计数，按需从SSD加载到CUDA VMM页，并共享全局SLRU。有限模式暂关闭CUDA Graph，MTP专家全量常驻；临时路由集合和页粒度不计作严格字节上限，不缓存整份展开W8。HC保留BF16权重；PLE表使用受预算限制的CPU缓存，其n-gram历史与卷积历史必须纳入请求状态及prefix恢复。
-- 27B后续实验与部署使用已重新编码的两级E8P Q4A8权重（coefficients=[4,1]、beam8搜索），本机当前模型目录为`artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为`artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。旧量化和TCQ实验仅保留结果记录，不作为权重回退。更换权重值而配置和buffer契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
-- Qwen3_5整数投影每种矩阵几何、dtype/stride及压缩布局只发布一个prefill动态fallback；常用1/2/3/4/8/16/32行可保留同源AOT，128行内的非AOT packet可由离线测量选择同源有界动态特化，显式传递真实行数、排除固定AOT点，仅发布被选择的配置，不逐batch枚举计算体。离线调优汇总多个长度的代价选择一个配置，不输出按prefill长度区间切换投影cubin的选择表；调优候选不等于线上多路径。收敛后检查实际发布包，验证尾部、完整请求性能和全部状态。
-- 27B的prefill以模型声明的层边界暂停，保留同一动态行块，仅将Hidden和FP32 residual列为跨层存活workspace；状态增长与最终提交复用公共Frame流程。普通decode的1–128路私有GDN/attention复用单行TileLang计算体的地址表包装。普通、验证和混合packet复用共享target前后置计算，MixedRows显式携带角色边界；验证输出全部位置，普通请求输出末位置。批量draft/commit/warm沿用公共MTP流程，草稿条件、紧凑GDN因子、卷积历史、KV及隐藏环均按owner绑定。公共packet调用、地址表绑定和prefill分层注册与Flash Next共用，不复制其HC/PLE/QSA或固定层数布局。
-- Flash Next采用已确定的混合量化方案：专家保留整数E8P Q2A8；主干GDN QKV/Z、QSA Q/gate和target/MTP共享输出头采用signed-block128旋转、输出行scale的Q4A8。GDN/QSA输出投影、共享FFN和MTP草稿Q/O保留W8；其余精度敏感部分维持原混合精度。原生适配器校验该策略，不保留逐矩阵试验精度分支。
-- Flash Next使用我们自己的整数E8P＋旋转量化表示，运行时反量化到INT8计算，不沿用社区Q2量化编码。当前优先完成算子和真实端到端推理，允许不校准或小样本校准；原始BF16按矩阵或专家分块读取，不需要保存完整BF16模型。完整校准需单独验证专家覆盖和层间误差，不能把反量化后的社区Q2称为原始BF16基线。
-- E8P可使用无损K64/K128压缩权重重排及完整A8位平面分解，以两个INT4 Tensor Core乘积恢复原INT32点积；这不是A4量化，必须保留原scale与FP16边界，并验证非零码本前提。未验证的MTP、并发及大prefill配置保留INT8路径，读取同一份压缩bank。
-- 在线模型采用HF配置/tokenizer目录和`cache/model.json`数据描述；标准分片safetensors保留当前W4表示，默认在线校验dtype、shape、物理layout和容器边界；权重payload hash由`--verify-weights`显式开启，`validate-model`始终完整校验。配置签名仍校验，前端资源、CPU资产元数据、原生执行库和kernel身份仍固定并校验hash。模型数据通过execution_package digest固定独立模型执行包，第一阶段采用INT8为主、质量优先的混合精度，关键部分可FP16/FP32；不实现force_int8或其他格式导入。离线AOT manifest只作构建中间产物，在线模型数据描述与执行包均保留schema 1，只支持当前原生模型包结构；不提供旧结构或schema 2兼容分支。算子夹具格式独立。
-- 服务协议位于orinfer-api；CLI只处理命令。CUDA执行器、加载器、模型适配器、计算策略与生成/视觉/MTP控制分离；权重、序列状态和workspace分作用域管理。
-- HTTP与离线入口并行准备前端和模型；CUDA模型在所属worker创建、使用及销毁，前端失败或panic也需等待并正确回收，模型销毁完成后再释放GPU锁。只读权重arena保持每张量对齐且仅释放单一owner，padding计入权重与显存预算；请求状态、KV和按需专家单独管理。权重读取和DMA有界流水化，缓冲区复用及失败清理等待对应传输完成；启动验收同时测进程到API就绪、首输出及首请求完成。
-- JSONL离线入口与HTTP复用Chat前端、模型加载和连续worker，不复制推理或状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
-- `serve`默认latency、`batch`默认throughput调度。吞吐策略复用动态packet和原生prefill，不沿用在线准入时间门限、两个长prefill限制或decode时间配额；物理内存、状态隔离和输出预算保持共同约束，联合路径按实测成本选择。排序使用一次性冻结的时间，不能在比较函数内反复读取elapsed导致顺序变化。
-- JSONL全局规划复用Chat前端提取实际token前缀，索引与工作区受预处理预算的四分之一约束，每条最多保留4096个前缀token，预算不足或不适合规划的内容保留流式处理。重排保持物理行号、custom_id、输入身份和续跑语义；缓存提示只影响快照选择，不能截断输入或输出。长度估计只观察自然完成的请求，不能把输出预算当成真实长度。异步结果队列保留内存计费，返回成功或中断结果前须排空并确认写入/同步；错误必须传播。
-- 主机输入通过有界、只追加的pinned slab按stream顺序上传，大输入同样分块，禁止因超过单slab容量而退回全context同步。调用者的内存可在上传方法返回后释放；slab复用和退出清理必须等待对应DMA完成，读回结果仍须确认GPU完成。
-- 离线构建将HF tokenizer_config的added_tokens_decoder合并到部署tokenizer.json，逐项验证ID不变。验收按Transformers实际生成的token ID比较，不只比较渲染字符串；缺失的thinking/工具标记不能当作普通文本切分。
-- 执行包catalog仅保存共享编译定义/资产及动态launch模板；逐层tensor角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进Rust模型库；禁止在生成模块逐层复制整份特化绑定，经orinfer_model_plans_v1的有owner C数组导出，在线不解析展开的kernels列表或Python计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model保留构建契约以支持离线重建；在线只导出最终程序、局部特化和专家常驻契约引用的绑定，不将融合前的构建输入注册为可执行launch。
-- Rust按实际导出host ABI绑定参数、grid/block/shared；检查CUDA返回值、unsafe边界、资源生存期和stream顺序。
-- 动态launch全行数验证放在离线构建使用的plan-model和validate-model，同容量及表达式去重；在线加载保留逐绑定ABI校验，实际launch保留真实行数与算术检查，不在启动时穷举行数。
-- Flash Next普通decode（1–128请求）、混合batch和MTP验证共享1–1024 token行的target执行模板；单／多流草稿和warm共享1–512行draft模板，输出头复用相同实现。因果段、接受前缀因子、捕获、提交和请求隔离独立处理，不复制投影／HC／FFN／专家计算流程。整数投影和专家按1/2/3/4/8/16/32离线特化，其余行数使用动态参数cubin；TileLang自动调优只选择不改变scale、dtype与归约边界的合法tile，路由与专家tile必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子不保留8/16分界。不得恢复旧的逐容量在线batch planner、空行补齐或混合decode子组回退；离线中间绑定只用于构建最终模板，MTP短尾也走一行packet，单请求target程序仅保留状态准备／参考用途。Graph分支按模板槽位注册，全部特化验证读写依赖后复用；不手写batch档位，不在线调优；缓存按源码、编译器和设备身份失效。
-- CUDA graph需要稳定地址和预分配workspace；改输入后replay验证实际执行。
-- 共享片段与完整packet复用同一套Graph分支捕获；片段只启用完整且无歧义的fork/join区间。动态槽位展开的连续辅助kernel属于同一边界，重复的私有状态槽位不得关闭无关共享分支；优先级按实际launch grid判断。模型声明支持batch验证时，单请求MTP也复用Verification packet，不另走逐算子验证链。
-- Flash Next因果段与MTP状态控制使用动态长度kernel：target段及draft最大512行，验证与接受前缀恢复最大8行；运行时显式传递真实段长，不从程序名推断。GDN head-major因子按真实行数定stride，卷积/PLE历史与隐藏环使用发布buffer的物理几何。协议允许长度、调度分块和轻量程序别名不代表独立cubin；不得恢复逐长度状态kernel枚举。验证/恢复/捕获必须沿动态行launch传递段长，并保持每个请求的owner及状态视图。
-- Flash Next最终包通过原生build.py和共享row_selection.py离线调优并发布局部选择表，不手写性能分界；只发布被选择的实现。混合因果段及MTP warm支持连续1–512行，不按16/128/512拆段；剩余长度与延迟预算决定实际片段。MixedRows在现有ABI v1 flags中显式携带前置prefill片段数，禁止从行数猜测prefill/验证角色；缓存身份包含该角色边界。warm用一个min_tokens=1的容量模板，MtpLength必须在映射动态KV前更新。最终执行包重打包资产，移除未引用的候选及旧cubin。共享大行数计算通过row_tuning.py与row_convergence.py测量发布，不保留32/128人工性能分界；专家路由与上下投影共同选择。HC injection 的直接与矩阵 tile 统一BF16 MMA K16累加顺序，单行参考也保持相同契约；不得把并行FP32求和与Tensor Core当成数值相同的候选。动态绑定合并只改身份，保留原始grid、实参表达式和token到专家行倍率。动态MTP在映射KV之前写入真实验证长度。视觉使用一个动态patch模板，merger launch按实际patch数除以4；提高视觉容量不得扩大现有文本程序的行数契约。MTP验证、恢复、捕获各用一个容量8、min_tokens=2的入口，运行时传递真实长度，固定形状参考包仅作离线构建输入。
-- Cooperative launch需显式声明并校验occupancy，不假定普通launch可跨block同步。
-- 性能以完整链及真实模型为准。合成探针、微测外推和四输出profile不能替代完整请求TPS。
-- 质量对照官方BF16或同模型FP8，固定seed20261002及teacher-forced历史；token不完全一致不是自动失败。任务结果、target NLL和长上下文另行判断。
+- 按真实 checkpoint 配置核对 GDN、GQA、RoPE、zero-centered RMSNorm、embedding 和 head 语义。
+- GDN 持续状态为 FP32；KV、卷积、GDN 和位置状态均属于请求私有状态。
+- Index-Translate-2B/9B 复用 27B 的动态 GDN/GQA、FFN、视觉、MTP 和请求状态组件，按配置传递头数与维度，共用模型执行流程。主干、embedding/共享输出头和视觉大矩阵使用两级 E8P Q4A8，敏感输出/MTP 投影保留 W8；2B 的 tied embedding 与输出头共享同一份 K128 压缩 bank；9B 按官方配置分别保留 embedding 与输出头 bank，embedding 按需解码并逆旋转选中行，输出头使用旋转 A8 输入，大权重保持单份压缩表示。
+- Qwen3.5-4B 复用相同动态行与请求状态组件，按官方配置使用 2560 hidden、9216 FFN、32 层、32 个 GDN value heads 和 16/4 个 GQA heads；tied embedding/head 共享 E8P Q4 bank。缺少 generation_config.json 时，构建器从本模型配置和 tokenizer 固定 EOS 与 padding；显式提供的生成配置保持原始字节。
+- 改变 prefill/decode、恢复或分支行为时校验 KV、GDN、卷积、位置和 MTP 等全部状态。
+- KV 增长契约可以同时引用请求私有 KV 和按上下文增长的共享 workspace；私有映射按 owner 查找，共享映射从会话查找，逐项按声明的作用域解析增长列表。
+- 单份常驻 W4；scale、zero、LUT、padding 和持久重复表示计入权重平均 bits。展开 W8 的存活期限定为临时计算。
+- Flash Next 扩展采用 Q2A8 和质量优先的混合精度；其 QSA 长上下文 KV 使用 group-64 对称 INT8 及 FP16 scale，压缩索引与未完成块也纳入请求私有状态；Q2 专家直接索引固定地址的压缩权重库，默认全量常驻；`--resident-experts N` 使用模型包声明的专家 bank 与路由计数，按需从 SSD 加载到 CUDA VMM 页，并共享全局 SLRU。有限模式暂关闭 CUDA Graph，MTP 专家全量常驻；专家数约束常驻容量；实际字节占用另含临时路由集合和页粒度开销，W8 展开限定在临时计算中。HC 保留 BF16 权重；PLE 表使用受预算限制的 CPU 缓存，其 n-gram 历史与卷积历史必须纳入请求状态及 prefix 恢复。
+- 27B 后续实验与部署使用已重新编码的两级 E8P Q4A8 权重（coefficients=[4,1]、beam8 搜索），本机当前模型目录为 `artifacts/models/qwen3.8-27b-e8p-q4a8-current`，离线量化产物为 `artifacts/quantization/qwen35-e8p-beam8-20261016/converted`。当前权重作为后续唯一部署与回退基线，旧量化和 TCQ 实验保留结果记录。更换权重值而配置和 buffer 契约相同时，可复用匹配执行包，仍需验证质量、状态和真实请求性能。
+- Qwen3_5 整数投影每种矩阵几何、dtype/stride 及压缩布局只发布一个 prefill 动态 fallback；常用 1/2/3/4/8/16/32 行可保留同源 AOT，128 行内的非 AOT packet 可由离线测量选择同源有界动态特化，显式传递真实行数、排除固定 AOT 点，各 batch 复用同源计算体，仅发布被选择的配置。离线调优汇总多个长度的代价，为 prefill 选择一个动态配置；候选保留在离线调优阶段。收敛后检查实际发布包，验证尾部、完整请求性能和全部状态。
+- 27B 的 prefill 以模型声明的层边界暂停，保留同一动态行块，仅将 Hidden 和 FP32 residual 列为跨层存活 workspace；状态增长与最终提交复用公共 Frame 流程。普通 decode 的 1–128 路私有 GDN/attention 复用单行 TileLang 计算体的地址表包装。普通、验证和混合 packet 复用共享 target 前后置计算，MixedRows 显式携带角色边界；验证输出全部位置，普通请求输出末位置。批量 draft/commit/warm 沿用公共 MTP 流程，草稿条件、紧凑 GDN 因子、卷积历史、KV 及隐藏环均按 owner 绑定。公共 packet 调用、地址表绑定和 prefill 分层注册与 Flash Next 共用，模型各自声明 HC/PLE/QSA 及层布局。
+- Flash Next 采用已确定的混合量化方案：专家保留整数 E8P Q2A8；主干 GDN QKV/Z、QSA Q/gate 和 target/MTP 共享输出头采用 signed-block128 旋转、输出行 scale 的 Q4A8。GDN/QSA 输出投影、共享 FFN 和 MTP 草稿 Q/O 保留 W8；其余精度敏感部分维持原混合精度。原生适配器统一校验和执行该策略。
+- Flash Next 使用我们自己的整数 E8P＋旋转量化表示，运行时从自有编码反量化到 INT8 计算。当前优先完成算子和真实端到端推理，允许免校准或小样本校准；原始 BF16 按矩阵或专家分块读取，分块释放。完整校准需单独验证专家覆盖和层间误差；BF16 基线必须直接来自原始浮点权重。
+- E8P 可使用无损 K64/K128 压缩权重重排及完整 A8 位平面分解，以两个 INT4 Tensor Core 乘积恢复原 INT32 点积；此过程保持完整 A8 精度，必须保留原 scale 与 FP16 边界，并验证非零码本前提。MTP、并发及大 prefill 配置通过验证后启用该路径，其余配置保留 INT8 路径，读取同一份压缩 bank。
+- 在线模型采用 HF 配置/tokenizer 目录和 `cache/model.json` 数据描述；标准分片 safetensors 保留当前 W4 表示，默认在线校验 dtype、shape、物理 layout 和容器边界；权重 payload hash 由 `--verify-weights` 显式开启，`validate-model` 始终完整校验。配置签名仍校验，前端资源、CPU 资产元数据、原生执行库和 kernel 身份仍固定并校验 hash。模型数据通过 execution_package digest 固定独立模型执行包，第一阶段采用 INT8 为主、质量优先的混合精度，关键部分可 FP16/FP32；本阶段实现 int8_quality 计算策略和原生格式加载。离线 AOT manifest 只作构建中间产物，在线模型数据描述与执行包均保留 schema 1，统一使用当前原生模型包结构。算子夹具格式独立。
+- 服务协议位于 orinfer-api；CLI 只处理命令。CUDA 执行器、加载器、模型适配器、计算策略与生成/视觉/MTP 控制分离；权重、序列状态和 workspace 分作用域管理。
+- HTTP 与离线入口并行准备前端和模型；CUDA 模型在所属 worker 创建、使用及销毁，前端失败或 panic 也需等待并正确回收，模型销毁完成后再释放 GPU 锁。只读权重 arena 保持每张量对齐且仅释放单一 owner，padding 计入权重与显存预算；请求状态、KV 和按需专家单独管理。权重读取和 DMA 有界流水化，缓冲区复用及失败清理等待对应传输完成；启动验收同时测进程到 API 就绪、首输出及首请求完成。
+- JSONL 离线入口与 HTTP 复用 Chat 前端、模型加载和连续 worker 及状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
+- `serve` 默认 latency、`batch` 默认 throughput 调度。吞吐策略复用动态 packet 和原生 prefill，按吞吐目标连续准入和执行 prefill；物理内存、状态隔离和输出预算保持共同约束，联合路径按实测成本选择。排序使用一次性冻结的时间，比较函数在同一轮保持稳定顺序。
+- JSONL 全局规划复用 Chat 前端提取实际 token 前缀，索引与工作区受预处理预算的四分之一约束，每条最多保留 4096 个前缀 token，预算紧张或规划范围外的内容保留流式处理。重排保持物理行号、custom_id、输入身份和续跑语义；缓存提示限定用于快照选择，输入和输出均保持完整。长度估计依据自然完成请求的实际长度，输出预算作为生成上限。异步结果队列保留内存计费，返回成功或中断结果前须排空并确认写入/同步；错误必须传播。
+- 主机输入通过有界、只追加的 pinned slab 按 stream 顺序上传，大输入同样分块，超过单 slab 容量时继续沿用 stream 级异步传输。调用者的内存可在上传方法返回后释放；slab 复用和退出清理必须等待对应 DMA 完成，读回结果仍须确认 GPU 完成。
+- 离线构建将 HF tokenizer_config 的 added_tokens_decoder 合并到部署 tokenizer.json，逐项验证 ID 一致。验收比较 Transformers 实际生成的 token ID；thinking/工具标记必须按原始特殊 token 映射切分。
+- 执行包 catalog 仅保存共享编译定义/资产及动态 launch 模板；逐层 tensor 角色与参数映射以共享调用模板、逐层参数表和去重特化表离线编译进 Rust 模型库；生成模块共享特化绑定，经 orinfer_model_plans_v1 的有 owner C 数组导出，在线直接消费原生计划。目录身份与原生绑定注册表必须匹配，重建后校验完整程序/参数及全部请求状态。plan-model 保留构建契约以支持离线重建；在线导出范围限定为最终程序、局部特化和专家常驻契约引用的绑定，融合前的输入留在离线构建契约中。
+- Rust 按实际导出 host ABI 绑定参数、grid/block/shared；检查 CUDA 返回值、unsafe 边界、资源生存期和 stream 顺序。
+- 动态 launch 全行数验证放在离线构建使用的 plan-model 和 validate-model，同容量及表达式去重；在线加载保留逐绑定 ABI 校验，实际 launch 保留真实行数与算术检查，行数穷举限定在离线验证。
+- Flash Next 普通 decode（1–128 请求）、混合 batch 和 MTP 验证共享 1–1024 token 行的 target 执行模板；单／多流草稿和 warm 共享 1–512 行 draft 模板，输出头复用相同实现。因果段、接受前缀因子、捕获、提交和请求隔离独立处理，投影／HC／FFN／专家复用同一计算流程。整数投影和专家按 1/2/3/4/8/16/32 离线特化，其余行数使用动态参数 cubin；TileLang 自动调优只选择保持 scale、dtype 与归约边界的合法 tile，路由与专家 tile 必须一致。运行时消费编译生成的行数选择表，单流也使用相同模板；辅助算子统一使用动态模板，真实请求直接组成混合 packet；离线中间绑定只用于构建最终模板，MTP 短尾也走一行 packet，单请求 target 程序仅保留状态准备／参考用途。Graph 分支按模板槽位注册，全部特化验证读写依赖后复用；batch 档位与配置由离线调优结果生成；缓存按源码、编译器和设备身份失效。
+- CUDA graph 需要稳定地址和预分配 workspace；改输入后 replay 验证实际执行。
+- 共享片段与完整 packet 复用同一套 Graph 分支捕获；片段只启用完整且无歧义的 fork/join 区间。动态槽位展开的连续辅助 kernel 属于同一边界，重复私有状态槽位的处理须保持其他共享分支可用；优先级按实际 launch grid 判断。模型声明支持 batch 验证时，单请求 MTP 也复用 Verification packet。
+- Flash Next 因果段与 MTP 状态控制使用动态长度 kernel：target 段及 draft 最大 512 行，验证与接受前缀恢复最大 8 行；运行时显式传递真实段长。GDN head-major 因子按真实行数定 stride，卷积/PLE 历史与隐藏环使用发布 buffer 的物理几何。协议长度、调度分块和轻量程序别名共用动态 cubin。验证/恢复/捕获必须沿动态行 launch 传递段长，并保持每个请求的 owner 及状态视图。
+- Flash Next 最终包通过原生 build.py 和共享 row_selection.py 离线调优，按测量结果生成局部选择表，只发布被选择的实现。混合因果段及 MTP warm 支持连续 1–512 行；剩余长度与延迟预算决定实际片段。MixedRows 在现有 ABI v1 flags 中显式携带前置 prefill 片段数，以该字段识别 prefill/验证角色；缓存身份包含该角色边界。warm 用一个 min_tokens=1 的容量模板，MtpLength 必须在映射动态 KV 前更新。最终执行包重打包资产，移除未引用的候选及旧 cubin。共享大行数计算通过 row_tuning.py 与 row_convergence.py 按测量结果发布；专家路由与上下投影共同选择。HC injection 的直接与矩阵 tile 统一 BF16 MMA K16 累加顺序，单行参考也保持相同契约；候选必须保持相同的 MMA K16 累加与舍入契约。动态绑定合并只改身份，保留原始 grid、实参表达式和 token 到专家行倍率。动态 MTP 在映射 KV 之前写入真实验证长度。视觉使用一个动态 patch 模板，merger launch 按实际 patch 数除以 4；提高视觉容量时须保持现有文本程序的行数契约。MTP 验证、恢复、捕获各用一个容量 8、min_tokens=2 的入口，运行时传递真实长度，固定形状参考包仅作离线构建输入。
+- 跨 block 同步使用显式声明的 cooperative launch，并校验 occupancy。
+- 性能验收使用真实模型的完整请求 TPS。合成探针、算子微测和四输出 profile 用于定位局部成本。
+- 质量对照官方 BF16 或同模型 FP8，固定 seed20261002 及 teacher-forced 历史；质量结合任务结果、target NLL、token 概率和长上下文行为判断，token 一致率作为诊断指标。
 
 ## 开发
 
-- 先用rg检查调用者和依赖；保持修改小而完整。不要默认启动subagent。
-- CPU Python依赖用uv管理项目`.venv`，通过`make python-env`同步固定版本，不直接更新主机Python环境。`make check`执行Rust格式/编译/clippy/测试及CPU评测检查；GPU验证用`bash tools/operators/run.sh`的固定编译镜像。
-- GPU工作通过`artifacts/gpu-experiment.lock`串行，保留其他服务；不自行改全局频率、功耗或清缓存。
-- GPU单测使用本轮构建输出的测试可执行文件，核对测试确实执行；不硬编码或复用历史`target/deps`可执行文件路径。
-- 当前原生Flash Next的整数算子重建使用`tools/model/flash_next/build.py`：从权重几何和host ABI读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经Rust计划检查后原子发布。它需要模型固定的执行契约，不是任意裸权重导入；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。不得将历史升级脚本串联目录作为正式重建接口。
-- 可变的HC无损指数、QSA radix shift使用ABI标量复用cubin；私有状态包装器必须保留标量、列stride及字节偏移。QSA条带数离线测量；动态整数投影调优覆盖多个实际行数及容量上限，不只测一个短长度。相邻选择区间仅在完整参数/launch契约一致时合并，不跨越空洞或隐式改变专家路由tile。
-- 新kernel验证数值、非对齐尾部和实际graph replay；状态改动另测分块、恢复和请求隔离。
-- 投影组件按权重读取、计算调度、输出处理组合：W8/Q4及融合SwiGLU复用integer_core，BF16矩阵复用floating_core，E8P的位平面、双INT4乘积和输出复用e8p_core。这些是编译期组件，不因模型、prefill/decode或MTP复制计算循环；访存调度、浮点归约和舍入契约显式保留。27B两级E8P Q4A8同样复用e8p_core，直接INT4与INT8回退读取同一份K128压缩权重。调优缓存必须包含内联组件源码身份。
-- Flash Next适配器仅接受当前动态prefill、target/draft行模板和因果状态契约；不恢复旧固定容量计划的注册、回退或逐长度改写。Q4前置变换按section、激活/scale工作区及符号表关联消费者，QKV/Z共享变换必须先于首个消费者，并对每个程序别名单独生成；禁止以算子序号补丁代替依赖关系。
-- 源码库保留实现、必要构建工具、测试、示例与使用文档。不提交研究过程、agent交付记录、历史实验报告或本机环境证据。
-- 权重、二进制、cubin、cache、日志及trace保留在忽略的artifacts/target目录；不提交密钥或token。
-- 部署使用Rust CLI的`package install`安装执行包，不要求Python或在线编译；新引擎、执行包和源码发行归档统一使用`.tar.xz`，安装器仍接受已发布的`.tar.gz`。Python只用于离线构建、归档和发布校验。
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 文档直接说明功能、用法、条件和验证范围，优先使用清晰的肯定句；技术限制按准确的支持范围和错误行为表述。
+
+- 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
+- CPU Python 依赖用 uv 管理项目 `.venv`，通过 `make python-env` 在独立虚拟环境中同步固定版本。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；GPU 验证用 `bash tools/operators/run.sh` 的固定编译镜像。
+- GPU 工作通过 `artifacts/gpu-experiment.lock` 串行，保留其他服务，并保持全局频率、功耗和缓存设置。
+- GPU 单测使用本轮构建输出的测试可执行文件，核对测试确实执行，并从本轮构建结果解析实际可执行文件路径。
+- 当前原生 Flash Next 的整数算子重建使用 `tools/model/flash_next/build.py`：从权重几何和 host ABI 读取构造契约，真实权重调优，编译对象按内容校验并原子缓存，最终模型经 Rust 计划检查后原子发布。其输入为模型固定的执行契约；HC/QSA/状态及专家联合选择表保留输入已验证实现，专家真实几何另行验证。正式重建统一使用该入口。
+- 可变的 HC 无损指数、QSA radix shift 使用 ABI 标量复用 cubin；私有状态包装器必须保留标量、列 stride 及字节偏移。QSA 条带数离线测量；动态整数投影调优覆盖多个实际行数及容量上限。选择区间仅在连续相邻且完整参数/launch 契约一致时合并，保持专家路由 tile。
+- 新 kernel 验证数值、非对齐尾部和实际 graph replay；状态改动另测分块、恢复和请求隔离。
+- 投影组件按权重读取、计算调度、输出处理组合：W8/Q4 及融合 SwiGLU 复用 integer_core，BF16 矩阵复用 floating_core，E8P 的位平面、双 INT4 乘积和输出复用 e8p_core。这些编译期组件供各模型的 prefill/decode 和 MTP 共享计算循环；访存调度、浮点归约和舍入契约显式保留。27B 两级 E8P Q4A8 同样复用 e8p_core，直接 INT4 与 INT8 回退读取同一份 K128 压缩权重。调优缓存必须包含内联组件源码身份。
+- Flash Next 适配器统一使用当前动态 prefill、target/draft 行模板和因果状态契约。Q4 前置变换按 section、激活/scale 工作区及符号表关联消费者，QKV/Z 共享变换必须先于首个消费者，并对每个程序别名单独生成；按实际依赖关系生成执行顺序。
+- 源码库保留实现、必要构建工具、测试、示例与使用文档。研究过程、agent 交付记录、历史实验报告和本机环境证据保存在忽略的 artifacts 目录。
+- 权重、二进制、cubin、cache、日志及 trace 保留在忽略的 artifacts/target 目录；密钥和 token 通过仓库外的环境变量或凭据管理提供。
+- 部署使用 Rust CLI 的 `package install` 安装已编译的执行包；新引擎、执行包和源码发行归档统一使用 `.tar.xz`，安装器仍接受已发布的 `.tar.gz`。Python 只用于离线构建、归档和发布校验。
