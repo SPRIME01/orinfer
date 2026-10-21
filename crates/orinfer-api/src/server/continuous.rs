@@ -475,7 +475,11 @@ pub(super) fn worker(
                 .map(|job| {
                     if job.hint.is_none() {
                         job.hint = model
-                            .request_hint(&job.prepared.input, &job.prepared.images)
+                            .request_hint(
+                                &job.prepared.input,
+                                &job.prepared.images,
+                                &job.prepared.audios,
+                            )
                             .ok();
                     }
                     let mut cost = job
@@ -587,6 +591,7 @@ pub(super) fn worker(
                 let input = GenerationInput {
                     input_tokens: job.prepared.input.clone(),
                     images: job.prepared.images.clone(),
+                    audios: job.prepared.audios.clone(),
                     max_new_tokens: job.prepared.max_tokens,
                     sampling: job.prepared.sampling.clone(),
                     prefix_hints: job.prepared.prefix_hints.clone(),
@@ -597,7 +602,7 @@ pub(super) fn worker(
                         if memory_guard.as_ref() == Some(&job.id) {
                             memory_guard = None;
                         }
-                        let text_only = input.images.is_empty();
+                        let text_only = input.images.is_empty() && input.audios.is_empty();
                         let prompt_tokens = input.input_tokens.len();
                         match model.start_request(input, || {
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
@@ -824,6 +829,7 @@ mod tests {
             _memory: None,
             limits: Limits::default(),
             prepared: Prepared {
+                audios: vec![],
                 input: vec![1],
                 images: vec![],
                 max_tokens: 16,

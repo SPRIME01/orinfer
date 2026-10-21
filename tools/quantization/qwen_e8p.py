@@ -1,4 +1,4 @@
-"""Resumable two-stage E8P Q4A8 encoding of original dense Qwen3.5 weights.
+"""Resumable two-stage E8P Q4A8 encoding of original dense Qwen and ASR weights.
 
 Each source shard is consumed independently. GPU ownership is released between
 bounded row blocks, and completed blocks are checksummed. Tied embeddings and
@@ -26,8 +26,19 @@ from tools.quantization.flash_next_aux import int8_rows
 from tools.quantization.qwen35 import gpu_lock
 
 
-def policy(name, info):
+def rotated_w8_layers(config):
+    if config["model_type"] != "qwen3_asr":
+        return []
+    contract = json.loads(
+        (Path(__file__).parents[2] / "configs/architecture-contract.json").read_text()
+    )
+    return contract["families"]["qwen3_asr"]["int8_quality"]["rotated_w8_layers"]
+
+
+def policy(name, info, *, protected_layers=()):
     shape = info["shape"]
+    if name.startswith(("model.audio_tower.", "model.multi_modal_projector.")):
+        return "original"
     expert_bank = len(shape) == 3 and name.endswith(
         (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
     )
@@ -45,16 +56,46 @@ def policy(name, info):
         ("linear_attn.out_proj.weight", "self_attn.o_proj.weight")
     ):
         return "w8"
+    if any(name.startswith(f"model.language_model.layers.{layer}.") for layer in protected_layers):
+        return "w8-rotated"
     return "e8p-q4"
 
 
 def text_configuration(config):
-    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe") or config.get(
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe", "qwen3_asr") or config.get(
         "quantization_config"
     ):
         raise ValueError("Expected original floating Qwen3.5 checkpoint")
     t = config["text_config"]
-    if config["model_type"] == "qwen3_5_moe":
+    if config["model_type"] == "qwen3_asr":
+        t["attn_output_gate"] = False
+        expected = dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            vocab_size=151936,
+        )
+        if (
+            any(t.get(k) != v for k, v in expected.items())
+            or t.get("layer_types") != ["full_attention"] * 28
+        ):
+            raise ValueError("Unsupported Qwen3 ASR decoder geometry")
+        audio = config.get("audio_config", {})
+        if any(
+            audio.get(k) != v
+            for k, v in dict(
+                d_model=1024,
+                encoder_layers=24,
+                encoder_ffn_dim=4096,
+                num_mel_bins=128,
+                output_dim=2048,
+            ).items()
+        ):
+            raise ValueError("Unsupported Qwen3 ASR audio geometry")
+    elif config["model_type"] == "qwen3_5_moe":
         expected = dict(
             hidden_size=2048,
             num_hidden_layers=40,
@@ -93,6 +134,7 @@ def encode(args):
         raise ValueError("Source and encoded directories must differ")
     config = json.loads((source_dir / "config.json").read_text())
     t = text_configuration(config)
+    protected_layers = rotated_w8_layers(config)
     origin = json.loads((source_dir / "source.json").read_text())
     source = Source(source_dir / "model.safetensors.index.json", directory=source_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -120,6 +162,7 @@ def encode(args):
             search="beam8",
             rows=args.rows,
             policy="qwen35-dense-e8p-q4a8-v2",
+            **(dict(rotated_w8_layers=protected_layers) if protected_layers else {}),
         ),
         sort_keys=True,
     )
@@ -182,16 +225,37 @@ def encode(args):
             name = canonical_name(name)
             shape = info["shape"]
             parameters += math.prod(shape)
-            kind = policy(name, info)
+            kind = policy(name, info, protected_layers=protected_layers)
             first, last = info["data_offsets"]
             if kind == "original":
+                segments = [(path, begin + first, last - first)]
+                dtype = info["dtype"]
+                if (
+                    config["model_type"] == "qwen3_asr"
+                    and name.startswith(("model.audio_tower.", "model.multi_modal_projector."))
+                    and dtype == "BF16"
+                ):
+                    values = np.memmap(
+                        path, mode="r", offset=begin + first, dtype="<u2", shape=shape
+                    )
+                    fp16 = ((np.asarray(values).astype(np.uint32) << 16).view(np.float32)).astype(
+                        np.float16
+                    )
+                    if not np.isfinite(fp16).all():
+                        raise ValueError(f"Audio FP16 conversion overflow: {name}")
+                    payload = payloads / (hashlib.sha256(name.encode()).hexdigest() + ".fp16")
+                    fp16.tofile(payload)
+                    segments = [(payload, 0, payload.stat().st_size)]
+                    garbage.append(payload)
+                    dtype = "F16"
+                    del values, fp16
                 layouts["orin.layout." + name] = "native_contiguous"
                 entries.append(
                     dict(
                         name=name,
-                        dtype=info["dtype"],
+                        dtype=dtype,
                         shape=shape,
-                        segments=[(path, begin + first, last - first)],
+                        segments=segments,
                     )
                 )
                 continue
@@ -248,9 +312,9 @@ def encode(args):
                         reference = rotate(floating, signs[k])
                         error = fitted.dequantize() - reference
                     else:
-                        codes, scale = int8_rows(floating)
+                        reference = rotate(floating, signs[k]) if kind == "w8-rotated" else floating
+                        codes, scale = int8_rows(reference)
                         data, scales = codes.tobytes(), scale.tobytes()
-                        reference = floating
                         error = (
                             codes.astype(np.float32) * scale.astype(np.float32)[:, None] - reference
                         )
@@ -372,7 +436,12 @@ def encode(args):
         layout="u32-low-coarse-high-residual",
         policy="qwen35-dense-e8p-q4a8-v2",
         embedding="e8p_q4",
-        vision="e8p_q4",
+        vision=None if config["model_type"] == "qwen3_asr" else "e8p_q4",
+        **(
+            dict(audio="float16", rotated_w8_layers=protected_layers)
+            if config["model_type"] == "qwen3_asr"
+            else {}
+        ),
         source=origin["repo"],
         source_revision=origin["revision"],
     )

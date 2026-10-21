@@ -182,7 +182,7 @@ mod tests {
         unsafe { (API.free_bytes)(bytes) };
         assert_eq!(info.package, "orinfer-models");
         assert_eq!(info.runtime_abi, 1);
-        assert_eq!(info.architectures, ["flash_next", "qwen3_5"]);
+        assert_eq!(info.architectures, ["qwen3_asr", "flash_next", "qwen3_5"]);
         assert_eq!(info.compute_policies, ["int8_quality"]);
     }
 }

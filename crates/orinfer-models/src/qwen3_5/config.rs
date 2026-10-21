@@ -12,10 +12,15 @@ pub(crate) struct TextConfig {
     pub num_hidden_layers: usize,
     pub vocab_size: usize,
     pub layer_types: Vec<String>,
+    #[serde(default)]
     pub linear_num_key_heads: usize,
+    #[serde(default)]
     pub linear_num_value_heads: usize,
+    #[serde(default)]
     pub linear_key_head_dim: usize,
+    #[serde(default)]
     pub linear_value_head_dim: usize,
+    #[serde(default)]
     pub linear_conv_kernel_dim: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
@@ -52,7 +57,11 @@ impl TextConfig {
         (2 * self.linear_num_key_heads + self.linear_num_value_heads) * self.linear_key_head_dim
     }
     pub fn mixer(&self) -> usize {
-        self.linear_num_value_heads * self.linear_value_head_dim
+        if self.linear_num_value_heads == 0 {
+            self.full_q()
+        } else {
+            self.linear_num_value_heads * self.linear_value_head_dim
+        }
     }
     pub fn full_q(&self) -> usize {
         self.num_attention_heads * self.head_dim
@@ -61,11 +70,16 @@ impl TextConfig {
         self.num_key_value_heads * self.head_dim
     }
     pub fn full_x(&self) -> usize {
-        2 * (self.full_q() + self.kv())
+        (if self.linear_num_value_heads == 0 {
+            1
+        } else {
+            2
+        }) * self.full_q()
+            + 2 * self.kv()
     }
 }
 
-fn parse_text(text_value: &Value) -> Result<TextConfig> {
+fn parse_text(text_value: &Value, standard: bool) -> Result<TextConfig> {
     let text: TextConfig =
         serde_json::from_value(text_value.clone()).map_err(|e| format!("Text config: {e}"))?;
     if text.hidden_size == 0
@@ -76,11 +90,12 @@ fn parse_text(text_value: &Value) -> Result<TextConfig> {
             .layer_types
             .iter()
             .any(|s| !matches!(s.as_str(), "linear_attention" | "full_attention"))
-        || text.linear_num_key_heads == 0
-        || text.linear_num_value_heads == 0
-        || text.linear_key_head_dim == 0
-        || text.linear_value_head_dim == 0
-        || text.linear_conv_kernel_dim < 2
+        || (!standard
+            && (text.linear_num_key_heads == 0
+                || text.linear_num_value_heads == 0
+                || text.linear_key_head_dim == 0
+                || text.linear_value_head_dim == 0
+                || text.linear_conv_kernel_dim < 2))
     {
         return Err("Invalid Qwen3_5 layer/state configuration".into());
     }
@@ -90,6 +105,8 @@ fn parse_text(text_value: &Value) -> Result<TextConfig> {
 pub(crate) struct Configuration {
     text: TextConfig,
     pub vision_depth: usize,
+    pub standard: bool,
+    pub rotated_w8_layers: Vec<usize>,
     pub signature: Value,
 }
 
@@ -101,12 +118,37 @@ impl Configuration {
     pub fn parse(config: Value) -> Result<Self> {
         if !matches!(
             config["model_type"].as_str(),
-            Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe")
+            Some("qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_asr")
         ) {
             return Err("Unsupported Qwen model configuration".into());
         }
         let text_value = config.get("text_config").unwrap_or(&config);
-        let text = parse_text(text_value)?;
+        let standard = config["model_type"] == "qwen3_asr";
+        let text = parse_text(text_value, standard)?;
+        if standard
+            && (text.layer_types.iter().any(|s| s != "full_attention")
+                || config["audio_config"]["encoder_layers"] != 24
+                || config["audio_config"]["d_model"] != 1024
+                || text_value["attn_output_gate"] != false
+                || text_value["rope_parameters"]["rope_theta"] != 1000000)
+        {
+            return Err("Unsupported ASR audio or decoder contract".into());
+        }
+        if standard {
+            for (key, value) in [
+                ("encoder_attention_heads", 16),
+                ("encoder_ffn_dim", 4096),
+                ("num_mel_bins", 128),
+                ("output_dim", 2048),
+                ("downsample_hidden_size", 480),
+                ("n_window", 50),
+                ("n_window_infer", 800),
+            ] {
+                if config["audio_config"][key] != value {
+                    return Err(format!("Unsupported ASR audio {key}"));
+                }
+            }
+        }
         if (config["model_type"] == "qwen3_5_moe") != (text.num_experts > 0) {
             return Err("Qwen dense/MoE configuration mismatch".into());
         }
@@ -117,7 +159,17 @@ impl Configuration {
             "../../../../configs/architecture-contract.json"
         ))
         .map_err(|e| e.to_string())?;
-        let text_keys = contract["families"]["qwen3_5"]["text_keys"]
+        let family = if standard { "qwen3_asr" } else { "qwen3_5" };
+        let rotated_w8_layers = if standard {
+            let expected = &contract["families"][family]["int8_quality"]["rotated_w8_layers"];
+            if config["quantization_config"]["rotated_w8_layers"] != *expected {
+                return Err("ASR requires its quality-first W8 layer policy".into());
+            }
+            serde_json::from_value(expected.clone()).map_err(|e| e.to_string())?
+        } else {
+            Vec::new()
+        };
+        let text_keys = contract["families"][family]["text_keys"]
             .as_array()
             .ok_or("Missing architecture signature contract")?;
         let text_signature: serde_json::Map<String, Value> = text_keys
@@ -129,9 +181,14 @@ impl Configuration {
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
-        let signature = serde_json::json!({"text": text_signature,
+        let mut signature = serde_json::json!({"text": text_signature,
             "vision": config.get("vision_config").cloned().unwrap_or(Value::Null)});
+        if standard {
+            signature["audio"] = config["audio_config"].clone();
+        }
         Ok(Self {
+            standard,
+            rotated_w8_layers,
             text,
             vision_depth,
             signature,

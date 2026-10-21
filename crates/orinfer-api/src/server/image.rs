@@ -211,6 +211,7 @@ pub fn messages(
                 Some("text") => {
                     content.push_str(part["text"].as_str().ok_or("Text part needs text")?)
                 }
+                Some("audio") => content.push_str("<|audio_start|><|audio_pad|><|audio_end|>"),
                 Some("image_url") => {
                     if message["role"] != "user" {
                         return Err("Image parts are supported in user messages".into());

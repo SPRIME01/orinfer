@@ -71,6 +71,8 @@ pub struct Manifest {
     pub weight_scope: String,
     #[serde(default)]
     pub vision: Option<crate::vision::VisionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<crate::audio::AudioSpec>,
     #[serde(default)]
     pub mtp: Option<crate::mtp::Spec>,
     #[serde(default)]
@@ -455,6 +457,9 @@ impl Manifest {
                 }
             }
         }
+        if let Some(audio) = &self.audio {
+            audio.validate(self)?;
+        }
         if let Some(vision) = &self.vision {
             vision.validate(self)?;
         }
@@ -548,7 +553,18 @@ impl Manifest {
                     .vision
                     .as_ref()
                     .and_then(|v| v.plans.iter().find(|p| &p.program == program))
-                    .map_or(self.chunk_tokens, |p| p.patches);
+                    .map_or_else(
+                        || {
+                            self.audio.as_ref().map_or(self.chunk_tokens, |a| {
+                                match program.as_str() {
+                                    "audio_stem" => a.stem_chunks,
+                                    "audio_encoder" => a.max_features,
+                                    _ => self.chunk_tokens,
+                                }
+                            })
+                        },
+                        |p| p.patches,
+                    );
                 if rows.program_capacity(program) > allocation {
                     return Err("Row execution exceeds the input allocation contract".into());
                 }

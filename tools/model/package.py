@@ -99,8 +99,10 @@ def verify_execution(package, directory):
 
 def config_signature(config):
     text = config.get("text_config", config)
+    family = "qwen3_asr" if config.get("model_type") == "qwen3_asr" else "qwen3_5"
     return {
-        "text": {k: text[k] for k in TEXT_KEYS if k in text},
+        **({"audio": config["audio_config"]} if family == "qwen3_asr" else {}),
+        "text": {k: text[k] for k in CONTRACT["families"][family]["text_keys"] if k in text},
         "vision": config.get("vision_config"),
     }
 

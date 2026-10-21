@@ -44,6 +44,7 @@ fn partial_prefix_boundaries() -> Vec<usize> {
 
 fn input(source: &GenerationInput, limit: usize) -> GenerationInput {
     GenerationInput {
+        audios: source.audios.clone(),
         input_tokens: source.input_tokens.clone(),
         images: source.images.clone(),
         max_new_tokens: limit,

@@ -156,10 +156,10 @@ fn validate_weights(
 ) -> Result<()> {
     let t = config.text();
     let map: BTreeMap<_, _> = m.buffers.iter().map(|b| (b.name.as_str(), b)).collect();
-    let gdn = m
-        .gdn_execution
-        .as_ref()
-        .ok_or("Missing explicit Qwen GDN execution contract")?;
+    let gdn = m.gdn_execution.as_ref();
+    if !config.standard && gdn.is_none() {
+        return Err("Missing explicit Qwen GDN execution contract".into());
+    }
     if !chunked_gdn(m) && map.keys().any(|name| name.starts_with("GdnChunk")) {
         return Err("Chunkwise GDN buffers disagree with the execution contract".into());
     }
@@ -226,7 +226,7 @@ fn validate_weights(
                 continue;
             }
             let capacity = gdn
-                .deferred_capacity()
+                .and_then(|g| g.deferred_capacity())
                 .filter(|n| [2, 4, 8, 16, 32].contains(n))
                 .ok_or("Invalid deferred GDN capacity")?;
             for (suffix, dtype, shape) in [
@@ -343,6 +343,18 @@ fn validate_weights(
         check("orinfer.e8p_q4.selectors".into(), Dtype::U32, vec![256, 1])?;
     }
     let q4 = |name: String, n: usize, k: usize| -> Result<()> {
+        if config
+            .rotated_w8_layers
+            .iter()
+            .any(|layer| name.starts_with(&format!("model.language_model.layers.{layer}.")))
+        {
+            check(format!("{name}.int8"), Dtype::I8, vec![n, k])?;
+            check(format!("{name}.scale"), Dtype::F16, vec![n])?;
+            if map.contains_key(format!("{name}.packed").as_str()) {
+                return Err("Protected projection has duplicate compressed weights".into());
+            }
+            return Ok(());
+        }
         let (dtype, shape) = if e8p {
             (Dtype::U32, vec![k / 128, n, 16])
         } else {
@@ -404,7 +416,10 @@ fn validate_weights(
             ]
         } else {
             &[
-                ("self_attn.q_proj", 2 * t.full_q()),
+                (
+                    "self_attn.q_proj",
+                    (if config.standard { 1 } else { 2 }) * t.full_q(),
+                ),
                 ("self_attn.k_proj", t.kv()),
                 ("self_attn.v_proj", t.kv()),
             ]
@@ -486,7 +501,9 @@ fn vision(m: &mut Manifest, depth: usize, hidden: usize) -> Result<()> {
 }
 
 pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate::registry::Built> {
-    if request.architecture != "qwen3_5" || policy != Policy::Int8Quality {
+    if !matches!(request.architecture.as_str(), "qwen3_5" | "qwen3_asr")
+        || policy != Policy::Int8Quality
+    {
         return Err("Unsupported Qwen row precision policy".into());
     }
     let quant = &request.config["quantization_config"];
@@ -519,26 +536,37 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
     }
     let c = Configuration::parse(request.config)?;
-    if c.signature != request.expected_signature {
-        return Err("Qwen row architecture signature differs".into());
+    let architecture = if c.standard { "qwen3_asr" } else { "qwen3_5" };
+    if request.architecture != architecture || c.signature != request.expected_signature {
+        return Err("Qwen row architecture or signature differs".into());
     }
     let t = c.text();
-    let geometry = matches!(
-        (
-            t.hidden_size,
-            t.intermediate_size,
-            t.num_hidden_layers,
-            t.num_attention_heads,
-            t.num_key_value_heads,
-            t.linear_num_value_heads,
-            t.tie_word_embeddings
-        ),
-        (5120, 17408, 64, 24, 4, 48, false)
-            | (4096, 12288, 32, 16, 4, 32, false)
-            | (2048, 6144, 24, 8, 2, 16, true)
-            | (2560, 9216, 32, 16, 4, 32, true)
-            | (2048, 512, 40, 16, 2, 32, false)
-    );
+    let standard_geometry = c.standard
+        && t.hidden_size == 2048
+        && t.intermediate_size == 6144
+        && t.num_hidden_layers == 28
+        && t.num_attention_heads == 16
+        && t.num_key_value_heads == 8
+        && t.head_dim == 128
+        && t.vocab_size == 151936
+        && t.tie_word_embeddings;
+    let geometry = standard_geometry
+        || matches!(
+            (
+                t.hidden_size,
+                t.intermediate_size,
+                t.num_hidden_layers,
+                t.num_attention_heads,
+                t.num_key_value_heads,
+                t.linear_num_value_heads,
+                t.tie_word_embeddings
+            ),
+            (5120, 17408, 64, 24, 4, 48, false)
+                | (4096, 12288, 32, 16, 4, 32, false)
+                | (2048, 6144, 24, 8, 2, 16, true)
+                | (2560, 9216, 32, 16, 4, 32, true)
+                | (2048, 512, 40, 16, 2, 32, false)
+        );
     let moe_geometry = if t.num_experts > 0 {
         e8p && t.hidden_size == 2048
             && t.num_hidden_layers == 40
@@ -554,12 +582,13 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     if !geometry
         || !moe_geometry
         || (t.tie_word_embeddings && !embedding_q4)
-        || t.head_dim != 256
-        || t.linear_num_key_heads != 16
-        || t.linear_key_head_dim != 128
-        || t.linear_value_head_dim != 128
-        || t.linear_conv_kernel_dim != 4
-        || (t.vocab_size,) != (248320,)
+        || (!c.standard
+            && (t.head_dim != 256
+                || t.linear_num_key_heads != 16
+                || t.linear_key_head_dim != 128
+                || t.linear_value_head_dim != 128
+                || t.linear_conv_kernel_dim != 4
+                || (t.vocab_size,) != (248320,)))
         || request.prefill_profiles.len() != 1
         || request.prefill_profiles[0].tokens != CAPACITY
         || request.prefill_profiles[0].min_tokens != 1
@@ -570,7 +599,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     let m = &mut request.metadata;
     validate_weights(m, &c, e8p, embedding_q4)?;
     m.programs.clear();
-    let begin = if m.vision.is_some() {
+    let begin = if m.vision.is_some() || m.audio.is_some() {
         vec!["prepare", "embedding", "overlay"]
     } else {
         vec!["prepare", "embedding"]
@@ -593,7 +622,9 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         ("Mix", t.hidden_size, 2),
         ("GateUp", 2 * t.intermediate_size, 2),
     ] {
-        strides.insert(name.into(), width * size);
+        if width > 0 && (!c.standard || name != "Zout") {
+            strides.insert(name.into(), width * size);
+        }
     }
     for (layer, kind) in t.layer_types.iter().enumerate() {
         let gdn = kind == "linear_attention";
@@ -704,6 +735,10 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     {
         let columns = &m.batch_layout.as_ref().unwrap().state_columns;
         let mut expected_columns = STATE_COLUMNS.to_vec();
+        if c.standard {
+            expected_columns
+                .retain(|name| !["History", "State", "SegmentLength", "Step"].contains(name));
+        }
         if deferred_gdn(m) {
             expected_columns.extend(DEFERRED_COLUMNS);
             expected_columns.sort_unstable();
@@ -749,12 +784,45 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     }
     mtp::register(m, t.num_experts > 0)?;
     vision(m, c.vision_depth, t.hidden_size)?;
+    if m.audio.is_some() {
+        m.programs.insert(
+            "audio_stem".into(),
+            kernels(
+                "qwen_rows/audio/stem",
+                &["conv1", "conv2", "conv3", "flatten", "out", "position"],
+            ),
+        );
+        let mut ops = vec![];
+        for layer in 0..24 {
+            ops.extend(kernels(
+                &format!("qwen_rows/audio/layer{layer}"),
+                &[
+                    "norm1",
+                    "qkv",
+                    "split",
+                    "attention",
+                    "out",
+                    "add1",
+                    "norm2",
+                    "up",
+                    "down",
+                    "add2",
+                ],
+            ));
+        }
+        ops.extend(kernels(
+            "qwen_rows/audio/end",
+            &["norm", "project1", "project2"],
+        ));
+        m.programs.insert("audio_encoder".into(), ops);
+    }
     let programs = m.programs.keys().cloned().collect::<BTreeSet<_>>();
     m.row_execution = Some(RowExecution {
         capacity: m
             .vision
             .as_ref()
-            .map_or(CAPACITY, |v| CAPACITY.max(v.max_patches)),
+            .map_or(CAPACITY, |v| CAPACITY.max(v.max_patches))
+            .max(m.audio.as_ref().map_or(0, |a| a.max_features)),
         programs: programs.clone(),
         program_capacities: programs
             .iter()
@@ -762,6 +830,8 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                 (
                     p.clone(),
                     match p.as_str() {
+                        "audio_stem" => m.audio.as_ref().unwrap().stem_chunks,
+                        "audio_encoder" => m.audio.as_ref().unwrap().max_features,
                         "vision" => m.vision.as_ref().map_or(CAPACITY, |v| v.max_patches),
                         "decode"
                         | "mtp_draft"

@@ -59,7 +59,7 @@ impl ModelRuntime {
         let mtp = self.manifest.mtp.clone();
         self.execution.reset_sequence(&m.reset_buffers)?;
         self.prepare_visual(input, images.unwrap_or(&[]), &cancelled)?;
-        let media = self.prefix_media(input, images.unwrap_or(&[]))?;
+        let media = self.prefix_media(input, images.unwrap_or(&[]), &[])?;
         let (mut offset, mut warm) = self.restore_prefix(input, &media, prefix)?;
         if offset != 0
             && offset < input.len()

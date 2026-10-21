@@ -135,6 +135,7 @@ fn score_batched_decode_histories() {
             model
                 .start_request(
                     GenerationInput {
+                        audios: case.audios.clone(),
                         input_tokens: case.prompt_ids.clone(),
                         images: case.images.clone(),
                         max_new_tokens: steps + 2,
@@ -182,7 +183,7 @@ fn score_batched_decode_histories() {
                 .collect();
             probes.push(json!({
                 "case_id":case.id,"execution_mode":"decode","position":position,"seed":spec.seed,
-                "context_sha256":crate::runtime::scoring::scoring_context_hash(&history, &case.images).unwrap(),
+                "context_sha256":crate::runtime::scoring::scoring_context_hash(&history, &case.images, &case.audios).unwrap(),
                 "reference_token_id":target,"reference_logprob":distribution[target as usize],
                 "top3":ids[..3].iter().map(|&id|json!({"token_id":id,"logprob":distribution[id]})).collect::<Vec<_>>(),
                 "queried_logprobs":queried

@@ -2,13 +2,14 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Rust と TileLang による NVIDIA Jetson 向け LLM・視覚言語モデル推論エンジン。
+Rust と TileLang による NVIDIA Jetson 向けテキスト・視覚言語・音声推論エンジン。
 
-**Jetson AGX Orin 64GB / CUDA SM87** 向けに設計しています。Rust がエンジンと API を実行し、TileLang がデプロイ前に GPU カーネルを実行パッケージへコンパイルします。Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B、Index-Translate-2B/9B/35B-A3B-preview に対応します。テキスト・画像・複数画像の対応範囲は各モデルパッケージが定義します。
+**Jetson AGX Orin 64GB / CUDA SM87** 向けに設計しています。Rust がエンジンと API を実行し、TileLang がデプロイ前に GPU カーネルを実行パッケージへコンパイルします。Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B、Index-Translate-2B/9B/35B-A3B-preview に対応します。Qwen3-ASR-1.7B は音声文字起こしに対応します。入力の対応範囲は各モデルパッケージが定義します。
 
 ## 機能
 
 - OpenAI Chat Completions と Ollama の chat/generate API：ストリーミング、thinking、サンプリング、関数呼び出し、JSON Schema 制約、トークン確率。
+- [音声認識](docs/audio.md)：Qwen3-ASR-1.7B、Rust によるファイル文字起こしと Chat 音声入力。
 - [JSONL オフライン推論](docs/batch.md)：Rust CLI による連続バッチ処理、結果の逐次保存、途中再開。
 - Qwen3_5 系は E8P Q4A8/W8 混合重み、Flash Next は E8P Q2 エキスパートと Q4/W8 投影を使用。精度に敏感な処理は BF16/FP16/FP32 を維持します。
 - チャンク化 prefill、リクエストごとの状態分離、prefix cache、INT8 KV、モデル設定による最大 256K トークンのコンテキスト。
@@ -40,7 +41,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 ## 性能
 
-対応する全 6 モデルを Jetson AGX Orin 64GB と開発版実行パッケージで **2026-10-21** に測定しました。入力は固定した英中翻訳プロンプトです。ベンチマークは単一リクエストで自動調整 MTP（草稿最大 3 個）を有効にし、複数リクエストでは自動的に MTP を無効にします。
+テキスト・視覚言語の 6 モデルを Jetson AGX Orin 64GB と開発版実行パッケージで **2026-10-21** に測定しました。入力は固定した英中翻訳プロンプトです。ベンチマークは単一リクエストで自動調整 MTP（草稿最大 3 個）を有効にし、複数リクエストでは自動的に MTP を無効にします。
 
 | モデル | Prefill 512 トークン | Prefill 8K トークン | 単一 decode・MTP 有効 | 8 リクエスト decode | 最大同時数 / decode | 起動→API（秒） | 起動→最初の出力（秒） |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

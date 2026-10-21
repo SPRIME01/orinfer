@@ -10,6 +10,7 @@ use crate::{
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::time::Instant;
+mod audio;
 mod benchmark;
 mod generation;
 #[cfg(test)]

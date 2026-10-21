@@ -51,6 +51,7 @@ fn validate_joint_target_verification() {
             tokens.extend([32, 33 + lane as u32]);
         }
         GenerationInput {
+            audios: vec![],
             input_tokens: tokens,
             images: vec![],
             max_new_tokens: 16,

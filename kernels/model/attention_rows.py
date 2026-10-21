@@ -67,6 +67,7 @@ def causal_attention_int8(
     stages=0,
     parallel_instances=False,
     decoded_kv=False,
+    gated=True,
 ):
     groups = query_heads // kv_heads if head_group is None else head_group
     if (
@@ -236,7 +237,11 @@ def causal_attention_int8(
                     head = kh * groups + (qb * block_m + i) % groups
                     if token < m:
                         value = T.if_then_else(denom[i] > 0, out[i, d] / T.max(denom[i], 1e-30), 0)
-                        Y[token, head, d] = gate_result(value, Gate[token, head, d])
+                        Y[token, head, d] = (
+                            gate_result(value, Gate[token, head, d])
+                            if gated
+                            else T.cast(value, T.float16)
+                        )
 
     main = explicit_rows(main)
     return explicit_scalar(main, instances) if parallel_instances else main
@@ -253,6 +258,7 @@ def merge_attention_int8(
     dimension=256,
     head_group=None,
     parallel_instances=False,
+    gated=True,
 ):
     m = row_count(capacity, True)
     instances = T.dynamic("independent_instances") if parallel_instances else 1
@@ -325,7 +331,11 @@ def merge_attention_int8(
                         value = T.if_then_else(
                             weights[0] > 0, values[0] / T.max(weights[0], 1e-30), 0
                         )
-                        Y[token, head, d] = gate_result(value, Gate[token, head, d])
+                        Y[token, head, d] = (
+                            gate_result(value, Gate[token, head, d])
+                            if gated
+                            else T.cast(value, T.float16)
+                        )
             else:
                 # Keep a real buffer argument when an unsplit specialization
                 # folds the merge away; NVRTC's adapter rejects zero arguments.

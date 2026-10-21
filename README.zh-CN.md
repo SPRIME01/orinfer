@@ -2,13 +2,14 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-以 Rust 和 TileLang 实现的 NVIDIA Jetson 大语言及视觉语言模型推理引擎。
+以 Rust 和 TileLang 实现的 NVIDIA Jetson 文本、视觉语言与语音推理引擎。
 
-面向 **Jetson AGX Orin 64GB / CUDA SM87**。Rust 负责引擎与 API，TileLang 在部署前将 GPU 算子编译为执行包。支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B，以及 Index-Translate-2B/9B/35B-A3B-preview；各模型包声明文本、图片与多图能力。
+面向 **Jetson AGX Orin 64GB / CUDA SM87**。Rust 负责引擎与 API，TileLang 在部署前将 GPU 算子编译为执行包。支持 Qwen3.8-27B、Qwen3.8-Flash-Next、Qwen3.5-4B，以及 Index-Translate-2B/9B/35B-A3B-preview，以及语音转写模型 Qwen3-ASR-1.7B；各模型包声明输入能力。
 
 ## 功能
 
 - OpenAI Chat Completions 和 Ollama 聊天/生成 API：流式输出、thinking、采样、函数调用、JSON Schema 约束及 token 概率。
+- [语音识别](docs/audio.md)：Qwen3-ASR-1.7B，Rust 原生文件转写和 Chat 音频输入。
 - [JSONL 离线推理](docs/batch.md)：通过 Rust CLI 连续批处理、逐条写入结果和断点续跑。
 - Qwen3_5 系列使用 E8P Q4A8/W8 混合权重；Flash Next 使用 E8P Q2 专家和 Q4/W8 投影。敏感路径保留 BF16/FP16/FP32。
 - 分块 prefill、独立请求状态、prefix cache、INT8 KV，以及由模型配置的最长 256K 上下文。
@@ -40,7 +41,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 ## 性能
 
-六个已支持模型统一在 Jetson AGX Orin 64GB 上测量，使用开发版执行包，日期 **2026-10-21**。输入为固定英译中翻译请求。基准按并发数切换：单流启用自适应 MTP（最多 3 个草稿），多流自动关闭 MTP。
+六个文本与视觉语言模型统一在 Jetson AGX Orin 64GB 上测量，使用开发版执行包，日期 **2026-10-21**。输入为固定英译中翻译请求。基准按并发数切换：单流启用自适应 MTP（最多 3 个草稿），多流自动关闭 MTP。
 
 | 模型 | Prefill 512 tokens | Prefill 8K tokens | 单流 decode，开 MTP | 8 并发 decode | 最高并发 / decode | 启动→API 就绪（秒） | 启动→首输出（秒） |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

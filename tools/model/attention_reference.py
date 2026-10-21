@@ -21,6 +21,8 @@ def attention_prefill_int8(
     dynamic_rows: bool = False,
     query_heads: int = 24,
     kv_heads: int = 4,
+    dimension: int = 256,
+    gated: bool = True,
 ):
     """Build (Q,K,V,RawGate,Positions,Lengths,Y), all explicit tensors.
 
@@ -50,18 +52,22 @@ def attention_prefill_int8(
         return T.call_extern("float32", "__expf", value) if exp_mode == "fast" else T.exp(value)
 
     qs = (
-        (batch, tq, query_heads * 256)
+        (batch, tq, query_heads * dimension)
         if input_layout == "token_major"
-        else (batch, query_heads, tq, 256)
+        else (batch, query_heads, tq, dimension)
     )
     ys = (
-        (batch, tq, query_heads, 256)
+        (batch, tq, query_heads, dimension)
         if output_layout == "token_major"
-        else (batch, query_heads, tq, 256)
+        else (batch, query_heads, tq, dimension)
     )
-    ks = (batch, tkv, kv_heads * 64) if kv_layout == "token_major" else (batch, kv_heads, tkv, 256)
+    ks = (
+        (batch, tkv, kv_heads * (dimension // 4))
+        if kv_layout == "token_major"
+        else (batch, kv_heads, tkv, dimension)
+    )
 
-    load_kv = int8_kv_tile(block_n, threads=threads)
+    load_kv = int8_kv_tile(block_n, dimension, threads=threads)
 
     @T.prim_func
     def kernel(
@@ -72,17 +78,17 @@ def attention_prefill_int8(
         Positions: T.Tensor((batch, tq), T.int32),
         Lengths: T.Tensor((batch,), T.int32),
         Y: T.Tensor(ys, T.float16),
-        KS: T.Tensor((batch, tkv, kv_heads * 4), T.float16),
-        VS: T.Tensor((batch, tkv, kv_heads * 4), T.float16),
+        KS: T.Tensor((batch, tkv, kv_heads * (dimension // 64)), T.float16),
+        VS: T.Tensor((batch, tkv, kv_heads * (dimension // 64)), T.float16),
     ):
         with T.Kernel(T.ceildiv(tq, block_m), query_heads, batch, threads=threads) as (qb, h, b):
             T.import_source(HALF2_SOURCE)
-            q = T.alloc_shared((block_m, 256), T.float16)
-            k = T.alloc_shared((block_n, 256), T.float16)
-            v = T.alloc_shared((block_n, 256), T.float16)
+            q = T.alloc_shared((block_m, dimension), T.float16)
+            k = T.alloc_shared((block_n, dimension), T.float16)
+            v = T.alloc_shared((block_n, dimension), T.float16)
             p = T.alloc_shared((block_m, block_n), T.float16)
             score = T.alloc_fragment((block_m, block_n), T.float32)
-            out = T.alloc_fragment((block_m, 256), T.float32)
+            out = T.alloc_fragment((block_m, dimension), T.float32)
             maximum = T.alloc_fragment((block_m,), T.float32)
             previous = T.alloc_fragment((block_m,), T.float32)
             correction = T.alloc_fragment((block_m,), T.float32)
@@ -97,7 +103,7 @@ def attention_prefill_int8(
                 pos[i] = T.if_then_else(qb * block_m + i < tq, Positions[b, qb * block_m + i], -1)
             T.reduce_max(pos, maxpos, dim=0)
             if input_layout == "token_major":
-                T.copy(Q[b, qb * block_m, h * 256], q, prefer_instruction="sync")
+                T.copy(Q[b, qb * block_m, h * dimension], q, prefer_instruction="sync")
             else:
                 T.copy(Q[b, h, qb * block_m, 0], q, prefer_instruction="sync")
             for kb in T.serial(T.ceildiv(T.max(0, T.min(Lengths[b], maxpos[0] + 1)), block_n)):
@@ -121,7 +127,7 @@ def attention_prefill_int8(
                 for i, j in T.Parallel(block_m, block_n):
                     score[i, j] = T.if_then_else(
                         kb * block_n + j < Lengths[b] and kb * block_n + j <= pos[i],
-                        score[i, j] * 0.0625,
+                        score[i, j] * (dimension**-0.5),
                         -1e30,
                     )
                 T.reduce_max(score, maximum, dim=1, clear=False)
@@ -136,16 +142,16 @@ def attention_prefill_int8(
                 for i in T.Parallel(block_m):
                     correction[i] = probability_exp(previous[i] - maximum[i])
                     denom[i] = denom[i] * correction[i] + rowsum[i]
-                for i, d in T.Parallel(block_m, 256):
+                for i, d in T.Parallel(block_m, dimension):
                     out[i, d] *= correction[i]
                 T.gemm(p, v, out)
-            for i, d in T.Parallel(block_m, 256):
+            for i, d in T.Parallel(block_m, dimension):
                 if qb * block_m + i < tq:
                     if input_layout == "token_major":
-                        raw = T.cast(Gate[b, qb * block_m + i, h * 256 + d], T.float32)
+                        raw = T.cast(Gate[b, qb * block_m + i, h * dimension + d], T.float32)
                     else:
                         raw = T.cast(Gate[b, h, qb * block_m + i, d], T.float32)
-                    sig = 1 / (1 + T.exp(-raw))
+                    sig = 1 / (1 + T.exp(-raw)) if gated else 1.0
                     attn = T.if_then_else(denom[i] > 0, out[i, d] / T.max(denom[i], 1e-30), 0)
                     if gate_mode == "native_fp16":
                         result = T.cast(T.cast(attn, T.float16), T.float32) * T.cast(

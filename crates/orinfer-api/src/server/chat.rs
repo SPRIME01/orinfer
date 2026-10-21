@@ -34,10 +34,11 @@ mod mtp_fixture_export {
         let mut cases = vec![];
         for case in raw["cases"].as_array().unwrap() {
             let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
+            let model = request.model.clone();
             let prepared = codec
                 .prepare(
                     request,
-                    "qwen3.8-27b",
+                    &model,
                     descriptor["metadata"]["max_context"].as_u64().unwrap() as usize,
                     vision.as_ref(),
                     &mut crate::server::preparation::Context::unbounded(),
@@ -45,7 +46,7 @@ mod mtp_fixture_export {
                 .unwrap();
             cases.push(json!({"id":case["id"],"input_tokens":prepared.input,
                 "max_new_tokens":prepared.max_tokens,"sampling":prepared.sampling,
-                "images":prepared.images,"stop_after":case["stop_after"]}));
+                "images":prepared.images,"audios":prepared.audios,"stop_after":case["stop_after"]}));
         }
         let fixture = json!({"model":raw["model"],"output":raw["result"],
             "cases":cases,"eos":codec.eos,"repetitions":raw["repetitions"],
@@ -84,6 +85,7 @@ pub struct ChatRequest {
     pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub response_format: Option<Value>,
     pub enable_thinking: Option<bool>,
+    pub asr_language: Option<String>,
     pub reasoning_effort: Option<String>,
     pub thinking_token_budget: Option<usize>,
     pub prompt_cache_key: Option<String>,
@@ -99,6 +101,7 @@ pub struct Prepared {
     pub input: Vec<u32>,
     pub prefix_hints: Vec<usize>,
     pub images: Vec<orinfer_engine::vision::ImageInput>,
+    pub audios: Vec<orinfer_engine::audio::AudioInput>,
     pub max_tokens: usize,
     pub sampling: Options,
     pub tools: Vec<Value>,
@@ -114,6 +117,7 @@ pub struct Prepared {
 }
 
 pub struct ChatCodec {
+    pub audio: Option<orinfer_engine::audio::AudioSpec>,
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
@@ -142,7 +146,7 @@ impl ChatCodec {
         let generation: Value =
             serde_json::from_slice(&assets["generation_config.json"]).map_err(|e| e.to_string())?;
         let ids = &generation["eos_token_id"];
-        let sampling_defaults = Options {
+        let mut sampling_defaults = Options {
             temperature: generation["temperature"].as_f64().unwrap_or(1.0),
             top_p: generation["top_p"].as_f64().unwrap_or(1.0),
             top_k: generation["top_k"]
@@ -187,13 +191,34 @@ impl ChatCodec {
             },
         );
         environment
-            .add_template_owned("chat", template)
+            .add_template_owned(
+                "chat",
+                template
+                    .replace("{% generation %}", "")
+                    .replace("{% endgeneration %}", ""),
+            )
             .map_err(|e| e.to_string())?;
         let grammar = super::grammar::Factory::new(
             assets.remove("tokenizer.json").unwrap(),
             eos.iter().copied().collect(),
         );
+        let descriptor: Value = match std::fs::read(directory.join("cache/model.json")) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|e| e.to_string())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+            Err(e) => return Err(e.to_string()),
+        };
+        let audio: Option<orinfer_engine::audio::AudioSpec> = descriptor["metadata"]
+            .get("audio")
+            .filter(|v| !v.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        if audio.is_some() && generation["do_sample"] == false {
+            sampling_defaults.temperature = 0.;
+        }
         Ok(Self {
+            audio,
             sampling_defaults,
             tokenizer,
             asset_hashes,
@@ -425,8 +450,22 @@ impl ChatCodec {
             }
             _ => return Err("Invalid tool_choice".into()),
         };
-        let (raw_messages, images) = super::image::messages(request.messages, vision, preparation)?;
+        let (messages_with_audio, audios) =
+            super::audio::messages(request.messages, self.audio.as_ref(), preparation)?;
+        let (raw_messages, images) =
+            super::image::messages(messages_with_audio, vision, preparation)?;
         let mut messages = normalize_messages(raw_messages)?;
+        if self.audio.is_some() {
+            for message in &mut messages {
+                if message["role"] == "user"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("<|audio_pad|>"))
+                {
+                    message["content"] = json!([{"type":"audio"}]);
+                }
+            }
+        }
         let parallel = request.parallel_tool_calls.unwrap_or(true);
         let grammar = super::grammar::recipe(schema.as_ref(), &tools, &choice, parallel, thinking)?;
         if grammar.is_some() && !stops.is_empty() {
@@ -477,7 +516,7 @@ impl ChatCodec {
             }
         }
         preparation.checkpoint(0)?;
-        let rendered = self
+        let mut rendered = self
             .template
             .get_template("chat")
             .map_err(|e| e.to_string())?
@@ -488,6 +527,15 @@ impl ChatCodec {
             })
             .map_err(|e| format!("Chat template: {e}"))?;
         preparation.checkpoint(0)?;
+        if let Some(language) = request.asr_language {
+            if self.audio.is_none() {
+                return Err("asr_language requires an ASR model".into());
+            }
+            rendered.push_str(&format!(
+                "language {}<asr_text>",
+                super::audio::language(&language)?
+            ));
+        }
         let input = self
             .tokenizer
             .encode(rendered, false)
@@ -496,6 +544,11 @@ impl ChatCodec {
             .to_vec();
         let input = if let Some(v) = vision {
             v.expand(&input, &images, context_limit)?
+        } else {
+            input
+        };
+        let input = if let Some(audio) = &self.audio {
+            audio.expand(&input, &audios, context_limit)?
         } else {
             input
         };
@@ -573,6 +626,7 @@ impl ChatCodec {
             input,
             prefix_hints,
             images,
+            audios,
             max_tokens,
             sampling,
             tools,
@@ -1018,11 +1072,12 @@ mod tests {
             let vision: Option<orinfer_engine::vision::VisionSpec> = case
                 .get("vision")
                 .map(|v| serde_json::from_value(v.clone()).unwrap());
+            let model = request.model.clone();
             let prepared = codec
                 .prepare(
                     request,
-                    "qwen3.8-27b",
-                    8704,
+                    &model,
+                    case["context_limit"].as_u64().unwrap_or(8704) as usize,
                     vision.as_ref(),
                     &mut crate::server::preparation::Context::unbounded(),
                 )

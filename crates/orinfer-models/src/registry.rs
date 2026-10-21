@@ -13,6 +13,11 @@ struct Factory {
 }
 const FACTORIES: &[Factory] = &[
     Factory {
+        architecture: "qwen3_asr",
+        policies: &[Policy::Int8Quality],
+        create: crate::qwen3_5::create,
+    },
+    Factory {
         architecture: "flash_next",
         policies: &[Policy::Int8Quality],
         create: crate::flash_next::create,

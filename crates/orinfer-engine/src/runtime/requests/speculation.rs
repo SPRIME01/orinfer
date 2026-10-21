@@ -1577,6 +1577,7 @@ mod policy_tests {
             let mut tokens = source.input_tokens.clone();
             tokens.extend([32, 32 + lane as u32]);
             GenerationInput {
+                audios: vec![],
                 input_tokens: tokens,
                 images: source.images.clone(),
                 max_new_tokens: 16,

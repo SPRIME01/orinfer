@@ -569,7 +569,7 @@ def _rotation_a8(
 
 
 @orin_jit
-def residual_norm_rotate_a8(M, K=5120, *, dynamic_rows=False):
+def residual_norm_rotate_a8(M, K=5120, *, dynamic_rows=False, zero_centered=True):
     """Residual RMSNorm, signed rotation and A8 with both FP16 boundaries intact."""
     from kernels.operators.op02_residual_norm import residual_norm_body
 
@@ -577,7 +577,7 @@ def residual_norm_rotate_a8(M, K=5120, *, dynamic_rows=False):
         raise ValueError("Fused residual rotation requires complete 256-column tiles")
     m = row_count(M, dynamic_rows)
     threads = 256
-    normalize = residual_norm_body(K, 1e-6, threads, staged=True)
+    normalize = residual_norm_body(K, 1e-6, threads, staged=True, zero_centered=zero_centered)
     transform = _block_rotation(K, K, False)
 
     @T.prim_func

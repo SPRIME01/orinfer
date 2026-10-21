@@ -19,6 +19,7 @@ impl ModelRuntime {
         let hints = std::mem::take(&mut self.prefix_hints);
         let mut request = self.start_request(
             requests::GenerationInput {
+                audios: vec![],
                 input_tokens: input.to_vec(),
                 images: images.unwrap_or(&[]).to_vec(),
                 max_new_tokens: limit,

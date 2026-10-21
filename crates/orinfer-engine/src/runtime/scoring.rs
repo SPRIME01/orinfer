@@ -19,6 +19,8 @@ pub struct ScoreCase {
     #[serde(default)]
     pub images: Vec<crate::vision::ImageInput>,
     #[serde(default)]
+    pub audios: Vec<crate::audio::AudioInput>,
+    #[serde(default)]
     pub query_ids: Vec<Vec<u32>>,
 }
 #[derive(Serialize)]
@@ -50,6 +52,7 @@ pub struct ScoreReport {
 pub(super) fn scoring_context_hash(
     history: &[u32],
     images: &[crate::vision::ImageInput],
+    audios: &[crate::audio::AudioInput],
 ) -> Result<String> {
     let mut context =
         serde_json::json!({"token_ids":history,"positions":(0..history.len()).collect::<Vec<_>>()});
@@ -63,6 +66,12 @@ pub(super) fn scoring_context_hash(
             })
             .collect();
         context["images"] = serde_json::json!(identities);
+    }
+    if !audios.is_empty() {
+        context["audios"] = serde_json::json!(audios.iter().map(|audio| {
+            let bytes: Vec<_> = audio.mel.iter().flat_map(|v| v.to_le_bytes()).collect();
+            serde_json::json!({"frames":audio.frames,"mel_sha256":crate::artifact::sha256(&bytes)})
+        }).collect::<Vec<_>>());
     }
     // Stable identity regardless of serde_json's feature-unified map backend.
     context.as_object_mut().unwrap().sort_keys();
@@ -165,6 +174,7 @@ impl ModelRuntime {
             // generation releases and resets it before returning to its caller.
             let mut request = self.start_request(
                 requests::GenerationInput {
+                    audios: case.audios.clone(),
                     input_tokens: case.prompt_ids.clone(),
                     images: case.images.clone(),
                     max_new_tokens: case.target_ids.len(),
@@ -217,7 +227,7 @@ impl ModelRuntime {
                     execution_mode: "decode",
                     position,
                     seed: requests.seed,
-                    context_sha256: scoring_context_hash(&history, &case.images)?,
+                    context_sha256: scoring_context_hash(&history, &case.images, &case.audios)?,
                     reference_token_id: target,
                     reference_logprob,
                     top3,
@@ -247,7 +257,7 @@ mod tests {
             grid_width: 2,
             pixels: vec![0.; 6144],
         };
-        let hash = scoring_context_hash(&[1, 2], std::slice::from_ref(&image)).unwrap();
+        let hash = scoring_context_hash(&[1, 2], std::slice::from_ref(&image), &[]).unwrap();
         assert_eq!(
             hash,
             "bf01648ff97c3d303d1e215026c2a49fa1b829b8ee66fb1edd201046f8ca8977"
@@ -256,12 +266,23 @@ mod tests {
         changed.pixels[0] = 1.;
         assert_ne!(
             hash,
-            scoring_context_hash(&[1, 2], std::slice::from_ref(&changed)).unwrap()
+            scoring_context_hash(&[1, 2], std::slice::from_ref(&changed), &[]).unwrap()
         );
         assert_ne!(
-            scoring_context_hash(&[1, 2], &[image.clone(), changed.clone()]).unwrap(),
-            scoring_context_hash(&[1, 2], &[changed, image]).unwrap()
+            scoring_context_hash(&[1, 2], &[image.clone(), changed.clone()], &[]).unwrap(),
+            scoring_context_hash(&[1, 2], &[changed, image], &[]).unwrap()
         );
+    }
+    #[test]
+    fn audio_changes_scoring_identity() {
+        let mut audio = crate::audio::AudioInput {
+            frames: 50,
+            mel: vec![0.; 12800],
+        };
+        let first = scoring_context_hash(&[1, 2], &[], std::slice::from_ref(&audio)).unwrap();
+        audio.mel[0] = 1.;
+        assert_ne!(first, scoring_context_hash(&[1, 2], &[], &[audio]).unwrap());
+        assert_ne!(first, scoring_context_hash(&[1, 2], &[], &[]).unwrap());
     }
     #[test]
     fn full_vocabulary_normalization_queries_and_ties() {
@@ -286,6 +307,7 @@ mod tests {
                 prompt_ids: vec![1, 2],
                 target_ids: vec![3, 4],
                 images: vec![],
+                audios: vec![],
                 query_ids: vec![],
             }],
         };

@@ -411,7 +411,9 @@ class BuildTests(unittest.TestCase):
 
     def test_tied_head_binds_the_shared_compressed_weight(self):
         builder = Builder.__new__(Builder)
-        builder.weights = SimpleNamespace(immutable=lambda n: n, packed_k=128)
+        builder.weights = SimpleNamespace(
+            immutable=lambda n: n, packed_k=128, index={"weight_map": {}}
+        )
         builder.q4_codec, builder.book = "e8p_q4", "book"
         launches = []
         builder.emit = lambda name, key, build, bindings, rows, **options: launches.append(bindings)
@@ -452,6 +454,7 @@ class BuildTests(unittest.TestCase):
         builder = Builder.__new__(Builder)
         builder.context, builder.lock = 262144, None
         builder.qh, builder.kvh = 24, 4
+        builder.dimension, builder.standard, builder.kv_width = 256, False, 1024
         builder.row_tuner = SimpleNamespace(attention=lambda _: selection)
         launches = []
         builder.emit = lambda name, key, build, bindings, rows: launches.append(
@@ -511,6 +514,7 @@ class BuildTests(unittest.TestCase):
         )
         builder = Builder.__new__(Builder)
         builder.context, builder.lock, builder.qh, builder.kvh = 262144, None, 16, 2
+        builder.dimension, builder.standard, builder.kv_width = 256, False, 512
         builder.row_tuner = SimpleNamespace(
             attention=lambda _: selection, staged_attention=lambda _, selection: selection
         )
@@ -559,7 +563,9 @@ class BuildTests(unittest.TestCase):
 
     def test_projection_bounds_measured_choices_and_preserves_exact_aot(self):
         builder = Builder.__new__(Builder)
-        builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
+        builder.weights = SimpleNamespace(
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+        )
         builder.q4_codec = "e8p_q4"
         builder.book = "selectors"
         builder.lock = None
@@ -587,7 +593,9 @@ class BuildTests(unittest.TestCase):
 
     def test_equivalent_projection_strides_share_the_compiled_identity(self):
         builder = Builder.__new__(Builder)
-        builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
+        builder.weights = SimpleNamespace(
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+        )
         builder.q4_codec, builder.book = "e8p_q4", "selectors"
         keys = []
         builder.emit = lambda name, key, *args, **kwargs: keys.append(key)
@@ -600,7 +608,9 @@ class BuildTests(unittest.TestCase):
 
     def test_bounded_tuning_is_shared_across_layer_weights_but_not_strides(self):
         builder = Builder.__new__(Builder)
-        builder.weights = SimpleNamespace(immutable=lambda name: name, packed_k=128)
+        builder.weights = SimpleNamespace(
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+        )
         builder.q4_codec, builder.book, builder.lock = "e8p_q4", "selectors", None
         builder.emit = lambda *args, **kwargs: None
         with patch.object(builder, "compile_projection", return_value=[]) as compile:
@@ -812,6 +822,36 @@ class BuildTests(unittest.TestCase):
             (source / "layer.safetensors").write_bytes(raw)
             with self.assertRaisesRegex(ValueError, "identity changed"):
                 Weights(source, root / "other").immutable("W.packed")
+
+    def test_asr_standard_attention_uses_the_shared_q4_contract(self):
+        candidate = config()
+        candidate["model_type"] = "qwen3_asr"
+        candidate["text_config"].update(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            vocab_size=151936,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            tie_word_embeddings=True,
+            attn_output_gate=False,
+            max_position_embeddings=65536,
+            layer_types=["full_attention"] * 28,
+            rope_parameters=dict(rope_type="default", rope_theta=1000000),
+        )
+        candidate["quantization_config"].update(
+            quant_method="orinfer_e8p_q4_int8",
+            coefficients=[4, 1],
+            basis_tensor="orinfer.e8p_q4.basis",
+            layout="u32-low-coarse-high-residual",
+            embedding="e8p_q4",
+            rotated_w8_layers=[0, 1, 2, 3],
+        )
+        self.assertEqual(configuration(candidate, 65536)["head_dim"], 128)
+        candidate["text_config"]["attn_output_gate"] = True
+        with self.assertRaises(ValueError):
+            configuration(candidate, 65536)
 
 
 if __name__ == "__main__":

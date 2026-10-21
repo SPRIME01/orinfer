@@ -44,6 +44,8 @@ class RowTuner:
         self.hv = text.get("linear_num_value_heads", 48)
         self.qh = text.get("num_attention_heads", 24)
         self.kvh = text.get("num_key_value_heads", 4)
+        self.dimension = text.get("head_dim", 256)
+        self.gated = text.get("attn_output_gate", True)
 
     def select(
         self,
@@ -277,6 +279,8 @@ class RowTuner:
             context=context,
             query_heads=self.qh,
             kv_heads=self.kvh,
+            dimension=self.dimension,
+            gated=self.gated,
             target_tiles=ATTENTION_TARGET,
             max_splits=ATTENTION_SPLITS,
         )
@@ -325,6 +329,8 @@ class RowTuner:
             context=context,
             query_heads=self.qh,
             kv_heads=self.kvh,
+            dimension=self.dimension,
+            gated=self.gated,
             candidates=configs,
         )
         key = str(spec)
@@ -350,6 +356,8 @@ class RowTuner:
             dynamic_rows=True,
             query_heads=self.qh,
             kv_heads=self.kvh,
+            dimension=self.dimension,
+            gated=self.gated,
         )
 
         def build(c):
@@ -365,6 +373,8 @@ class RowTuner:
                     head_group=c["head_group"],
                     query_heads=self.qh,
                     kv_heads=self.kvh,
+                    dimension=self.dimension,
+                    gated=self.gated,
                     threads=c.get("threads", 128),
                     stages=c.get("stages", 0),
                     decoded_kv=c.get("decoded_kv", False),
@@ -378,8 +388,16 @@ class RowTuner:
                     head_group=c["head_group"],
                     query_heads=self.qh,
                     kv_heads=self.kvh,
+                    dimension=self.dimension,
+                    gated=self.gated,
                 ),
-                primitive(dequantize_attention_kv, 4096, context, kv_heads=self.kvh)
+                primitive(
+                    dequantize_attention_kv,
+                    4096,
+                    context,
+                    kv_heads=self.kvh,
+                    dimension=self.dimension,
+                )
                 if c.get("decoded_kv")
                 else None,
             )
@@ -388,16 +406,28 @@ class RowTuner:
             # Autoregressive positions usually end inside a tile. Exact tile
             # multiples alone hide loading/masking and instruction-cache costs.
             for length in sorted({max(rows, 536), max(rows, 8216)}):
-                q = torch.randn((rows, self.qh, 256), device="cuda", dtype=torch.float16) * 0.1
+                q = (
+                    torch.randn((rows, self.qh, self.dimension), device="cuda", dtype=torch.float16)
+                    * 0.1
+                )
                 gate = torch.randn_like(q)
                 kv = [
                     torch.randint(
-                        -127, 128, (1, context, self.kvh, 256), device="cuda", dtype=torch.int8
+                        -127,
+                        128,
+                        (1, context, self.kvh, self.dimension),
+                        device="cuda",
+                        dtype=torch.int8,
                     )
                     for _ in range(2)
                 ]
                 scales = [
-                    torch.full((1, context, self.kvh, 4), 0.001, device="cuda", dtype=torch.float16)
+                    torch.full(
+                        (1, context, self.kvh, self.dimension // 64),
+                        0.001,
+                        device="cuda",
+                        dtype=torch.float16,
+                    )
                     for _ in range(2)
                 ]
                 pos = torch.arange(length - rows, length, device="cuda", dtype=torch.int32)
@@ -418,17 +448,21 @@ class RowTuner:
                     first, second, decoder = pair
                     bm = c["block_m"]
                     heads = self.qh // c["head_group"]
-                    partial = torch.empty((heads, 2 * ATTENTION_TARGET, bm, 256), device="cuda")
+                    partial = torch.empty(
+                        (heads, 2 * ATTENTION_TARGET, bm, self.dimension), device="cuda"
+                    )
                     maximum = torch.empty((heads, 2 * ATTENTION_TARGET, bm), device="cuda")
                     denom = torch.empty_like(maximum)
                     storage = torch.full(
-                        (rows + 1, self.qh, 256), 91, device="cuda", dtype=torch.float16
+                        (rows + 1, self.qh, self.dimension), 91, device="cuda", dtype=torch.float16
                     )
                     out = storage[:rows]
                     decoded = (
                         [
                             torch.empty(
-                                (1, context, self.kvh * 256), device="cuda", dtype=torch.float16
+                                (1, context, self.kvh * self.dimension),
+                                device="cuda",
+                                dtype=torch.float16,
                             )
                             for _ in range(2)
                         ]

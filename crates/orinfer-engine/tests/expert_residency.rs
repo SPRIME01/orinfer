@@ -20,6 +20,7 @@ fn batch(model: &mut Model, cases: &[Vec<u32>]) -> (Vec<Vec<u32>>, Vec<usize>) {
             model
                 .start_request(
                     GenerationInput {
+                        audios: vec![],
                         input_tokens: input.clone(),
                         images: vec![],
                         max_new_tokens: 8,

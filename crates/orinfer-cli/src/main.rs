@@ -72,6 +72,15 @@ enum Command {
         #[arg(long, default_value = "{}")]
         params: String,
     },
+    /// Transcribe an audio file with a registered ASR model.
+    Transcribe {
+        name: String,
+        input: PathBuf,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+    },
     /// Show recent worker log output.
     Logs {
         name: String,
@@ -419,6 +428,25 @@ fn execute(command: Command, data_dir: &std::path::Path) -> Result<(), String> {
                     &json!({"name":name,"path":path.canonicalize().map_err(|e| e.to_string())?,"options":options}),
                 ),
             )?)
+        }
+        Command::Transcribe {
+            name,
+            input,
+            language,
+            prompt,
+        } => {
+            let value = client::transcribe(
+                data_dir,
+                &name,
+                &input,
+                language.as_deref(),
+                prompt.as_deref(),
+            )?;
+            println!(
+                "{}",
+                value["text"].as_str().ok_or("Missing transcription text")?
+            );
+            Ok(())
         }
         Command::List => print_json(client::request(data_dir, "GET", "/models", None)?),
         Command::Ps => print_json(client::request(data_dir, "GET", "/ps", None)?),

@@ -4,6 +4,8 @@
 
 kernel 经离线编译生成 cubin 和真实 host ABI，在线由 Rust CUDA Driver 执行。导出格式与模型组装入口见[模型工具](../tools/model/README.md)。新增实现应检查完整数值、非对齐尾部、状态语义和改变输入后的 graph replay。
 
+`audio/encoder.py` 提供 Qwen3-ASR 的动态 chunk 卷积、特征重排与位置注入。音频 Transformer 复用 `vision/encoder.py` 的浮点投影、LayerNorm、GELU、残差与窗口 attention；文本解码器复用 Qwen 动态行模板。`tools/model/qwen_asr/check_kernels.py` 验证卷积、104-token 窗口尾部和改变输入后的 Graph replay。部署与精度策略见[语音识别](../docs/audio.md)。
+
 ## 共享计算组件
 
 - `model/integer_core.py` 提供 W8、标量码表 Q4 及双 W8 融合 SwiGLU 共用的 DP4A/Tensor Core 循环、尾部处理和输出缩放。权重 loader 按编码选择；gate/up 各自先舍入 FP16 再执行 SwiGLU。外层工厂只保留几何校验、ABI 和 launch 映射。两个调度由离线调优选择，各模型与请求场景共享计算体。

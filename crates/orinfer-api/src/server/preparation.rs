@@ -72,6 +72,11 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
             .as_array()
             .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
     });
+    let audio = request.messages.iter().any(|m| {
+        m["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|p| p["type"] == "input_audio"))
+    });
     // JSON, rendered text, tokenizer intermediates and final IDs; image decoder
     // additionally checks actual dimensions before allocation under this ceiling.
     let text = bytes
@@ -99,7 +104,7 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
     };
     (text
         .saturating_add(probabilities)
-        .saturating_add(if image { 512 << 20 } else { 0 })
+        .saturating_add(if image || audio { 512 << 20 } else { 0 })
         .div_ceil(1 << 20)) as u32
 }
 

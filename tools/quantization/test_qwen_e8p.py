@@ -5,6 +5,33 @@ from tools.quantization.qwen_e8p import canonical_name, policy, text_configurati
 
 
 class DensePolicyTests(unittest.TestCase):
+    def test_protected_projections_keep_the_shared_input_rotation(self):
+        info = dict(dtype="BF16", shape=[2048, 2048])
+        self.assertEqual(
+            policy(
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+                info,
+                protected_layers=[0, 1, 2, 3],
+            ),
+            "w8-rotated",
+        )
+        self.assertEqual(
+            policy(
+                "model.language_model.layers.4.self_attn.q_proj.weight",
+                info,
+                protected_layers=[0, 1, 2, 3],
+            ),
+            "e8p-q4",
+        )
+        self.assertEqual(
+            policy(
+                "model.language_model.layers.3.self_attn.o_proj.weight",
+                info,
+                protected_layers=[0, 1, 2, 3],
+            ),
+            "w8",
+        )
+
     def test_four_billion_preserves_tied_embedding_semantics(self):
         config = dict(
             model_type="qwen3_5",
@@ -81,6 +108,26 @@ class DensePolicyTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertEqual(policy(name, dict(dtype="BF16", shape=shape)), expected)
+
+    def test_asr_encoder_retains_floating_weights_and_decoder_uses_shared_policy(self):
+        self.assertEqual(
+            policy("model.audio_tower.layers.0.fc1.weight", dict(dtype="BF16", shape=[4096, 1024])),
+            "original",
+        )
+        self.assertEqual(
+            policy(
+                "model.language_model.layers.0.mlp.up_proj.weight",
+                dict(dtype="BF16", shape=[6144, 2048]),
+            ),
+            "e8p-q4",
+        )
+        self.assertEqual(
+            policy(
+                "model.language_model.layers.0.self_attn.o_proj.weight",
+                dict(dtype="BF16", shape=[2048, 2048]),
+            ),
+            "w8",
+        )
 
 
 if __name__ == "__main__":

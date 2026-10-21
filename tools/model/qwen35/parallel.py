@@ -53,6 +53,8 @@ def factory(role, context, attention, text=None, recurrent=None):
     text = text or {}
     hk, hv = text.get("linear_num_key_heads", 16), text.get("linear_num_value_heads", 48)
     qh, kvh = text.get("num_attention_heads", 24), text.get("num_key_value_heads", 4)
+    dim = text.get("head_dim", 256)
+    gated = text.get("attn_output_gate", True)
 
     def invoke(fn, *args, **kwargs):
         return inspect.unwrap(getattr(fn, "func", fn))(*args, **kwargs)
@@ -102,6 +104,10 @@ def factory(role, context, attention, text=None, recurrent=None):
             max_position=context,
             query_heads=qh,
             kv_heads=kvh,
+            dimension=dim,
+            rotary_dim=64 if gated else dim,
+            gated=gated,
+            zero_centered=gated,
         )
     else:
         options = dict(
@@ -112,6 +118,8 @@ def factory(role, context, attention, text=None, recurrent=None):
             max_splits=attention["max_splits"],
             head_group=attention["head_group"],
             parallel_instances=True,
+            dimension=dim,
+            gated=gated,
         )
         if role == "attention":
             options.update(
@@ -142,8 +150,11 @@ def build(b, attention=None, recurrent=None):
         with gpu_lock(b.lock):
             attention = select(b.row_tuner, b.context, geometry(b.row_tuner.attention(b.context)))
     if recurrent is None:
-        with gpu_lock(b.lock):
-            recurrent = b.row_tuner.private_gdn()
+        if any(kind == "linear_attention" for kind in b.text["layer_types"]):
+            with gpu_lock(b.lock):
+                recurrent = b.row_tuner.private_gdn()
+        else:
+            recurrent = dict(configs=[{}], default="0", selections=[], used=["0"])
     w = b.weights
     recurrent_choices = list(b.row_choices(recurrent, LANES))
     deferred_configs = [c for _, c in recurrent_choices if c.get("deferred")]

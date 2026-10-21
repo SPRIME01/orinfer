@@ -30,7 +30,7 @@ HEAD_ROWS = 512
 
 
 def configuration(config, context):
-    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe"):
+    if config.get("model_type") not in ("qwen3_5", "qwen3_5_moe", "qwen3_asr"):
         raise ValueError("Expected Qwen3_5 checkpoint")
     t = config["text_config"]
     expected = dict(
@@ -50,7 +50,22 @@ def configuration(config, context):
         hidden_act="silu",
         tie_word_embeddings=False,
     )
-    if config["model_type"] == "qwen3_5_moe":
+    standard = config["model_type"] == "qwen3_asr"
+    if standard:
+        expected = dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            vocab_size=151936,
+            num_attention_heads=16,
+            num_key_value_heads=8,
+            head_dim=128,
+            rms_norm_eps=1e-6,
+            hidden_act="silu",
+            tie_word_embeddings=True,
+            attn_output_gate=False,
+        )
+    elif config["model_type"] == "qwen3_5_moe":
         expected.update(
             hidden_size=2048,
             intermediate_size=512,
@@ -91,24 +106,32 @@ def configuration(config, context):
             linear_num_value_heads=32,
             num_attention_heads=16,
         )
-    if any(t.get(k) != v or type(t.get(k)) is not type(v) for k, v in expected.items()) or t.get(
-        "layer_types"
-    ) != [
-        "full_attention" if i % 4 == 3 else "linear_attention"
-        for i in range(expected["num_hidden_layers"])
-    ]:
+    layers = (
+        ["full_attention"] * expected["num_hidden_layers"]
+        if standard
+        else [
+            "full_attention" if i % 4 == 3 else "linear_attention"
+            for i in range(expected["num_hidden_layers"])
+        ]
+    )
+    if (
+        any(t.get(k) != v or type(t.get(k)) is not type(v) for k, v in expected.items())
+        or t.get("layer_types") != layers
+    ):
         raise ValueError("Unsupported Qwen arithmetic geometry")
     rope = t["rope_parameters"]
-    if any(
-        rope.get(k) != v
-        for k, v in dict(
+    expected_rope = (
+        dict(rope_type="default", rope_theta=1000000)
+        if standard
+        else dict(
             rope_type="default",
             rope_theta=10000000,
             partial_rotary_factor=0.25,
             mrope_section=[11, 11, 10],
             mrope_interleaved=True,
-        ).items()
-    ):
+        )
+    )
+    if any(rope.get(k) != v for k, v in expected_rope.items()):
         raise ValueError("Unsupported dense Qwen RoPE contract")
     q = config.get("quantization_config", {})
     if any(
@@ -121,6 +144,11 @@ def configuration(config, context):
         ).items()
     ):
         raise ValueError("Expected our completed table-Q4A8 conversion")
+    if standard:
+        from tools.quantization.qwen_e8p import rotated_w8_layers
+
+        if q.get("rotated_w8_layers") != rotated_w8_layers(config):
+            raise ValueError("ASR requires its quality-first W8 layer policy")
     if q.get("quant_method") not in ("orinfer_q4_int8", "orinfer_e8p_q4_int8"):
         raise ValueError("Unsupported Qwen Q4 codec")
     if q["quant_method"] == "orinfer_e8p_q4_int8":
@@ -177,16 +205,21 @@ class Builder:
         self.config = json.loads((source / "config.json").read_text())
         self.text = configuration(self.config, context)
         t = self.text
+        self.standard = self.config["model_type"] == "qwen3_asr"
+        self.dimension = t["head_dim"]
         self.tied = t.get("tie_word_embeddings", False)
         self.h, self.v = t["hidden_size"], t["vocab_size"]
         self.f = t["intermediate_size"]
         self.moe = self.config["model_type"] == "qwen3_5_moe"
-        self.hk, self.hv = t["linear_num_key_heads"], t["linear_num_value_heads"]
+        self.hk, self.hv = t.get("linear_num_key_heads", 1), t.get("linear_num_value_heads", 16)
         self.qh, self.kvh = t["num_attention_heads"], t["num_key_value_heads"]
         self.qkv, self.mixdim = (2 * self.hk + self.hv) * 128, self.hv * 128
-        self.qproj, self.kv_width = self.qh * 512, self.kvh * 256
+        self.qproj = self.qh * self.dimension * (1 if self.standard else 2)
+        self.kv_width = self.kvh * self.dimension
+        if self.standard:
+            self.mixdim = self.qh * self.dimension
         self.fullx = self.qproj + 2 * self.kv_width
-        self.architecture = "qwen3_5"
+        self.architecture = "qwen3_asr" if self.standard else "qwen3_5"
         self.head_weight = (
             "model.language_model.embed_tokens.weight" if self.tied else "lm_head.weight"
         )
@@ -202,7 +235,9 @@ class Builder:
         self.state = state
         self.context = context
         self.lock = lock
-        self.gdn_execution = dict(prefill="sequential", decode=dict(kind="dense"))
+        self.gdn_execution = (
+            None if self.standard else dict(prefill="sequential", decode=dict(kind="dense"))
+        )
         self.weights = Weights(source, root, packed_k=128 if self.q4_codec == "e8p_q4" else 0)
         prepare_chat_template(source, root / "chat_template.jinja")
         self.aot = Aot(
@@ -216,21 +251,32 @@ class Builder:
         self.workspace()
         from tools.model.qwen35 import vision
 
-        vision.build(self)
+        self.vision = None
+        self.audio = None
+        if self.standard:
+            from tools.model.qwen_asr.audio import build as build_audio
+
+            build_audio(self)
+        else:
+            vision.build(self)
         self.forward()
         self.head()
         from tools.model.qwen35 import mtp
 
-        mtp.build(self)
+        self.mtp = None
+        if not self.standard:
+            mtp.build(self)
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
         from tools.model.qwen35 import causal_parallel
 
-        causal_parallel.build(self)
+        if not self.standard:
+            causal_parallel.build(self)
         from tools.model.qwen35 import commit
 
-        commit.build(self)
+        if not self.standard:
+            commit.build(self)
 
     def workspace(self):
         w = self.weights
@@ -255,13 +301,13 @@ class Builder:
             ("Y", "f16", [c, self.mixdim]),
             ("MixerIn", "f16", [c, self.mixdim]),
             ("FullX", "f16", [c, self.fullx]),
-            ("FullQ", "f16", [c, self.qh, 256]),
-            ("FullGate", "f16", [c, self.qh, 256]),
+            ("FullQ", "f16", [c, self.qh, self.dimension]),
+            ("FullGate", "f16", [c, self.qh, self.dimension]),
             ("Mix", "f16", [c, h]),
             ("GateUp", "f16", [2 * c, f]),
             ("RotationValues", "f16", [c, f]),
             ("RotationMaxima", "f32", [c, math.ceil(f / 256)]),
-            ("AttentionPartial", "f32", [self.qh, 32, 64, 256]),
+            ("AttentionPartial", "f32", [self.qh, 32, 64, self.dimension]),
             ("AttentionMaximum", "f32", [self.qh, 32, 64]),
             ("AttentionDenominator", "f32", [self.qh, 32, 64]),
             ("A8", "i8", [c * max(f, h, self.mixdim, 2 * h)]),
@@ -276,7 +322,25 @@ class Builder:
             ("GreedyInvalid", "i32", [HEAD_ROWS * math.ceil(v / 1024)]),
             ("Pairs", "i32", [HEAD_ROWS, 2]),
         ]:
-            w.fixed(name, dtype, shape)
+            if not (
+                self.standard
+                and name
+                in {
+                    "QKV",
+                    "Zout",
+                    "AB",
+                    "g",
+                    "Beta",
+                    "Q",
+                    "K",
+                    "V",
+                    "HistoryOut",
+                    "PositionOut",
+                    "GdnScratch",
+                    "Y",
+                }
+            ):
+                w.fixed(name, dtype, shape)
         for name, dtype, shape in [
             ("Input", "i32", [c]),
             ("Token", "i32", [1]),
@@ -315,7 +379,9 @@ class Builder:
                     self.kv[name] = width * (2 if dtype == "f16" else 1)
                     self.reset.append(name)
         w.constant("Pages", np.arange(math.ceil(self.context / 128), dtype=np.int32)[None])
-        freq = 1 / (10000000.0 ** (np.arange(0, 64, 2, dtype=np.float32) / 64))
+        rotary_dim = self.dimension if self.standard else 64
+        theta = float(self.text["rope_parameters"]["rope_theta"])
+        freq = 1 / (theta ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         angles = np.arange(self.context, dtype=np.float32)[:, None] * freq[None]
         w.constant(
             "Rotary", np.concatenate([np.cos(angles), np.sin(angles)], axis=-1).astype(np.float16)
@@ -404,7 +470,13 @@ class Builder:
         self.emit(
             section + "/norm_rotate",
             f"norm-rotation-a8-{self.h}",
-            lambda: primitive(residual_norm_rotate_a8, CAPACITY, self.h, dynamic_rows=True),
+            lambda: primitive(
+                residual_norm_rotate_a8,
+                CAPACITY,
+                self.h,
+                dynamic_rows=True,
+                zero_centered=not self.standard,
+            ),
             dict(
                 X=input,
                 R=residual,
@@ -521,7 +593,7 @@ class Builder:
             for buffer in ("AttentionDecodedK", "AttentionDecodedV"):
                 if buffer not in self.weights.buffers:
                     # Shared scratch, not request state or a prefix-cache entry.
-                    self.weights.fixed(buffer, "f16", [self.context, self.kvh * 256])
+                    self.weights.fixed(buffer, "f16", [self.context, self.kv_width])
             decode_bindings = {key: inputs[key] for key in ("K", "V", "KS", "VS", "Lengths")}
             decode_bindings.update(DK="AttentionDecodedK", DV="AttentionDecodedV")
 
@@ -530,7 +602,11 @@ class Builder:
                     name + "_decode" + suffix,
                     f"gqa-stage-{self.context}-{self.kvh}",
                     lambda: primitive(
-                        dequantize_attention_kv, CAPACITY, self.context, kv_heads=self.kvh
+                        dequantize_attention_kv,
+                        CAPACITY,
+                        self.context,
+                        kv_heads=self.kvh,
+                        dimension=self.dimension,
                     ),
                     decode_bindings,
                     rows,
@@ -554,6 +630,8 @@ class Builder:
                     query_heads=self.qh,
                     kv_heads=self.kvh,
                     head_group=group,
+                    dimension=self.dimension,
+                    gated=not self.standard,
                 )
                 if fn is causal_attention_int8:
                     options.update(
@@ -622,7 +700,7 @@ class Builder:
         if stride == n:
             stride = None
         if kind == "q4":
-            kind = self.q4_codec
+            kind = "w8" if weight + ".int8" in w.index["weight_map"] else self.q4_codec
         compressed = kind in ("q4", "e8p_q4")
         suffix = ".packed" if compressed else ".int8"
         data = w.immutable(weight + suffix)
@@ -891,6 +969,10 @@ class Builder:
                         max_position=self.context,
                         query_heads=self.qh,
                         kv_heads=self.kvh,
+                        dimension=self.dimension,
+                        rotary_dim=self.dimension if self.standard else 64,
+                        gated=not self.standard,
+                        zero_centered=not self.standard,
                     ),
                     dict(
                         X="FullX",
@@ -973,7 +1055,7 @@ class Builder:
         self.emit(
             "gather/norm",
             "final-norm",
-            lambda: primitive(final_norm, None, 1, hidden=self.h),
+            lambda: primitive(final_norm, None, 1, hidden=self.h, zero_centered=not self.standard),
             dict(
                 X="Hidden",
                 R="R0",
@@ -1071,6 +1153,7 @@ class Builder:
                 direct_prefill=True, demand_mapping=True, buffers=self.kv, prefill_workspace={}
             ),
             vision=self.vision,
+            **(dict(audio=self.audio) if self.audio else {}),
             mtp=self.mtp,
             gdn_execution=self.gdn_execution,
             batch_layout=dict(

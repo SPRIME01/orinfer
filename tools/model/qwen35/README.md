@@ -57,3 +57,5 @@ bash tools/operators/run.sh tools/model/qwen35/check_decode.py artifacts/qwen35-
 ```
 
 构建缓存默认位于 `artifacts/build-cache/qwen35`。失败可用包装器 `--resume` 重跑，已校验编译对象会复用。算子检查验证局部数值与 ABI；新执行包还须完成真实模型加载、生成、prefix 恢复、并发和 MTP 验收。
+
+Qwen3-ASR-1.7B 使用相同构建器并传入 `--context 65536`。它复用文本投影、动态 GQA、FFN 和请求状态，音频部分由 `qwen_asr/audio.py` 绑定共享 FP16 encoder 组件。其 RMSNorm、完整 RoPE 和 ungated attention 按配置传递，音频前端与转写用法见[语音识别](../../../docs/audio.md)。

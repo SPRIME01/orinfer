@@ -1,3 +1,4 @@
+pub(crate) mod audio;
 pub(crate) mod batch;
 mod chat;
 mod continuous;
@@ -115,6 +116,13 @@ async fn serve(settings: Settings) -> Result<()> {
         .route(
             "/v1/chat/completions",
             post(completions).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::ingress,
+            )),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(audio::transcriptions).layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 preparation::ingress,
             )),
@@ -279,7 +287,7 @@ async fn health(State(state): State<Service>) -> Response {
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
             "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
-            "images":state.vision.is_some(),"video":false,"audio":false,"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
+            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":state.default_request_params.get("max_completion_tokens").and_then(Value::as_u64).or_else(|| state.default_request_params.get("max_tokens").and_then(Value::as_u64)).unwrap_or(8192),
             "thinking_token_budget":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
         "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
         "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},

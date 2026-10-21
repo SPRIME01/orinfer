@@ -59,6 +59,7 @@ fn benchmark_fixed_requests() {
                     model
                         .start_request(
                             GenerationInput {
+                                audios: vec![],
                                 input_tokens: prompt.clone(),
                                 images: vec![],
                                 max_new_tokens: case.output_tokens,

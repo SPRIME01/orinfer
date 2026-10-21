@@ -101,7 +101,9 @@ def linear(
 
 
 @orin_jit
-def layer_norm(hidden: int, padded: int | None = None, dtype: str = "float16"):
+def layer_norm(
+    hidden: int, padded: int | None = None, dtype: str = "float16", epsilon: float = 1e-6
+):
     padded = padded or 1 << (hidden - 1).bit_length()
     assert hidden <= padded
     rows = T.dynamic("rows")
@@ -129,7 +131,7 @@ def layer_norm(hidden: int, padded: int | None = None, dtype: str = "float16"):
             for i in T.Parallel(padded):
                 if i < hidden:
                     Y[row, i] = (x[i] - mean[0] / hidden) * T.rsqrt(
-                        variance[0] / hidden + 1e-6
+                        variance[0] / hidden + epsilon
                     ) * T.cast(W[i], T.float32) + T.cast(B[i], T.float32)
 
     return kernel
@@ -283,7 +285,12 @@ def qkv_rope(hidden: int = 1152, heads: int = 16, merge: int = 2, dtype: str = "
 
 @orin_jit
 def attention(
-    hidden: int = 1152, heads: int = 16, bm: int = 32, bn: int = 32, dtype: str = "float16"
+    hidden: int = 1152,
+    heads: int = 16,
+    bm: int = 32,
+    bn: int = 32,
+    dtype: str = "float16",
+    window: int = 0,
 ):
     dim = hidden // heads
     padded = ((dim + 15) // 16) * 16
@@ -297,7 +304,14 @@ def attention(
         Length: T.Tensor((1,), T.int32),
         Y: T.Tensor((rows, hidden), dtype),
     ):
-        with T.Kernel(T.ceildiv(rows, bm), heads, threads=128) as (qb, head):
+        with T.Kernel(
+            T.ceildiv(window, bm) if window else T.ceildiv(rows, bm),
+            heads,
+            T.ceildiv(rows, window) if window else 1,
+            threads=128,
+        ) as (qb, head, segment):
+            base = segment * window
+            end = T.min(Length[0], base + window) if window else Length[0]
             q = T.alloc_shared((bm, padded), dtype)
             k = T.alloc_shared((bn, padded), dtype)
             v = T.alloc_shared((bn, padded), dtype)
@@ -314,15 +328,19 @@ def attention(
             T.clear(out)
             for i, d in T.Parallel(bm, padded):
                 q[i, d] = T.if_then_else(
-                    qb * bm + i < Length[0] and d < dim, Q[qb * bm + i, head * dim + d], 0
+                    base + qb * bm + i < end and d < dim, Q[base + qb * bm + i, head * dim + d], 0
                 )
-            for kb in T.serial(T.ceildiv(Length[0], bn)):
+            for kb in T.serial(T.ceildiv(end - base, bn)):
                 for j, d in T.Parallel(bn, padded):
                     k[j, d] = T.if_then_else(
-                        kb * bn + j < Length[0] and d < dim, K[kb * bn + j, head * dim + d], 0
+                        base + kb * bn + j < end and d < dim,
+                        K[base + kb * bn + j, head * dim + d],
+                        0,
                     )
                     v[j, d] = T.if_then_else(
-                        kb * bn + j < Length[0] and d < dim, V[kb * bn + j, head * dim + d], 0
+                        base + kb * bn + j < end and d < dim,
+                        V[base + kb * bn + j, head * dim + d],
+                        0,
                     )
                 T.sync_threads()
                 T.clear(score)
@@ -331,12 +349,12 @@ def attention(
                     previous[i] = maximum[i]
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        kb * bn + j < Length[0], score[i, j] * math.sqrt(1.0 / dim), -1e30
+                        base + kb * bn + j < end, score[i, j] * math.sqrt(1.0 / dim), -1e30
                     )
                 T.reduce_max(score, maximum, dim=1, clear=False)
                 for i, j in T.Parallel(bm, bn):
                     score[i, j] = T.if_then_else(
-                        kb * bn + j < Length[0], T.exp(score[i, j] - maximum[i]), 0
+                        base + kb * bn + j < end, T.exp(score[i, j] - maximum[i]), 0
                     )
                     p[i, j] = score[i, j]
                 T.reduce_sum(score, rowsum, dim=1)
@@ -347,9 +365,9 @@ def attention(
                     out[i, d] *= correction[i]
                 T.gemm(p, v, out)
             for i, d in T.Parallel(bm, padded):
-                if qb * bm + i < rows and d < dim:
-                    Y[qb * bm + i, head * dim + d] = T.if_then_else(
-                        qb * bm + i < Length[0], out[i, d] / T.max(denom[i], 1e-30), 0
+                if base + qb * bm + i < rows and (not window or qb * bm + i < window) and d < dim:
+                    Y[base + qb * bm + i, head * dim + d] = T.if_then_else(
+                        base + qb * bm + i < end, out[i, d] / T.max(denom[i], 1e-30), 0
                     )
 
     return kernel

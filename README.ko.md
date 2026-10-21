@@ -2,13 +2,14 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-Rust와 TileLang으로 구현한 NVIDIA Jetson용 LLM 및 비전 언어 모델 추론 엔진입니다.
+Rust와 TileLang으로 구현한 NVIDIA Jetson용 텍스트, 비전 언어 및 음성 추론 엔진입니다.
 
-**Jetson AGX Orin 64GB / CUDA SM87**을 대상으로 설계했습니다. Rust가 엔진과 API를 실행하고, TileLang은 배포 전에 GPU 커널을 실행 패키지로 컴파일합니다. Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, Index-Translate-2B/9B/35B-A3B-preview를 지원합니다. 텍스트·이미지·다중 이미지 지원 범위는 각 모델 패키지에서 정의합니다.
+**Jetson AGX Orin 64GB / CUDA SM87**을 대상으로 설계했습니다. Rust가 엔진과 API를 실행하고, TileLang은 배포 전에 GPU 커널을 실행 패키지로 컴파일합니다. Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, Index-Translate-2B/9B/35B-A3B-preview를 지원합니다. Qwen3-ASR-1.7B는 음성 전사를 지원합니다. 입력 지원 범위는 각 모델 패키지에서 정의합니다.
 
 ## 기능
 
 - OpenAI Chat Completions 및 Ollama chat/generate API: 스트리밍, thinking, 샘플링, 함수 호출, JSON Schema 제약, 토큰 확률.
+- [음성 인식](docs/audio.md): Qwen3-ASR-1.7B, Rust 기반 파일 전사 및 Chat 오디오 입력.
 - [JSONL 오프라인 추론](docs/batch.md): Rust CLI를 통한 연속 배치 처리, 결과 순차 저장, 중단 지점부터 재개.
 - Qwen3_5 계열은 E8P Q4A8/W8 혼합 가중치를, Flash Next는 E8P Q2 전문가와 Q4/W8 투영을 사용합니다. 정밀도에 민감한 경로는 BF16/FP16/FP32를 유지합니다.
 - 청크 prefill, 요청별 상태 격리, prefix cache, INT8 KV, 모델 설정에 따른 최대 256K 토큰 컨텍스트.
@@ -40,7 +41,7 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 
 ## 성능
 
-지원하는 6개 모델을 Jetson AGX Orin 64GB와 개발용 실행 패키지로 **2026-10-21**에 측정했습니다. 입력은 고정된 영어→중국어 번역 프롬프트입니다. 벤치마크는 단일 요청에서 적응형 MTP(초안 최대 3개)를 활성화하고, 다중 요청에서는 MTP를 자동으로 비활성화합니다.
+텍스트·비전 언어 6개 모델을 Jetson AGX Orin 64GB와 개발용 실행 패키지로 **2026-10-21**에 측정했습니다. 입력은 고정된 영어→중국어 번역 프롬프트입니다. 벤치마크는 단일 요청에서 적응형 MTP(초안 최대 3개)를 활성화하고, 다중 요청에서는 MTP를 자동으로 비활성화합니다.
 
 | 모델 | Prefill 512 토큰 | Prefill 8K 토큰 | 단일 decode, MTP 활성 | 8개 요청 decode | 최대 동시 요청 / decode | 시작→API(초) | 시작→첫 출력(초) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |

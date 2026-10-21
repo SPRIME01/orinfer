@@ -118,6 +118,53 @@ fn read_chat(reader: impl BufRead, output: &mut impl Write) -> Result<Value> {
     Err("Incomplete Chat response".into())
 }
 
+/// Submit a local audio file through the same lazy ASR worker as HTTP clients.
+pub fn transcribe(
+    data: &Path,
+    name: &str,
+    path: &Path,
+    language: Option<&str>,
+    prompt: Option<&str>,
+) -> Result<Value> {
+    let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if metadata.len() == 0 || metadata.len() > 24 * 1024 * 1024 {
+        return Err("Audio file must contain 1..24 MiB".into());
+    }
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid audio filename")?
+        .to_owned();
+    let part =
+        reqwest::blocking::multipart::Part::bytes(std::fs::read(path).map_err(|e| e.to_string())?)
+            .file_name(filename);
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .text("model", name.to_owned())
+        .part("file", part);
+    if let Some(language) = language {
+        form = form.text("language", language.to_owned());
+    }
+    if let Some(prompt) = prompt {
+        form = form.text("prompt", prompt.to_owned());
+    }
+    let mut request = client(data)?
+        .post("http://localhost/v1/audio/transcriptions")
+        .multipart(form);
+    if let Ok(key) = std::env::var("ORINFER_API_KEY") {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().map_err(|e| e.to_string())?;
+    let status = response.status();
+    let value: Value = response.json().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(value["error"]["message"]
+            .as_str()
+            .unwrap_or("Transcription failed")
+            .to_owned());
+    }
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

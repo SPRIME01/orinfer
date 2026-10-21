@@ -5,7 +5,8 @@
 ## 范围
 
 - 硬件固定本机 Jetson AGX Orin 64GB，aarch64/CUDA SM87。
-- 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B（Qwen3_5）的文本、图片和多图输入。
+- 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
+- Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。
 - 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护，共享架构与计算策略组件。orinfer-models 分别注册模型适配器与计算策略，部署包内 Rust cdylib 通过版本化 C ABI 生成执行程序、动态 batch 和状态绑定，匹配的 TileLang cubin 与库同包发布。公共 CUDA 执行器从模型契约读取模型族、层数、维度和层序；新增架构通过适配器注册接入。
 - 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。

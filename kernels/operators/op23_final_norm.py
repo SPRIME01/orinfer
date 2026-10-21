@@ -35,6 +35,7 @@ def final_norm(
     epsilon: float = 1e-6,
     threads: int = 256,
     last_row: bool = False,
+    zero_centered: bool = True,
 ):
     """Build (X, R, I, W, Y): FP16 hidden plus FP32 residual, FP16 Y.
 
@@ -76,7 +77,7 @@ def final_norm(
             for j in T.Parallel(columns):
                 if j < hidden:
                     Y[b, j] = (value[j] * T.rsqrt(total[0] / hidden + epsilon)) * (
-                        T.cast(W[j], T.float32) + 1.0
+                        T.cast(W[j], T.float32) + (1.0 if zero_centered else 0.0)
                     )
 
     return kernel

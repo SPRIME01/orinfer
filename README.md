@@ -2,13 +2,14 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
-LLM and vision-language inference on NVIDIA Jetson, powered by Rust and TileLang.
+Text, vision-language and speech inference on NVIDIA Jetson, powered by Rust and TileLang.
 
-Built for **Jetson AGX Orin 64GB / CUDA SM87**. Rust runs the engine and APIs; TileLang compiles GPU kernels into execution packages ahead of deployment. Models include Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, and Index-Translate-2B/9B/35B-A3B-preview. Each model package declares its text, image and multi-image capabilities.
+Built for **Jetson AGX Orin 64GB / CUDA SM87**. Rust runs the engine and APIs; TileLang compiles GPU kernels into execution packages ahead of deployment. Models include Qwen3.8-27B, Qwen3.8-Flash-Next, Qwen3.5-4B, and Index-Translate-2B/9B/35B-A3B-preview. Qwen3-ASR-1.7B provides speech transcription. Each model package declares its input capabilities.
 
 ## Features
 
 - OpenAI Chat Completions and Ollama chat/generate APIs: streaming, thinking, sampling, function calling, JSON Schema constraints and token probabilities.
+- [Speech recognition](docs/audio.md): Qwen3-ASR-1.7B, file transcription and Chat audio input through the Rust runtime.
 - [JSONL offline inference](docs/batch.md): continuous batching, incremental output and resumable jobs through the Rust CLI.
 - E8P Q4A8/W8 mixed weights for Qwen3_5 models; E8P Q2 experts and Q4/W8 projections for Flash Next. Sensitive paths retain BF16/FP16/FP32.
 - Chunked prefill, isolated request state, prefix cache, INT8 KV and model-configured context up to 256K tokens.
@@ -40,7 +41,7 @@ Endpoints include `/health`, `/v1/models` and `/v1/chat/completions`. The [servi
 
 ## Performance
 
-All supported models, Jetson AGX Orin 64GB, development execution packages, measured **2026-10-21**. Inputs are fixed English-to-Chinese translation prompts. The benchmark enables adaptive MTP (up to 3 drafts) for single-request runs and automatically disables MTP for multi-request runs.
+Text and vision-language models, Jetson AGX Orin 64GB, development execution packages, measured **2026-10-21**. Inputs are fixed English-to-Chinese translation prompts. The benchmark enables adaptive MTP (up to 3 drafts) for single-request runs and automatically disables MTP for multi-request runs.
 
 | Model | Prefill, 512 tokens | Prefill, 8K tokens | Single decode, MTP | 8-request decode | Max requests / decode | Serve → API (s) | Serve → first output (s) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -92,7 +93,7 @@ make check
 - [Build and release](tools/build/README.md) · [Model packages](docs/model-packages.md).
 - [Model builders](tools/model/README.md) · [GPU kernels](kernels/README.md) · [Quality evaluation](tools/eval/README.md).
 
-Detailed guides are currently in Chinese.
+Additional guides are available in Chinese.
 
 ## License
 

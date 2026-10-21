@@ -19,7 +19,11 @@ class Aot:
         self.kernels, self.dynamic = [], []
         self.objects = {}
         sha = hashlib.sha256()
-        for directory in [ROOT / "kernels", ROOT / "tools/model/qwen35"]:
+        for directory in [
+            ROOT / "kernels",
+            ROOT / "tools/model/qwen35",
+            ROOT / "tools/model/qwen_asr",
+        ]:
             for file in sorted(directory.rglob("*.py")):
                 if file.name.startswith(("test_", "check_")):
                     continue

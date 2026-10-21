@@ -46,11 +46,29 @@ async fn completions(
     gateway(manager, headers, body, None).await
 }
 
+async fn transcriptions(
+    State(manager): State<Arc<Manager>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    gateway_request(manager, headers, body, None, true).await
+}
+
 pub(super) async fn gateway(
     manager: Arc<Manager>,
     headers: HeaderMap,
     body: Body,
     protocol: Option<ollama::Kind>,
+) -> Response {
+    gateway_request(manager, headers, body, protocol, false).await
+}
+
+async fn gateway_request(
+    manager: Arc<Manager>,
+    headers: HeaderMap,
+    body: Body,
+    protocol: Option<ollama::Kind>,
+    transcription: bool,
 ) -> Response {
     if !authorized(&headers) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
@@ -61,8 +79,9 @@ pub(super) async fn gateway(
             "Global request queue is full",
         );
     };
+    let reserve = if transcription { 128 } else { 96 };
     let Ok(mut memory) = Arc::clone(&manager.body_memory)
-        .acquire_many_owned(96)
+        .acquire_many_owned(reserve)
         .await
     else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "Service is stopping");
@@ -71,14 +90,31 @@ pub(super) async fn gateway(
         Ok(b) => b,
         Err(e) => return error(StatusCode::PAYLOAD_TOO_LARGE, e.to_string()),
     };
-    let charge = (bytes.len().saturating_mul(3).div_ceil(1 << 20)).clamp(1, 96);
-    let input_bytes = bytes.len();
-    drop(memory.split(96 - charge));
-    let mut request: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+    let input_bytes = if transcription {
+        bytes.len().saturating_mul(4).div_ceil(3)
+    } else {
+        bytes.len()
     };
-    drop(bytes);
+    let charge = input_bytes
+        .saturating_mul(3)
+        .div_ceil(1 << 20)
+        .clamp(1, reserve as usize) as u32;
+    drop(memory.split((reserve - charge) as usize));
+    let (mut request, transcription_plain) = if transcription {
+        let form = match crate::server::audio::multipart(&headers, bytes) {
+            Ok(v) => v,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        match crate::server::audio::transcription_request(form).await {
+            Ok((request, plain)) => (request, Some(plain)),
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => (value, None),
+            Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+        }
+    };
     let native = if let Some(kind) = protocol {
         match ollama::request::translate(&request, kind) {
             Ok(mut native) => {
@@ -199,6 +235,9 @@ pub(super) async fn gateway(
         if let Some(value) = response_headers.get(name) {
             output.headers_mut().insert(name, value.clone());
         }
+    }
+    if let Some(plain) = transcription_plain {
+        return crate::server::audio::transcription_response(output, plain).await;
     }
     if let Some(native) = native {
         output.extensions_mut().insert(ollama::response::Context {
@@ -523,6 +562,7 @@ pub(super) fn public_router(manager: Arc<Manager>) -> Router {
         )
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
+        .route("/v1/audio/transcriptions", post(transcriptions))
         .merge(ollama::router())
         .with_state(manager)
 }
@@ -542,6 +582,7 @@ pub(super) async fn serve(manager: Arc<Manager>) -> Result<()> {
         .route("/ps", get(ps))
         .route("/show", get(show))
         .route("/v1/chat/completions", post(completions))
+        .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/import", post(import))
         .route("/pull", post(pull_model))
         .route("/load", post(load))

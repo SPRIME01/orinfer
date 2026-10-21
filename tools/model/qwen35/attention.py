@@ -35,9 +35,15 @@ def select(tuner, context, reference):
     from tools.model.row_tuning import launch, ATTENTION_TARGET
 
     qh, kvh = tuner.qh, tuner.kvh
+    dimension = tuner.dimension
     configs = candidates(qh, kvh, reference)
     lengths = sorted({min(context, n) for n in (256, 2048, 8192)})
-    text = dict(num_attention_heads=qh, num_key_value_heads=kvh)
+    text = dict(
+        num_attention_heads=qh,
+        num_key_value_heads=kvh,
+        head_dim=dimension,
+        attn_output_gate=tuner.gated,
+    )
 
     def build(config):
         compiled = []
@@ -73,21 +79,27 @@ def select(tuner, context, reference):
 
     def inputs(owners):
         values = dict(
-            Q=torch.randn(owners + 1, qh, 256, device="cuda", dtype=torch.float16) * 0.1,
-            Gate=torch.randn(owners + 1, qh, 256, device="cuda", dtype=torch.float16),
+            Q=torch.randn(owners + 1, qh, dimension, device="cuda", dtype=torch.float16) * 0.1,
+            Gate=torch.randn(owners + 1, qh, dimension, device="cuda", dtype=torch.float16),
             K=torch.randint(
-                -100, 101, (owners, max(lengths), kvh * 256), device="cuda", dtype=torch.int8
+                -100, 101, (owners, max(lengths), kvh * dimension), device="cuda", dtype=torch.int8
             ),
             V=torch.randint(
-                -100, 101, (owners, max(lengths), kvh * 256), device="cuda", dtype=torch.int8
+                -100, 101, (owners, max(lengths), kvh * dimension), device="cuda", dtype=torch.int8
             ),
-            KS=torch.rand(owners, max(lengths), kvh * 4, device="cuda", dtype=torch.float16) * 0.002
+            KS=torch.rand(
+                owners, max(lengths), kvh * (dimension // 64), device="cuda", dtype=torch.float16
+            )
+            * 0.002
             + 0.001,
-            VS=torch.rand(owners, max(lengths), kvh * 4, device="cuda", dtype=torch.float16) * 0.002
+            VS=torch.rand(
+                owners, max(lengths), kvh * (dimension // 64), device="cuda", dtype=torch.float16
+            )
+            * 0.002
             + 0.001,
             Positions=torch.empty(owners, 1, device="cuda", dtype=torch.int32),
             Lengths=torch.empty(owners, 1, device="cuda", dtype=torch.int32),
-            Partial=torch.full((owners + 1, partials * 256), 91, device="cuda"),
+            Partial=torch.full((owners + 1, partials * dimension), 91, device="cuda"),
             Maximum=torch.full((owners + 1, partials), 91, device="cuda"),
             Denominator=torch.full((owners + 1, partials), 91, device="cuda"),
         )
@@ -96,7 +108,7 @@ def select(tuner, context, reference):
             device="cuda",
             dtype=torch.uint64,
         )
-        storage = torch.full((owners + 1, qh, 256), 91, device="cuda", dtype=torch.float16)
+        storage = torch.full((owners + 1, qh, dimension), 91, device="cuda", dtype=torch.float16)
         expected = torch.empty_like(storage)
 
         def runner(pair, output):

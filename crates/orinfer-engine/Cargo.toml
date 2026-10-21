@@ -27,6 +27,7 @@ tar = { version = "=0.4.46", default-features = false }
 flate2 = "=1.1.10"
 tempfile = "=3.27.0"
 lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["std", "xz", "optimization"] }
+rustfft = { version = "=6.4.1", default-features = false, features = ["neon"] }
 
 [dev-dependencies]
 lzma-rust2 = { version = "=0.22.0", default-features = false, features = ["encoder"] }

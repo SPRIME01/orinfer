@@ -16,6 +16,8 @@ pub struct GenerationInput {
     pub input_tokens: Vec<u32>,
     #[serde(default)]
     pub images: Vec<crate::vision::ImageInput>,
+    #[serde(default)]
+    pub audios: Vec<crate::audio::AudioInput>,
     pub max_new_tokens: usize,
     pub sampling: crate::sampling::Options,
     #[serde(default)]
@@ -229,12 +231,27 @@ impl ModelRuntime {
         } else if !input.images.is_empty() {
             return Err("Model has no image adapter".into());
         }
+        if let Some(a) = &self.manifest.audio {
+            let features = input.audios.iter().try_fold(0usize, |n, v| {
+                n.checked_add(v.features()?)
+                    .ok_or("Audio feature overflow".to_string())
+            })?;
+            if features > a.max_features {
+                return Err("Audio exceeds encoder capacity".into());
+            }
+            limits.insert(a.features.clone(), features.max(1) * a.hidden * 2);
+            limits.insert(a.feature_index.clone(), context * 4);
+            limits.insert(a.positions.clone(), context * 12);
+        } else if !input.audios.is_empty() {
+            return Err("Model has no audio adapter".into());
+        }
         Ok(limits)
     }
     pub(crate) fn request_hint(
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
+        audios: &[crate::audio::AudioInput],
     ) -> Result<scheduler::RequestHint> {
         let image_work = images.iter().try_fold(0usize, |n, image| {
             let patches = image
@@ -243,10 +260,17 @@ impl ModelRuntime {
                 .ok_or("Image work overflow")?;
             n.checked_add(patches).ok_or("Image work overflow")
         })?;
+        let audio_work = audios.iter().try_fold(0usize, |n, a| {
+            n.checked_add(a.features()?)
+                .ok_or("Audio work overflow".to_string())
+        })?;
+        let image_work = image_work
+            .checked_add(audio_work)
+            .ok_or("Media work overflow")?;
         Ok(scheduler::RequestHint {
             owner: self.owner_id,
             tokens: input.to_vec(),
-            media: self.prefix_media(input, images)?,
+            media: self.prefix_media(input, images, audios)?,
             image_work,
         })
     }
@@ -255,7 +279,7 @@ impl ModelRuntime {
         input: &[u32],
         images: &[crate::vision::ImageInput],
     ) -> Result<scheduler::Waiting> {
-        self.hint_cost(&self.request_hint(input, images)?)
+        self.hint_cost(&self.request_hint(input, images, &[])?)
     }
     fn startup_key(image_work: usize, context: usize, cached: bool) -> (usize, usize, bool) {
         (
@@ -533,6 +557,12 @@ impl ModelRuntime {
             .iter()
             .map(|image| image.grid_height * image.grid_width)
             .sum();
+        let image_work = image_work
+            .checked_add(input.audios.iter().try_fold(0usize, |n, a| {
+                n.checked_add(a.features()?)
+                    .ok_or("Audio work overflow".to_string())
+            })?)
+            .ok_or("Media work overflow")?;
         let prompt_len = input.input_tokens.len();
         let limits = self.request_limits(&input)?;
         let slot = self.execution.lease_sequence(&limits)?;
@@ -540,7 +570,8 @@ impl ModelRuntime {
             self.execution
                 .reset_sequence_reusing_pages(&self.manifest.reset_buffers)?;
             self.prepare_visual_capacity(&input.input_tokens, &input.images, context, cancelled)?;
-            let media = self.prefix_media(&input.input_tokens, &input.images)?;
+            self.prepare_audio_capacity(&input.input_tokens, &input.audios, context, cancelled)?;
+            let media = self.prefix_media(&input.input_tokens, &input.images, &input.audios)?;
             let mut prefix = super::prefix::Context::default();
             let (offset, mut warm) =
                 self.restore_prefix(&input.input_tokens, &media, &mut prefix)?;

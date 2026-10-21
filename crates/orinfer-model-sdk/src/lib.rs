@@ -8,3 +8,5 @@ pub mod model;
 pub mod mtp;
 pub mod operators;
 pub mod vision;
+
+pub mod audio;

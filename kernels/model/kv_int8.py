@@ -68,68 +68,80 @@ def full_prepare_mrope_int8(
     max_position: int = 8704,
     query_heads: int = 24,
     kv_heads: int = 4,
+    dimension: int = 256,
+    rotary_dim: int = 64,
+    gated: bool = True,
+    zero_centered: bool = True,
 ):
     if min(query_heads, kv_heads) <= 0 or query_heads % kv_heads:
         raise ValueError("Invalid full-attention heads")
-    qwidth = query_heads * 512
-    vstart = qwidth + kv_heads * 256
-    width = vstart + kv_heads * 256
+    if dimension % 64 or not 0 < rotary_dim <= dimension or rotary_dim % 2:
+        raise ValueError("Invalid Q/K normalization or rotary geometry")
+    qwidth = query_heads * dimension * (2 if gated else 1)
+    vstart = qwidth + kv_heads * dimension
+    width = vstart + kv_heads * dimension
     heads = query_heads + kv_heads
     rows = T.dynamic("rows")
 
     @T.prim_func
     def kernel(
         X: T.Tensor((rows, width), T.float16),
-        WQ: T.Tensor((256,), T.float16),
-        WK: T.Tensor((256,), T.float16),
-        Cache: T.Tensor((max_position, 64), T.float16),
+        WQ: T.Tensor((dimension,), T.float16),
+        WK: T.Tensor((dimension,), T.float16),
+        Cache: T.Tensor((max_position, rotary_dim), T.float16),
         Req: T.Tensor((rows,), T.int32),
         Pos: T.Tensor((rows,), T.int32),
         Pages: T.Tensor((1, max_pages), T.int32),
         Status: T.Tensor((1,), T.int32),
         MRope: T.Tensor((context, 3), T.int32),
-        Q: T.Tensor((rows, query_heads, 256), T.float16),
-        Gate: T.Tensor((rows, query_heads, 256), T.float16),
-        K: T.Tensor((max_pages, block_size, kv_heads, 256), T.int8),
-        V: T.Tensor((max_pages, block_size, kv_heads, 256), T.int8),
-        KS: T.Tensor((max_pages, block_size, kv_heads, 4), T.float16),
-        VS: T.Tensor((max_pages, block_size, kv_heads, 4), T.float16),
+        Q: T.Tensor((rows, query_heads, dimension), T.float16),
+        Gate: T.Tensor((rows, query_heads, dimension), T.float16),
+        K: T.Tensor((max_pages, block_size, kv_heads, dimension), T.int8),
+        V: T.Tensor((max_pages, block_size, kv_heads, dimension), T.int8),
+        KS: T.Tensor((max_pages, block_size, kv_heads, dimension // 64), T.float16),
+        VS: T.Tensor((max_pages, block_size, kv_heads, dimension // 64), T.float16),
     ):
         with T.Kernel(rows * heads, threads=128) as work:
             row = work // heads
             head = work % heads
-            values = T.alloc_fragment((256,), T.float32)
-            square = T.alloc_fragment((256,), T.float32)
+            values = T.alloc_fragment((dimension,), T.float32)
+            square = T.alloc_fragment((dimension,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
-            norm = T.alloc_shared((256,), T.float16)
-            ka = T.alloc_fragment((4, 64), T.float32)
-            va = T.alloc_fragment((4, 64), T.float32)
-            km = T.alloc_fragment((4,), T.float32)
-            vm = T.alloc_fragment((4,), T.float32)
-            ks = T.alloc_shared((4,), T.float16)
-            vs = T.alloc_shared((4,), T.float16)
+            norm = T.alloc_shared((dimension,), T.float16)
+            ka = T.alloc_fragment((dimension // 64, 64), T.float32)
+            va = T.alloc_fragment((dimension // 64, 64), T.float32)
+            km = T.alloc_fragment((dimension // 64,), T.float32)
+            vm = T.alloc_fragment((dimension // 64,), T.float32)
+            ks = T.alloc_shared((dimension // 64,), T.float16)
+            vs = T.alloc_shared((dimension // 64,), T.float16)
             if Status[0] == 0:
-                for j in T.Parallel(256):
+                for j in T.Parallel(dimension):
                     if head < query_heads:
-                        values[j] = T.cast(X[row, head * 512 + j], T.float32)
-                        Gate[row, head, j] = X[row, head * 512 + 256 + j]
+                        values[j] = T.cast(
+                            X[row, head * dimension * (2 if gated else 1) + j], T.float32
+                        )
+                        Gate[row, head, j] = (
+                            X[row, head * dimension * 2 + dimension + j] if gated else 0.0
+                        )
                     else:
                         values[j] = T.cast(
-                            X[row, qwidth + (head - query_heads) * 256 + j], T.float32
+                            X[row, qwidth + (head - query_heads) * dimension + j], T.float32
                         )
                     square[j] = values[j] * values[j]
                 T.reduce_sum(square, total, dim=0)
-                for j in T.Parallel(256):
+                for j in T.Parallel(dimension):
                     weight = T.if_then_else(head < query_heads, WQ[j], WK[j])
-                    norm[j] = (values[j] * T.rsqrt(total[0] / 256 + 1e-6)) * (
-                        1 + T.cast(weight, T.float32)
+                    norm[j] = (values[j] * T.rsqrt(total[0] / dimension + 1e-6)) * (
+                        (1.0 if zero_centered else 0.0) + T.cast(weight, T.float32)
                     )
                 T.sync_threads()
-                for j in T.Parallel(256):
+                for j in T.Parallel(dimension):
                     values[j] = T.cast(norm[j], T.float32)
-                    if j < 64:
-                        idx = j % 32
-                        partner = T.if_then_else(j < 32, j + 32, j - 32)
+                    if j < rotary_dim:
+                        idx = j % (rotary_dim // 2)
+                        partner = T.if_then_else(
+                            j < rotary_dim // 2, j + rotary_dim // 2, j - rotary_dim // 2
+                        )
                         axis = T.if_then_else(
                             idx % 3 == 1 and idx < section[1] * 3,
                             1,
@@ -142,11 +154,11 @@ def full_prepare_mrope_int8(
                         )
                         b = T.cast(
                             T.cast(norm[partner], T.float32)
-                            * T.cast(Cache[position, idx + 32], T.float32),
+                            * T.cast(Cache[position, idx + rotary_dim // 2], T.float32),
                             T.float16,
                         )
                         values[j] = T.if_then_else(
-                            j < 32,
+                            j < rotary_dim // 2,
                             T.cast(a, T.float32) - T.cast(b, T.float32),
                             T.cast(a, T.float32) + T.cast(b, T.float32),
                         )
@@ -154,27 +166,30 @@ def full_prepare_mrope_int8(
                         Q[row, head, j] = values[j]
                 if head >= query_heads:
                     # Quantize the exact FP16 values the reference cache stores.
-                    for g, d in T.Parallel(4, 64):
+                    for g, d in T.Parallel(dimension // 64, 64):
                         ka[g, d] = T.abs(T.cast(T.cast(values[g * 64 + d], T.float16), T.float32))
                         va[g, d] = T.abs(
                             T.cast(
-                                X[row, vstart + (head - query_heads) * 256 + g * 64 + d], T.float32
+                                X[row, vstart + (head - query_heads) * dimension + g * 64 + d],
+                                T.float32,
                             )
                         )
                     T.reduce_max(ka, km, dim=1)
                     T.reduce_max(va, vm, dim=1)
-                    for g in T.Parallel(4):
+                    for g in T.Parallel(dimension // 64):
                         # FP16 scales, bounded above zero even for subnormal input.
                         ks[g] = T.max(km[g] / 127.0, 0.000000059604644775390625)
                         vs[g] = T.max(vm[g] / 127.0, 0.000000059604644775390625)
                     T.sync_threads()
                     page = Pages[Req[row], Pos[row] // block_size]
-                    for g in T.Parallel(4):
+                    for g in T.Parallel(dimension // 64):
                         KS[page, Pos[row] % block_size, head - query_heads, g] = ks[g]
                         VS[page, Pos[row] % block_size, head - query_heads, g] = vs[g]
-                    for j in T.Parallel(256):
+                    for j in T.Parallel(dimension):
                         kval = T.cast(T.cast(values[j], T.float16), T.float32)
-                        vval = T.cast(X[row, vstart + (head - query_heads) * 256 + j], T.float32)
+                        vval = T.cast(
+                            X[row, vstart + (head - query_heads) * dimension + j], T.float32
+                        )
                         kr = T.call_extern(
                             "float32", "__fdiv_rn", kval, T.cast(ks[j // 64], T.float32)
                         )

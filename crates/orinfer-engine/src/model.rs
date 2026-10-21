@@ -224,8 +224,9 @@ impl Model {
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
+        audios: &[crate::audio::AudioInput],
     ) -> Result<crate::scheduler::RequestHint> {
-        self.0.request_hint(input, images)
+        self.0.request_hint(input, images, audios)
     }
     pub fn estimated_hint_cost(
         &self,

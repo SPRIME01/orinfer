@@ -15,17 +15,16 @@ impl ModelRuntime {
         &self,
         input: &[u32],
         images: &[crate::vision::ImageInput],
+        audios: &[crate::audio::AudioInput],
     ) -> Result<Media> {
-        let Some(v) = &self.manifest.vision else {
-            return if images.is_empty() {
-                Ok(Media::default())
-            } else {
-                Err("Model has no vision adapter".into())
-            };
-        };
         let mut media = vec![];
         let mut cursor = 0;
         for image in images {
+            let v = self
+                .manifest
+                .vision
+                .as_ref()
+                .ok_or("Model has no image adapter")?;
             let start = input
                 .get(cursor..)
                 .ok_or("Image span outside prompt")?
@@ -47,6 +46,32 @@ impl ModelRuntime {
                 return Err("Image span outside prompt".into());
             }
         }
+        cursor = 0;
+        for audio in audios {
+            let a = self
+                .manifest
+                .audio
+                .as_ref()
+                .ok_or("Model has no audio adapter")?;
+            let features = audio.features()?;
+            let start = input
+                .iter()
+                .skip(cursor)
+                .position(|&t| t == a.token_id)
+                .map(|i| i + cursor)
+                .ok_or("Missing audio marker")?;
+            let mut hash = Sha256::new();
+            hash.update((audio.frames as u64).to_le_bytes());
+            for value in &audio.mel {
+                hash.update(value.to_bits().to_le_bytes());
+            }
+            media.push((start, hash.finalize().into()));
+            cursor = start
+                .checked_add(features)
+                .filter(|&n| n <= input.len())
+                .ok_or("Audio span outside prompt")?;
+        }
+        media.sort_by_key(|item| item.0);
         Ok(Media(media))
     }
     pub(crate) fn prefix_match_tokens(
@@ -65,7 +90,7 @@ impl ModelRuntime {
         if self.prefix_cache.budget == 0 {
             return Ok((0, 0));
         }
-        let media = self.prefix_media(input, images)?;
+        let media = self.prefix_media(input, images, &[])?;
         Ok(self.prefix_match_media(input, &media))
     }
     pub(super) fn prefix_match_media(&self, input: &[u32], media: &Media) -> (usize, usize) {

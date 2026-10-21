@@ -253,6 +253,7 @@ fn profile_cached_generation() {
             let mut request = model
                 .start_request(
                     GenerationInput {
+                        audios: vec![],
                         input_tokens: source.input_tokens.clone(),
                         images: source.images.clone(),
                         max_new_tokens: source.max_new_tokens,
@@ -391,6 +392,7 @@ fn profile_speculative_verification() {
             let mut request = model
                 .start_request(
                     GenerationInput {
+                        audios: vec![],
                         input_tokens: source.input_tokens.clone(),
                         images: vec![],
                         max_new_tokens: width + 16,
@@ -1067,6 +1069,7 @@ fn profile_continuous_decode() {
                 model
                     .start_request(
                         GenerationInput {
+                            audios: vec![],
                             input_tokens: source.input_tokens.clone(),
                             images: vec![],
                             max_new_tokens: 160,
@@ -1290,6 +1293,7 @@ fn capture_prefill_partitions() {
         let mut req = model
             .start_request(
                 GenerationInput {
+                    audios: vec![],
                     input_tokens: source.input_tokens.clone(),
                     images: source.images.clone(),
                     max_new_tokens: 1,
@@ -1470,6 +1474,7 @@ fn profile_adaptive_mtp_decode() {
                         model
                             .start_request(
                                 GenerationInput {
+                                    audios: vec![],
                                     input_tokens: source.input_tokens.clone(),
                                     images: vec![],
                                     max_new_tokens: 512,

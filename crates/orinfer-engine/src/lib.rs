@@ -28,3 +28,5 @@ pub const STATUS: &str = "Rust/TileLang resident image/text inference with OpenA
 
 /// Authoritative benchmark plan, embedded without duplicating its thresholds.
 pub const BENCHMARK_PLAN: &str = include_str!("../../../configs/benchmark.json");
+
+pub mod audio;

@@ -9,7 +9,7 @@ import tilelang.language as T
 from tools.operators.common import orin_jit
 
 
-def residual_norm_body(hidden, epsilon, threads, *, staged=False):
+def residual_norm_body(hidden, epsilon, threads, *, staged=False, zero_centered=True):
     """Shared FP32 reduction and FP16 norm boundary, optionally staged for fusion."""
     columns = ((hidden + threads - 1) // threads) * threads
 
@@ -29,7 +29,7 @@ def residual_norm_body(hidden, epsilon, threads, *, staged=False):
             if j < hidden:
                 normalized = T.cast(
                     (value[j] * T.rsqrt(total[0] / hidden + epsilon))
-                    * (T.cast(W[j], T.float32) + 1.0),
+                    * (T.cast(W[j], T.float32) + (1.0 if zero_centered else 0.0)),
                     T.float16,
                 )
                 Y[row, j] = normalized
