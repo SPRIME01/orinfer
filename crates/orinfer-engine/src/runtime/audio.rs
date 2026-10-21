@@ -1,10 +1,124 @@
 use super::*;
+use half::slice::HalfFloatSliceExt;
 impl ModelRuntime {
+    pub(super) fn prepare_audio_stem(
+        &self,
+        input: &crate::audio::AudioInput,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        self.prepare_audio_stems(&[(0, input)], cancelled)?;
+        self.execution.sync()
+    }
+    fn prepare_audio_stems(
+        &self,
+        inputs: &[(usize, &crate::audio::AudioInput)],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        let a = self
+            .manifest
+            .audio
+            .as_ref()
+            .ok_or("Model has no audio adapter")?;
+        let chunks: Vec<_> = inputs
+            .iter()
+            .flat_map(|&(base, input)| {
+                (0..input.frames.div_ceil(100)).map(move |chunk| (base, input, chunk))
+            })
+            .collect();
+        for group in chunks.chunks(a.stem_chunks) {
+            if cancelled() {
+                return Err("Request cancelled during audio encoding".into());
+            }
+            let mut raw = vec![half::f16::ZERO; group.len() * 128 * 100];
+            for (local, &(_, input, chunk)) in group.iter().enumerate() {
+                let padded = input.frames.div_ceil(100) * 100;
+                for mel in 0..128 {
+                    let source = mel * padded + chunk * 100;
+                    let destination = (local * 128 + mel) * 100;
+                    raw[destination..destination + 100]
+                        .convert_from_f32_slice(&input.mel[source..source + 100]);
+                }
+            }
+            // SAFETY: f16 is transparent 16-bit storage; the byte view stays
+            // within its live allocation. Jetson stores it little-endian.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), raw.len() * 2) };
+            self.upload_bytes(&a.mel, bytes)?;
+            self.execution.submit_program_rows(
+                "audio_stem",
+                group.len(),
+                ExecutionPhase::Vision,
+            )?;
+            for (local, &(base, input, chunk)) in group.iter().enumerate() {
+                let features = (input.frames / 100) * 13 + (input.frames % 100).div_ceil(8);
+                let live = (features - chunk * 13).min(13);
+                self.execution.copy_range_async(
+                    &a.stem_output,
+                    local * 13 * 1024 * 2,
+                    &a.encoder_input,
+                    (base + chunk * 13) * 1024 * 2,
+                    live * 1024 * 2,
+                )?;
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn encode_audio_cohort(
+        &mut self,
+        inputs: &[(usize, &crate::audio::AudioInput)],
+    ) -> Result<()> {
+        let a = self
+            .manifest
+            .audio
+            .clone()
+            .ok_or("Model has no audio adapter")?;
+        let sources: Vec<_> = inputs.iter().map(|(_, input)| *input).collect();
+        let layout = audio_layout(&sources, a.window_size, a.max_features)?;
+        self.prepare_audio_stems(
+            &layout
+                .spans
+                .iter()
+                .zip(&sources)
+                .map(|(&(base, _), input)| (base, *input))
+                .collect::<Vec<_>>(),
+            &|| false,
+        )?;
+        self.upload_ids(&a.length, &layout.lengths)?;
+        self.launch_rows("audio_encoder", layout.rows, ExecutionPhase::Vision)?;
+        for (&(slot, _), &(base, features)) in inputs.iter().zip(&layout.spans) {
+            self.execution.copy_to_sequence_async(
+                &a.output,
+                base * a.hidden * 2,
+                slot,
+                &a.features,
+                features * a.hidden * 2,
+            )?;
+        }
+        self.execution.sync()
+    }
     pub(super) fn prepare_audio_capacity(
         &self,
         tokens: &[u32],
         inputs: &[crate::audio::AudioInput],
         capacity: usize,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<()> {
+        self.prepare_audio_inputs(tokens, inputs, capacity, true, cancelled)
+    }
+    pub(super) fn prepare_audio_metadata(
+        &self,
+        tokens: &[u32],
+        inputs: &[crate::audio::AudioInput],
+        capacity: usize,
+    ) -> Result<()> {
+        self.prepare_audio_inputs(tokens, inputs, capacity, false, &|| false)
+    }
+    fn prepare_audio_inputs(
+        &self,
+        tokens: &[u32],
+        inputs: &[crate::audio::AudioInput],
+        capacity: usize,
+        encode: bool,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
         let Some(a) = &self.manifest.audio else {
@@ -40,43 +154,18 @@ impl ModelRuntime {
             for (i, slot) in index[start..end].iter_mut().enumerate() {
                 *slot = (feature_offset + i) as i32;
             }
-            let chunks = input.frames.div_ceil(100);
-            let padded = chunks * 100;
-            for first in (0..chunks).step_by(a.stem_chunks) {
-                if cancelled() {
-                    return Err("Request cancelled during audio encoding".into());
-                }
-                let count = a.stem_chunks.min(chunks - first);
-                let mut raw = Vec::with_capacity(count * 128 * 100 * 2);
-                for chunk in first..first + count {
-                    for mel in 0..128 {
-                        for t in 0..100 {
-                            raw.extend_from_slice(
-                                &half::f16::from_f32(input.mel[mel * padded + chunk * 100 + t])
-                                    .to_bits()
-                                    .to_le_bytes(),
-                            );
-                        }
-                    }
-                }
-                self.upload_bytes(&a.mel, &raw)?;
-                self.launch_rows("audio_stem", count, ExecutionPhase::Vision)?;
-                let live = (features - first * 13).min(count * 13);
+            if encode {
+                self.prepare_audio_stem(input, cancelled)?;
+                let layout = audio_layout(&[input], a.window_size, a.max_features)?;
+                self.upload_ids(&a.length, &layout.lengths)?;
+                self.launch_rows("audio_encoder", features, ExecutionPhase::Vision)?;
                 self.execution.copy_range(
-                    &a.stem_output,
-                    &a.encoder_input,
-                    first * 13 * 1024 * 2,
-                    live * 1024 * 2,
+                    &a.output,
+                    &a.features,
+                    feature_offset * a.hidden * 2,
+                    features * a.hidden * 2,
                 )?;
             }
-            self.upload_ids(&a.length, &[features as u32])?;
-            self.launch_rows("audio_encoder", features, ExecutionPhase::Vision)?;
-            self.execution.copy_range(
-                &a.output,
-                &a.features,
-                feature_offset * a.hidden * 2,
-                features * a.hidden * 2,
-            )?;
             feature_offset += features;
             cursor = end;
         }
@@ -96,9 +185,69 @@ impl ModelRuntime {
     }
 }
 
+struct AudioLayout {
+    rows: usize,
+    spans: Vec<(usize, usize)>,
+    lengths: Vec<u32>,
+}
+fn audio_layout(
+    inputs: &[&crate::audio::AudioInput],
+    window: usize,
+    capacity: usize,
+) -> Result<AudioLayout> {
+    if inputs.is_empty() || (window == 0 && inputs.len() > 1) {
+        return Err("Invalid audio cohort".into());
+    }
+    let mut layout = AudioLayout {
+        rows: 0,
+        spans: vec![],
+        lengths: vec![],
+    };
+    for input in inputs {
+        let features = input.features()?;
+        let base = if window == 0 {
+            0
+        } else {
+            layout.rows.div_ceil(window) * window
+        };
+        layout.rows = base
+            .checked_add(features)
+            .filter(|&n| n <= capacity)
+            .ok_or("Audio cohort exceeds workspace".to_string())?;
+        layout.spans.push((base, features));
+        if window == 0 {
+            layout.lengths.push(features as u32);
+        } else {
+            layout.lengths.extend(
+                (0..features)
+                    .step_by(window)
+                    .map(|first| (features - first).min(window) as u32),
+            );
+        }
+    }
+    Ok(layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packed_windows_keep_recording_tails_separate() {
+        let first = crate::audio::AudioInput {
+            frames: 801,
+            mel: vec![0.; 128 * 900],
+        };
+        let second = crate::audio::AudioInput {
+            frames: 101,
+            mel: vec![0.; 128 * 200],
+        };
+        let layout = audio_layout(&[&first, &second], 104, 312).unwrap();
+        assert_eq!(layout.spans, [(0, 105), (208, 14)]);
+        assert_eq!(layout.lengths, [104, 1, 14]);
+        assert_eq!(layout.rows, 222);
+        assert!(audio_layout(&[&first, &second], 104, 221).is_err());
+        assert!(audio_layout(&[&first, &second], 0, 312).is_err());
+    }
     #[derive(serde::Deserialize)]
     struct Case {
         input: crate::audio::AudioInput,

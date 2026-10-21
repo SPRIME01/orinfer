@@ -62,6 +62,17 @@ impl Context {
         self.retained += bytes;
         Ok(())
     }
+    pub fn release_media_scratch(&self, permit: &mut tokio::sync::OwnedSemaphorePermit) {
+        // Prepared media and the worker's pending copy stay charged. Decoded
+        // files, PCM and frontend scratch end with blocking preparation.
+        let live_mib = self
+            .retained
+            .saturating_mul(2)
+            .div_ceil(1 << 20)
+            .saturating_add(16);
+        let release = 512usize.saturating_sub(live_mib).min(permit.num_permits());
+        drop(permit.split(release));
+    }
 }
 pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
     let bytes = serde_json::to_vec(&request.messages)
@@ -73,9 +84,11 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
             .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
     });
     let audio = request.messages.iter().any(|m| {
-        m["content"]
-            .as_array()
-            .is_some_and(|parts| parts.iter().any(|p| p["type"] == "input_audio"))
+        m["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|p| matches!(p["type"].as_str(), Some("input_audio" | "audio")))
+        })
     });
     // JSON, rendered text, tokenizer intermediates and final IDs; image decoder
     // additionally checks actual dimensions before allocation under this ceiling.
@@ -111,6 +124,18 @@ pub(super) fn request_memory_mib(request: &ChatRequest, context: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn queued_media_keeps_live_tensors_and_releases_frontend_peak() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1024));
+        let mut permit = Arc::clone(&pool).acquire_many_owned(522).await.unwrap();
+        let mut context = Context::new(Arc::new(AtomicBool::new(false)), 522 << 20);
+        context.retain(32 << 20).unwrap();
+        context.release_media_scratch(&mut permit);
+        assert_eq!(permit.num_permits(), 10 + 2 * 32 + 16);
+        assert_eq!(pool.available_permits(), 1024 - permit.num_permits());
+        drop(permit);
+        assert_eq!(pool.available_permits(), 1024);
+    }
     #[test]
     fn probability_budget_counts_completion_limit_and_streaming_retention() {
         let mut request: ChatRequest = serde_json::from_value(json!({"model":"test",

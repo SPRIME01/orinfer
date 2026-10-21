@@ -269,6 +269,9 @@ class Builder:
         from tools.model.qwen35 import parallel
 
         parallel.build(self)
+        from tools.model.qwen35 import packet
+
+        packet.build(self)
         from tools.model.qwen35 import causal_parallel
 
         if not self.standard:
@@ -700,7 +703,11 @@ class Builder:
         if stride == n:
             stride = None
         if kind == "q4":
-            kind = "w8" if weight + ".int8" in w.index["weight_map"] else self.q4_codec
+            kind = (
+                "w8"
+                if weight + ".int8" in w.index["weight_map"] or weight + ".int8" in w.buffers
+                else self.q4_codec
+            )
         compressed = kind in ("q4", "e8p_q4")
         suffix = ".packed" if compressed else ".int8"
         data = w.immutable(weight + suffix)
@@ -943,11 +950,18 @@ class Builder:
                 )
             else:
                 base = p + ".self_attn"
-                for role, n, offset in [
+                projections = [
                     ("q", self.qproj, 0),
                     ("k", self.kv_width, self.qproj),
                     ("v", self.kv_width, self.qproj + self.kv_width),
-                ]:
+                ]
+                if self.standard:
+                    combined = w.combined_projection(
+                        base + ".qkv_proj.weight",
+                        [base + f".{role}_proj.weight" for role, _, _ in projections],
+                    )
+                    self.projection(pre + "/qkv", combined, self.fullx, self.h, "FullX")
+                for role, n, offset in [] if self.standard else projections:
                     self.projection(
                         pre + "/" + role,
                         base + f".{role}_proj.weight",
@@ -1022,7 +1036,15 @@ class Builder:
 
                 moe_ffn(self, post, p + ".mlp")
             else:
-                for role, offset in [("gate", 0), ("up", CAPACITY * self.f)]:
+                if self.standard:
+                    combined = w.combined_projection(
+                        p + ".mlp.gate_up_proj.weight",
+                        [p + f".mlp.{role}_proj.weight" for role in ["gate", "up"]],
+                    )
+                    self.projection(post + "/gate_up", combined, 2 * self.f, self.h, "GateUp")
+                for role, offset in (
+                    [] if self.standard else [("gate", 0), ("up", CAPACITY * self.f)]
+                ):
                     self.projection(
                         post + "/" + role,
                         p + f".mlp.{role}_proj.weight",
@@ -1033,7 +1055,11 @@ class Builder:
                         offset=offset,
                     )
                 self.rotation(
-                    post + "/swiglu_rotate", self.f, "GateUp", swiglu=True, plane_rows=CAPACITY
+                    post + "/swiglu_rotate",
+                    self.f,
+                    "GateUp",
+                    swiglu=True,
+                    plane_rows=0 if self.standard else CAPACITY,
                 )
                 self.projection(
                     post + "/down", p + ".mlp.down_proj.weight", self.h, self.f, "Hidden"
@@ -1184,7 +1210,9 @@ class Builder:
             plan_kernel_contracts=[
                 k["name"]
                 for k in self.aot.kernels
-                if "/rows/" in k["name"] or "/skip/" in k["name"]
+                if "/rows/" in k["name"]
+                or "/skip/" in k["name"]
+                or k["name"].startswith("qwen_rows/packet/")
             ],
         )
         from tools.model.sampling import append as append_sampling

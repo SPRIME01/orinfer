@@ -109,6 +109,8 @@ class Weights:
         return raw, info
 
     def array(self, name):
+        if name in self.extra:
+            return self.extra[name]
         raw, info = self.raw(name)
         if info["dtype"] == "BF16":
             return (
@@ -204,6 +206,25 @@ class Weights:
         self.mapping[name] = "runtime.safetensors"
         return name
 
+    def combined_projection(self, name, sources):
+        """Losslessly join output rows while keeping the original integer codec."""
+        suffixes = [
+            ".int8" if p + ".int8" in self.index["weight_map"] else ".packed" for p in sources
+        ]
+        if len(set(suffixes)) != 1:
+            raise ValueError("Combined projections require the same integer representation")
+        suffix = suffixes[0]
+        values = [self.array(p + suffix) for p in sources]
+        if suffix == ".packed" and (self.packed_k != 128 or any(v.ndim != 3 for v in values)):
+            raise ValueError("Combined compressed projections require K128 E8P banks")
+        target = self.constant(
+            name + suffix, np.concatenate(values, axis=0 if suffix == ".int8" else 1)
+        )
+        if suffix == ".packed":
+            self.buffers[target]["layout"] = "e8p-q4-k128-u32"
+        self.constant(name + ".scale", np.concatenate([self.array(p + ".scale") for p in sources]))
+        return name
+
     def fixed(self, name, dtype, shape, scope="workspace"):
         if name in self.buffers:
             raise ValueError(f"Duplicate storage: {name}")
@@ -228,7 +249,7 @@ class Weights:
         save_file(
             self.extra,
             str(self.directory / "runtime.safetensors"),
-            metadata={f"orin.layout.{n}": "native_contiguous" for n in self.extra},
+            metadata={f"orin.layout.{n}": self.buffers[n]["layout"] for n in self.extra},
         )
         # Assembled banks replace individually stored tensors. Prune unbound
         # source data from each adopted shard without changing bound bytes.

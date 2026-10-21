@@ -333,7 +333,7 @@ async fn completions(
             "Request exceeds preprocessing memory budget",
         );
     }
-    let memory = match Arc::clone(&state.preparation.memory)
+    let mut memory = match Arc::clone(&state.preparation.memory)
         .acquire_many_owned(memory_mib)
         .await
     {
@@ -364,6 +364,9 @@ async fn completions(
         let prepared =
             codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
         preparation.checkpoint(0)?;
+        if !prepared.audios.is_empty() || !prepared.images.is_empty() {
+            preparation.release_media_scratch(&mut memory);
+        }
         Ok::<_, String>((prepared, slot, memory))
     })
     .await

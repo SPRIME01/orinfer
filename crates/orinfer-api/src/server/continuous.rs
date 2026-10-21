@@ -456,7 +456,13 @@ pub(super) fn worker(
         let mut admitted_count = 0;
         let mut cached_count = 0;
         let mut cold_deferrals = 0;
+        let cold_prompt_capacity = model.prefill_packet_capacity();
         while lifecycle.is_ready() && active.len() < options.max_active && !waiting.is_empty() {
+            let pending_prefill: usize = active
+                .iter()
+                .filter(|a| a.request.is_prefilling())
+                .map(|a| a.request.remaining_prefill_tokens())
+                .sum();
             let slack = active
                 .iter()
                 .filter_map(|a| a.request.decode_slack_s(options.target_tpot_ms))
@@ -537,17 +543,26 @@ pub(super) fn worker(
                 } else {
                     untried.pop().expect("nonempty candidates")
                 };
+                // Keep cold residency aligned with one executable packet.
+                // Later requests stay in the CPU queue while this packet is
+                // prepared, rather than paying allocation/media startup first.
+                // Cached requests can still join the active decode cohort.
+                if !latency
+                    && costs[i].remaining_tokens > 0
+                    && pending_prefill >= cold_prompt_capacity
+                {
+                    cold_deferrals += 1;
+                    continue;
+                }
                 if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
                     // Large cold prompts need bounded residency. Small prompts
                     // must still form a cohort to amortize a model weight pass.
                     if latency
-                        && costs[i].remaining_tokens > options.max_batch_tokens
+                        && costs[i].remaining_tokens > cold_prompt_capacity
                         && active
                             .iter()
                             .filter(|a| a.request.is_prefilling())
-                            .filter(|a| {
-                                a.request.remaining_prefill_tokens() > options.max_batch_tokens
-                            })
+                            .filter(|a| a.request.remaining_prefill_tokens() > cold_prompt_capacity)
                             .count()
                             >= 2
                     {

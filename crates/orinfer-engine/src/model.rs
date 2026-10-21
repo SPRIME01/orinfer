@@ -210,6 +210,14 @@ impl Model {
     pub fn batching_supported(&self) -> bool {
         !self.0.manifest.batch_profiles.is_empty()
     }
+    /// A cold prompt fitting this extent can join one native prefill packet.
+    pub fn prefill_packet_capacity(&self) -> usize {
+        self.0
+            .manifest
+            .batch_layout
+            .as_ref()
+            .map_or(1, |layout| layout.segment_tokens.max(1))
+    }
     pub fn scheduler_statistics(&self) -> crate::scheduler::Statistics {
         self.0.scheduling_statistics()
     }

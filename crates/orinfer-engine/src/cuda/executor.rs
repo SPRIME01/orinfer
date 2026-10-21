@@ -157,6 +157,7 @@ pub(crate) struct Executor {
     pub(crate) workspace_restore_s: f64,
     pub(super) sequences: Vec<super::sequence::Sequence>,
     pub(super) state_table: RefCell<super::state_table::StateTable>,
+    pub(super) idle_selection: RefCell<Option<super::sequence::IdleSelection>>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
     pub(super) sequence_strides: BTreeMap<String, usize>,
@@ -650,6 +651,7 @@ impl Executor {
                 .unwrap_or_default(),
             sequences: vec![super::sequence::Sequence::default()],
             state_table: Default::default(),
+            idle_selection: Default::default(),
             live_workspace: None,
             workspace_save_s: 0.,
             workspace_restore_s: 0.,
@@ -714,6 +716,7 @@ impl Executor {
         self.reset_sequence_inner(names, true)
     }
     fn reset_sequence_inner(&self, names: &[String], reuse: bool) -> Result<()> {
+        self.idle_selection.borrow_mut().take();
         self.sync()?;
         // Keep at most one allocation granule per KV buffer for short requests.
         // Clear retained pages before reuse; larger contexts release their slabs.
@@ -791,7 +794,22 @@ impl Executor {
         offset: usize,
         bytes: usize,
     ) -> Result<()> {
-        if bytes > *self.sizes.get(source).ok_or("Unknown copy source")?
+        self.copy_range_async(source, 0, destination, offset, bytes)?;
+        self.sync()
+    }
+    /// Checked copy on the execution stream; the caller owns its final fence.
+    pub(crate) fn copy_range_async(
+        &self,
+        source: &str,
+        source_offset: usize,
+        destination: &str,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let source_bytes = *self.sizes.get(source).ok_or("Unknown copy source")?;
+        if source_offset
+            .checked_add(bytes)
+            .is_none_or(|n| n > source_bytes)
             || offset
                 .checked_add(bytes)
                 .is_none_or(|n| n > self.sizes.get(destination).copied().unwrap_or(0))
@@ -805,14 +823,14 @@ impl Executor {
             check(
                 sys::cuMemcpyDtoDAsync_v2(
                     self.pointers[destination] + offset as u64,
-                    self.pointers[source],
+                    self.pointers[source] + source_offset as u64,
                     bytes,
                     self.session.stream,
                 ),
                 "copy tensor range",
             )?;
         }
-        self.sync()
+        Ok(())
     }
     pub(crate) fn launch_program(&self, name: &str, phase: ExecutionPhase) -> Result<()> {
         self.submit_program(name, phase)?;

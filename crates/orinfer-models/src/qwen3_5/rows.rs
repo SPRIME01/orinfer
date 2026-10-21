@@ -17,6 +17,25 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const CAPACITY: usize = 4096;
 const LANES: usize = 128;
+// Appended after the layer state table; tools/model/qwen35/packet.py shares this order.
+const PACKET_COLUMNS: &[&str] = &[
+    "Input",
+    "Token",
+    "TokenStatus",
+    "Logits",
+    "Step",
+    "Positions",
+    "SeqLength",
+    "SegmentLength",
+    "LastIndex",
+    "Requests",
+    "MRopePositions",
+    "Features",
+    "FeatureIndex",
+    "AudioFeatures",
+    "AudioFeatureIndex",
+    "MtpTargetHidden",
+];
 fn head_capacity(m: &Manifest) -> usize {
     m.buffers
         .iter()
@@ -144,7 +163,29 @@ fn kernels(prefix: &str, names: &[&str]) -> Vec<Operation> {
 }
 fn section(m: &mut Manifest, suffix: &str, names: &[&str]) -> Vec<Operation> {
     let name = format!("{PREFIX}/{suffix}");
-    let ops = kernels(&name, names);
+    // Joined banks share the same projection implementation and row planner.
+    // Collapse consecutive logical projections when their combined binding exists.
+    let mut names = names.to_vec();
+    let layer = suffix.split('/').next().filter(|s| s.starts_with("layer"));
+    for (parts, combined, role) in [
+        (&["q", "k", "v"][..], "qkv", "self_attn.qkv_proj"),
+        (&["gate", "up"][..], "gate_up", "mlp.gate_up_proj"),
+    ] {
+        if layer.is_some_and(|layer| {
+            let prefix = format!(
+                "model.language_model.layers.{}.{}.weight.",
+                &layer[5..],
+                role
+            );
+            let packed = format!("{prefix}packed");
+            let int8 = format!("{prefix}int8");
+            m.buffers.iter().any(|b| b.name == packed || b.name == int8)
+        }) && let Some(at) = names.windows(parts.len()).position(|p| p == parts)
+        {
+            names.splice(at..at + parts.len(), [combined]);
+        }
+    }
+    let ops = kernels(&name, &names);
     m.programs.insert(name, ops.clone());
     ops
 }
@@ -367,6 +408,10 @@ fn validate_weights(
         }
         check(format!("{name}.scale"), Dtype::F16, vec![n])
     };
+    let has_projection = |name: &str| {
+        map.contains_key(format!("{name}.packed").as_str())
+            || map.contains_key(format!("{name}.int8").as_str())
+    };
     if embedding_q4 {
         q4(
             "model.language_model.embed_tokens.weight".into(),
@@ -379,11 +424,22 @@ fn validate_weights(
     }
     for (layer, kind) in t.layer_types.iter().enumerate() {
         let p = format!("model.language_model.layers.{layer}");
+        let combined_ffn = format!("{p}.mlp.gate_up_proj.weight");
+        let joined_ffn = t.num_experts == 0 && has_projection(&combined_ffn);
+        if joined_ffn {
+            q4(combined_ffn, 2 * t.intermediate_size, t.hidden_size)?;
+        }
         for (name, n, k) in [
             ("gate_proj", t.intermediate_size, t.hidden_size),
             ("up_proj", t.intermediate_size, t.hidden_size),
             ("down_proj", t.hidden_size, t.intermediate_size),
         ] {
+            if joined_ffn && name != "down_proj" {
+                if has_projection(&format!("{p}.mlp.{name}.weight")) {
+                    return Err("Combined FFN has duplicate source weights".into());
+                }
+                continue;
+            }
             let branch = if t.num_experts > 0 {
                 "shared_expert."
             } else {
@@ -409,7 +465,19 @@ fn validate_weights(
                 check(format!("{name}.scale"), Dtype::F16, vec![t.num_experts, n])?;
             }
         }
-        let shapes: &[(&str, usize)] = if kind == "linear_attention" {
+        let combined_qkv = format!("{p}.self_attn.qkv_proj.weight");
+        let joined_qkv = kind == "full_attention" && has_projection(&combined_qkv);
+        if joined_qkv {
+            q4(combined_qkv, t.full_x(), t.hidden_size)?;
+            for role in ["q", "k", "v"] {
+                if has_projection(&format!("{p}.self_attn.{role}_proj.weight")) {
+                    return Err("Combined QKV has duplicate source weights".into());
+                }
+            }
+        }
+        let shapes: &[(&str, usize)] = if joined_qkv {
+            &[]
+        } else if kind == "linear_attention" {
             &[
                 ("linear_attn.in_proj_qkv", t.qkv()),
                 ("linear_attn.in_proj_z", t.mixer()),
@@ -743,13 +811,23 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             expected_columns.extend(DEFERRED_COLUMNS);
             expected_columns.sort_unstable();
         }
+        let packet_columns = if request
+            .kernel_contracts
+            .iter()
+            .any(|k| k.name == "qwen_rows/packet/tokens")
+        {
+            PACKET_COLUMNS.len()
+        } else {
+            0
+        };
         if *columns != expected_columns
             || m.buffers
                 .iter()
                 .find(|b| b.name == "QwenRowPointers")
                 .is_none_or(|b| {
                     b.dtype != Dtype::U64
-                        || b.shape != [LANES * t.layer_types.len() * columns.len()]
+                        || b.shape
+                            != [LANES * (t.layer_types.len() * columns.len() + packet_columns)]
                 })
         {
             return Err("Invalid Qwen private address table".into());
@@ -783,6 +861,33 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
         }
     }
     mtp::register(m, t.num_experts > 0)?;
+    if request
+        .kernel_contracts
+        .iter()
+        .any(|k| k.name == "qwen_rows/packet/tokens")
+    {
+        let mut begin = vec!["tokens", "prepare", "embedding"];
+        if m.vision.is_some() || m.audio.is_some() {
+            begin.push("overlay");
+        }
+        m.programs.insert(
+            "qwen_rows/packet/begin".into(),
+            kernels("qwen_rows/packet", &begin),
+        );
+        let mut end = vec!["advance"];
+        if m.mtp.is_some() {
+            end.push("capture");
+        }
+        end.push("norm");
+        m.programs.insert(
+            "qwen_rows/packet/end".into(),
+            kernels("qwen_rows/packet", &end),
+        );
+        m.programs.insert(
+            "qwen_rows/packet/outputs".into(),
+            kernels("qwen_rows/packet", &["outputs"]),
+        );
+    }
     vision(m, c.vision_depth, t.hidden_size)?;
     if m.audio.is_some() {
         m.programs.insert(
@@ -844,6 +949,7 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
                         | "mtp_advance" => 512,
                         "verify" | "restore" => 8,
                         name if name.starts_with("qwen_rows/state/") => LANES,
+                        name if name.starts_with("qwen_rows/packet/") => LANES,
                         name if name.starts_with("qwen_rows/verify_state/") => LANES,
                         name if name.starts_with("qwen_rows/verify/") => 8,
                         "qwen_rows/head" => head_capacity(m),
@@ -1023,7 +1129,28 @@ impl Adapter for QwenRows {
 impl QwenRows {
     fn state_bindings(&self, segments: &[BatchSegment]) -> abi::StateBindings {
         let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
-        crate::packet::private_bindings(&decoders, decoders.len(), &self.private_roles)
+        if self
+            .manifest
+            .programs
+            .contains_key("qwen_rows/packet/begin")
+        {
+            let mut bindings =
+                crate::packet::private_bindings(&decoders, LANES, &self.private_roles);
+            let names: BTreeSet<_> = self
+                .manifest
+                .buffers
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect();
+            let roles = PACKET_COLUMNS
+                .iter()
+                .map(|name| names.contains(name).then(|| (*name).to_owned()))
+                .collect::<Vec<_>>();
+            bindings.extend(crate::packet::private_bindings(&decoders, LANES, &roles));
+            bindings
+        } else {
+            crate::packet::private_bindings(&decoders, decoders.len(), &self.private_roles)
+        }
     }
     fn packet(
         &self,
@@ -1135,9 +1262,20 @@ impl QwenRows {
         let layout = m.batch_layout.as_ref().ok_or("Missing Qwen row arena")?;
         let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
         let parallel = prefills.is_none() && decoders > 0;
+        let packet = parallel && m.programs.contains_key("qwen_rows/packet/begin");
         let (mut out, mut offset, mut views) = (Vec::new(), 0, Vec::new());
         let empty = BTreeMap::new();
-        for segment in segments {
+        if packet {
+            append(
+                m,
+                &mut out,
+                "qwen_rows/packet/begin",
+                decoders,
+                None,
+                &empty,
+            )?;
+        }
+        for (lane, segment) in segments.iter().enumerate() {
             let v = layout
                 .row_strides
                 .iter()
@@ -1151,6 +1289,11 @@ impl QwenRows {
                     )
                 })
                 .collect();
+            if packet && lane < decoders {
+                views.push(v);
+                offset += segment.tokens;
+                continue;
+            }
             if segment.tokens == 1 {
                 out.push(Invocation {
                     operation: Operation::Copy {
@@ -1256,9 +1399,17 @@ impl QwenRows {
                 &empty,
             )?;
         }
+        if packet {
+            append(m, &mut out, "qwen_rows/packet/end", decoders, None, &empty)?;
+        }
         let mut head_lane = 0;
         let mut heads = vec![];
         for (lane, (segment, v)) in segments.iter().zip(&views).enumerate() {
+            if packet && lane < decoders {
+                heads.push((head_lane, 1));
+                head_lane += 1;
+                continue;
+            }
             append(
                 m,
                 &mut out,
@@ -1310,7 +1461,20 @@ impl QwenRows {
             None,
             &empty,
         )?;
+        if packet {
+            append(
+                m,
+                &mut out,
+                "qwen_rows/packet/outputs",
+                decoders,
+                None,
+                &empty,
+            )?;
+        }
         for (lane, segment) in segments.iter().enumerate() {
+            if packet && lane < decoders {
+                continue;
+            }
             let (first, count) = heads[lane];
             let v = BTreeMap::from([
                 (
@@ -1373,8 +1537,145 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn joined_sections_follow_weight_banks_before_kernel_contracts_are_materialized() {
+        let mut m = request().metadata;
+        m.kernels.clear();
+        for role in ["self_attn.qkv_proj", "mlp.gate_up_proj"] {
+            let mut buffer = m.buffers.iter().find(|b| b.data.is_some()).unwrap().clone();
+            buffer.name = format!("model.language_model.layers.3.{role}.weight.packed");
+            m.buffers.push(buffer);
+        }
+        let pre = section(&mut m, "layer3/pre", PRE_ATTN);
+        assert_eq!(
+            pre,
+            kernels("qwen_rows/layer3/pre", &["norm_rotate", "qkv"])
+        );
+        let post = section(
+            &mut m,
+            "layer3/post",
+            &["norm_rotate", "gate", "up", "swiglu_rotate", "down"],
+        );
+        assert_eq!(
+            post,
+            kernels(
+                "qwen_rows/layer3/post",
+                &["norm_rotate", "gate_up", "swiglu_rotate", "down"]
+            )
+        );
+        let unjoined = section(&mut m, "layer7/pre", PRE_ATTN);
+        assert_eq!(unjoined, kernels("qwen_rows/layer7/pre", PRE_ATTN));
+    }
+
     fn request() -> CreateRequest {
         request_geometry(false)
+    }
+
+    #[test]
+    fn decode_packet_boundaries_keep_constant_launches_and_owner_addresses() {
+        for small in [false, true] {
+            let mut request = request_geometry(small);
+            let layers = request.config["text_config"]["num_hidden_layers"]
+                .as_u64()
+                .unwrap() as usize;
+            let columns = request
+                .metadata
+                .batch_layout
+                .as_ref()
+                .unwrap()
+                .state_columns
+                .len();
+            request
+                .metadata
+                .buffers
+                .iter_mut()
+                .find(|b| b.name == "QwenRowPointers")
+                .unwrap()
+                .shape[0] += LANES * PACKET_COLUMNS.len();
+            for name in ["Input", "Token", "TokenStatus", "Step"] {
+                request.metadata.buffers.push(
+                    serde_json::from_value(json!({
+                        "name":name,"dtype":"i32","shape":[4096],"layout":"native_contiguous",
+                        "alignment":256,"access":"read_write"
+                    }))
+                    .unwrap(),
+                );
+            }
+            request.kernel_contracts.push(serde_json::from_value(json!({
+                "name":"qwen_rows/packet/tokens","symbol":"test","grid":[1,1,1],"block":[32,1,1],
+                "shared_memory_bytes":0,"cooperative":false,"args":[],
+                "module":{"file":"test","sha256":"0".repeat(64)},
+                "source":{"file":"test","sha256":"0".repeat(64)},
+                "host_abi":{"file":"test","sha256":"0".repeat(64)}
+            })).unwrap());
+            let (adapter, _) = create(request, Policy::Int8Quality).unwrap();
+            let mut count = None;
+            for batch in [1, 2, 8, 128] {
+                let segments = (0..batch)
+                    .map(|i| BatchSegment {
+                        slot: 200 - i,
+                        tokens: 1,
+                    })
+                    .collect::<Vec<_>>();
+                let (calls, bindings) = adapter.batch(&segments, true).unwrap();
+                assert_eq!(*count.get_or_insert(calls.len()), calls.len());
+                assert!(calls.iter().all(
+                    |c| c.sequence.is_none() && matches!(c.operation, Operation::Kernel { .. })
+                ));
+                assert!(
+                    matches!(&calls[0].operation, Operation::Kernel { name } if name == "qwen_rows/packet/tokens")
+                );
+                assert!(
+                    matches!(&calls.last().unwrap().operation, Operation::Kernel { name } if name == "qwen_rows/packet/outputs")
+                );
+                let base = LANES * layers * columns;
+                assert_eq!(bindings.len(), base + LANES * PACKET_COLUMNS.len());
+                for (lane, segment) in segments.iter().enumerate() {
+                    assert_eq!(
+                        bindings[base + lane * PACKET_COLUMNS.len() + 1],
+                        Some((segment.slot, "Token".into()))
+                    );
+                }
+                if batch < LANES {
+                    assert!(
+                        bindings[base + batch * PACKET_COLUMNS.len()..]
+                            .iter()
+                            .all(Option::is_none)
+                    );
+                }
+                assert_eq!(adapter.batch(&segments, false).unwrap().1, bindings);
+                if batch == LANES {
+                    continue;
+                }
+                let mut mixed = segments.clone();
+                mixed.insert(
+                    0,
+                    BatchSegment {
+                        slot: 999,
+                        tokens: 3,
+                    },
+                );
+                let (calls, mixed_bindings) = adapter.batch(&mixed, true).unwrap();
+                assert_eq!(bindings, mixed_bindings);
+                assert!(
+                    calls
+                        .iter()
+                        .all(|c| c.sequence.is_none_or(|slot| slot == 999))
+                );
+                let gather = calls
+                    .iter()
+                    .find(|c| {
+                        matches!(&c.operation,
+                    Operation::Kernel { name } if name == "qwen_rows/gather/norm")
+                    })
+                    .unwrap();
+                assert_eq!(gather.sequence, Some(999));
+                assert_eq!(
+                    gather.views["HeadHidden"].offset,
+                    batch * if small { 2048 } else { 5120 } * 2
+                );
+            }
+        }
     }
 
     fn deferred_request() -> CreateRequest {

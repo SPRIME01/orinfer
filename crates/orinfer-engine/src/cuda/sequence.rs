@@ -9,6 +9,18 @@ use std::time::Instant;
 // Oversized plans retain direct execution rather than exceeding this budget.
 const BATCH_GRAPH_NODES: usize = 12288;
 
+fn fixed_resize_cost(current: usize, needed: usize, limited: bool) -> usize {
+    if current < needed {
+        needed - current
+    } else if limited && current - needed >= 65536 {
+        // A shrink replaces storage and invalidates captures too. Prefer an
+        // already fitting idle arena before resizing another recording's slot.
+        needed
+    } else {
+        0
+    }
+}
+
 /// A shared piece can cut through a certified branch. Only complete regions
 /// may fork. Contiguous helpers replacing one row slot share its boundaries.
 fn parallel_regions(
@@ -83,6 +95,11 @@ pub(super) struct Sequence {
     pub quarantined: bool,
     fixed_allocation: Option<u64>,
     fixed_slices: std::collections::BTreeSet<String>,
+}
+
+pub(super) struct IdleSelection {
+    limits: BTreeMap<String, usize>,
+    slot: Option<usize>,
 }
 
 impl Executor {
@@ -291,6 +308,7 @@ impl Executor {
     pub(crate) fn lease_sequence(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         let reused = self.idle_sequence(limits)?;
         let result = self.lease_sequence_inner(limits);
+        self.idle_selection.get_mut().take();
         if result.is_err()
             && let Some(slot) = reused
         {
@@ -299,6 +317,11 @@ impl Executor {
         result
     }
     fn idle_sequence(&self, limits: &BTreeMap<String, usize>) -> Result<Option<usize>> {
+        if let Some(cached) = self.idle_selection.borrow().as_ref()
+            && cached.limits == *limits
+        {
+            return Ok(cached.slot);
+        }
         let current = self.session.virtual_buffers.borrow();
         let mut best = None;
         for (slot, sequence) in self.sequences.iter().enumerate() {
@@ -321,7 +344,7 @@ impl Executor {
                         extent.saturating_sub(r.mapped)
                     }
                 } else {
-                    bytes.saturating_sub(sequence.sizes[&b.name])
+                    fixed_resize_cost(sequence.sizes[&b.name], bytes, limits.contains_key(&b.name))
                 };
                 sum.checked_add(additional)
                     .ok_or("Idle sequence budget overflow".to_string())
@@ -333,7 +356,12 @@ impl Executor {
                 break;
             }
         }
-        Ok(best.map(|(slot, _)| slot))
+        let slot = best.map(|(slot, _)| slot);
+        *self.idle_selection.borrow_mut() = Some(IdleSelection {
+            limits: limits.clone(),
+            slot,
+        });
+        Ok(slot)
     }
     fn lease_sequence_inner(&mut self, limits: &BTreeMap<String, usize>) -> Result<usize> {
         for (name, &bytes) in limits {
@@ -362,7 +390,7 @@ impl Executor {
                 .into_iter()
                 .filter(|(n, b)| {
                     let old = self.sequences[slot].sizes[n];
-                    old < *b || (limits.contains_key(n) && old.saturating_sub(*b) >= 65536)
+                    fixed_resize_cost(old, *b, limits.contains_key(n)) != 0
                 })
                 .collect();
             if !needed.is_empty() {
@@ -803,6 +831,7 @@ impl Executor {
     /// Keep one warm idle arena; reclaim the others only under admission
     /// pressure. Empty ordinary buffers are rebuilt before their next lease.
     pub(crate) fn reclaim_idle_state(&mut self) -> Result<()> {
+        self.idle_selection.get_mut().take();
         let idle: Vec<_> = self
             .sequences
             .iter()
@@ -895,6 +924,7 @@ impl Executor {
         Ok(())
     }
     pub(crate) fn release_sequence(&mut self, slot: usize, resets: &[String]) -> Result<()> {
+        self.idle_selection.get_mut().take();
         let result = self
             .activate_sequence(slot)
             .and_then(|()| self.reset_sequence_reusing_pages(resets));
@@ -1015,6 +1045,46 @@ impl Executor {
         // before upload_sequence_bytes returns; no host pointer is retained.
         let raw = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), bytes) };
         self.upload_sequence_bytes(slot, name, raw)
+    }
+    /// Copy into a live owner's private buffer on the existing stream.
+    /// Fixed buffers keep their stable addresses without rebinding the arena;
+    /// demand-mapped destinations retain the regular mapping/COW safeguards.
+    pub(crate) fn copy_to_sequence_async(
+        &mut self,
+        source: &str,
+        source_offset: usize,
+        slot: usize,
+        destination: &str,
+        bytes: usize,
+    ) -> Result<()> {
+        let arena = self
+            .sequences
+            .get(slot)
+            .filter(|s| s.leased && !s.quarantined)
+            .ok_or("Copy requires a live leased arena")?;
+        if !arena.addresses.contains_key(destination) {
+            return Err("Copy destination requires private storage".into());
+        }
+        if self.sequence_strides.contains_key(destination) {
+            self.activate_sequence(slot)?;
+            self.ensure_writable_range(destination, 0, bytes)?;
+        }
+        self.invoke(&Invocation {
+            operation: crate::model::Operation::Copy {
+                source: source.into(),
+                destination: destination.into(),
+                bytes,
+            },
+            sequence: Some(slot),
+            launch: None,
+            views: BTreeMap::from([(
+                source.into(),
+                crate::execution::BufferView {
+                    buffer: source.into(),
+                    offset: source_offset,
+                },
+            )]),
+        })
     }
     fn address(
         &self,

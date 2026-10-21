@@ -53,11 +53,12 @@ def linear(
     dtype: str = "float16",
     output_dtype: str | None = None,
     separate_bias: bool = False,
+    stages: int = 2,
 ):
     assert activation in ("none", "gelu", "gelu_tanh")
     output_dtype = output_dtype or dtype
     rows = T.dynamic("rows")
-    project = mma_loop(rows, k, bm, bn, bk, dtype=dtype)
+    project = mma_loop(rows, k, bm, bn, bk, dtype=dtype, stages=stages)
 
     @T.macro
     def store(Y, i, j, value):
@@ -291,17 +292,19 @@ def attention(
     bn: int = 32,
     dtype: str = "float16",
     window: int = 0,
+    windowed_lengths: bool = False,
 ):
     dim = hidden // heads
     padded = ((dim + 15) // 16) * 16
     rows = T.dynamic("rows")
+    length_count = T.ceildiv(rows, window) if windowed_lengths else 1
 
     @T.prim_func
     def kernel(
         Q: T.Tensor((rows, hidden), dtype),
         K: T.Tensor((rows, hidden), dtype),
         V: T.Tensor((rows, hidden), dtype),
-        Length: T.Tensor((1,), T.int32),
+        Length: T.Tensor((length_count,), T.int32),
         Y: T.Tensor((rows, hidden), dtype),
     ):
         with T.Kernel(
@@ -311,7 +314,11 @@ def attention(
             threads=128,
         ) as (qb, head, segment):
             base = segment * window
-            end = T.min(Length[0], base + window) if window else Length[0]
+            end = (
+                base + T.min(Length[segment], window)
+                if windowed_lengths
+                else (T.min(Length[0], base + window) if window else Length[0])
+            )
             q = T.alloc_shared((bm, padded), dtype)
             k = T.alloc_shared((bn, padded), dtype)
             v = T.alloc_shared((bn, padded), dtype)

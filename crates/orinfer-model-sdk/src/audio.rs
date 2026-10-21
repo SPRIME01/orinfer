@@ -40,6 +40,13 @@ pub struct AudioSpec {
     pub feature_index: String,
     pub positions: String,
     pub token_id: u32,
+    /// Per-window valid lengths permit packing independent recordings.
+    /// Zero uses the original single-recording length buffer.
+    #[serde(default, skip_serializing_if = "zero")]
+    pub window_size: usize,
+}
+fn zero(n: &usize) -> bool {
+    *n == 0
 }
 impl AudioSpec {
     pub fn validate(&self, m: &Manifest) -> Result<()> {
@@ -47,6 +54,7 @@ impl AudioSpec {
             || self.max_features != 15600
             || self.stem_chunks != 32
             || self.token_id != 151676
+            || ![0, 104].contains(&self.window_size)
         {
             return Err("Unsupported ASR feature contract".into());
         }
@@ -74,7 +82,15 @@ impl AudioSpec {
             ),
             (&self.feature_index, Dtype::I32, vec![m.max_context]),
             (&self.positions, Dtype::I32, vec![m.max_context, 3]),
-            (&self.length, Dtype::I32, vec![1]),
+            (
+                &self.length,
+                Dtype::I32,
+                vec![if self.window_size == 0 {
+                    1
+                } else {
+                    self.max_features.div_ceil(self.window_size)
+                }],
+            ),
         ] {
             if m.buffers.iter().find(|b| &b.name == name).is_none_or(|b| {
                 b.dtype != dtype
@@ -136,6 +152,7 @@ mod tests {
             feature_index: "index".into(),
             positions: "positions".into(),
             token_id: 151676,
+            window_size: 0,
         }
     }
     #[test]

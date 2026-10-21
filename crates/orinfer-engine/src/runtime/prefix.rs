@@ -10,6 +10,16 @@ pub(super) struct Context {
     pub statistics: crate::prefix::Statistics,
 }
 
+fn hash_floats(hash: &mut Sha256, values: &[f32]) {
+    let (chunks, tail) = values.as_chunks::<256>();
+    for chunk in chunks {
+        hash.update(chunk.map(f32::to_le_bytes).as_flattened());
+    }
+    for value in tail {
+        hash.update(value.to_le_bytes());
+    }
+}
+
 impl ModelRuntime {
     pub(crate) fn prefix_media(
         &self,
@@ -35,9 +45,7 @@ impl ModelRuntime {
             let mut hash = Sha256::new();
             hash.update((image.grid_height as u64).to_le_bytes());
             hash.update((image.grid_width as u64).to_le_bytes());
-            for pixel in &image.pixels {
-                hash.update(pixel.to_bits().to_le_bytes());
-            }
+            hash_floats(&mut hash, &image.pixels);
             media.push((start, hash.finalize().into()));
             cursor = start
                 .checked_add(v.feature_count(image)?)
@@ -62,9 +70,7 @@ impl ModelRuntime {
                 .ok_or("Missing audio marker")?;
             let mut hash = Sha256::new();
             hash.update((audio.frames as u64).to_le_bytes());
-            for value in &audio.mel {
-                hash.update(value.to_bits().to_le_bytes());
-            }
+            hash_floats(&mut hash, &audio.mel);
             media.push((start, hash.finalize().into()));
             cursor = start
                 .checked_add(features)
@@ -419,5 +425,27 @@ impl ModelRuntime {
         }
         context.kv.clear();
         self.execution.collect_snapshots()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_hash_preserves_little_endian_float_bits_and_tails() {
+        let values: Vec<_> = (0..1025u32)
+            .map(|i| f32::from_bits(i.wrapping_mul(1664525)))
+            .chain([0., -0., f32::INFINITY, f32::from_bits(0x7fc00001)])
+            .collect();
+        for n in [0, 1, 255, 256, 257, 1025, values.len()] {
+            let mut expected = Sha256::new();
+            for value in &values[..n] {
+                expected.update(value.to_bits().to_le_bytes());
+            }
+            let mut actual = Sha256::new();
+            hash_floats(&mut actual, &values[..n]);
+            assert_eq!(actual.finalize(), expected.finalize());
+        }
     }
 }

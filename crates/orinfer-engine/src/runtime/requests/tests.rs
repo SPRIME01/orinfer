@@ -1,3 +1,4 @@
+mod audio;
 mod auto_speculation;
 mod benchmark;
 mod decode_quality;

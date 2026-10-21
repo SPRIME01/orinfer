@@ -54,6 +54,63 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_joined_integer_banks_preserve_output_rows_scales_and_layout(self):
+        from tools.model.publication import file_hash
+        from tools.model.safetensors_source import local_header
+
+        for codec in ("int8", "packed"):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "source"
+                source.mkdir()
+                values = {}
+                for i, rows in enumerate([4, 2, 2]):
+                    dtype = np.int8 if codec == "int8" else np.uint32
+                    values[f"p{i}.{codec}"] = np.arange(
+                        rows * (256 if codec == "int8" else 32), dtype=dtype
+                    ).reshape(rows, -1)
+                    values[f"p{i}.scale"] = np.full(rows, (i + 1) * 0.01, np.float16)
+                shard = source / "weights.safetensors"
+                save_file(
+                    values,
+                    str(shard),
+                    metadata={
+                        f"orin.layout.{n}": "e8p-q4-row-u32"
+                        if n.endswith("packed")
+                        else "native_contiguous"
+                        for n in values
+                    },
+                )
+                (source / "model.safetensors.index.json").write_text(
+                    json.dumps(
+                        dict(
+                            metadata={"orinfer.sha256": {shard.name: file_hash(shard)}},
+                            weight_map={n: shard.name for n in values},
+                        )
+                    )
+                )
+                weights = Weights(source, root / "model", packed_k=128)
+                weights.combined_projection("joined", ["p0", "p1", "p2"])
+                actual = weights.array(f"joined.{codec}")
+                if codec == "packed":
+                    actual = actual.transpose(1, 0, 2).reshape(8, 32)
+                np.testing.assert_array_equal(
+                    actual, np.concatenate([values[f"p{i}.{codec}"] for i in range(3)])
+                )
+                np.testing.assert_array_equal(
+                    weights.array("joined.scale"),
+                    np.concatenate([values[f"p{i}.scale"] for i in range(3)]),
+                )
+                weights.finish()
+                _, header = local_header(root / "model/cache/weights/runtime.safetensors")
+                self.assertEqual(
+                    set(header) - {"__metadata__"}, {f"joined.{codec}", "joined.scale"}
+                )
+                self.assertEqual(
+                    header["__metadata__"][f"orin.layout.joined.{codec}"],
+                    "e8p-q4-k128-u32" if codec == "packed" else "native_contiguous",
+                )
+
     def test_rotation_projects_quantization_choices_without_register_parameters(self):
         def rotate(*args, **kwargs):
             return args, kwargs
@@ -412,7 +469,7 @@ class BuildTests(unittest.TestCase):
     def test_tied_head_binds_the_shared_compressed_weight(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(
-            immutable=lambda n: n, packed_k=128, index={"weight_map": {}}
+            immutable=lambda n: n, packed_k=128, index={"weight_map": {}}, buffers={}
         )
         builder.q4_codec, builder.book = "e8p_q4", "book"
         launches = []
@@ -564,7 +621,7 @@ class BuildTests(unittest.TestCase):
     def test_projection_bounds_measured_choices_and_preserves_exact_aot(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(
-            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
         builder.q4_codec = "e8p_q4"
         builder.book = "selectors"
@@ -594,7 +651,7 @@ class BuildTests(unittest.TestCase):
     def test_equivalent_projection_strides_share_the_compiled_identity(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(
-            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
         builder.q4_codec, builder.book = "e8p_q4", "selectors"
         keys = []
@@ -609,7 +666,7 @@ class BuildTests(unittest.TestCase):
     def test_bounded_tuning_is_shared_across_layer_weights_but_not_strides(self):
         builder = Builder.__new__(Builder)
         builder.weights = SimpleNamespace(
-            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}
+            immutable=lambda name: name, packed_k=128, index={"weight_map": {}}, buffers={}
         )
         builder.q4_codec, builder.book, builder.lock = "e8p_q4", "selectors", None
         builder.emit = lambda *args, **kwargs: None

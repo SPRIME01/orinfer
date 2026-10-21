@@ -152,8 +152,25 @@ fn score_batched_decode_histories() {
                 .unwrap()
         })
         .collect();
-    for request in &mut requests {
-        prefill_reference(&mut model, request);
+    if fixture["joint_prefill"].as_bool() == Some(true) {
+        let selected: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (i, r.input.len()))
+            .collect();
+        assert!(
+            selected.iter().map(|(_, n)| n).sum::<usize>()
+                <= model.manifest.batch_layout.as_ref().unwrap().segment_tokens
+        );
+        let mut active: Vec<_> = requests.iter_mut().collect();
+        model.prepare_audio_cohorts(&mut active).unwrap();
+        model
+            .execute_batch_selected(&mut active, &selected, &mut vec![], &mut || {})
+            .unwrap();
+    } else {
+        for request in &mut requests {
+            prefill_reference(&mut model, request);
+        }
     }
     let mut probes = vec![];
     for position in 0..steps {

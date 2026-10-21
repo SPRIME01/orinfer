@@ -1,11 +1,24 @@
 """Owner KV bindings must survive prefill implementation selection."""
 
 import unittest
+import re
+from pathlib import Path
 
 from tools.model.qwen35.parallel import attention_pointers
 
 
 class AttentionPointersTests(unittest.TestCase):
+    def test_packet_column_order_matches_native_pointer_table(self):
+        from tools.model.qwen35.packet import COLUMNS
+
+        source = (
+            Path(__file__).resolve().parents[3] / "crates/orinfer-models/src/qwen3_5/rows.rs"
+        ).read_text()
+        declaration = re.search(r"const PACKET_COLUMNS: &\[&str\] = &\[(.*?)\];", source, re.S)
+        self.assertIsNotNone(declaration)
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', declaration[1])), COLUMNS)
+        self.assertEqual(len(COLUMNS), len(set(COLUMNS)))
+
     def test_staged_prefill_cannot_replace_owner_int8_kv(self):
         staged = dict(K="decoded-key", V="decoded-value", live_k="decoded-key", Q="query")
         for aliases in (False, True):

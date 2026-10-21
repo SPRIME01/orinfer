@@ -2,8 +2,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use orinfer_engine::audio::{AudioInput, AudioSpec};
 use rubato::{
-    Async, FixedAsync, Resampler, SincInterpolationParameters, WindowFunction,
-    audioadapter_buffers::direct::InterleavedSlice,
+    Fft, FixedSync, Resampler, WindowFunction, audioadapter_buffers::direct::InterleavedSlice,
 };
 use serde_json::{Value, json};
 use std::io::Cursor;
@@ -89,13 +88,16 @@ pub(super) fn decode(
         return Err("Audio contains invalid PCM samples".into());
     }
     if rate != 16000 {
-        let mut resampler = Async::<f32>::new_sinc(
-            16000.0 / rate as f64,
-            1.0,
-            &SincInterpolationParameters::new(256, WindowFunction::BlackmanHarris2),
+        // Files have one fixed sample-rate ratio. Rubato's FFT resampler
+        // preserves anti-aliasing and trims its delay in process_all.
+        let mut resampler = Fft::<f32>::new_custom(
+            rate as usize,
+            16000,
             1024,
             1,
-            FixedAsync::Input,
+            1,
+            WindowFunction::BlackmanHarris2,
+            FixedSync::Both,
         )
         .map_err(|e| format!("Audio resampler: {e}"))?;
         let buffer =
@@ -142,7 +144,8 @@ pub(super) fn messages(
                         .decode(data)
                         .map_err(|e| format!("Audio base64: {e}"))?;
                     let pcm = decode(raw, format, preparation)?;
-                    preparation.checkpoint(pcm.len() * 4 + 128 * (pcm.len() / 160 + 100) * 4)?;
+                    // Frame groups and final mel coexist during bounded reassembly.
+                    preparation.checkpoint(pcm.len() * 4 + 128 * (pcm.len() / 160 + 100) * 8)?;
                     let input =
                         orinfer_engine::audio::log_mel(&pcm, &|| preparation.checkpoint(0))?;
                     input.features()?;
@@ -385,6 +388,48 @@ mod tests {
         data
     }
     #[test]
+    #[ignore = "Real audio CPU frontend timings; requires ORINFER_AUDIO_CPU_FIXTURE"]
+    fn profile_cpu_frontend() {
+        let fixture: Value = serde_json::from_slice(
+            &std::fs::read(std::env::var("ORINFER_AUDIO_CPU_FIXTURE").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let output = std::path::Path::new(fixture["output"].as_str().unwrap());
+        assert!(!output.exists());
+        let mut rows = vec![];
+        for case in fixture["cases"].as_array().unwrap() {
+            let path = std::path::Path::new(case.as_str().unwrap());
+            let bytes = std::fs::read(path).unwrap();
+            let mut decode_ms = vec![];
+            let mut mel_ms = vec![];
+            for iteration in 0..8 {
+                let start = std::time::Instant::now();
+                let samples = decode(
+                    bytes.clone(),
+                    path.extension().unwrap().to_str().unwrap(),
+                    &super::super::preparation::Context::unbounded(),
+                )
+                .unwrap();
+                let decoded = start.elapsed().as_secs_f64() * 1000.;
+                let start = std::time::Instant::now();
+                let input = orinfer_engine::audio::log_mel(&samples, &|| Ok(())).unwrap();
+                std::hint::black_box(input);
+                if iteration > 0 {
+                    decode_ms.push(decoded);
+                    mel_ms.push(start.elapsed().as_secs_f64() * 1000.);
+                }
+            }
+            decode_ms.sort_by(f64::total_cmp);
+            mel_ms.sort_by(f64::total_cmp);
+            rows.push(
+                json!({"path":path,"decode_resample_median_ms":decode_ms[decode_ms.len()/2],
+                "log_mel_median_ms":mel_ms[mel_ms.len()/2]}),
+            );
+        }
+        std::fs::write(output, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+    }
+
+    #[test]
     fn decoder_downmixes_and_resamples_with_preserved_duration() {
         let mut pcm = vec![];
         for _ in 0..4410 {
@@ -411,6 +456,62 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn resampling_preserves_time_alignment_and_rejects_aliases() {
+        let decode_pcm = |rate, samples: &[i16]| {
+            decode(
+                wav(rate, 1, samples),
+                "wav",
+                &super::super::preparation::Context::unbounded(),
+            )
+            .unwrap()
+        };
+        for rate in [8000_u32, 22050, 44100, 48000, 96000, 192000] {
+            let mut impulse = vec![0_i16; rate as usize / 10];
+            impulse[rate as usize / 20] = 16000;
+            let output = decode_pcm(rate, &impulse);
+            assert_eq!(output.len(), 1600);
+            let peak = output
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap()
+                .0;
+            assert!(peak.abs_diff(800) <= 1, "rate={rate} peak={peak}");
+            for frequency in [1000., 12000.] {
+                if frequency >= rate as f64 / 2. {
+                    continue;
+                }
+                let input: Vec<_> = (0..rate / 2)
+                    .map(|i| {
+                        (8000. * (std::f64::consts::TAU * frequency * i as f64 / rate as f64).sin())
+                            as i16
+                    })
+                    .collect();
+                let output = decode_pcm(rate, &input);
+                assert_eq!(output.len(), 8000);
+                let energy = output[512..7488]
+                    .iter()
+                    .map(|v| f64::from(*v).powi(2))
+                    .sum::<f64>()
+                    / 6976.;
+                if frequency == 1000. {
+                    let expected = (8000. / 32768_f64).powi(2) / 2.;
+                    assert!(
+                        (energy / expected - 1.).abs() < 0.01,
+                        "rate={rate} passband energy={energy}"
+                    );
+                } else {
+                    assert!(
+                        energy.sqrt() < 0.0005,
+                        "rate={rate} aliased RMS={}",
+                        energy.sqrt()
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn language_hints_use_model_names() {
         assert_eq!(language("zh").unwrap(), "Chinese");

@@ -5,6 +5,7 @@ from tools.model.compile import primitive
 from kernels.audio import encoder as audio
 from kernels.vision import encoder as common
 from kernels.vision.features import overlay
+from tools.model.qwen_asr.tuning import select
 
 CHUNKS = 32
 FEATURES = 15600
@@ -14,9 +15,9 @@ def build(b):
     w = b.weights
     for name, dtype, shape, scope in [
         ("AudioMel", "f16", [CHUNKS, 128, 100], "workspace"),
-        ("AudioConv1", "f16", [CHUNKS, 480, 64, 50], "workspace"),
-        ("AudioConv2", "f16", [CHUNKS, 480, 32, 25], "workspace"),
-        ("AudioConv3", "f16", [CHUNKS, 480, 16, 13], "workspace"),
+        ("AudioConv1", "f16", [CHUNKS, 64, 50, 480], "workspace"),
+        ("AudioConv2", "f16", [CHUNKS, 32, 25, 480], "workspace"),
+        ("AudioConv3", "f16", [CHUNKS, 16, 13, 480], "workspace"),
         ("AudioFlat", "f16", [CHUNKS * 13, 7680], "workspace"),
         ("AudioStem", "f16", [CHUNKS * 13, 1024], "workspace"),
         ("AudioHidden", "f16", [FEATURES, 1024], "workspace"),
@@ -29,7 +30,7 @@ def build(b):
         ("AudioProjection", "f16", [FEATURES, 1024], "workspace"),
         ("AudioFFN", "f16", [FEATURES, 4096], "workspace"),
         ("AudioOutput", "f16", [FEATURES, 2048], "workspace"),
-        ("AudioLength", "i32", [1], "workspace"),
+        ("AudioLength", "i32", [FEATURES // 104], "workspace"),
         ("AudioFeatures", "f16", [FEATURES, 2048], "sequence"),
         ("AudioFeatureIndex", "i32", [b.context], "sequence"),
     ]:
@@ -57,10 +58,18 @@ def build(b):
         emit(
             f"stem/conv{i}",
             f"conv-{channels}-{height}-{width}",
-            lambda channels=channels, height=height, width=width: primitive(
-                audio.convolution, channels, height, width
+            lambda channels=channels, height=height, width=width: select(
+                b.row_tuner, convolution=(channels, height, width)
             ),
-            dict(X=src, W=weight(p + ".weight"), Bias=weight(p + ".bias"), Y=f"AudioConv{i}"),
+            dict(
+                X=src,
+                W=w.constant(
+                    p + ".weight.runtime",
+                    w.array(p + ".weight").transpose(0, 2, 3, 1).astype(np.float16),
+                ),
+                Bias=weight(p + ".bias"),
+                Y=f"AudioConv{i}",
+            ),
             CHUNKS,
         )
     emit(
@@ -74,7 +83,7 @@ def build(b):
     emit(
         "stem/out",
         "conv-out",
-        lambda: primitive(common.linear, 1024, 7680),
+        lambda: select(b.row_tuner, outputs=1024, inputs=7680),
         dict(
             X="AudioFlat", W=weight("model.audio_tower.conv_out.weight"), Bias=zero, Y="AudioStem"
         ),
@@ -108,7 +117,7 @@ def build(b):
         emit(
             name,
             f"linear-{n}-{k}-{activation}",
-            lambda: primitive(common.linear, n, k, activation),
+            lambda: select(b.row_tuner, outputs=n, inputs=k, activation=activation),
             dict(X=source, W=weight(prefix + ".weight"), Bias=weight(prefix + ".bias"), Y=target),
         )
 
@@ -133,7 +142,7 @@ def build(b):
         emit(
             s + "qkv",
             "linear-3072-1024-none",
-            lambda: primitive(common.linear, 3072, 1024),
+            lambda: select(b.row_tuner, outputs=3072, inputs=1024),
             dict(X="AudioNorm", W=qw, Bias=qb, Y="AudioQKV"),
         )
         emit(
@@ -144,8 +153,8 @@ def build(b):
         )
         emit(
             s + "attention",
-            "window-attention-104",
-            lambda: primitive(common.attention, 1024, 16, window=104),
+            "window-attention-104-packed",
+            lambda: primitive(common.attention, 1024, 16, window=104, windowed_lengths=True),
             dict(Q="AudioQ", K="AudioK", V="AudioV", Length="AudioLength", Y="AudioAttention"),
         )
         dense(s + "out", 1024, 1024, "AudioAttention", "AudioProjection", p + ".self_attn.out_proj")
@@ -193,4 +202,5 @@ def build(b):
         feature_index="AudioFeatureIndex",
         positions="MRopePositions",
         token_id=151676,
+        window_size=104,
     )

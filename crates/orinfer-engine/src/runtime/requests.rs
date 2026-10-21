@@ -53,6 +53,7 @@ pub struct RequestState {
     decoder: crate::sampling::Decoder,
     cache_prompt: bool,
     cache_generated: bool,
+    pending_audio: Vec<crate::audio::AudioInput>,
 }
 impl Drop for RequestState {
     fn drop(&mut self) {
@@ -570,7 +571,7 @@ impl ModelRuntime {
             self.execution
                 .reset_sequence_reusing_pages(&self.manifest.reset_buffers)?;
             self.prepare_visual_capacity(&input.input_tokens, &input.images, context, cancelled)?;
-            self.prepare_audio_capacity(&input.input_tokens, &input.audios, context, cancelled)?;
+            self.prepare_audio_metadata(&input.input_tokens, &input.audios, context)?;
             let media = self.prefix_media(&input.input_tokens, &input.images, &input.audios)?;
             let mut prefix = super::prefix::Context::default();
             let (offset, mut warm) =
@@ -655,9 +656,16 @@ impl ModelRuntime {
                 decoder: Default::default(),
                 cache_prompt: true,
                 cache_generated: true,
+                pending_audio: if offset < prompt_len {
+                    input.audios
+                } else {
+                    vec![]
+                },
             })
         })();
-        if let Ok(req) = &result {
+        if let Ok(req) = &result
+            && req.pending_audio.is_empty()
+        {
             self.startup_costs
                 .entry(Self::startup_key(
                     image_work,
@@ -681,6 +689,107 @@ impl ModelRuntime {
             self.scheduler_statistics.prefix_restore_s += request.prefix.statistics.restore_s;
         }
         result
+    }
+    fn prepare_pending_audio(&mut self, req: &mut RequestState) -> Result<()> {
+        if req.pending_audio.is_empty() {
+            return Ok(());
+        }
+        let work = req.pending_audio.iter().try_fold(0usize, |n, a| {
+            n.checked_add(a.features()?)
+                .ok_or("Audio work overflow".to_string())
+        })?;
+        let began = Instant::now();
+        self.execution.activate_sequence(req.slot)?;
+        self.prepare_audio_capacity(
+            &req.input,
+            &req.pending_audio,
+            self.reserved_requests[&req.slot].context,
+            &|| false,
+        )?;
+        let seconds = began.elapsed().as_secs_f64();
+        self.startup_costs
+            .entry(Self::startup_key(
+                work,
+                req.input.len(),
+                req.prefix.statistics.cached_tokens > 0,
+            ))
+            .or_default()
+            .observe(seconds);
+        self.scheduler_statistics.request_start_s += seconds;
+        req.pending_audio.clear();
+        Ok(())
+    }
+    fn prepare_audio_cohorts(&mut self, requests: &mut [&mut RequestState]) -> Result<()> {
+        let Some(a) = self.manifest.audio.as_ref().filter(|a| a.window_size > 0) else {
+            for req in requests {
+                self.prepare_pending_audio(req)?;
+            }
+            return Ok(());
+        };
+        let (window, capacity) = (a.window_size, a.max_features);
+        let mut cohorts = vec![];
+        let mut cohort = vec![];
+        let mut rows = 0usize;
+        for (i, req) in requests.iter().enumerate() {
+            if let Some(input) = req.pending_audio.first() {
+                let features = input.features()?;
+                if rows.div_ceil(window) * window + features > capacity {
+                    cohorts.push(std::mem::take(&mut cohort));
+                    rows = 0;
+                }
+                rows = rows.div_ceil(window) * window + features;
+                cohort.push((i, features));
+            }
+        }
+        if !cohort.is_empty() {
+            cohorts.push(cohort);
+        }
+        for cohort in cohorts {
+            let began = Instant::now();
+            self.encode_audio_cohort(
+                &cohort
+                    .iter()
+                    .map(|&(i, _)| (requests[i].slot, &requests[i].pending_audio[0]))
+                    .collect::<Vec<_>>(),
+            )?;
+            let seconds = began.elapsed().as_secs_f64();
+            self.scheduler_statistics.request_start_s += seconds;
+            for (i, features) in cohort {
+                let req = &mut requests[i];
+                // Keep a conservative bound for admission alongside decoders;
+                // a packed encoder is indivisible at this scheduling point.
+                self.startup_costs
+                    .entry(Self::startup_key(
+                        features,
+                        req.input.len(),
+                        req.prefix.statistics.cached_tokens > 0,
+                    ))
+                    .or_default()
+                    .observe(seconds);
+                req.pending_audio.clear();
+            }
+        }
+        Ok(())
+    }
+    fn prepare_selected_audio(
+        &mut self,
+        requests: &mut [&mut RequestState],
+        selected: &[(usize, usize)],
+    ) -> Result<()> {
+        if selected
+            .iter()
+            .all(|&(i, _)| requests[i].pending_audio.is_empty())
+        {
+            return Ok(());
+        }
+        let owners: BTreeSet<_> = selected.iter().map(|&(i, _)| i).collect();
+        let mut active: Vec<_> = requests
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, req)| owners.contains(i) && !req.pending_audio.is_empty())
+            .map(|(_, req)| &mut **req)
+            .collect();
+        self.prepare_audio_cohorts(&mut active)
     }
     fn with_request<T>(
         &mut self,
@@ -804,6 +913,7 @@ impl ModelRuntime {
         if chunk == 0 || chunk > remaining {
             return Err("Invalid selected prefill extent".into());
         }
+        self.prepare_pending_audio(req)?;
         let plan = self.manifest.prefill_plan(chunk);
         if chunk != 1 && plan.is_none() {
             return Err("Missing selected prefill shape".into());
@@ -1118,6 +1228,9 @@ impl ModelRuntime {
         if requests.is_empty() {
             return Ok(vec![]);
         }
+        // Encoder work follows the selected text packet. Encoding every admitted
+        // recording here would delay existing decoders and the first prompt
+        // behind media that cannot fit in this iteration's token budget.
         self.trim_request_cache(options, 0, 0)?;
         self.scheduler_statistics.iterations += 1;
         let at = Instant::now();
@@ -1144,6 +1257,21 @@ impl ModelRuntime {
         let feedback_stats = self.execution.batch_statistics.get();
         self.maintain_lazy_drafts(requests)?;
         let prefill_work = self.select_work(requests, options, &initialized)?;
+        let media_at = Instant::now();
+        match &prefill_work {
+            Work::Prefill(i, tokens, ..) => {
+                self.prepare_selected_audio(requests, &[(*i, *tokens)])?;
+            }
+            Work::Batch(selected) | Work::MixedSpeculative(selected) => {
+                self.prepare_selected_audio(requests, selected)?;
+            }
+            _ => {}
+        }
+        // Media startup is accounted independently. Text-packet observations
+        // must compare the same work for native and joint execution.
+        let media_time = media_at.elapsed();
+        let at = at + media_time;
+        let feedback_at = feedback_at + media_time;
         let feedback = self.speculation_feedback(requests, &prefill_work);
         let does_prefill = match &prefill_work {
             Work::Prefill(..) => true,
@@ -1644,6 +1772,7 @@ impl ModelRuntime {
             && selected[0].1 == 1
             && (requests[selected[0].0].prefilling || !self.manifest.batch_profiles.contains(&1))
         {
+            self.prepare_selected_audio(requests, selected)?;
             let at = Instant::now();
             let key = Self::iteration_key(requests, selected);
             let capture_before = self.execution.batch_statistics.get().sequence_capture_s;
@@ -1831,6 +1960,7 @@ impl ModelRuntime {
         requests: &mut [&mut RequestState],
         selected: &[(usize, usize)],
     ) -> Result<Vec<BatchSegment>> {
+        self.prepare_selected_audio(requests, selected)?;
         self.execution.prepare_batch_workspace()?;
         let segments: Vec<_> = selected
             .iter()
@@ -1842,8 +1972,8 @@ impl ModelRuntime {
         for &(i, chunk) in selected {
             let req = &mut requests[i];
             if req.prefilling {
-                self.execution.activate_sequence(req.slot)?;
-                self.upload_ids(
+                self.execution.upload_sequence_ids(
+                    req.slot,
                     if chunk == 1 {
                         &self.manifest.token
                     } else {

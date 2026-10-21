@@ -73,6 +73,7 @@ impl ModelRuntime {
         {
             return Err("Invalid resumed prefill extent".into());
         }
+        self.prepare_pending_audio(req)?;
         let at = Instant::now();
         let mut frame = if let Some(frame) = req.prefill_frame.take() {
             frame

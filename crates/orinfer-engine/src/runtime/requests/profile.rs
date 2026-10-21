@@ -253,7 +253,7 @@ fn profile_cached_generation() {
             let mut request = model
                 .start_request(
                     GenerationInput {
-                        audios: vec![],
+                        audios: source.audios.clone(),
                         input_tokens: source.input_tokens.clone(),
                         images: source.images.clone(),
                         max_new_tokens: source.max_new_tokens,
@@ -741,16 +741,25 @@ fn profile_prefill_stages() {
         // Materialize the exact context and its KV/workspace before profiling.
         // Replays reset only the target position; they are timing diagnostics,
         // not a comparison of the recurrent state or generated text.
-        model
-            .generate(
-                &source.input_tokens,
-                None,
-                1,
-                &source.sampling,
-                || false,
-                |_| false,
+        let mut request = model
+            .start_request(
+                GenerationInput {
+                    input_tokens: source.input_tokens.clone(),
+                    images: source.images.clone(),
+                    audios: source.audios.clone(),
+                    max_new_tokens: 1,
+                    sampling: source.sampling.clone(),
+                    prefix_hints: vec![],
+                },
+                &|| false,
             )
             .unwrap();
+        while request.prefilling {
+            model
+                .advance_requests(&mut [&mut request], &scheduler::Options::default())
+                .unwrap();
+        }
+        model.execution.activate_sequence(request.slot).unwrap();
         model
             .upload_ids(&model.manifest.input, &source.input_tokens[base..])
             .unwrap();
@@ -766,7 +775,7 @@ fn profile_prefill_stages() {
             .unwrap();
         model
             .execution
-            .ensure_sequence_program(0, &program)
+            .ensure_sequence_program(request.slot, &program)
             .unwrap();
         let plan = row_invocations(&model, &program, chunk).unwrap();
         if fixture["ncu"].as_bool() == Some(true) {
@@ -777,6 +786,7 @@ fn profile_prefill_stages() {
                 serde_json::to_vec_pretty(&json!({"rows":rows})).unwrap(),
             )
             .unwrap();
+            model.finish_request(&mut request, false).unwrap();
             continue;
         }
         let stream = fixture["stream"].as_bool() == Some(true);
@@ -809,6 +819,7 @@ fn profile_prefill_stages() {
             "gpu_group_median_ms":groups.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>() }));
         std::fs::write(&output,serde_json::to_vec_pretty(&json!({"rows":rows,"fingerprint":model.stats.manifest_sha256,
             "scope":"Last real-model prefill chunk at fixed target position; three instrumented trials after warm-up; event boundaries include any stream launch gaps in stream mode; head excluded. Recurrent state advances between replays. Diagnostic only, not end-to-end TPS or quality acceptance."})).unwrap()).unwrap();
+        model.finish_request(&mut request, false).unwrap();
     }
 }
 
@@ -961,6 +972,168 @@ fn profile_vision_stages() {
 }
 
 #[test]
+#[ignore = "Real joint audio/prefill stages; requires exclusive GPU experiment lock"]
+fn profile_joint_prefill_stages() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let mut requests: Vec<_> = sources
+        .into_iter()
+        .map(|source| model.start_request(source, &|| false).unwrap())
+        .collect();
+    let began = Instant::now();
+    model
+        .prepare_audio_cohorts(&mut requests.iter_mut().collect::<Vec<_>>())
+        .unwrap();
+    let audio_ms = began.elapsed().as_secs_f64() * 1000.;
+    let capacity = model.manifest.batch_layout.as_ref().unwrap().segment_tokens;
+    let mut remaining = capacity;
+    let selected: Vec<_> = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            let count = remaining.min(r.input.len());
+            remaining -= count;
+            (count > 0).then_some((i, count))
+        })
+        .collect();
+    let began = Instant::now();
+    let segments = model
+        .prepare_batch_inputs(&mut requests.iter_mut().collect::<Vec<_>>(), &selected)
+        .unwrap();
+    let prepare_ms = began.elapsed().as_secs_f64() * 1000.;
+    // Repeat the same causal positions. Production packets advance each owner
+    // by its segment length; retaining that commit in a microbenchmark would
+    // change the context and eventually exceed the prepared KV mappings.
+    let mut plan = model.model_package.batch_plan(&segments).unwrap();
+    plan.retain(|call| {
+        !matches!(&call.operation,
+        crate::model::Operation::Kernel { name } if name == "qwen_rows/end/advance")
+    });
+    let mut result = json!({"audio_ms":audio_ms,"prepare_ms":prepare_ms,
+        "segments":segments.iter().map(|s|json!({"slot":s.slot,"tokens":s.tokens})).collect::<Vec<_>>(),"operations":plan,
+        "scope":"Real uncached recordings encoded as a cohort, followed by a native joint prefill packet. Position commits are excluded so replays overwrite the same causal positions; diagnostics are discarded."});
+    if fixture["ncu"].as_bool() == Some(true) {
+        profile_native_ncu(&mut model, &plan);
+    } else {
+        let hot = model.execution.profile_invocations_hot(&plan, 8).unwrap();
+        // Bound external-event nodes per diagnostic graph; the Jetson driver
+        // cannot replay thousands of external events in one graph reliably.
+        let mut trials = vec![vec![]; 3];
+        for chunk in plan.chunks(256) {
+            let times = model.execution.profile_graph_operations(chunk).unwrap();
+            for (trial, values) in trials.iter_mut().zip(times) {
+                trial.extend(values);
+            }
+        }
+        result["hot_graph_median_ms"] = json!(median(
+            &hot[1..].iter().map(|&v| f64::from(v)).collect::<Vec<_>>()
+        ));
+        result["operation_median_ms"] = json!(
+            (0..plan.len())
+                .map(|i| median(&trials.iter().map(|t| f64::from(t[i])).collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        );
+    }
+    for request in &mut requests {
+        model.finish_request(request, false).unwrap();
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "Real audio encoder stages; requires exclusive GPU experiment lock"]
+fn profile_audio_stages() {
+    let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
+        std::env::var("ORINFER_BATCH_FIXTURE").unwrap(),
+    ))
+    .unwrap();
+    let output = std::path::PathBuf::from(fixture["output"].as_str().unwrap());
+    assert!(!output.exists());
+    let sources: Vec<GenerationInput> = serde_json::from_value(fixture["cases"].clone()).unwrap();
+    let mut model = ModelRuntime::load_with_options(
+        std::path::Path::new(fixture["model"].as_str().unwrap()),
+        LoadOptions {
+            cuda_graph: crate::execution::CudaGraphMode::DecodeOnly,
+            prefix_cache_bytes: 0,
+            mtp_drafts: Some(0),
+            ..LoadOptions::default()
+        },
+    )
+    .unwrap();
+    let a = model.manifest.audio.clone().unwrap();
+    let mut rows = vec![];
+    for (case, source) in sources.iter().enumerate() {
+        let input = &source.audios[0];
+        let features = input.features().unwrap();
+        let started = Instant::now();
+        model.prepare_audio_stem(input, &|| false).unwrap();
+        let stem_ms = started.elapsed().as_secs_f64() * 1000.;
+        // The sequence feature buffer is unused in this encoder diagnostic.
+        // Keep the real CNN output there, and restore it before every replay.
+        let bytes = features * 1024 * 2;
+        model
+            .execution
+            .copy_range(&a.encoder_input, &a.features, 0, bytes)
+            .unwrap();
+        let lengths: Vec<u32> = if a.window_size == 0 {
+            vec![features as u32]
+        } else {
+            (0..features)
+                .step_by(a.window_size)
+                .map(|i| (features - i).min(a.window_size) as u32)
+                .collect()
+        };
+        model.upload_ids(&a.length, &lengths).unwrap();
+        for (program, count) in [
+            ("audio_stem", input.frames.div_ceil(100).min(a.stem_chunks)),
+            ("audio_encoder", features),
+        ] {
+            let mut plan = row_invocations(&model, program, count).unwrap();
+            if program == "audio_encoder" {
+                plan.insert(
+                    0,
+                    Invocation {
+                        operation: crate::model::Operation::Copy {
+                            source: a.features.clone(),
+                            destination: a.encoder_input.clone(),
+                            bytes,
+                        },
+                        sequence: None,
+                        launch: None,
+                        views: BTreeMap::new(),
+                    },
+                );
+            }
+            if fixture["ncu"].as_bool() == Some(true) {
+                profile_native_ncu(&mut model, &plan);
+            } else {
+                let hot = model.execution.profile_invocations_hot(&plan, 8).unwrap();
+                let trials = model.execution.profile_graph_operations(&plan).unwrap();
+                rows.push(json!({"case":case,"frames":input.frames,"features":features,"program":program,"count":count,"stem_wall_ms":stem_ms,
+                    "hot_graph_median_ms":median(&hot[1..].iter().map(|&v|f64::from(v)).collect::<Vec<_>>()),
+                    "operations":plan,"operation_median_ms":(0..plan.len()).map(|i|median(&trials.iter().map(|t|f64::from(t[i])).collect::<Vec<_>>())).collect::<Vec<_>>() }));
+            }
+        }
+        std::fs::write(&output, serde_json::to_vec_pretty(&json!({"rows":rows,"scope":"CUDA graph diagnostic with real audio features and reset encoder input; excludes frontend and text generation."})).unwrap()).unwrap();
+    }
+}
+
+#[test]
 #[ignore = "Full native decode plan; requires real model and exclusive GPU experiment lock"]
 fn profile_decode_chain() {
     let fixture: serde_json::Value = crate::model::read(&std::path::PathBuf::from(
@@ -1069,9 +1242,9 @@ fn profile_continuous_decode() {
                 model
                     .start_request(
                         GenerationInput {
-                            audios: vec![],
+                            audios: source.audios.clone(),
                             input_tokens: source.input_tokens.clone(),
-                            images: vec![],
+                            images: source.images.clone(),
                             max_new_tokens: 160,
                             sampling: source.sampling.clone(),
                             prefix_hints: vec![],
@@ -1203,6 +1376,17 @@ fn profile_continuous_decode() {
             .into_iter()
             .map(f64::from)
             .collect();
+        if fixture["hot_only"].as_bool() == Some(true) {
+            rows.push(json!({"batch":count,"iterations":iterations,
+                "wall_median_ms":median(&walls),
+                "target_tokens_per_second":count as f64*1000./(walls.iter().sum::<f64>()/walls.len() as f64),
+                "phases_median_ms":phases.iter().map(|(k,v)|(k.clone(),median(v))).collect::<BTreeMap<_,_>>(),
+                "hot_graph_gpu_median_ms":median(&gpu),"operations":plan}));
+            for request in &mut requests {
+                model.finish_request(request, false).unwrap();
+            }
+            continue;
+        }
         let trials = model.execution.profile_graph_operations(&plan).unwrap();
         let mut groups: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let mut operations = Vec::with_capacity(plan.len());
@@ -1260,7 +1444,10 @@ fn profile_continuous_decode() {
             model.finish_request(request, false).unwrap();
         }
     }
-    if fixture["live_only"].as_bool() == Some(true) || fixture["ncu"].as_bool() == Some(true) {
+    if fixture["live_only"].as_bool() == Some(true)
+        || fixture["ncu"].as_bool() == Some(true)
+        || fixture["hot_only"].as_bool() == Some(true)
+    {
         std::fs::write(&output,serde_json::to_vec_pretty(&json!({"scope":"Live autoregressive iterations; two graph timing events, CPU stage timestamps; diagnostic only.","rows":rows})).unwrap()).unwrap();
     }
 }
