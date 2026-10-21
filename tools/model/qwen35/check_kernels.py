@@ -11,7 +11,7 @@ def run():
     import torch
     from tools.model.projection_tuning import ProjectionTuner, make_prim
     from kernels.model.rotation_a8 import rotate_activation_a8
-    from kernels.model.kv_int8 import attention_prefill_int8
+    from tools.model.attention_reference import attention_prefill_int8
     from tools.quantization.vq import rotate
     from tools.operators.common import SEED
 

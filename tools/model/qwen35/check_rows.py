@@ -282,7 +282,7 @@ def kv_loader_checks():
 def attention_checks(context=1024, kv_length=None):
     import torch
     from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
-    from kernels.model.kv_int8 import attention_prefill_int8
+    from tools.model.attention_reference import attention_prefill_int8
     from tools.model.qwen35.build import primitive
     from tools.operators.common import SEED
 

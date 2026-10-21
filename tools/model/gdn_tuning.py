@@ -4,6 +4,7 @@ import inspect
 import math
 
 from tools.model.row_tuning import launch
+from tools.model.row_selection import aggregate_winner
 
 
 def select(tuner, dense):
@@ -16,9 +17,11 @@ def select(tuner, dense):
 
     hk, hv = tuner.hk, tuner.hv
     configs = [dict(deferred=False)] + [
-        dict(deferred=True, capacity=4, value_tile=vt, threads=threads)
-        for vt, threads in [(16, 64)]
+        dict(deferred=True, capacity=capacity, value_tile=vt, threads=threads)
+        for capacity in (2, 4, 8, 16)
+        for vt, threads in [(16, 64), (32, 128), (64, 256)]
     ]
+    cycles = math.lcm(*(config.get("capacity", 1) for config in configs))
 
     def compile_function(fn, prefetch=False):
         private = {"State", "LogK", "LogD", "LogG", "Count"}
@@ -74,7 +77,7 @@ def select(tuner, dense):
         expected = torch.empty(rows, 1, hv * 128, device="cuda", dtype=torch.float16)
         expected_state = torch.empty_like(initial)
 
-        def runner(compiled, state, out, logs):
+        def runner(compiled, state, out, logs, traces=None):
             kernel, names, columns = compiled
             private = dict(State=state, **logs)
             table = torch.tensor(
@@ -99,12 +102,18 @@ def select(tuner, dense):
                     logs["Count"][:rows].zero_()
                 # Equal complete cycles, including the dense merge. Reset and
                 # state copies are charged identically to both strategies.
-                for _ in range(4):
+                for step in range(cycles):
                     launch(kernel, *args)
+                    if traces is not None:
+                        traces[step].copy_(out[:rows])
 
             return run
 
         run_reference = runner(reference, expected_state, expected, {})
+        expected_traces = torch.empty(
+            (cycles, rows, 1, hv * 128), device="cuda", dtype=torch.float16
+        )
+        reference_trace = runner(reference, expected_state, expected, {}, expected_traces)
 
         def fixture(compiled, config):
             state = torch.full((rows + 1, hv, 128, 128), 91.0, device="cuda")
@@ -112,13 +121,15 @@ def select(tuner, dense):
             logs = {}
             if config["deferred"]:
                 for name, shape, dtype in [
-                    ("LogK", [4, hk, 128], torch.float16),
-                    ("LogD", [4, hv, 128], torch.float32),
-                    ("LogG", [4, hv], torch.float32),
+                    ("LogK", [config["capacity"], hk, 128], torch.float16),
+                    ("LogD", [config["capacity"], hv, 128], torch.float32),
+                    ("LogG", [config["capacity"], hv], torch.float32),
                     ("Count", [hv, 128], torch.int32),
                 ]:
                     logs[name] = torch.full((rows + 1, *shape), 91, device="cuda", dtype=dtype)
             run = runner(compiled or reference, state, out, logs)
+            traces = torch.empty_like(expected_traces)
+            trace = runner(compiled or reference, state, out, logs, traces)
 
             def check():
                 run_reference()
@@ -126,13 +137,18 @@ def select(tuner, dense):
                 assert torch.equal(out[:rows], expected)
                 assert bool(torch.all(state[rows:] == 91)) and bool(torch.all(out[rows:] == 91))
                 assert all(bool(torch.all(value[rows:] == 91)) for value in logs.values())
+                # Validate every pending-log phase outside the timed work.
+                reference_trace()
+                trace()
+                assert torch.equal(traces, expected_traces)
+                assert torch.equal(state[:rows], expected_state)
 
             return run, check, lambda: values["V"].neg_()
 
         yield fixture
 
     result = tuner.select(
-        dict(kind="gdn_state_strategy", key_heads=hk, value_heads=hv, cycles=4, dense=dense),
+        dict(kind="gdn_state_strategy", key_heads=hk, value_heads=hv, cycles=cycles, dense=dense),
         configs,
         build,
         inputs,
@@ -141,11 +157,7 @@ def select(tuner, dense):
     # Logs cannot change representation when batch membership changes. Select
     # one whole strategy by relative geometric mean, retaining the measured
     # dense policy if no log strategy wins across these cohorts.
-    scores = {
-        name: sum(math.log(row["times"][name]) for row in result["measurements"])
-        for name in result["measurements"][0]["times"]
-    }
-    chosen = configs[int(min(scores, key=scores.get))]
+    chosen = configs[int(aggregate_winner(result["measurements"]))]
     if not chosen["deferred"]:
         return dense
     return dict(configs=[chosen], default="0", selections=[])

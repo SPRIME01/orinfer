@@ -57,8 +57,8 @@ fn recipe(tokens: usize) -> Result<Recipe> {
     })
 }
 
-/// Freeze layer boundaries only after every fusion and prerequisite has been
-/// inserted. A stage refers to the exact same operations as the full program.
+/// Freeze layer boundaries after prerequisites are inserted. Later local
+/// fusions update both the full program and its stages to keep them identical.
 pub(super) fn stages(manifest: &mut Manifest, kernels: &[crate::artifact::Kernel]) -> Result<()> {
     let mut registrations = vec![];
     for plan in &mut manifest.prefill_plans {

@@ -30,6 +30,8 @@ bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-buil
 - `compile.py`、`row_contract.py`、`row_selection.py`：动态行工厂、host ABI 合同与离线选择规则。
 - `host_compiler.py`、`build_cache.py`：公共 host ABI 生成与内容缓存；`projection_policy.py`、`projection_tuning.py`：共享整数投影候选与离线测量；`row_convergence.py`：动态 launch 表达式及相邻选择合并。
 - `catalog.py`、`binding_templates.py`：共享编译定义和原生参数模板。
+- `private_rows.py`：普通 decode 与 MTP 共用的请求私有地址表、scratch 布局和动态行包装；各入口保留自己的状态生命周期。
+- `attention_reference.py`：独立 FP32 attention 参考，供离线候选和质量验证使用。
 - `publication.py`、`compact.py`：不可变资产复用、safetensors 合并及原子发布。
 - `package.py`：离线执行包校验、XZ 归档、发布工具内部安装及前端资源固定；部署使用 Rust 的 `orinfer package install`。
 - `attach_execution.py`：为匹配的数据目录安装执行包。
@@ -62,3 +64,5 @@ bash tools/operators/run.sh tools/model/sampling.py artifacts/sampling-build \
 该入口重建Rust绑定库并原子发布当前schema-1模型，沿用完整程序与ABI检查。新包仍需完整请求、状态隔离及prefix/MTP验收。GPU采样不改变greedy路径；需要top_logprobs或MTP p/q分布的调用保留CPU路径。
 
 Qwen3_5 的 `gdn_execution` 明确声明 prefill 的 sequential/chunked 策略，以及 decode 的 dense/deferred 策略和日志容量；构建、验证、恢复与提交消费同一契约。原生适配器校验所声明策略的全部状态和工作区，不通过 buffer 名称推断策略。Attention 的 INT8 读取与临时 FP16 KV 暂存候选按完整流水线实测选择，覆盖小行数、非对齐尾部和大 prefill，不设置固定行数分界。
+
+`auxiliary_tuning.py`可为已有原生包测量并发布MoE top-k、QSA选择和FP16 PLE norm/gate融合，参数为`--model`、`--model-output`和`--output`；`--families router`只处理共享MoE路由。Flash Next正式`build.py`包含该步骤，Qwen3_5构建器复用同一MoE调优器。几何来自checkpoint签名及物理buffer视图，支持展开或扁平workspace；数值、尾部和Graph检查通过后才参与选择。QSA与PLE汇总多长度测量选择一个配置，Rust适配器验证完整生产者链后应用融合，不发布Python执行顺序。

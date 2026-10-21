@@ -28,6 +28,8 @@ class Aot:
         for file in [
             ROOT / "tools/model/compile.py",
             ROOT / "tools/model/row_tuning.py",
+            ROOT / "tools/model/attention_reference.py",
+            ROOT / "tools/model/private_rows.py",
             ROOT / "tools/model/expert_tuning.py",
             ROOT / "tools/model/gdn_tuning.py",
             ROOT / "tools/model/row_selection.py",

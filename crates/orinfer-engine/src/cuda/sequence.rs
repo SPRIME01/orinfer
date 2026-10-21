@@ -400,7 +400,7 @@ impl Executor {
                             .insert(retired.clone(), old);
                         self.sequences[slot].addresses.insert(name.clone(), address);
                         self.sequences[slot].sizes.insert(name.clone(), bytes);
-                        self.pointers.insert(name.clone(), address);
+                        self.pointers.bind_private(&name, address)?;
                         self.sizes.insert(name, bytes);
                         let old = self
                             .session
@@ -441,7 +441,7 @@ impl Executor {
                     }
                     self.sequences[slot].addresses.insert(name.clone(), address);
                     self.sequences[slot].sizes.insert(name.clone(), bytes);
-                    self.pointers.insert(name.clone(), address);
+                    self.pointers.bind_private(&name, address)?;
                     self.sizes.insert(name, bytes);
                 }
             }
@@ -577,7 +577,7 @@ impl Executor {
         *self.graphs.get_mut() = std::mem::take(&mut self.sequences[slot].graphs);
         self.active_sequence = slot;
         for (name, &address) in &self.sequences[slot].addresses {
-            self.pointers.insert(name.clone(), address);
+            self.pointers.bind_private(name, address)?;
             self.sizes
                 .insert(name.clone(), self.sequences[slot].sizes[name]);
         }
@@ -877,7 +877,7 @@ impl Executor {
                 }
                 self.sequences[slot].addresses.insert(name.clone(), 0);
                 self.sequences[slot].sizes.insert(name.clone(), 0);
-                self.pointers.insert(name.clone(), 0);
+                self.pointers.bind_private(&name, 0)?;
                 self.sizes.insert(name, 0);
             }
             if let Some(owner) = self.sequences[slot].fixed_allocation {
@@ -1553,7 +1553,7 @@ impl Executor {
                             .views
                             .get(name)
                             .map_or(name.as_str(), |v| v.buffer.as_str());
-                        if self.sequence_names.contains(target) {
+                        if self.pointers.is_private(target) {
                             return Ok(None);
                         }
                         addresses.push(self.address(name, None, &op.views)?);
@@ -1570,7 +1570,7 @@ impl Executor {
         };
         if names.iter().any(|name| {
             let target = op.views.get(*name).map_or(*name, |v| v.buffer.as_str());
-            self.sequence_names.contains(target)
+            self.pointers.is_private(target)
         }) {
             return Ok(None);
         }
@@ -1579,48 +1579,6 @@ impl Executor {
             .map(|name| self.address(name, None, &op.views))
             .collect::<Result<Vec<_>>>()
             .map(Some)
-    }
-    fn shared_buffer_checks(&self, operations: &[Invocation]) -> Result<Vec<(String, u64)>> {
-        let direct = self.direct.as_ref().ok_or("Missing direct bindings")?;
-        let kernels = direct.kernels.borrow();
-        let mut names = std::collections::BTreeSet::new();
-        for call in operations {
-            let mut add = |name: &str| {
-                names.insert(
-                    call.views
-                        .get(name)
-                        .map_or(name, |v| v.buffer.as_str())
-                        .to_owned(),
-                );
-            };
-            match &call.operation {
-                Operation::Kernel { name } => {
-                    for arg in &kernels.get(name).ok_or("Missing shared kernel")?.spec.args {
-                        if let Argument::Buffer { name } | Argument::BufferSlice { name, .. } = arg
-                        {
-                            add(name);
-                        }
-                    }
-                }
-                Operation::Copy {
-                    source,
-                    destination,
-                    ..
-                } => {
-                    add(source);
-                    add(destination);
-                }
-                Operation::Zero { destination, .. } => add(destination),
-            }
-        }
-        let views = BTreeMap::new();
-        names
-            .into_iter()
-            .map(|name| {
-                let address = self.address(&name, None, &views)?;
-                Ok((name, address))
-            })
-            .collect()
     }
     /// Share stateless pieces across changing request membership. Private stages
     /// remain direct; pointer-table contents are uploaded before any replay.
@@ -1653,7 +1611,6 @@ impl Executor {
             let key = SharedGraphKey {
                 operations: piece.to_vec(),
                 addresses,
-                buffers: vec![],
             };
             let tick = self.batch_graph_clock.get().wrapping_add(1);
             self.batch_graph_clock.set(tick);
@@ -1716,8 +1673,8 @@ impl Executor {
     }
     /// COW and live workspace preservation must run before this lookup. Exact
     /// graphs retain owner-specific addresses and are invalidated on arena
-    /// replacement. Indirect graphs additionally compare the immutable program
-    /// and its current buffer bases; a different workspace takes the bind path.
+    /// replacement. Indirect graphs use only fixed session addresses plus the
+    /// pointer table; its request-owned contents are refreshed before replay.
     fn replay_cached_batch(
         &self,
         operation: orinfer_model_sdk::abi::BatchOperation,
@@ -1732,7 +1689,6 @@ impl Executor {
             return Ok(false);
         }
         let rows = segments.iter().map(|(_, n)| n).sum::<usize>();
-        let views = BTreeMap::new();
         let graph = self
             .batch_graphs
             .borrow_mut()
@@ -1746,11 +1702,6 @@ impl Executor {
                             decode
                                 && segments.iter().all(|(_, n)| *n == 1)
                                 && shared.operations == operations
-                                && !shared.buffers.is_empty()
-                                && shared.buffers.iter().all(|(name, expected)| {
-                                    self.address(name, None, &views)
-                                        .is_ok_and(|actual| actual == *expected)
-                                })
                         }
                     }
             })
@@ -1815,45 +1766,18 @@ impl Executor {
                             && key.operation == operation
                             && key.rows == segments.len()
                     })
-                    .map(|(key, (graph, last, _, hits))| {
+                    .map(|(_, (graph, last, _, hits))| {
                         let tick = self.batch_graph_clock.get().wrapping_add(1);
                         self.batch_graph_clock.set(tick);
                         *last = tick;
                         *hits = hits.saturating_add(1);
-                        (*graph, key.shared.as_ref().unwrap())
+                        *graph
                     })
-                    .map(|(graph, shared)| -> Result<_> {
-                        // Views and slice offsets are immutable in the cached
-                        // program; checking each unique base covers every bound
-                        // pointer without traversing all kernel arguments again.
-                        let views = BTreeMap::new();
-                        let valid = !shared.buffers.is_empty()
-                            && shared.buffers.iter().all(|(name, expected)| {
-                                self.address(name, None, &views)
-                                    .is_ok_and(|actual| actual == *expected)
-                            });
-                        if valid {
-                            Ok((graph, None))
-                        } else {
-                            Ok((graph, Some(shared.operations.clone())))
-                        }
-                    })
-                    .transpose()?
             };
-            if let Some((graph, rebind)) = cached {
-                if let Some(operations) = rebind {
-                    return self.execute_batch_operation_with(
-                        operation,
-                        segments,
-                        &operations,
-                        decode,
-                        allow_capture,
-                        overlap,
-                    );
-                }
+            if let Some(graph) = cached {
                 self.save_live_workspace()?;
                 let at = Instant::now();
-                // SAFETY: Address identity was checked; pointer-table owners were
+                // SAFETY: Captured session addresses cannot change; pointer-table owners were
                 // validated and uploaded by the caller before every replay.
                 unsafe {
                     check(
@@ -1928,7 +1852,6 @@ impl Executor {
                 Some(super::executor::SharedGraphKey {
                     operations: operations.to_vec(),
                     addresses,
-                    buffers: self.shared_buffer_checks(operations)?,
                 })
             } else {
                 None
@@ -2390,7 +2313,6 @@ mod graph_cache_tests {
         let graph = SharedGraphKey {
             operations: vec![],
             addresses: vec![42],
-            buffers: vec![("workspace".into(), 42)],
         };
         let first = BatchGraphKey {
             operation: orinfer_model_sdk::abi::BatchOperation::Ordinary,

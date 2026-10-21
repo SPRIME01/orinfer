@@ -2,11 +2,33 @@
 
 import unittest
 import tempfile
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
-from tools.model.row_selection import ranges
+from tools.model.row_selection import aggregate_winner, ranges
 from tools.model.row_selection import choices, prefill_fallback, project, samples, split_fixed
 from tools.model.row_tuning import RowTuner
+
+
+class AggregateSelectionTests(unittest.TestCase):
+    def test_policy_uses_all_cohorts_and_breaks_ties_deterministically(self):
+        records = [dict(times={"0": 1.0, "1": 1.5}), dict(times={"0": 10.0, "1": 2.0})]
+        self.assertEqual(aggregate_winner(records), "1")
+        self.assertEqual(aggregate_winner(list(reversed(records))), "1")
+        self.assertEqual(aggregate_winner([dict(times={"1": 1.0, "0": 1.0})]), "0")
+
+    def test_missing_invalid_and_inconsistent_measurements_are_rejected(self):
+        for records in (
+            [],
+            [dict(times={})],
+            [dict(times={"0": 0.0})],
+            [dict(times={"0": -1.0})],
+            [dict(times={"0": math.nan})],
+            [dict(times={"0": math.inf})],
+            [dict(times={"0": 1.0}), dict(times={"1": 1.0})],
+        ):
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                aggregate_winner(records)
 
 
 class ValidationOnlyTuningTests(unittest.TestCase):

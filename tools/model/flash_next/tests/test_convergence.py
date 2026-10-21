@@ -3,12 +3,11 @@
 import unittest
 from tools.model.row_convergence import divide_rows
 from tools.model.row_selection import split_fixed
-from tools.model.flash_next.row_tuning import intervals
 
 
 class ConvergenceTests(unittest.TestCase):
     def test_metadata_certificates_keep_private_offsets_and_radix_order(self):
-        from tools.model.flash_next.converge_metadata import private_roles, radix_shift
+        from tools.model.host_compiler import private_roles
 
         roles, offsets = private_roles(
             "a = Pointers[(((int64_t)lane) * (int64_t)624)];\n"
@@ -21,17 +20,6 @@ class ConvergenceTests(unittest.TestCase):
             roles, dict(Query=("private", "Scratch"), Position=("private", "Position"))
         )
         self.assertEqual(offsets, dict(Query=108544, Position=0))
-        for shift in (24, 16, 8):
-            self.assertEqual(
-                radix_shift("hist", f"AtomicAdd(hist[(key >> {shift}) & 255], 1);"), shift
-            )
-            self.assertEqual(
-                radix_shift("choose", f"prefix = (prefix | ((255 - b) << {shift}));"), shift
-            )
-        self.assertEqual(radix_shift("hist", "AtomicAdd(hist[key & 255], 1);"), 0)
-        self.assertEqual(radix_shift("choose", "prefix = (prefix | (255 - b));"), 0)
-        with self.assertRaises(ValueError):
-            radix_shift("choose", "unrelated kernel")
 
     def test_dynamic_tuning_covers_the_allocation_instead_of_one_short_sample(self):
         from tools.model.projection_tuning import profile_rows
@@ -120,10 +108,3 @@ class ConvergenceTests(unittest.TestCase):
 
     def test_exact_precompilations_do_not_steal_neighbouring_rows(self):
         self.assertEqual(split_fixed(1, 40, {"1": "a", "2": "b", "32": "c"}), [(3, 31), (33, 40)])
-
-    def test_measured_winner_drops_unused_candidates(self):
-        r = intervals(
-            [dict(rows=1, times=dict(a=1, b=2)), dict(rows=512, times=dict(a=1, b=3))], 512
-        )
-        self.assertEqual(r["used"], ["a"])
-        self.assertEqual(r["intervals"], [[1, 512, "a"]])

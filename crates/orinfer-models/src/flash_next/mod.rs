@@ -1,4 +1,5 @@
 //! Flash Next execution order and immutable CPU lookup owned by the model package.
+mod auxiliary;
 mod batching;
 mod causal_rows;
 mod decode_fusions;
@@ -329,6 +330,9 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
     unified_decode::configure(&mut request.metadata, &request.kernel_contracts)?;
     causal_rows::configure(&mut request.metadata)?;
     vision::configure(&mut request.metadata)?;
+    // Row construction also creates complete verification programs. Fuse only
+    // after every alias exists so none can reintroduce replaced producers.
+    auxiliary::build(&mut request.metadata, &request.kernel_contracts)?;
     parallel::build_rows(&mut request.metadata, &request.kernel_contracts)?;
     let expert_banks = experts::banks(&request.metadata, &request.kernel_contracts)?;
     let inputs = inputs::Inputs::open(

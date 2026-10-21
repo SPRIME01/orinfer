@@ -8,6 +8,31 @@ from tools.model.row_contract import contract
 from tools.operators.abi import evaluate, parse_host, validate_parameter_count
 
 
+def private_roles(source, columns, row_stride=None):
+    """Recover certified pointer-table columns/byte views from exported wrappers."""
+    loads = dict(re.findall(r"\b(\w+) = Pointers\[([^;]+)\];", source))
+    roles, offsets = {}, {}
+    for role, variable, offset in re.findall(
+        r"void\* (\w+)_row = orin_row_pointer\(\(?([A-Za-z_][A-Za-z_0-9]*)"
+        r"(?: \+ \(uint64_t\)(\d+))?\)?\);",
+        source,
+    ):
+        expression = loads[variable]
+        index = re.search(r"\+ \(int64_t\)(\d+)\)$", expression)
+        if index is None and " + " in expression:
+            raise ValueError("Unknown private-state column expression")
+        if row_stride is not None and set(
+            map(int, re.findall(r"\* \(int64_t\)(\d+)", expression))
+        ) != {row_stride}:
+            raise ValueError("Private-state row stride differs from model layout")
+        column = int(index[1]) if index else 0
+        if column >= len(columns):
+            raise ValueError("Invalid private-state column")
+        roles[role] = ("private", columns[column])
+        offsets[role] = int(offset or 0)
+    return roles, offsets
+
+
 def pointer_bindings(kernel, host, *, allow_scalars=False):
     """Retain the original offsets; exported argument order is authoritative."""
     if len(kernel["args"]) != len(host["ordered_arguments"]):

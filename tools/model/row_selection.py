@@ -4,6 +4,18 @@ import math
 from collections import Counter
 
 
+def aggregate_winner(records):
+    """Choose one configuration by geometric mean across all measured cases."""
+    if not records:
+        raise ValueError("Missing pipeline measurements")
+    names = set(records[0]["times"])
+    if not names or any(set(row["times"]) != names for row in records):
+        raise ValueError("Inconsistent pipeline measurements")
+    if any(not math.isfinite(t) or t <= 0 for row in records for t in row["times"].values()):
+        raise ValueError("Invalid pipeline timing")
+    return min(sorted(names), key=lambda name: sum(math.log(row["times"][name]) for row in records))
+
+
 def project(selection, keys):
     """Coalesce a pipeline choice after restricting it to one component's knobs."""
     configs, indices, names = [], {}, {}

@@ -25,16 +25,84 @@ impl BatchGraphKey {
 }
 pub(super) type BatchGraphCache = BTreeMap<BatchGraphKey, (Handle, u64, usize, u64)>;
 
-/// Shared pieces are keyed by program and resolved addresses, never membership.
-/// Address identity also prevents replay after a workspace growth/replacement.
+/// Shared pieces are keyed by program and resolved views, never membership.
+/// Their session-owned addresses stay fixed; request state uses indirect tables.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct SharedGraphKey {
     pub operations: Vec<crate::execution::Invocation>,
     pub addresses: Vec<u64>,
-    /// Unique buffer bases checked by the fully indirect replay fast path.
-    pub buffers: Vec<(String, u64)>,
 }
 pub(super) type SharedGraphCache = BTreeMap<SharedGraphKey, (Handle, u64)>;
+
+/// Shared addresses stay fixed for this executor's lifetime. Only request
+/// addresses can be rebound; shared graph capture rejects those names.
+pub(crate) struct BufferAddresses {
+    values: BTreeMap<String, u64>,
+    private: std::collections::BTreeSet<String>,
+}
+
+impl BufferAddresses {
+    fn new(values: BTreeMap<String, u64>, private: std::collections::BTreeSet<String>) -> Self {
+        Self { values, private }
+    }
+
+    pub(super) fn is_private(&self, name: &str) -> bool {
+        self.private.contains(name)
+    }
+
+    pub(super) fn bind_private(&mut self, name: &str, address: u64) -> Result<()> {
+        if !self.is_private(name) {
+            return Err("Cannot rebind a session-owned buffer".into());
+        }
+        *self.values.get_mut(name).ok_or("Unknown private buffer")? = address;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for BufferAddresses {
+    type Target = BTreeMap<String, u64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::BufferAddresses;
+
+    #[test]
+    fn only_request_addresses_can_be_rebound() {
+        let mut addresses = BufferAddresses::new(
+            [("weights", 10), ("workspace", 20), ("request", 30)]
+                .map(|(name, address)| (name.into(), address))
+                .into(),
+            ["request".into()].into(),
+        );
+        for name in ["weights", "workspace", "unknown"] {
+            assert!(!addresses.is_private(name));
+            assert!(addresses.bind_private(name, 99).is_err());
+        }
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses["weights"], 10);
+        assert_eq!(addresses["workspace"], 20);
+        assert_eq!(addresses["request"], 30);
+        assert!(addresses.is_private("request"));
+        addresses.bind_private("request", 40).unwrap();
+        assert_eq!(addresses["request"], 40);
+        addresses.bind_private("request", 0).unwrap();
+        assert_eq!(addresses["request"], 0);
+    }
+
+    #[test]
+    fn binding_never_creates_an_unknown_private_address() {
+        let mut addresses =
+            BufferAddresses::new([("weights".into(), 10)].into(), ["missing".into()].into());
+        assert!(addresses.bind_private("missing", 99).is_err());
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses["weights"], 10);
+    }
+}
 
 pub(super) struct DirectKernel {
     pub(super) spec: Kernel,
@@ -61,7 +129,7 @@ pub(super) struct DirectPrograms {
 /// A CUDA model is thread-affine. Construct, use and drop it on its worker.
 pub(crate) struct Executor {
     pub(crate) session: Session,
-    pub(crate) pointers: BTreeMap<String, u64>,
+    pub(crate) pointers: BufferAddresses,
     pub(crate) sizes: BTreeMap<String, usize>,
     pub(crate) graphs: RefCell<BTreeMap<String, Handle>>,
     pub(super) direct: Option<DirectPrograms>,
@@ -91,7 +159,6 @@ pub(crate) struct Executor {
     pub(super) state_table: RefCell<super::state_table::StateTable>,
     pub(super) active_sequence: usize,
     pub(super) sequence_specs: Vec<crate::artifact::Buffer<crate::weights::TensorIdentity>>,
-    pub(super) sequence_names: std::collections::BTreeSet<String>,
     pub(super) sequence_strides: BTreeMap<String, usize>,
     pub(super) batch_graphs: RefCell<BatchGraphCache>,
     pub(super) batch_graph_trials: RefCell<BTreeMap<BatchGraphKey, usize>>,
@@ -551,7 +618,15 @@ impl Executor {
             #[cfg(test)]
             live_graph_ms: Default::default(),
             session: s,
-            pointers,
+            pointers: BufferAddresses::new(
+                pointers,
+                manifest
+                    .buffers
+                    .iter()
+                    .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
+                    .map(|b| b.name.clone())
+                    .collect(),
+            ),
             sizes,
             graphs: RefCell::new(graphs),
             direct,
@@ -584,12 +659,6 @@ impl Executor {
                 .iter()
                 .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
                 .cloned()
-                .collect(),
-            sequence_names: manifest
-                .buffers
-                .iter()
-                .filter(|b| scopes[&b.name] == crate::loader::BufferScope::Sequence)
-                .map(|b| b.name.clone())
                 .collect(),
             sequence_strides: lazy.map(|kv| kv.buffers.clone()).unwrap_or_default(),
             batch_graphs: Default::default(),

@@ -11,7 +11,7 @@ import math
 from itertools import chain
 from pathlib import Path
 from tools.model.compile import primitive
-from tools.model.row_selection import ranges
+from tools.model.row_selection import aggregate_winner, ranges
 from tools.model.publication import write_json
 
 ROTATION_TILES = (256, 512, 1024)
@@ -116,10 +116,7 @@ class RowTuner:
             print("ROW TUNING", spec.get("kind", "pipeline"), key, record, flush=True)
         decisions = records
         if relative_tolerance:
-            preferred = min(
-                records[0]["times"],
-                key=lambda name: sum(math.log(r["times"][name]) for r in records),
-            )
+            preferred = aggregate_winner(records)
             # Prefer the aggregate winner when differences are within noise.
             # Keep original measurements intact in the published tuning report.
             decisions = [
@@ -210,7 +207,10 @@ class RowTuner:
         spec = dict(kind="rotation", k=k, swiglu=swiglu, plane_rows=plane_rows)
         if str(spec) in self.records:
             return self.records[str(spec)]
-        configs = [dict(block_k=b) for b in ROTATION_TILES]
+        configs = [dict(block_k=b) for b in ROTATION_TILES] + [
+            dict(block_k=b, registers=True, threads=t)
+            for b, t in ((512, 128), (1024, 128), (1024, 256), (2048, 256))
+        ]
         reference = primitive(rotate_activation_a8, 4096, k, swiglu=swiglu, dynamic_rows=True)
 
         def build(c):
@@ -224,6 +224,7 @@ class RowTuner:
                     swiglu,
                     dynamic_rows=True,
                     plane_rows=plane_rows,
+                    **{key: value for key, value in c.items() if key != "block_k"},
                 ),
                 primitive(quantize_rotation_tiles, 4096, k, b, dynamic_rows=True),
             )
@@ -337,7 +338,8 @@ class RowTuner:
 
     def _measure_attention(self, context, spec, configs, *, measure_rows=None):
         from kernels.model.attention_rows import causal_attention_int8, merge_attention_int8
-        from kernels.model.kv_int8 import attention_prefill_int8, dequantize_attention_kv
+        from kernels.model.kv_int8 import dequantize_attention_kv
+        from tools.model.attention_reference import attention_prefill_int8
         import torch
 
         reference = primitive(

@@ -10,7 +10,36 @@ import tilelang.language as T
 
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
-from kernels.model.hyperconnection import _dtype
+from kernels.model.hyperconnection import _dtype, norm_fragment
+
+
+def gate_fragment(H, dtype):
+    """Original PLE products, sum tree and every stream-dtype boundary."""
+    width = 1 << (H - 1).bit_length()
+
+    @T.macro
+    def apply(Key, Query, Value, Gated, row, branch):
+        product = T.alloc_fragment((width,), T.float32)
+        total = T.alloc_fragment((1,), T.float32)
+        gate = T.alloc_local((1,), T.float32)
+        for j in T.Parallel(width, coalesced_width=T.int32(1)):
+            product[j] = T.cast(
+                T.cast(T.cast(Key[j], T.float32) * T.cast(Query[j], T.float32), dtype),
+                T.float32,
+            )
+        T.reduce_sum(product, total, dim=0)
+        raw = T.cast(
+            T.cast(T.cast(T.cast(total[0], dtype), T.float32) / (H**0.5), dtype), T.float32
+        )
+        absolute = T.cast(T.cast(T.max(T.abs(raw), 1e-6), dtype), T.float32)
+        root = T.cast(T.cast(T.sqrt(absolute), dtype), T.float32)
+        sign = T.if_then_else(raw > 0.0, 1.0, T.if_then_else(raw < 0.0, -1.0, 0.0))
+        signed = T.cast(T.cast(root * sign, dtype), T.float32)
+        gate[0] = T.cast(T.cast(1.0 / (1.0 + T.exp(-signed)), dtype), T.float32)
+        for j in T.Parallel(H, coalesced_width=T.int32(1)):
+            Gated[row, branch, j] = gate[0] * T.cast(Value[row, j], T.float32)
+
+    return apply
 
 
 @orin_jit
@@ -60,6 +89,36 @@ def ple_gate(M: int, H: int, streams: int = 4, dtype: str = "float16", dynamic_r
                 Gated[row, branch, j] = gate[0] * T.cast(Value[row, j], T.float32)
 
     return main
+
+
+@orin_jit
+def ple_norm_gate(M: int, H: int, streams: int = 4, dtype: str = "float16", dynamic_rows=False):
+    """Fuse two HC norms and PLE gating, retaining both rounded norm values."""
+    _dtype(dtype)
+    if min(M, H, streams) <= 0 or dtype != "float16":
+        raise ValueError("Invalid fused PLE dimensions")
+    width = 1 << (H - 1).bit_length()
+    m = row_count(M, dynamic_rows)
+    normalize = norm_fragment(H, 1e-6, dtype)
+    apply = gate_fragment(H, dtype)
+
+    @T.prim_func
+    def main(
+        Key: T.Tensor((m, streams, H), dtype),
+        Query: T.Tensor((m, streams, H), dtype),
+        KeyWeight: T.Tensor((streams, H), T.float32),
+        QueryWeight: T.Tensor((streams, H), T.float32),
+        Value: T.Tensor((m, H), dtype),
+        Gated: T.Tensor((m, streams, H), dtype),
+    ):
+        with T.Kernel(m, streams, threads=min(256, width)) as (row, branch):
+            key = T.alloc_fragment((width,), T.float32)
+            query = T.alloc_fragment((width,), T.float32)
+            normalize(Key, KeyWeight, key, row, branch)
+            normalize(Query, QueryWeight, query, row, branch)
+            apply(key, query, Value, Gated, row, branch)
+
+    return main.with_attr("global_symbol", "ple_norm_gate")
 
 
 @orin_jit

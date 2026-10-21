@@ -431,25 +431,31 @@ class Builder:
                 X=input, Signs=self.signs[k], Rotated="RotationValues", Maxima="RotationMaxima"
             )
             second = dict(Rotated="RotationValues", Maxima="RotationMaxima", Q="A8", S="AS")
-            for role, fn, args in [
-                (name, rotate_activation_tiles, first),
-                (name.removesuffix("_rotate") + "_quantize", quantize_rotation_tiles, second),
+            from tools.model.row_selection import project
+
+            for role, fn, args, choices, options in [
+                (
+                    name,
+                    rotate_activation_tiles,
+                    first,
+                    selection,
+                    dict(swiglu=swiglu, plane_rows=plane_rows),
+                ),
+                (
+                    name.removesuffix("_rotate") + "_quantize",
+                    quantize_rotation_tiles,
+                    second,
+                    project(selection, ("block_k",)),
+                    {},
+                ),
             ]:
-                for suffix, config in self.row_choices(selection, rows):
-                    tile = config["block_k"]
+                for suffix, config in self.row_choices(choices, rows):
+                    parameters = dict(dynamic_rows=True, **options, **config)
                     self.emit(
                         role + suffix,
-                        f"rotation-tiles-{fn.__name__}-{k}-{tile}-{swiglu}-planes{plane_rows if fn is rotate_activation_tiles else 0}",
-                        lambda fn=fn, tile=tile: primitive(
-                            fn,
-                            CAPACITY,
-                            k,
-                            tile,
-                            **(
-                                dict(swiglu=swiglu, dynamic_rows=True, plane_rows=plane_rows)
-                                if fn is rotate_activation_tiles
-                                else dict(dynamic_rows=True)
-                            ),
+                        f"rotation-tiles-{fn.__name__}-{k}-{parameters}",
+                        lambda fn=fn, parameters=parameters: primitive(
+                            fn, CAPACITY, k, **parameters
                         ),
                         args,
                         rows,

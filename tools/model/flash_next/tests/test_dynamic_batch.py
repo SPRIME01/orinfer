@@ -4,8 +4,13 @@ import unittest
 from tilelang import tvm
 
 from kernels.model.rows import explicit_rows
-from tools.model.flash_next.dynamic_batch import factory
 from tools.model.projection_tuning import factory as projection_factory, make_prim
+from kernels.model import moe, hyperconnection, flash_next, rotation_a8
+from kernels.model.int8_swiglu import int8_swiglu
+from kernels.model.int8_projection import int8_small_projection
+from kernels.model.q4_projection import q4_projection
+from kernels.model.bf16_single import bf16_single
+from kernels.model.greedy import greedy_merge
 
 Analyzer = tvm.arith.Analyzer
 tir = tvm.tirx
@@ -302,7 +307,9 @@ class DynamicRowsTests(unittest.TestCase):
 
     def test_moe_combine_bound_tracks_live_assignments_beyond_initial_capacity(self):
         for capacity in [8, 16, 128]:
-            fn = explicit_rows(factory(f"combine-{capacity}", capacity))
+            fn = explicit_rows(
+                moe.moe_combine.__wrapped__(capacity, 2560, capacity * 10, 10, dynamic_rows=True)
+            )
             (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
             buffers = {b.name: b for b in fn.buffer_map.values()}
             bound = buffers["Expert"].shape[0]
@@ -311,7 +318,7 @@ class DynamicRowsTests(unittest.TestCase):
                 self.assertEqual(int(actual), live * 10)
 
     def test_fused_shared_ffn_launch_covers_multiple_row_tiles(self):
-        fn = explicit_rows(factory("shared-w8-swiglu-8", 128))
+        fn = explicit_rows(int8_swiglu.__wrapped__(128, 640, 2560, dynamic_rows=True))
         (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
         buffers = {b.name: b for b in fn.buffer_map.values()}
         self.assertTrue(buffers["A"].shape[0].same_as(rows))
@@ -420,7 +427,7 @@ class DynamicRowsTests(unittest.TestCase):
             self.assertEqual(len(loops), 1)
 
     def test_lowered_q4_retains_explicit_live_rows(self):
-        fn = explicit_rows(factory("q4-gemv-r4-n6144-k2560-d0", 4))
+        fn = explicit_rows(q4_projection.__wrapped__(4, 6144, 2560, dynamic_rows=True))
         (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
         buffers = {b.name: b for b in fn.buffer_map.values()}
         for name in ("A", "AS", "Out"):
@@ -428,12 +435,14 @@ class DynamicRowsTests(unittest.TestCase):
         self.assertEqual(int(buffers["W"].shape[1]), 640)
 
     def test_lowered_head_keeps_fp32_logits(self):
-        fn = explicit_rows(factory("q4-gemv-r4-n248320-k2560-float32-d0", 4))
+        fn = explicit_rows(
+            q4_projection.__wrapped__(4, 248320, 2560, output_dtype="float32", dynamic_rows=True)
+        )
         buffers = {b.name: b for b in fn.buffer_map.values()}
         self.assertEqual(str(buffers["Out"].dtype), "float32")
 
     def test_direct_bf16_rows_do_not_change_private_split_layout(self):
-        fn = explicit_rows(factory("bf16-r4-n320-g4-d0", 4))
+        fn = explicit_rows(bf16_single.__wrapped__(320, 2560, 4, rows=4, dynamic_rows=True))
         (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
         buffers = {b.name: b for b in fn.buffer_map.values()}
         self.assertTrue(buffers["A"].shape[0].same_as(rows))
@@ -441,8 +450,8 @@ class DynamicRowsTests(unittest.TestCase):
         self.assertEqual(int(buffers["Output"].shape[0]), 4)
 
     def test_large_route_histograms_keep_live_segment_strides_and_assignment_rows(self):
-        for label in ("histogram-local-1024", "histogram-finish-1024"):
-            fn = explicit_rows(factory(label, 1024))
+        for primitive in (moe.expert_histogram_local, moe.expert_histogram_finish):
+            fn = explicit_rows(primitive.__wrapped__(1024, dynamic_rows=True))
             (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
             buffers = {b.name: b for b in fn.buffer_map.values()}
             self.assertTrue(buffers["IDs"].shape[0].same_as(rows))
@@ -454,29 +463,28 @@ class DynamicRowsTests(unittest.TestCase):
                     partial.shape[1], {rows: tir.IntImm("int32", live)}
                 )
                 self.assertEqual(int(Analyzer().simplify(stride)), (live * 10 + 1023) // 1024)
-        self.assertIsNone(factory("histogram-offsets-1024", 1024))
 
     def test_affine_greedy_output_has_an_explicit_scalar_parameter(self):
-        fn = explicit_rows(factory("greedy-merge-4-248320", 4))
+        fn = explicit_rows(greedy_merge.__wrapped__(248320, 4, dynamic_rows=True))
         (scalar,) = [p for p in fn.params if str(p.dtype) == "int32"]
         self.assertEqual(scalar.name, "m")
         self.assertTrue(explicit_rows(fn).same_as(fn))
 
     def test_expert_rotation_uses_assignment_rows_without_implicit_affine_inference(self):
-        fn = explicit_rows(factory("rotate-a8-ffn-8", 8))
+        fn = explicit_rows(
+            rotation_a8.rotate_activation_a8.__wrapped__(80, 640, swiglu=True, dynamic_rows=True)
+        )
         (scalar,) = [p for p in fn.params if str(p.dtype) == "int32"]
         for buffer in fn.buffer_map.values():
             if buffer.name in ("X", "Q", "S"):
                 self.assertTrue(buffer.shape[0].same_as(scalar))
 
-    def test_unknown_shared_geometry_is_not_silently_reused(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported"):
-            factory("unknown-4", 4)
-
     def test_single_output_gate_keeps_the_dynamic_row_argument(self):
         for capacity in (8, 128):
             with self.subTest(capacity=capacity):
-                fn = explicit_rows(factory("bf16-gate-8-2560", capacity))
+                fn = explicit_rows(
+                    flash_next.scalar_bf16_projection.__wrapped__(capacity, 2560, dynamic_rows=True)
+                )
                 (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
                 buffers = {b.name: b for b in fn.buffer_map.values()}
                 self.assertTrue(buffers["A"].shape[0].same_as(rows))
@@ -487,7 +495,11 @@ class DynamicRowsTests(unittest.TestCase):
     def test_hc_down_cache_and_streaming_keep_symbolic_partial_rows(self):
         for capacity in (8, 128):
             with self.subTest(capacity=capacity):
-                fn = explicit_rows(factory("hc-down-partial-8-4", capacity))
+                fn = explicit_rows(
+                    hyperconnection.hc_down_partial.__wrapped__(
+                        capacity, 320, 10240, 4, dynamic_rows=True
+                    )
+                )
                 (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
                 buffers = {b.name: b for b in fn.buffer_map.values()}
                 self.assertTrue(buffers["A"].shape[0].same_as(rows))
@@ -498,7 +510,11 @@ class DynamicRowsTests(unittest.TestCase):
     def test_small_int8_projection_keeps_dynamic_rows_and_packed_operand_width(self):
         for capacity in (8, 128):
             with self.subTest(capacity=capacity):
-                fn = explicit_rows(factory("dense-small-a8-8-48-2560-float16", capacity))
+                fn = explicit_rows(
+                    int8_small_projection.__wrapped__(
+                        capacity, 48, 2560, "float16", dynamic_rows=True
+                    )
+                )
                 (rows,) = [p for p in fn.params if str(p.dtype) == "int32"]
                 buffers = {b.name: b for b in fn.buffer_map.values()}
                 for name in ("A", "Output", "TokenScale"):

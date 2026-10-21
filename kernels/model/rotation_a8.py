@@ -38,6 +38,62 @@ __device__ __forceinline__ float orinfer_rotation_max(const float* values, int s
 """
 
 
+def _register_block_rotation(width, inputs, threads, swiglu, plane_rows=0):
+    """Share the register butterflies and FP16 boundaries across row and tile CTAs."""
+    local_width = width // threads
+
+    @T.macro
+    def transform(X, Signs, row, offset, values, maxima, maximum):
+        T.import_source(REGISTER_ROTATION_SOURCE)
+        lane = T.get_thread_binding()
+        for i in T.unroll(local_width):
+            k = offset + (i // 4) * (threads * 4) + (lane // 32) * 128 + (i % 4) * 32 + lane % 32
+            values[i] = 0
+            if k < inputs:
+                if swiglu:
+                    gate = T.cast(X[row, k], T.float32)
+                    e = T.exp(-T.abs(gate))
+                    sigmoid = T.if_then_else(gate >= 0, 1 / (1 + e), e / (1 + e))
+                    value = T.cast(
+                        T.cast(
+                            (gate * sigmoid)
+                            * T.cast(
+                                X[row + plane_rows, k] if plane_rows else X[row, k + inputs],
+                                T.float32,
+                            ),
+                            T.float16,
+                        ),
+                        T.float32,
+                    )
+                    values[i] = value * T.cast(Signs[k], T.float32)
+                else:
+                    values[i] = T.cast(X[row, k], T.float32) * T.cast(Signs[k], T.float32)
+        T.evaluate(
+            T.call_extern(
+                "void",
+                "orinfer_fht128",
+                T.access_ptr(values[0], "rw", local_width),
+                local_width,
+            )
+        )
+        for i in T.unroll(local_width):
+            values[i] = T.cast(T.cast(values[i] * 0.08838834764831845, T.float16), T.float32)
+        maximum[0] = T.call_pure_extern(
+            "float32",
+            "orinfer_rotation_max",
+            T.access_ptr(values[0], "r", local_width),
+            local_width,
+        )
+        if lane % 32 == 0:
+            maxima[lane // 32] = maximum[0]
+        T.sync_threads()
+        maximum[0] = maxima[0]
+        for i in T.unroll(1, threads // 32):
+            maximum[0] = T.max(maximum[0], maxima[i])
+
+    return transform
+
+
 def _register_rotation_a8(capacity, inputs, swiglu, reciprocal, dynamic_rows):
     """Keep complete block128 butterflies in each warp's registers.
 
@@ -49,6 +105,7 @@ def _register_rotation_a8(capacity, inputs, swiglu, reciprocal, dynamic_rows):
     threads = 128
     width = ((inputs + threads * 4 - 1) // (threads * 4)) * threads * 4
     local_width = width // threads
+    transform = _register_block_rotation(width, inputs, threads, swiglu)
 
     @T.prim_func
     def main(
@@ -58,52 +115,13 @@ def _register_rotation_a8(capacity, inputs, swiglu, reciprocal, dynamic_rows):
         S: T.Tensor((m, 1), T.float16),
     ):
         with T.Kernel(m, threads=threads) as row:
-            T.import_source(REGISTER_ROTATION_SOURCE)
             values = T.alloc_local((local_width,), T.float32)
             maxima = T.alloc_shared((threads // 32,), T.float32)
             maximum = T.alloc_local((1,), T.float32)
             scale = T.alloc_local((1,), T.float16)
             inv = T.alloc_local((1,), T.float32)
             lane = T.get_thread_binding()
-            for i in T.unroll(local_width):
-                k = (i // 4) * (threads * 4) + (lane // 32) * 128 + (i % 4) * 32 + lane % 32
-                values[i] = 0
-                if k < inputs:
-                    if swiglu:
-                        gate = T.cast(X[row, k], T.float32)
-                        e = T.exp(-T.abs(gate))
-                        sigmoid = T.if_then_else(gate >= 0, 1 / (1 + e), e / (1 + e))
-                        value = T.cast(
-                            T.cast(
-                                (gate * sigmoid) * T.cast(X[row, k + inputs], T.float32), T.float16
-                            ),
-                            T.float32,
-                        )
-                        values[i] = value * T.cast(Signs[k], T.float32)
-                    else:
-                        values[i] = T.cast(X[row, k], T.float32) * T.cast(Signs[k], T.float32)
-            T.evaluate(
-                T.call_extern(
-                    "void",
-                    "orinfer_fht128",
-                    T.access_ptr(values[0], "rw", local_width),
-                    local_width,
-                )
-            )
-            for i in T.unroll(local_width):
-                values[i] = T.cast(T.cast(values[i] * 0.08838834764831845, T.float16), T.float32)
-            maximum[0] = T.call_pure_extern(
-                "float32",
-                "orinfer_rotation_max",
-                T.access_ptr(values[0], "r", local_width),
-                local_width,
-            )
-            if lane % 32 == 0:
-                maxima[lane // 32] = maximum[0]
-            T.sync_threads()
-            maximum[0] = maxima[0]
-            for i in T.unroll(1, threads // 32):
-                maximum[0] = T.max(maximum[0], maxima[i])
+            transform(X, Signs, row, 0, values, maxima, maximum)
             scale[0] = _rotation_scale(maximum[0])
             if lane == 0:
                 S[row, 0] = scale[0]
@@ -206,8 +224,57 @@ def _block_rotation(width, inputs, swiglu, plane_rows=0):
     return transform
 
 
+def _register_rotation_tiles(M, K, block_k, swiglu, dynamic_rows, plane_rows, threads):
+    if threads not in (64, 128, 256, 512) or block_k % (threads * 4):
+        raise ValueError("Register tiles must contain complete warp butterflies")
+    m = row_count(M, dynamic_rows)
+    blocks = T.ceildiv(K, block_k)
+    local_width = block_k // threads
+    transform = _register_block_rotation(block_k, K, threads, swiglu, plane_rows)
+
+    @T.prim_func
+    def main(
+        X: T.Tensor(
+            (m + plane_rows, K) if plane_rows else (m, K * (2 if swiglu else 1)), T.float16
+        ),
+        Signs: T.Tensor((K,), T.int8),
+        Rotated: T.Tensor((m, K), T.float16),
+        Maxima: T.Tensor((m, blocks), T.float32),
+    ):
+        with T.Kernel(m, blocks, threads=threads) as (row, block):
+            values = T.alloc_local((local_width,), T.float32)
+            maxima = T.alloc_shared((threads // 32,), T.float32)
+            maximum = T.alloc_local((1,), T.float32)
+            transform(X, Signs, row, block * block_k, values, maxima, maximum)
+            lane = T.get_thread_binding()
+            if lane == 0:
+                Maxima[row, block] = maximum[0]
+            for i in T.unroll(local_width):
+                k = (
+                    block * block_k
+                    + (i // 4) * (threads * 4)
+                    + (lane // 32) * 128
+                    + (i % 4) * 32
+                    + lane % 32
+                )
+                if k < K:
+                    Rotated[row, k] = values[i]
+
+    return main
+
+
 @orin_jit
-def rotate_activation_tiles(M, K, block_k=512, swiglu=False, dynamic_rows=False, *, plane_rows=0):
+def rotate_activation_tiles(
+    M,
+    K,
+    block_k=512,
+    swiglu=False,
+    dynamic_rows=False,
+    *,
+    plane_rows=0,
+    registers=False,
+    threads=128,
+):
     """Parallel transforms plus partial maxima; scale remains one per row."""
     if min(M, K) <= 0 or K % 128 or block_k not in (128, 256, 512, 1024, 2048):
         raise ValueError("Invalid tiled block128 rotation")
@@ -217,6 +284,10 @@ def rotate_activation_tiles(M, K, block_k=512, swiglu=False, dynamic_rows=False,
         or (plane_rows and (not swiglu or plane_rows < M))
     ):
         raise ValueError("Invalid SwiGLU plane capacity")
+    if type(registers) is not bool or (not registers and threads != 128):
+        raise ValueError("Invalid tiled rotation implementation")
+    if registers:
+        return _register_rotation_tiles(M, K, block_k, swiglu, dynamic_rows, plane_rows, threads)
     m = row_count(M, dynamic_rows)
     blocks = T.ceildiv(K, block_k)
     transform = _block_rotation(block_k, K, swiglu, plane_rows)
@@ -301,36 +372,65 @@ def rotate_activation_a8(
     swiglu=False,
     reciprocal=True,
     dynamic_rows: bool = False,
-    output_layout: str = "a8",
     registers: bool = False,
 ):
-    if type(M) is not int or M <= 0 or type(K) is not int or K <= 0 or K % 128:
-        raise ValueError("Invalid rotation dimensions")
-    if output_layout not in ("a8", "e8p", "e8p_dispatch", "e8p_rows", "e8p_scatter"):
-        raise ValueError("Invalid activation output layout")
-    if type(registers) is not bool or (registers and output_layout != "a8"):
-        raise ValueError("Register rotation requires the A8 output layout")
+    """Signed block128 rotation followed by one row-level A8 quantization."""
+    _validate_rotation(M, K)
+    if type(registers) is not bool:
+        raise ValueError("Invalid register rotation selection")
     if registers:
         return _register_rotation_a8(M, K, swiglu, reciprocal, dynamic_rows)
-    exact = output_layout != "a8"
-    scatter = output_layout == "e8p_scatter"
-    dispatch = output_layout in ("e8p_dispatch", "e8p_scatter")
-    if output_layout in ("e8p", "e8p_dispatch") and (
-        dynamic_rows
-        or (M, K, swiglu, dispatch)
-        not in (
-            (1, 2560, False, True),
-            (10, 640, True, False),
-        )
-    ):
-        raise ValueError("Unsupported decode activation fusion")
-    if output_layout == "e8p_rows" and (M > 1280 or K != 640 or not swiglu):
-        raise ValueError("Unsupported row-tiled expert down fusion")
-    if scatter and (M > 128 or K != 2560 or swiglu):
-        raise ValueError("Unsupported row-tiled expert input fusion")
+    return _rotation_a8(M, K, swiglu, reciprocal, dynamic_rows)
+
+
+@orin_jit
+def rotate_expert_a8(
+    M: int,
+    K: int,
+    swiglu=False,
+    reciprocal=True,
+    dynamic_rows: bool = False,
+    *,
+    routing=None,
+    top_k=1,
+    experts=1,
+):
+    """Fuse exact A8 planes and optional routing, with explicit expert geometry.
+
+    No routing writes one plane row per input. Scatter writes routed assignment
+    rows; shared keeps input planes and emits each assignment's scale and slot.
+    """
+    _validate_rotation(M, K)
+    if routing not in (None, "shared", "scatter"):
+        raise ValueError("Invalid expert activation routing")
+    if type(top_k) is not int or type(experts) is not int or not 1 <= top_k <= experts:
+        raise ValueError("Invalid expert activation geometry")
+    return _rotation_a8(
+        M,
+        K,
+        swiglu,
+        reciprocal,
+        dynamic_rows,
+        exact=True,
+        routing=routing,
+        top_k=top_k,
+        experts=experts,
+    )
+
+
+def _validate_rotation(M, K):
+    if type(M) is not int or M <= 0 or type(K) is not int or K <= 0 or K % 128:
+        raise ValueError("Invalid rotation dimensions")
+
+
+def _rotation_a8(
+    M, K, swiglu, reciprocal, dynamic_rows, *, exact=False, routing=None, top_k=1, experts=1
+):
+    scatter = routing == "scatter"
+    dispatch = routing is not None
     width = 2 * K if swiglu else K
     M = row_count(M, dynamic_rows)
-    slots = M * 10 if dispatch else M
+    slots = M * top_k if dispatch else M
     transform = _block_rotation(K, K, swiglu)
 
     @T.macro
@@ -388,7 +488,7 @@ def rotate_activation_a8(
             T.reduce_sum(quant, total, dim=0)
             if scatter:
                 T.sync_threads()
-                for choice in T.serial(10):
+                for choice in T.serial(top_k):
                     slot = RowOffsets[IDs[row, choice]] + RelativeSlot[row, choice]
                     for k in T.Parallel(K):
                         if k % 8 == 0:
@@ -401,16 +501,9 @@ def rotate_activation_a8(
             else:
                 for k in T.Parallel(K):
                     if k % 8 == 0:
-                        if dispatch:
-                            Low[0, k // 8] = low[k]
-                            High[0, k // 8] = high[k]
-                        else:
-                            Low[row, k // 8] = low[k]
-                            High[row, k // 8] = high[k]
-                if dispatch:
-                    Sum[0] = total[0]
-                else:
-                    Sum[row] = total[0]
+                        Low[row, k // 8] = low[k]
+                        High[row, k // 8] = high[k]
+                Sum[row] = total[0]
 
     if not exact:
 
@@ -443,7 +536,7 @@ def rotate_activation_a8(
 
         return (
             rotate_split_a8.with_attr("global_symbol", "rows_rotate_split")
-            if output_layout == "e8p_rows"
+            if dynamic_rows
             else rotate_split_a8
         )
 
@@ -456,19 +549,19 @@ def rotate_activation_a8(
         Low: T.Tensor((slots, K // 8), T.uint32),
         High: T.Tensor((slots, K // 8), T.uint32),
         Sum: T.Tensor((slots,), T.int32),
-        IDs: T.Tensor((M, 10), T.int32),
-        RelativeSlot: T.Tensor((M, 10), T.int32),
-        RowOffsets: T.Tensor((512,), T.int32),
+        IDs: T.Tensor((M, top_k), T.int32),
+        RelativeSlot: T.Tensor((M, top_k), T.int32),
+        RowOffsets: T.Tensor((experts,), T.int32),
         DS: T.Tensor((slots, 1), T.float16),
-        SlotMap: T.Tensor((M, 10), T.int32),
+        SlotMap: T.Tensor((M, top_k), T.int32),
     ):
         with T.Kernel(M, threads=128) as row:
             body(X, Signs, Q, S, Low, High, Sum, IDs, RelativeSlot, RowOffsets, DS, SlotMap, row)
             if not scatter:
-                for rank in T.Parallel(10):
-                    slot = RowOffsets[IDs[0, rank]] + RelativeSlot[0, rank]
-                    SlotMap[0, rank] = slot
-                    DS[slot, 0] = S[0, 0]
+                for rank in T.Parallel(top_k):
+                    slot = RowOffsets[IDs[row, rank]] + RelativeSlot[row, rank]
+                    SlotMap[row, rank] = slot
+                    DS[slot, 0] = S[row, 0]
 
     if scatter:
         return rotate_dispatch_a8.with_attr("global_symbol", "rows_rotate_scatter")

@@ -136,6 +136,64 @@ def expert_projection(rows, outputs, inputs, experts, top_k, *, codec, config, d
 
 
 class MoeTuner(RowTuner):
+    def topk(self, experts, top_k):
+        """Measure exact block/warp selection, including tie and tail fixtures."""
+        import torch
+        from kernels.model import moe
+        from tools.model.row_selection import samples
+
+        spec = dict(kind="router_topk", experts=experts, top_k=top_k)
+        key = str(spec)
+        if key in self.records:
+            return self.records[key]
+        configs = [dict(algorithm="block")] + [dict(algorithm="warp", warps=w) for w in (1, 2, 4)]
+
+        def build(config):
+            if config["algorithm"] == "block":
+                return primitive(moe.router_topk, 4096, experts, top_k, dynamic_rows=True)
+            return primitive(
+                moe.router_topk_warp, 4096, experts, top_k, dynamic_rows=True, warps=config["warps"]
+            )
+
+        baseline = build(configs[0])
+
+        def inputs(rows):
+            scores = torch.randn(rows, experts, device="cuda")
+            scores[0].zero_()
+            if rows > 1:
+                scores[1].copy_(torch.arange(experts, device="cuda") % 3)
+            expected = [
+                torch.full((rows + 2, top_k), 42, dtype=t, device="cuda")
+                for t in (torch.int32, torch.float32)
+            ]
+            launch(baseline, scores, *expected, rows)
+            torch.cuda.synchronize()
+
+            def fixture(kernel, config):
+                actual = [torch.full_like(t, 42) for t in expected]
+
+                def run():
+                    launch(kernel, scores, *actual, rows)
+
+                def check():
+                    torch.cuda.synchronize()
+                    if not all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True)):
+                        raise ValueError("Router selection changes scores, ties or tail guards")
+
+                def change():
+                    scores.copy_(scores.flip(1))
+                    launch(baseline, scores, *expected, rows)
+
+                return run, check, change
+
+            yield fixture
+
+        result = self.select(
+            spec, configs, build, inputs, measure_rows=samples(4096), relative_tolerance=0.03
+        )
+        self.records[key] = result
+        return result
+
     def router(self, hidden, experts):
         """Tune the FP32 router result without changing its K16 MMA reduction."""
         import torch

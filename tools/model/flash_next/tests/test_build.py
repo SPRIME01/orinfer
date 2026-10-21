@@ -11,6 +11,28 @@ from tools.model.projection_tuning import measurement_rows, profile_rows
 
 
 class BuildTests(unittest.TestCase):
+    def test_router_uses_checkpoint_geometry_for_flattened_sliced_workspaces(self):
+        from tools.model.auxiliary_tuning import router_geometry
+
+        package = dict(config_signature=dict(text=dict(num_experts=512, num_experts_per_tok=10)))
+        operands = {role: dict(name=role) for role in ("Logits", "IDs", "Prob")}
+        buffers = {
+            role: dict(dtype=dtype, shape=[rows])
+            for role, dtype, rows in (
+                ("Logits", "f32", 4096 * 512),
+                ("IDs", "i32", 4096 * 10),
+                ("Prob", "f32", 4096 * 10),
+            )
+        }
+        self.assertEqual(router_geometry(package, operands, buffers, 1024), (512, 10))
+        operands["Logits"]["offset"] = 4095 * 512 * 4
+        self.assertEqual(router_geometry(package, operands, buffers, 1), (512, 10))
+        with self.assertRaisesRegex(ValueError, "physical view"):
+            router_geometry(package, operands, buffers, 2)
+        operands["Logits"]["offset"] = 1
+        with self.assertRaisesRegex(ValueError, "physical view"):
+            router_geometry(package, operands, buffers, 1)
+
     def test_prefill_portfolio_keeps_legal_wide_tiles_at_every_capacity(self):
         from tools.model.projection_policy import q4_configs, w8_configs
 

@@ -443,6 +443,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
         b.moe_router_tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)
     with gpu_lock(b.lock):
         router_selection = b.moe_router_tuner.router(h, e)
+        topk_selection = b.moe_router_tuner.topk(e, top)
     for suffix, config in b.row_choices(router_selection, rows):
         emit(
             "router",
@@ -454,14 +455,18 @@ def build(b, section, prefix, *, rows=4096, draft=False):
             suffix=suffix,
             **config,
         )
-    emit(
-        "topk",
-        moe.router_topk,
-        dict(Logits="MoeLogits", IDs="MoeIDs", Prob="MoeProb"),
-        rows,
-        e,
-        top,
-    )
+    for suffix, config in b.row_choices(topk_selection, rows):
+        options = {k: v for k, v in config.items() if k != "algorithm"}
+        emit(
+            "topk",
+            moe.router_topk_warp if config["algorithm"] == "warp" else moe.router_topk,
+            dict(Logits="MoeLogits", IDs="MoeIDs", Prob="MoeProb"),
+            rows,
+            e,
+            top,
+            suffix=suffix,
+            **options,
+        )
     emit(
         "histogram_local",
         moe.expert_histogram_local,

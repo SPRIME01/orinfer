@@ -330,6 +330,86 @@ def expert_dispatch(
 
 
 @orin_jit
+def router_topk_warp(M: int, E: int, top_k: int, dynamic_rows=False, warps: int = 4):
+    """One warp per row, register candidates and native SM80 integer reductions.
+
+    Ordered FP32 keys retain exact scores and signed-zero equivalence. Ranking
+    uses two 32-bit warp reductions instead of a cross-warp 64-bit reduction.
+    The selected probability sum keeps the original FP32 tree and boundaries.
+    """
+    if min(M, E, top_k) <= 0 or E % 32 or top_k > 32 or top_k > E or warps not in (1, 2, 4):
+        raise ValueError("Invalid warp router geometry")
+    m = row_count(M, dynamic_rows)
+    local = E // 32
+
+    @T.prim_func
+    def main(
+        Logits: T.Tensor((m, E), T.float32),
+        IDs: T.Tensor((m, top_k), T.int32),
+        Prob: T.Tensor((m, top_k), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(m, warps), threads=warps * 32) as block:
+            tx = T.get_thread_binding()
+            row = block * warps + tx // 32
+            lane = tx % 32
+            if row < m:
+                keys = T.alloc_local((local,), T.uint32)
+                best = T.alloc_var(T.uint32)
+                best_id = T.alloc_var(T.int32)
+                selected = T.alloc_var(T.float32, 0.0)
+                maximum = T.alloc_var(T.float32, 0.0)
+                for j in T.unroll(local):
+                    value = Logits[row, j * 32 + lane]
+                    bits = T.reinterpret(T.uint32, value)
+                    keys[j] = T.if_then_else(
+                        value == 0,
+                        T.uint32(0x80000000),
+                        T.if_then_else((bits >> 31) != 0, ~bits, bits ^ T.uint32(0x80000000)),
+                    )
+                for rank in T.serial(top_k):
+                    best = 0
+                    for j in T.unroll(local):
+                        best = T.max(best, keys[j])
+                    best = T.call_pure_extern(
+                        "uint32", "__reduce_max_sync", T.uint32(0xFFFFFFFF), best
+                    )
+                    best_id = E
+                    for j in T.unroll(local):
+                        if keys[j] == best:
+                            best_id = T.min(best_id, j * 32 + lane)
+                    best_id = T.call_pure_extern(
+                        "int32", "__reduce_min_sync", T.uint32(0xFFFFFFFF), best_id
+                    )
+                    bits = T.if_then_else((best >> 31) != 0, best ^ T.uint32(0x80000000), ~best)
+                    score = T.reinterpret(T.float32, bits)
+                    if rank == 0:
+                        maximum = score
+                    if lane == rank:
+                        IDs[row, rank] = best_id
+                        selected = score
+                    for j in T.unroll(local):
+                        if j * 32 + lane == best_id:
+                            keys[j] = 0
+                mass = T.alloc_var(T.float32)
+                denominator = T.alloc_var(T.float32)
+                mass = T.if_then_else(lane < top_k, T.exp(selected - maximum), 0.0)
+                denominator = mass
+                for stage in T.unroll(5):
+                    denominator += T.call_pure_extern(
+                        "float32",
+                        "__shfl_xor_sync",
+                        T.uint32(0xFFFFFFFF),
+                        denominator,
+                        1 << (4 - stage),
+                        32,
+                    )
+                if lane < top_k:
+                    Prob[row, lane] = mass / denominator
+
+    return main
+
+
+@orin_jit
 def router_topk(
     M: int, E: int = 512, top_k: int = 10, renormalize: bool = True, dynamic_rows: bool = False
 ):

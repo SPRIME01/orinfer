@@ -325,6 +325,10 @@ def rebuild(args):
         from tools.model.sampling import append as append_sampling
 
         append_sampling(data, package, root, args.output / "sampling")
+        if not args.prefill_only:
+            from tools.model.auxiliary_tuning import publish as publish_auxiliary
+
+            publish_auxiliary(data, package, manifest, compiler, args.output / "auxiliary")
         coalesce_adjacent_selections(package)
         digest = compact_package(root, package, staging / "cache/packages")
         shutil.rmtree(root)

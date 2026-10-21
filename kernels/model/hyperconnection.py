@@ -24,6 +24,29 @@ def _dtype(value):
     return value
 
 
+def norm_fragment(H, eps, dtype):
+    """Keep the HC norm tree and stream rounding when consumed by a fusion."""
+    width = 1 << (H - 1).bit_length()
+
+    @T.macro
+    def normalize(Residual, Weight, Normed, row, branch):
+        values = T.alloc_fragment((width,), T.float32)
+        square = T.alloc_fragment((width,), T.float32)
+        total = T.alloc_fragment((1,), T.float32)
+        for j in T.Parallel(width, coalesced_width=T.int32(1)):
+            values[j] = T.if_then_else(j < H, T.cast(Residual[row, branch, j], T.float32), 0.0)
+            square[j] = values[j] * values[j]
+        T.reduce_sum(square, total, dim=0)
+        for j in T.Parallel(width, coalesced_width=T.int32(1)):
+            Normed[j] = 0
+            if j < H:
+                Normed[j] = T.cast(
+                    values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j]), dtype
+                )
+
+    return normalize
+
+
 @orin_jit
 def hc_norm(
     M: int,
@@ -39,6 +62,7 @@ def hc_norm(
         raise ValueError("Invalid HC normalization dimensions/epsilon")
     width = 1 << (H - 1).bit_length()
     M = row_count(M, dynamic_rows)
+    normalize = norm_fragment(H, eps, dtype)
 
     @T.prim_func
     def main(
@@ -47,17 +71,10 @@ def hc_norm(
         Normed: T.Tensor((M, streams, H), dtype),
     ):
         with T.Kernel(M, streams, threads=min(256, width)) as (row, branch):
-            values = T.alloc_fragment((width,), T.float32)
-            square = T.alloc_fragment((width,), T.float32)
-            total = T.alloc_fragment((1,), T.float32)
-            for j in T.Parallel(width, coalesced_width=T.int32(1)):
-                values[j] = T.if_then_else(j < H, T.cast(Residual[row, branch, j], T.float32), 0.0)
-                square[j] = values[j] * values[j]
-            T.reduce_sum(square, total, dim=0)
+            normalized = T.alloc_fragment((width,), dtype)
+            normalize(Residual, Weight, normalized, row, branch)
             for j in T.Parallel(H, coalesced_width=T.int32(1)):
-                Normed[row, branch, j] = (
-                    values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j])
-                )
+                Normed[row, branch, j] = normalized[j]
 
     return main
 

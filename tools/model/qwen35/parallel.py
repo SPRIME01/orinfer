@@ -1,12 +1,32 @@
 """Request-parallel M1 state, wrapping the original TileLang arithmetic."""
 
 import inspect
-import math
 import re
+
+from tools.model.private_rows import PrivateRows, compile_private
 
 TABLE = "QwenRowPointers"
 SCRATCH = "QwenRowScratch"
 LANES = 128
+ROW_BUFFERS = {"QKV", "Zout", "AB", "FullX", "FullQ", "FullGate", "MixerIn"}
+
+
+def state_role(name):
+    return re.sub(r"^L\d+_", "", name)
+
+
+def attention_pointers(pointers, prepared):
+    """Bind owner KV from its writer, independent of prefill's selected ABI."""
+    result = dict(pointers)
+    for name in ("K", "V", "KS", "VS"):
+        alias = "live_" + name.lower()
+        pointer = prepared.get(name) or prepared.get(alias)
+        if pointer is None:
+            raise ValueError(f"Missing prepared KV pointer {name}")
+        result[name] = pointer
+        if alias in result:
+            result[alias] = pointer
+    return result
 
 
 def geometry(selection, row=1):
@@ -114,13 +134,13 @@ def build(b, attention=None, recurrent=None):
     Changing log capacity while a request is live requires materialization;
     one package therefore uses one log geometry for its complete row domain.
     """
-    import tilelang
-    from kernels.model.independent_rows import independent_rows
     from tools.model.qwen35.build import gpu_lock
 
     if attention is None:
+        from tools.model.qwen35.attention import select
+
         with gpu_lock(b.lock):
-            attention = geometry(b.row_tuner.attention(b.context))
+            attention = select(b.row_tuner, b.context, geometry(b.row_tuner.attention(b.context)))
     if recurrent is None:
         with gpu_lock(b.lock):
             recurrent = b.row_tuner.private_gdn()
@@ -161,11 +181,8 @@ def build(b, attention=None, recurrent=None):
                 dynamic=False,
             )
     kernels = {k["name"]: k for k in b.aot.kernels}
-    row_roles = set(["QKV", "Zout", "AB", "FullX", "FullQ", "FullGate", "MixerIn"])
     layers = []
-    scratch = {}
-    columns = {SCRATCH}
-    dtypes = dict(f16=2, f32=4, i8=1, u8=1, i32=4)
+    private = PrivateRows(w, ROW_BUFFERS, SCRATCH, state_role, LANES, len(b.text["layer_types"]))
     for layer, kind in enumerate(b.text["layer_types"]):
         entries = []
         names = (
@@ -182,6 +199,9 @@ def build(b, attention=None, recurrent=None):
         ]:
             old = kernels[f"qwen_rows/layer{layer}/private/{role}"]
             pointers = b.aot.compiler.pointers(old)
+            if role == "attention":
+                prepared = kernels[f"qwen_rows/layer{layer}/private/prepare"]
+                pointers = attention_pointers(pointers, b.aot.compiler.pointers(prepared))
             if config and config.get("deferred"):
                 pointers.update(
                     {
@@ -197,93 +217,31 @@ def build(b, attention=None, recurrent=None):
             if role == "conv":
                 pointers["History"] = pointers["HI"]
             fn = factory(role, b.context, attention, b.text, config)
-            modes = {}
-            normalized = dict(pointers)
-            from tvm import tirx as tir
-
-            used = set()
-
-            def visit(node):
-                if isinstance(node, (tir.BufferLoad, tir.BufferStore)):
-                    used.add(node.buffer.data)
-                if isinstance(node, tir.Var):
-                    used.add(node)
-
-            tir.stmt_functor.post_order_visit(fn.body, visit)
-            for parameter, buf in fn.buffer_map.items():
-                if buf.data not in used:
-                    continue
-                arg = pointers.get(buf.name)
-                if arg is None:
-                    # Compressed KV prefetch aliases use the same pointer.
-                    arg = pointers.get("live_" + buf.name.lower())
-                if arg is None:
-                    raise ValueError(f"Missing private ABI {role}/{buf.name}")
-                name = arg["name"]
-                normalized[buf.name] = arg
-                storage = w.buffers[name]
-                if storage.get("data") is not None:
-                    mode, identity = "weight", name
-                elif name in row_roles:
-                    mode, identity = "row", name
-                elif w.scopes[name] == "sequence":
-                    mode, identity = "private", re.sub(r"^L\d+_", "", name)
-                    columns.add(identity)
-                else:
-                    mode, identity = "private", SCRATCH
-                    size = math.prod(int(n) for n in buf.shape) * dtypes[storage["dtype"]]
-                    scratch[name] = max(scratch.get(name, 0), size)
-                modes[buf.name] = (mode, identity)
+            modes, normalized = private.bind(fn, pointers)
             entries.append((role, suffix, config, fn, modes, normalized))
         layers.append(entries)
-    offsets = {}
-    cursor = 0
-    for name in sorted(scratch, key=lambda name: (name != "HistoryOut", name)):
-        offsets[name] = cursor
-        cursor += (scratch[name] + 255) // 256 * 256
+    offsets, cursor, columns = private.layout(first=("HistoryOut",))
     w.fixed(SCRATCH, "u8", [cursor], "sequence")
-    columns = sorted(columns)
     b.state_columns = columns
     w.fixed(TABLE, "u64", [LANES * len(layers) * len(columns)])
-    column_map = {name: i for i, name in enumerate(columns)}
     print("PRIVATE ROWS", len(columns), "columns", cursor, "scratch bytes/request", flush=True)
     for layer, entries in enumerate(layers):
         for role, suffix, config, fn, modes, pointers in entries:
-            args_offsets = {
-                name: offsets[arg["name"]]
-                for name, arg in pointers.items()
-                if arg["name"] in offsets
-            }
-            wrapped, inputs = independent_rows(
+            wrapped, bindings = private.wrap(
                 fn,
-                LANES,
                 modes,
-                column_map,
-                row_stride=len(layers) * len(columns),
-                dynamic=True,
-                offsets=args_offsets,
+                pointers,
+                layer,
+                TABLE,
                 batch_parameters=("independent_instances",)
                 if role in ("attention", "attention_merge")
                 else (),
             )
-            bindings = {}
-            for name in inputs:
-                if name is None:
-                    continue
-                if name == "__rows__":
-                    continue
-                bindings[name] = pointers[name]
-            bindings["Pointers"] = dict(
-                kind="buffer_slice", name=TABLE, offset=layer * len(columns) * 8
-            )
             key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else config}"
 
             def compile_wrapped(wrapped=wrapped, role=role, config=config):
-                return tilelang.compile(
+                return compile_private(
                     wrapped,
-                    out_idx=[],
-                    execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
                     pass_configs={
                         "tl.disable_thread_storage_sync": True,
                         "tl.disable_shared_memory_reuse": True,

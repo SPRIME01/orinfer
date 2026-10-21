@@ -54,6 +54,58 @@ def config():
 
 
 class BuildTests(unittest.TestCase):
+    def test_rotation_projects_quantization_choices_without_register_parameters(self):
+        def rotate(*args, **kwargs):
+            return args, kwargs
+
+        def quantize(*args, **kwargs):
+            return args, kwargs
+
+        selection = dict(
+            configs=[
+                dict(block_k=1024, registers=True, threads=128),
+                dict(block_k=1024, registers=True, threads=256),
+            ],
+            default="0",
+            selections=[dict(min_rows=1, max_rows=7, implementation="1")],
+        )
+        builder = SimpleNamespace(
+            lock=None,
+            signs={6144: "Signs"},
+            row_tuner=SimpleNamespace(rotation=lambda *a, **kw: selection),
+            row_choices=Builder.row_choices,
+        )
+        compiled = []
+        builder.emit = lambda name, key, build, *args: compiled.append((name, key, build()))
+        with (
+            patch.dict(
+                "sys.modules",
+                {
+                    "kernels.model.rotation_a8": SimpleNamespace(
+                        rotate_activation_a8=rotate,
+                        rotate_activation_tiles=rotate,
+                        quantize_rotation_tiles=quantize,
+                    )
+                },
+            ),
+            patch("tools.model.qwen35.build.primitive", side_effect=lambda fn, *a, **kw: (fn, kw)),
+        ):
+            Builder.rotation(
+                builder, "layer0/post/swiglu_rotate", 6144, "GateUp", swiglu=True, plane_rows=4096
+            )
+            first = list(compiled)
+            compiled.clear()
+            Builder.rotation(builder, "layer1/post/swiglu_rotate", 6144, "GateUp", swiglu=True)
+        transforms = [entry for entry in first if "swiglu_rotate" in entry[0]]
+        quantizations = [entry for entry in first if "swiglu_quantize" in entry[0]]
+        self.assertEqual(len(transforms), 2)
+        self.assertEqual(len(quantizations), 1)
+        self.assertEqual({entry[2][1]["threads"] for entry in transforms}, {128, 256})
+        self.assertTrue(all(entry[2][1]["registers"] for entry in transforms))
+        self.assertEqual(quantizations[0][2], (quantize, dict(dynamic_rows=True, block_k=1024)))
+        quantized = [entry for entry in compiled if "swiglu_quantize" in entry[0]]
+        self.assertEqual(quantized[0][1:], quantizations[0][1:])
+
     def test_expert_schedules_follow_selected_rows_and_assignment_multiplier(self):
         from tools.model.qwen35 import moe
 
@@ -220,9 +272,10 @@ class BuildTests(unittest.TestCase):
             projection=lambda *args, **kw: None,
             lock=None,
             moe_router_tuner=SimpleNamespace(
-                router=lambda *_: dict(configs=[{}], default="0", selections=[])
+                router=lambda *_: dict(configs=[{}], default="0", selections=[]),
+                topk=lambda *_: dict(configs=[dict(algorithm="block")], default="0", selections=[]),
             ),
-            row_choices=lambda *_: [("", {})],
+            row_choices=lambda selection, *_: [("", selection["configs"][0])],
         )
         launches = []
 

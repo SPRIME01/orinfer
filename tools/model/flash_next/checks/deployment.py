@@ -10,8 +10,10 @@ import shutil
 from tools.model.flash_next.checkpoint import Checkpoint
 from tools.model.flash_next.native import Model
 from tools.model.flash_next.scenes import scenes
-from tools.model.flash_next.prepare import PREFILL_PROFILES
 from tools.operators.common import configure, write_json
+
+
+PREFILL_PROFILES = (16, 128, 512, 2048, 4096)
 
 
 def freeze(model, checkpoint, output):

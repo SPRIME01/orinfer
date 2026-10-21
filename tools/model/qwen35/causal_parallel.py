@@ -3,12 +3,10 @@
 import hashlib
 import inspect
 import json
-import math
-import re
 
-from kernels.model.independent_rows import independent_rows
 from kernels.model.rows import explicit_scalar
-from tools.model.qwen35.parallel import LANES, geometry
+from tools.model.qwen35.parallel import LANES, ROW_BUFFERS, state_role, attention_pointers, geometry
+from tools.model.private_rows import PrivateRows, compile_private
 
 TABLE = "QwenVerifyPointers"
 OFFSET = "QwenVerifyRowOffset"
@@ -94,9 +92,6 @@ def factories(b, attention, conv):
 
 
 def build(b, *, attention=None, conv=None):
-    import tilelang
-    from tvm import tirx as tir
-
     selection = attention or b.row_tuner.attention(b.context)
     configs, choices = {}, []
     for width in range(2, 9):
@@ -113,8 +108,16 @@ def build(b, *, attention=None, conv=None):
     functions = factories(b, attention, conv)
     b.weights.fixed(OFFSET, "i32", [1], "sequence")
     original = {k["name"]: k for k in b.aot.kernels}
-    columns, scratch, entries = {OFFSET, "SegmentLength", "AcceptedInputs", SCRATCH}, {}, []
-    row_roles = {"QKV", "Zout", "AB", "FullX", "FullQ", "FullGate", "MixerIn"}
+    entries = []
+    private = PrivateRows(
+        b.weights,
+        ROW_BUFFERS,
+        SCRATCH,
+        state_role,
+        LANES,
+        len(b.text["layer_types"]),
+        columns=(OFFSET, "SegmentLength", "AcceptedInputs"),
+    )
     for layer, kind in enumerate(b.text["layer_types"]):
         roles = (
             [
@@ -142,6 +145,9 @@ def build(b, *, attention=None, conv=None):
             name = f"qwen_rows/{'verify/' if verify else ''}layer{layer}/{'' if verify else 'private/'}{role}"
             fn, variables = symbolic_rows(factory())
             pointers = b.aot.compiler.pointers(original[name])
+            if role == "attention":
+                prepared = original[f"qwen_rows/layer{layer}/private/prepare"]
+                pointers = attention_pointers(pointers, b.aot.compiler.pointers(prepared))
             if role == "recurrent":
                 pointers.update(
                     {
@@ -154,53 +160,10 @@ def build(b, *, attention=None, conv=None):
                         ).items()
                     }
                 )
-            used = set()
-            tir.stmt_functor.post_order_visit(
-                fn.body,
-                lambda n: (
-                    used.add(n.buffer.data)
-                    if isinstance(n, (tir.BufferLoad, tir.BufferStore))
-                    else used.add(n)
-                    if isinstance(n, tir.Var)
-                    else None
-                ),
-            )
-            modes = {}
-            for buf in fn.buffer_map.values():
-                if buf.data not in used:
-                    continue
-                arg = pointers.get(buf.name) or pointers.get("live_" + buf.name.lower())
-                if arg is None:
-                    raise ValueError(f"Missing causal pointer {role}/{buf.name}")
-                pointers[buf.name] = arg
-                target = arg["name"]
-                storage = b.weights.buffers[target]
-                if storage.get("data") is not None:
-                    modes[buf.name] = ("weight", target)
-                elif target in row_roles:
-                    modes[buf.name] = ("row", target)
-                elif b.weights.scopes[target] == "sequence":
-                    identity = re.sub(r"^L\d+_", "", target)
-                    columns.add(identity)
-                    modes[buf.name] = ("private", identity)
-                else:
-                    modes[buf.name] = ("private", SCRATCH)
-                    substitute = {var: 8 for var in variables}
-                    shape = tir.stmt_functor.substitute(math.prod(buf.shape), substitute)
-                    size = (
-                        int(tilelang.tvm.arith.Analyzer().simplify(shape))
-                        * dict(float16=2, float32=4, int32=4, uint32=4, int8=1, uint8=1)[buf.dtype]
-                    )
-                    scratch[target] = max(scratch.get(target, 0), size)
+            modes, pointers = private.bind(fn, pointers, extents={v: 8 for v in variables})
             entries.append((layer, emitted, fn, variables, modes, pointers))
-    cursor = 0
-    offsets = {}
-    for name, size in sorted(scratch.items()):
-        offsets[name] = cursor
-        cursor += (size + 255) // 256 * 256
+    offsets, cursor, columns = private.layout()
     b.weights.buffers[SCRATCH]["shape"][0] = max(b.weights.buffers[SCRATCH]["shape"][0], cursor)
-    columns = sorted(columns)
-    column_map = {name: i for i, name in enumerate(columns)}
     layers = len(b.text["layer_types"])
     b.weights.fixed(TABLE, "u64", [LANES * layers * len(columns)])
     b.mtp["verification_table"] = dict(
@@ -211,18 +174,12 @@ def build(b, *, attention=None, conv=None):
         attention=choices,
     )
     for layer, role, fn, variables, modes, pointers in entries:
-        fn, inputs = independent_rows(
+        fn, bindings = private.wrap(
             fn,
-            LANES,
             modes,
-            column_map,
-            row_stride=layers * len(columns),
-            dynamic=True,
-            offsets={
-                name: offsets[arg["name"]]
-                for name, arg in pointers.items()
-                if arg["name"] in offsets
-            },
+            pointers,
+            layer,
+            TABLE,
             scalar_columns={v.name: ("SegmentLength", 8) for v in variables},
             row_offset=OFFSET,
             row_capacity=4096,
@@ -230,15 +187,12 @@ def build(b, *, attention=None, conv=None):
             if role in ("attention", "attention_merge")
             else (),
         )
-        bindings = {name: pointers[name] for name in inputs if name not in (None, "__rows__")}
-        bindings["Pointers"] = dict(
-            kind="buffer_slice", name=TABLE, offset=layer * len(columns) * 8
-        )
-
-        def compile_fn(fn=fn):
-            return tilelang.compile(
-                fn, out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
-            )
 
         key = "causal-rows-" + role + "-" + hashlib.sha256(str(fn).encode()).hexdigest()
-        b.emit(f"verify_state/layer{layer}/{role}", key, compile_fn, bindings, LANES)
+        b.emit(
+            f"verify_state/layer{layer}/{role}",
+            key,
+            lambda fn=fn: compile_private(fn),
+            bindings,
+            LANES,
+        )
