@@ -61,3 +61,22 @@ Measured on Jetson AGX Orin 64GB through the Rust CLI/API with `decode_only`, gr
 For the Chinese cold request, a fresh lazy manager reaches `/health` in **0.008 s**, emits its first content **1.21 s** after process launch and completes in **1.31 s**. Model loading and first-request work are included; filesystem caches are retained.
 
 Concurrency checks cover 2/4/8 requests with independent recordings and silence. Four JSONL requests complete with four active requests and zero errors or truncations. WAV (including 48 kHz PCM24 and float PCM), FLAC, MP3, AAC/MP4 and Ogg/Vorbis uploads pass end-to-end checks. A 1,200-second silent FLAC produces 15,615 prompt tokens and empty transcription in **8.50 s**. A 488-second repeated-speech test exercises prefill beyond 4,096 tokens with a deliberately bounded 128-token output; its timing measures capacity and prefix generation.
+
+### vLLM FP8 baseline
+
+A separate 2026-10-21 comparison uses the same audio through both Chat APIs, greedy sampling, seed `20261002`, decode-only graphs and prefix caching off. Each configuration has one warmup and three measurements; the table reports median complete-response time. vLLM audio caches are reset before every trial, and concurrent requests have distinct PCM identities so each recording is encoded. Cohorts use mixed input lengths and natural EOS.
+
+The baseline is [vrfai/Qwen3-ASR-1.7B-fp8](https://huggingface.co/vrfai/Qwen3-ASR-1.7B-fp8), revision `201f1359c25a2d2a759c6f5742a747c789fc776f`, with vLLM source `18f658bb3185779ee58999a328246d09886d568b`. SM87 uses the built-in Marlin FP8 weight / FP16 activation fallback, FP16 audio and FP16 KV. The research loader lowers the ModelOpt FP8 capability check from SM89 to SM80 to allow that fallback; the downloaded checkpoint payload is unchanged. Orinfer uses the mixed precision described above, including INT8 KV.
+
+| Scenario | Audio duration | vLLM FP8 complete | Orinfer Q4A8 complete |
+| --- | ---: | ---: | ---: |
+| Chinese | 4.20 s | 0.2305 s | 0.1384 s |
+| English | 15.05 s | 0.7702 s | 0.5068 s |
+| Independent English | 7.06 s | 0.4379 s | 0.2848 s |
+| 2 concurrent requests | 19.26 s total | 0.8475 s | 0.5406 s |
+| 4 concurrent requests | 25.26 s total | 0.8782 s | 0.5935 s |
+| 8 concurrent requests | 71.03 s total | 1.0572 s | 0.9535 s |
+| 16 concurrent requests | 142.05 s total | 1.3747 s | 1.7253 s |
+| 32 concurrent requests | 284.10 s total | 1.9888 s | 3.2777 s |
+
+Single-request streaming decode estimates are **73–75 tok/s for vLLM** and **106–109 tok/s for Orinfer** on the three original recordings. These use `(completion_tokens - 1) / (response_end - first_content)` and include streaming overhead. Chinese and independent English output counts match; ordinary English produces 49 tokens with vLLM and 46 with Orinfer because of the initial filler. Orinfer leads in single-request and 2/4/8-request latency; vLLM leads at 16/32 requests. Each engine completes 272 requests with successful basic transcription-content checks. This comparison measures complete requests; time to first content includes audio preprocessing, encoding and text prefill.
