@@ -88,9 +88,9 @@ def execution_assets(archives, cache, binary, tag):
         if any(not isinstance(f, str) or not re.fullmatch(r"[a-z0-9_]+", f) for f in fields):
             raise ValueError("Unsafe execution package asset identity")
         architecture, policy, target = fields
-        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-execution.tar.xz"
+        name = f"orinfer-{tag}-{architecture}-{policy.replace('_', '-')}-{target.replace('_', '')}-{digest[:12]}-execution.tar.xz"
         if name in names:
-            raise ValueError("Duplicate architecture, compute policy and target in release")
+            raise ValueError("Duplicate execution package asset in release")
         names.add(name)
         assets.append(
             dict(

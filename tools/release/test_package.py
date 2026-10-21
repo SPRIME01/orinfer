@@ -31,7 +31,7 @@ class ReleaseTests(unittest.TestCase):
 
 
 class ExecutionAssetsTests(unittest.TestCase):
-    def test_two_architectures_have_distinct_assets_and_tampered_identity_fails(self):
+    def test_model_variants_have_distinct_assets_and_tampered_identity_fails(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             header = bytearray(20)
@@ -44,14 +44,16 @@ class ExecutionAssetsTests(unittest.TestCase):
                 library=dict(file="lib/model.so", sha256=hashlib.sha256(header).hexdigest()),
             )
             archives = []
-            for architecture in ("qwen3_5", "flash_next"):
+            for index, architecture in enumerate(("qwen3_5", "flash_next", "qwen3_5")):
                 manifest = dict(
                     schema_version=1,
                     runtime_abi=1,
                     architecture=architecture,
                     compute_policy="int8_quality",
                     target="sm_87",
-                    catalog=dict(assets=[], definitions=[], dynamic=[], binding_signature="0" * 64),
+                    catalog=dict(
+                        assets=[], definitions=[], dynamic=[], binding_signature=str(index) * 64
+                    ),
                     execution=identity,
                 )
                 raw = json.dumps(manifest).encode()
@@ -60,7 +62,7 @@ class ExecutionAssetsTests(unittest.TestCase):
                 (package / "package.json").write_bytes(raw)
                 (package / "lib/model.so").write_bytes(header)
                 suffix = ".tar.gz" if architecture == "qwen3_5" else ".tar.xz"
-                path = root / (architecture + suffix)
+                path = root / (f"{architecture}-{index}" + suffix)
                 from tools.model.package import archive as archive_package
 
                 if suffix == ".tar.gz":
@@ -72,11 +74,12 @@ class ExecutionAssetsTests(unittest.TestCase):
             with patch("tools.release.package.execution_identity", return_value=identity):
                 assets = execution_assets(archives, root / "cache", Path("/bin/true"), "v0.1.2")
                 names = [a["metadata"]["file"] for a in assets]
-                self.assertEqual(len(set(names)), 2)
+                self.assertEqual(len(set(names)), 3)
                 self.assertIn("flash_next", names[1])
                 self.assertNotIn("27b", names[1])
                 self.assertEqual(
-                    [a["metadata"]["architecture"] for a in assets], ["qwen3_5", "flash_next"]
+                    [a["metadata"]["architecture"] for a in assets],
+                    ["qwen3_5", "flash_next", "qwen3_5"],
                 )
                 from tools.model.package import install
 
