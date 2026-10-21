@@ -724,15 +724,26 @@ pub(crate) fn create(mut request: CreateRequest, policy: Policy) -> Result<crate
             max_rows: LANES,
         });
         for (layer, kind) in t.layer_types.iter().enumerate() {
-            let names = if kind == "linear_attention" {
+            let mut names = if kind == "linear_attention" {
                 &["gates", "conv", "recurrent", "gated_norm"][..]
             } else {
                 &["prepare", "attention", "attention_merge"][..]
-            };
+            }
+            .to_vec();
             let name = format!("{PREFIX}/state/layer{layer}");
+            // A separately bound history update belongs between convolution
+            // and recurrence. In-place convolution packages omit this binding.
+            if kind == "linear_attention"
+                && request
+                    .kernel_contracts
+                    .iter()
+                    .any(|kernel| kernel.name == format!("{name}/history"))
+            {
+                names.insert(2, "history");
+            }
             m.programs.insert(
                 name,
-                kernels(&format!("{PREFIX}/state/layer{layer}"), names),
+                kernels(&format!("{PREFIX}/state/layer{layer}"), &names),
             );
         }
     }
@@ -1477,6 +1488,44 @@ mod tests {
         capacity.metadata.gdn_execution.as_mut().unwrap().decode =
             orinfer_model_sdk::operators::gdn::Decode::Deferred { capacity: 4 };
         assert!(create(capacity, Policy::Int8Quality).is_err());
+    }
+
+    #[test]
+    fn request_parallel_history_update_precedes_recurrence_when_bound() {
+        for separate_history in [false, true] {
+            let mut request = request();
+            if separate_history {
+                let asset = json!({"file":"test", "sha256":"0".repeat(64)});
+                request.kernel_contracts.push(
+                    serde_json::from_value(json!({
+                        "name":"qwen_rows/state/layer0/history",
+                        "module":asset,"source":asset,"host_abi":asset,
+                        "symbol":"history","grid":[1,1,1],"block":[1,1,1],
+                        "shared_memory_bytes":0,"cooperative":false,"args":[]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let (adapter, _) = create(request, Policy::Int8Quality).unwrap();
+            let segments = [
+                BatchSegment { slot: 7, tokens: 1 },
+                BatchSegment { slot: 2, tokens: 1 },
+            ];
+            let (calls, _) = adapter.batch(&segments, true).unwrap();
+            let state: Vec<_> = calls
+                .iter()
+                .filter_map(|call| match &call.operation {
+                    Operation::Kernel { name } => name.strip_prefix("qwen_rows/state/layer0/"),
+                    _ => None,
+                })
+                .collect();
+            let expected = if separate_history {
+                vec!["gates", "conv", "history", "recurrent", "gated_norm"]
+            } else {
+                vec!["gates", "conv", "recurrent", "gated_norm"]
+            };
+            assert_eq!(state, expected);
+        }
     }
 
     #[test]
