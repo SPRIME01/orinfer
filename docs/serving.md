@@ -194,6 +194,18 @@ Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512
 
 草稿长度在 CLI 上限内按整轮耗时和实际提交量选择，包含草稿、验证、提交和预热。多请求先测普通 target batch 的成本，再判断 MTP 是否更快；跨上下文档位保留低收益结论，通过同一个有界探测周期复测，以复用已有成本结论。各档先采集预热与稳定样本，稳定估计使用完成 CUDA 模块加载及 Graph 捕获后的样本；低收益时退回普通 batch，按已提交 token 数定期复测。探索仍受其他请求的 decode 时间预算约束。收益取决于接受率与并发规模，短请求的调优样本可能较少。构建方法见[模型工具](../tools/model/README.md)。
 
+#### 单请求深度探索（可选）
+
+`ORINFER_SINGLE_MTP_POLICY=explore_local` 可选启用单请求 MTP 深度探索：在时间预算内为合法草稿深度采集稳定样本，第二次观测时丢弃首次冷执行耗时，并使用当前请求的接受率估计收益，避免其他提示词的历史拒绝率压低本请求的预期提交量。当前请求的稀疏样本收缩估计仍保留。
+
+```bash
+ORINFER_SINGLE_MTP_POLICY=explore_local orinfer serve /path/to/prepared-model --mtp-drafts 3
+```
+
+该策略仅作用于当前执行轮次选中一个 decoder、且没有混合 prefill 的情况，不要求整个服务只有一个活跃请求。CLI 草稿上限、合法执行计划、剩余输出长度和其他请求的时间预算仍约束候选选择；多 decoder 和混合 prefill 保留原有策略。接受率低或请求短时，探索成本可能抵消收益，应使用实际工作负载测量。
+
+未设置该变量或设为 `auto` 时保留默认行为。`explore` 仅启用深度探索和冷样本排除，保留跨请求收益上限；`fixed0`–`fixed3` 用于诊断，分别限制为最多 0–3 个草稿，并选择预算内最宽的合法候选。这些诊断模式同样只作用于上述单 decoder 轮次。其他值会报错。
+
 ### Prefix cache
 
 `--prefix-cache-mib` 默认 12288，单位 MiB，0 关闭复用；随实际缓存内容按需分配。缓存保存完整 KV、FP32 GDN、卷积、位置及 MTP 检查点。Rust radix tree 按 token 和图片身份匹配，并结合实际 prefill/恢复成本选择可用端点。

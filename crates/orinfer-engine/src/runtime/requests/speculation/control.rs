@@ -79,6 +79,7 @@ pub(in crate::runtime) struct Key {
 }
 #[derive(Default)]
 struct Arm {
+    trials: usize,
     time: Estimate,
     tokens: f64,
     last_trial: usize,
@@ -90,12 +91,42 @@ struct Cohort {
     active: usize,
     probe_credit: f64,
 }
-#[derive(Default)]
+#[derive(Clone, Copy, Default, PartialEq)]
+enum SinglePolicy {
+    #[default]
+    Auto,
+    Explore,
+    ExploreLocal,
+    Fixed(usize),
+}
+
 pub(in crate::runtime) struct Controller {
+    single_policy: SinglePolicy,
     cohorts: BTreeMap<Key, Cohort>,
     #[cfg(test)]
     pub(in crate::runtime) fixed_width: Option<usize>,
 }
+impl Default for Controller {
+    fn default() -> Self {
+        let single_policy = match std::env::var("ORINFER_SINGLE_MTP_POLICY").as_deref() {
+            Ok("explore") => SinglePolicy::Explore,
+            Ok("explore_local") => SinglePolicy::ExploreLocal,
+            Ok("fixed0") => SinglePolicy::Fixed(1),
+            Ok("fixed1") => SinglePolicy::Fixed(2),
+            Ok("fixed2") => SinglePolicy::Fixed(3),
+            Ok("fixed3") => SinglePolicy::Fixed(4),
+            Ok("auto") | Err(_) => SinglePolicy::Auto,
+            Ok(other) => panic!("Unsupported ORINFER_SINGLE_MTP_POLICY: {other}"),
+        };
+        Self {
+            cohorts: Default::default(),
+            single_policy,
+            #[cfg(test)]
+            fixed_width: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(in crate::runtime) struct Candidate {
     pub width: usize,
@@ -122,6 +153,17 @@ impl Controller {
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
         let arm = cohort.arms.entry(width).or_default();
+        if matches!(
+            self.single_policy,
+            SinglePolicy::Explore | SinglePolicy::ExploreLocal
+        ) && key.batch == 1
+            && key.prefill == 0
+            && arm.trials == 1
+        {
+            // Exclude the first cold graph/module cost from the steady estimate.
+            arm.time = Default::default();
+        }
+        arm.trials += 1;
         arm.time.observe(seconds);
         arm.tokens = if arm.time.samples == 1 {
             tokens as f64
@@ -144,6 +186,20 @@ impl Controller {
                 .any(|c| c.width == width)
                 .then_some((width, false));
         }
+        let single = key.batch == 1 && key.prefill == 0;
+        if single && let SinglePolicy::Fixed(width) = self.single_policy {
+            return candidates
+                .iter()
+                .filter(|c| c.width <= width && c.prior_seconds <= slack)
+                .max_by_key(|c| c.width)
+                .map(|c| (c.width, false));
+        }
+        let explore_single = single
+            && matches!(
+                self.single_policy,
+                SinglePolicy::Explore | SinglePolicy::ExploreLocal
+            );
+        let local_acceptance = single && self.single_policy == SinglePolicy::ExploreLocal;
         self.retain_key(key);
         let cohort = self.cohorts.entry(key).or_default();
         cohort.calls += 1;
@@ -197,7 +253,14 @@ impl Controller {
             }
             let samples = arm.map_or(0, |a| a.time.samples);
             let score = arm.map_or(f64::INFINITY, |a| {
-                a.time.mean / candidate.expected_tokens.min(a.tokens).max(1.)
+                // Request-local acceptance already includes sparse-sample shrinkage.
+                // A previous prompt's acceptance must not cap this prompt's yield.
+                let expected = if local_acceptance {
+                    candidate.expected_tokens
+                } else {
+                    candidate.expected_tokens.min(a.tokens)
+                };
+                a.time.mean / expected.max(1.)
             });
             // Bootstrap the cheapest depth even with an uncertain cold prior.
             // Other cold depths must either predict a win or spend accumulated
@@ -214,7 +277,8 @@ impl Controller {
             let retry = (stale || samples == 0)
                 && (samples == 0 || !cold_pending)
                 && cohort.probe_credit >= seconds;
-            if (initial || promising || retry) && probe.is_none() {
+            if ((explore_single && samples < 3) || initial || promising || retry) && probe.is_none()
+            {
                 probe = Some((candidate.width, if retry { seconds } else { 0. }));
             }
             let margin = arm.map_or(1., |a| {
@@ -259,6 +323,70 @@ mod tests {
         assert_eq!(allocate(&choices, 3), None);
         assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 3), None);
         assert_eq!(allocate(&[vec![(2, 1.8), (4, 2.9)]], 4), Some(vec![4]));
+    }
+    #[test]
+    fn single_fixed_respects_legal_widths_and_leaves_batch_adaptive() {
+        let mut c = Controller {
+            single_policy: SinglePolicy::Fixed(4),
+            ..Default::default()
+        };
+        let plans = [
+            Candidate {
+                width: 2,
+                expected_tokens: 1.5,
+                prior_seconds: 0.03,
+            },
+            Candidate {
+                width: 3,
+                expected_tokens: 2.,
+                prior_seconds: 0.04,
+            },
+        ];
+        assert_eq!(c.choose(key(1), &plans, 0.02, 0.4), Some((3, false)));
+        assert_eq!(c.choose(key(2), &plans, 0.02, 0.4), None);
+        assert_eq!(c.choose(key(1), &plans, 0.02, 0.01), None);
+        c.single_policy = SinglePolicy::Fixed(1);
+        assert_eq!(c.choose(key(1), &plans, 0.02, 0.4), None);
+    }
+    #[test]
+    fn single_explore_replaces_one_cold_sample_only() {
+        let mut c = Controller {
+            single_policy: SinglePolicy::Explore,
+            ..Default::default()
+        };
+        c.observe(key(1), 3, 1., 2);
+        c.observe(key(1), 3, 0.03, 2);
+        assert_eq!(c.cohorts[&key(1)].arms[&3].time.samples, 1);
+        c.observe(key(1), 3, 0.03, 2);
+        assert_eq!(c.cohorts[&key(1)].arms[&3].time.samples, 2);
+        assert!((c.cohorts[&key(1)].arms[&3].time.mean - 0.03).abs() < 1e-9);
+    }
+    #[test]
+    fn single_local_acceptance_does_not_inherit_another_prompts_rejection_rate() {
+        let mut c = Controller {
+            single_policy: SinglePolicy::ExploreLocal,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            c.observe(key(1), 1, 0.03, 1);
+            c.observe(key(1), 3, 0.05, 3);
+            c.observe(key(1), 4, 0.055, 2);
+        }
+        let plans = [
+            Candidate {
+                width: 3,
+                expected_tokens: 2.8,
+                prior_seconds: 0.05,
+            },
+            Candidate {
+                width: 4,
+                expected_tokens: 3.8,
+                prior_seconds: 0.055,
+            },
+        ];
+        assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((4, false)));
+        c.single_policy = SinglePolicy::Explore;
+        assert_eq!(c.choose(key(1), &plans, 0.03, 0.4), Some((3, false)));
     }
     fn key(batch: usize) -> Key {
         Key {
