@@ -12,13 +12,8 @@ from pathlib import Path
 import shutil
 
 from tools.model.package import execution_identity, verify_execution, verify_library
-from tools.model.publication import (
-    AssetReader,
-    atomic_model,
-    clone_cpu_assets,
-    link_or_copy,
-    write_json,
-)
+from tools.model.publication import AssetReader, atomic_model, clone_cpu_assets, link_or_copy
+from tools.build.files import write_json
 
 
 def attach(source, output, library, engine, package_name=None, version=None):

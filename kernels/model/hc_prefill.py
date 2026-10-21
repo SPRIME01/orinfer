@@ -9,7 +9,7 @@ BF16 projection inputs preserve the same Tensor Core accumulation traversal.
 import tilelang
 import tilelang.language as T
 from tools.operators.common import orin_jit
-from kernels.model.hyperconnection import _dtype
+from kernels.model.hyperconnection import _dtype, combine_fragment
 from kernels.model.floating_core import mma_loop
 from kernels.model.rows import row_count
 from kernels.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
@@ -99,6 +99,7 @@ def hc_combine_norm_prefill(
         raise ValueError("Invalid HC combination/normalization dimensions")
     width = 1 << (H - 1).bit_length()
     M = row_count(M, dynamic_rows)
+    combine = combine_fragment(H, streams, dtype)
 
     @T.prim_func
     def hc_prefill_combine_norm(
@@ -115,22 +116,7 @@ def hc_combine_norm_prefill(
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
-            raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
-            gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
-            for j in T.Parallel(width, coalesced_width=T.int32(1)):
-                values[j] = 0.0
-                if j < H:
-                    injection = T.cast(
-                        T.cast(Block[row, j], T.float32) * T.cast(gate, T.float32), dtype
-                    )
-                    rounded = T.cast(
-                        T.cast(Residual[row, branch, j], T.float32) + T.cast(injection, T.float32),
-                        dtype,
-                    )
-                    values[j] = T.cast(rounded, T.float32)
-                    Output[row, branch, j] = rounded
-                square[j] = values[j] * values[j]
-            T.reduce_sum(square, total, dim=0)
+            combine(Block, Residual, Inject, Output, values, square, total, row, branch)
             inverse = T.rsqrt(total[0] / H + eps)
             InvRms[row, branch] = inverse
             for j in T.Parallel(H, coalesced_width=T.int32(1)):

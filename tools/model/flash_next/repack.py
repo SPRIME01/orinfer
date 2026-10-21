@@ -12,7 +12,8 @@ import re
 import shutil
 
 from tools.model.compact import compact_weights
-from tools.model.publication import clone_cpu_assets, staged_directory, write_json
+from tools.model.publication import clone_cpu_assets, staged_directory
+from tools.build.files import write_json
 
 
 def shard_name(name):

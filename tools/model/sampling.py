@@ -11,7 +11,8 @@ import shutil
 import subprocess
 import os
 from tools.model.compile import primitive
-from tools.model.publication import atomic_model, clone_model, load_model, write_json
+from tools.model.publication import atomic_model, clone_model, load_model
+from tools.build.files import write_json
 
 
 def append(data, package, root, output):

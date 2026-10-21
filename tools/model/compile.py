@@ -3,12 +3,26 @@
 import inspect
 
 
-def primitive(function, *args, compiler_options=None, **kwargs):
+def instantiate(function, *args, **kwargs):
+    return inspect.unwrap(getattr(function, "func", function))(*args, **kwargs)
+
+
+def compile_function(function, **options):
     import tilelang
+
+    return tilelang.compile(
+        function,
+        out_idx=[],
+        execution_backend="nvrtc",
+        target={"kind": "cuda", "arch": "sm_87"},
+        **options,
+    )
+
+
+def primitive(function, *args, compiler_options=None, **kwargs):
     from kernels.model.rows import explicit_rows
 
-    factory = inspect.unwrap(getattr(function, "func", function))
-    fn = factory(*args, **kwargs)
+    fn = instantiate(function, *args, **kwargs)
     if kwargs.get("dynamic_rows"):
         fn = explicit_rows(fn)
     passes = (
@@ -20,10 +34,4 @@ def primitive(function, *args, compiler_options=None, **kwargs):
         else {}
     )
     passes.update(compiler_options or {})
-    return tilelang.compile(
-        fn,
-        out_idx=[],
-        execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
-        pass_configs=passes,
-    )
+    return compile_function(fn, pass_configs=passes)

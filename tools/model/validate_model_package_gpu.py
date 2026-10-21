@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import save_file
 
 from kernels.fixtures.model_package import transition
-from tools.model.publication import file_hash, write_json
+from tools.build.files import file_hash, write_json
 from tools.operators.abi import evaluate, parse_host
 from tools.operators.common import ROOT, configure, export_kernel
 

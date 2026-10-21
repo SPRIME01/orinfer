@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Support direct script invocation before loading project modules.
 sys.path.insert(0, str(ROOT))
 from tools.model.package import execution_identity, install  # noqa: E402
-from tools.model.publication import file_hash  # noqa: E402
+from tools.build.files import file_hash  # noqa: E402
 
 
 def command(*args, cwd=ROOT):

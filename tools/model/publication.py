@@ -1,6 +1,8 @@
 """Shared immutable model cloning and validated, atomic publication."""
 
 from contextlib import contextmanager
+from tools.build.files import write_json
+
 import hashlib
 import errno
 import json
@@ -25,14 +27,6 @@ def source_path(base, file):
     if not resolved.is_relative_to(base):
         raise ValueError(f"Artifact leaves its directory: {file}")
     return resolved
-
-
-def file_hash(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class AssetReader:
@@ -70,10 +64,6 @@ class AssetReader:
         if hashlib.sha256(raw).hexdigest() != asset["sha256"]:
             raise ValueError("Operator asset sha256 mismatch")
         return raw
-
-
-def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
 
 def link_or_copy(source, destination):

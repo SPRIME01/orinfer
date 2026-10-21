@@ -3,6 +3,7 @@
 import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.independent_rows import POINTER_SOURCE
+from kernels.model.packet_io import output_fragments
 
 IO_COLUMNS = 10
 
@@ -103,6 +104,7 @@ def end(private_stride, ring, capture):
 @orin_jit
 def outputs(private_stride, vocab):
     base = 128 * private_stride
+    write_logits, write_selected = output_fragments(vocab, batched=True)
 
     @T.prim_func
     def kernel(
@@ -119,9 +121,7 @@ def outputs(private_stride, vocab):
                 var=T.ptr("float32"),
             )
             logits_buffer = T.decl_buffer((vocab,), "float32", data=logits)
-            for col in T.Parallel(512):
-                if block * 512 + col < vocab:
-                    logits_buffer[block * 512 + col] = Logits[row, block * 512 + col]
+            write_logits(Logits, logits_buffer, row, block)
             if block == 0 and T.get_thread_binding() == 0:
                 token = T.bind(
                     T.call_extern("handle", "orin_row_pointer", Pointers[offset + 3]),
@@ -133,7 +133,6 @@ def outputs(private_stride, vocab):
                     var=T.ptr("int32"),
                 )
                 status_buffer = T.decl_buffer((1,), "int32", data=status)
-                token_buffer[0] = Selected[row, 0]
-                status_buffer[0] = Selected[row, 1]
+                write_selected(Selected, token_buffer, status_buffer, row)
 
     return kernel

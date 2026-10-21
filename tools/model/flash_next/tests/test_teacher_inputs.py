@@ -7,7 +7,7 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from tools.model.flash_next.reference.inputs import Inputs
-from tools.quantization.flash_next import digest
+from tools.build.files import file_hash as digest
 
 
 class InputTests(unittest.TestCase):

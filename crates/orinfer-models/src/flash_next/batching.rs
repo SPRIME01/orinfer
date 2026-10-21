@@ -1,11 +1,11 @@
 //! Shared dense/MoE work with request-private recurrence and sparse attention.
 use crate::{
     artifact::Result,
-    execution::{BufferView, Invocation},
+    execution::Invocation,
     model::{Manifest, Operation},
 };
 use orinfer_model_sdk::architecture::BatchSegment;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const PROFILES: [usize; 7] = [2, 4, 8, 16, 32, 64, 128];
 const POINTERS: &str = "FlashBatchPointers";
@@ -124,26 +124,13 @@ pub(super) fn state_bindings(
         let decoders: Vec<_> = segments.iter().filter(|s| s.tokens == 1).cloned().collect();
         return state_bindings(m, &decoders);
     }
-    if segments.len() > 128
-        || segments
-            .iter()
-            .map(|s| s.slot)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != segments.len()
-    {
-        return Err("Flash private table requires distinct single-token requests".into());
+    // A prefill-only packet clears every decoder pointer in the shared table.
+    if !segments.is_empty() {
+        crate::packet::Rows::packet(segments, 128, 128)?;
     }
-    let names: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
-    let roles: Vec<_> = (0..48)
-        .flat_map(|layer| {
-            let names = &names;
-            layout.state_columns.iter().map(move |column| {
-                let name = private_role(column, layer);
-                names.contains(name.as_str()).then_some(name)
-            })
-        })
-        .collect();
+    let roles = crate::packet::layer_roles(m, 48, &layout.state_columns, |role, layer| {
+        [private_role(role, layer)]
+    });
     let rows = super::unified_decode::CAPACITY;
     let mut result = crate::packet::private_bindings(segments, rows, &roles);
     let io = [
@@ -158,44 +145,14 @@ pub(super) fn state_bindings(
         m.mtp.as_ref().map(|_| "MtpHiddenRing".into()),
         Some("State_ple".into()),
     ];
-    for lane in 0..128 {
-        result.extend(io.iter().map(|name| {
-            segments
-                .get(lane)
-                .and_then(|s| name.as_ref().map(|name| (s.slot, name.clone())))
-        }));
-    }
+    result.extend(crate::packet::private_bindings(segments, rows, &io));
     Ok(result)
-}
-
-fn invocation(
-    operation: Operation,
-    sequence: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Invocation {
-    Invocation {
-        operation,
-        sequence,
-        views: views.clone(),
-        launch: None,
-    }
 }
 pub(super) fn plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocation>> {
     if segments.iter().any(|s| s.tokens != 1) {
         return super::mixed::plan(m, segments);
     }
-    if segments.is_empty()
-        || segments.len() > 128
-        || segments.iter().any(|s| s.tokens != 1)
-        || segments
-            .iter()
-            .map(|s| s.slot)
-            .collect::<BTreeSet<_>>()
-            .len()
-            != segments.len()
-    {
-        return Err("Flash batch needs 1..128 distinct single-token sequences".into());
-    }
+    crate::packet::Rows::packet(segments, 128, 128)?;
     unified_plan(m, segments)
 }
 
@@ -217,7 +174,7 @@ fn unified_plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocatio
     };
     let append_private = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
         for op in &m.programs[program] {
-            let mut call = invocation(op.clone(), None, &BTreeMap::new());
+            let mut call = crate::packet::invocation(op.clone(), None, &BTreeMap::new());
             if let Operation::Kernel { name } = &call.operation {
                 call.launch = Some(
                     m.dynamic_batch_kernels
@@ -250,6 +207,7 @@ fn unified_plan(m: &Manifest, segments: &[BatchSegment]) -> Result<Vec<Invocatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     fn manifest() -> Manifest {
         let mut m: Manifest = serde_json::from_value(serde_json::json!({
             "schema_version":2,"target":"sm_87","model":"test","chunk_tokens":4096,
@@ -970,7 +928,7 @@ mod tests {
             .shape = vec![128 * (48 * 3 + 10)];
         register(&mut m).unwrap();
         assert_eq!(m.state_pointer_table.as_ref().unwrap().max_rows, 128);
-        for count in [1, 2, 3, 8, 15, 128] {
+        for count in [0, 1, 2, 3, 8, 15, 128] {
             let segments: Vec<_> = (0..count)
                 .map(|lane| BatchSegment {
                     slot: 129 - lane,
@@ -1001,5 +959,33 @@ mod tests {
         }
         m.batch_layout.as_mut().unwrap().state_columns.swap(0, 1);
         assert!(register(&mut m).is_err());
+    }
+
+    #[test]
+    fn prefill_only_packet_clears_previous_decode_owner_bindings() {
+        let mut m = mixed_manifest();
+        m.batch_layout.as_mut().unwrap().state_columns = vec!["Position".into()];
+        let active = state_bindings(
+            &m,
+            &[BatchSegment {
+                slot: 19,
+                tokens: 1,
+            }],
+        )
+        .unwrap();
+        assert!(active.iter().any(Option::is_some));
+        let cold = state_bindings(
+            &m,
+            &[
+                BatchSegment {
+                    slot: 7,
+                    tokens: 128,
+                },
+                BatchSegment { slot: 3, tokens: 7 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(cold.len(), active.len());
+        assert!(cold.iter().all(Option::is_none));
     }
 }

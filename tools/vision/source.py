@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import urllib.request
 
-from tools.model.publication import file_hash, write_json
+from tools.build.files import file_hash, write_json
 from tools.model.safetensors_source import Source
 
 

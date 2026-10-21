@@ -1,8 +1,7 @@
 """Lift unchanged Qwen packet boundaries into address-table dynamic kernels."""
 
-import inspect
-
-from tools.model.private_rows import compile_private
+from tools.model.compile import compile_function, instantiate
+from tools.model.private_rows import wrap_private
 from tools.model.qwen35.parallel import LANES, TABLE
 
 # Shared with qwen3_5::rows::PACKET_COLUMNS; appended after the layer table.
@@ -29,7 +28,6 @@ ROW_BUFFERS = {"Hidden", "R0", "HeadHidden", "HeadLogits", "Pairs"}
 
 def build(b):
     from kernels.model import qwen35, control, e8p_q4, packet_io, speculation
-    from kernels.model.independent_rows import independent_rows
     from kernels.model.rows import static_rows
     from kernels.operators.op23_final_norm import final_norm
     from kernels.vision.features import overlay
@@ -40,7 +38,7 @@ def build(b):
     kernels = {k["name"]: k for k in b.aot.kernels}
 
     def invoke(factory, *args, **kwargs):
-        return static_rows(inspect.unwrap(getattr(factory, "func", factory))(*args, **kwargs))
+        return static_rows(instantiate(factory, *args, **kwargs))
 
     def emit(role, function, pointers):
         pointers = {
@@ -60,15 +58,13 @@ def build(b):
                 else "private",
                 name,
             )
-        wrapped, inputs = independent_rows(
-            function, LANES, modes, {name: i for i, name in enumerate(COLUMNS)}, dynamic=True
+        wrapped, bindings = wrap_private(
+            function, LANES, modes, COLUMNS, pointers, TABLE, table_offset=base * 8
         )
-        bindings = {name: pointers[name] for name in inputs if name not in (None, "__rows__")}
-        bindings["Pointers"] = dict(kind="buffer_slice", name=TABLE, offset=base * 8)
         b.emit(
             "packet/" + role,
             f"packet-{role}-{b.h}-{b.v}-{b.context}-{b.standard}",
-            lambda: compile_private(wrapped),
+            lambda: compile_function(wrapped),
             bindings,
             LANES,
         )

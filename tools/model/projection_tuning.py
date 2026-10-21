@@ -5,11 +5,12 @@ model's floating-point reductions are not tuning parameters. No Torch or
 autotuner dependency enters the published Rust runtime.
 """
 
-import hashlib
 import json
 import math
 from pathlib import Path
-import tempfile
+
+from tools.build.files import atomic_json, source_hash
+from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 from tools.model.projection_policy import (
     q4_configs,
@@ -18,22 +19,11 @@ from tools.model.projection_policy import (
     swiglu_configs,
     candidate_scores,
 )
-from tools.model.publication import write_json
 from tools.model.expert_tuning import (
     EXACT_EXPERT_PASSES as EXACT_PASSES,
     expert_configs,
     expert_projection,
 )
-
-
-def atomic_json(path, value):
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-    try:
-        write_json(temporary, value)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 TARGET = {"kind": "cuda", "arch": "sm_87"}
@@ -265,46 +255,39 @@ class ProjectionTuner:
             configs = list(candidate_configs)
         samples = measurement_rows(rows, dynamic, measure_rows)
         sample = samples[0]
-        source = hashlib.sha256()
-        for file in ("projection_tuning.py", "projection_policy.py"):
-            source.update(Path(__file__).with_name(file).read_bytes())
         root = Path(__file__).resolve().parents[2]
-        source.update((root / "tools/model/row_selection.py").read_bytes())
-        source.update((root / "tools/model/compile.py").read_bytes())
-        source.update((root / "tools/model/expert_tuning.py").read_bytes())
         # Include inlined components as well as public wrappers. A change to a
         # shared loader/mainloop/epilogue must invalidate every consumer's tile.
-        for path in sorted((root / "kernels").rglob("*.py")):
-            source.update(str(path.relative_to(root)).encode())
-            source.update(path.read_bytes())
+        sources = [
+            Path(__file__).with_name(name + ".py")
+            for name in (
+                "projection_tuning",
+                "projection_policy",
+                "row_selection",
+                "compile",
+                "expert_tuning",
+                "tuning",
+            )
+        ]
+        sources.extend((root / "kernels").rglob("*.py"))
+        sources.extend((root / "tools/build").glob("*.py"))
         identity = dict(
             spec=spec,
             configs=configs,
             samples=samples,
             seed=SEED,
-            source=source.hexdigest(),
+            source=source_hash(root, sources),
             weights=weight_identity,
             tilelang=tilelang.__version__,
             cuda=torch.version.cuda,
             device=torch.cuda.get_device_name(),
         )
-        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-        cached = self.cache / f"{key}.json"
+        cached = record_path(self.cache, identity)
+        key = cached.stem
         passes = EXACT_PASSES if kind == "expert" else {}
-        record = None
-        if cached.exists():
-            try:
-                record = json.loads(cached.read_text())
-                if (
-                    record["identity"] != identity
-                    or record["config"] not in configs
-                    or not record["checked_rows"]
-                ):
-                    record = None
-            except (ValueError, KeyError, TypeError):
-                record = None
-            if record is None:
-                cached.unlink()
+        record = read_record(
+            cached, identity, lambda r: r["config"] in configs and r["checked_rows"]
+        )
         if record is not None:
             kernel = tilelang.compile(
                 make_prim(spec, record["config"]),
@@ -314,25 +297,17 @@ class ProjectionTuner:
                 pass_configs=passes,
             )
         elif dynamic:
-            from tools.operators.common import benchmark
-
-            candidates, legal, rejected = [], [], []
-            for cfg in configs:
-                try:
-                    candidate = tilelang.compile(
-                        make_prim(spec, cfg),
-                        out_idx=[],
-                        execution_backend="nvrtc",
-                        target=TARGET,
-                        pass_configs=passes,
-                    )
-                except Exception as error:
-                    rejected.append(dict(config=cfg, stage="compile", reason=str(error)))
-                    continue
-                candidates.append(candidate)
-                legal.append(cfg)
-            if not candidates:
-                raise ValueError(f"All dynamic tile candidates failed compilation: {rejected}")
+            candidates, legal, rejected = compile_candidates(
+                configs,
+                lambda cfg: tilelang.compile(
+                    make_prim(spec, cfg),
+                    out_idx=[],
+                    execution_backend="nvrtc",
+                    target=TARGET,
+                    pass_configs=passes,
+                ),
+                tolerate_failures=True,
+            )
             invalid = set()
             timings = []
             for live in samples:
@@ -369,10 +344,7 @@ class ProjectionTuner:
                     # Large dynamic tiles can take tens of milliseconds. Spend
                     # the same minimum timing budget on every candidate rather
                     # than replaying the slowest fallback eight times per trial.
-                    pilot, _ = benchmark(run, repetitions=1, warmup=1)
-                    repetitions = max(1, min(8, math.ceil(1.0 / pilot["median_ms"])))
-                    time, _ = benchmark(run, repetitions=repetitions, warmup=0)
-                    times.append(time["median_ms"])
+                    times.append(measure(run, budget_ms=1.0, max_repetitions=8))
                 timings.append(dict(rows=live, times_ms=times))
             scores = candidate_scores(timings, invalid, objective)
             if len(invalid) == len(legal):

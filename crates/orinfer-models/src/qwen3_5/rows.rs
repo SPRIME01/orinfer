@@ -1170,21 +1170,8 @@ impl QwenRows {
             segments.to_vec()
         };
         let segments = ordered.as_slice();
-        let total: usize = segments
-            .iter()
-            .map(|s| s.tokens)
-            .try_fold(0usize, usize::checked_add)
-            .ok_or("Qwen packet row overflow")?;
-        let mut owners = BTreeSet::new();
-        if segments.is_empty()
-            || segments.len() > LANES
-            || total > CAPACITY
-            || segments
-                .iter()
-                .any(|s| s.tokens == 0 || !owners.insert(s.slot))
-        {
-            return Err("Invalid Qwen causal row packet".into());
-        }
+        let rows = crate::packet::Rows::packet(segments, LANES, CAPACITY)?;
+        let total = rows.total;
         let verified = |lane: usize| prefills.is_some_and(|n| lane >= n);
         let causal = prefills.and_then(|_| m.mtp.as_ref()?.verification_table.as_ref());
         let mut causal_groups = BTreeMap::<&str, Vec<BatchSegment>>::new();
@@ -1214,37 +1201,30 @@ impl QwenRows {
         }
         let causal_bindings = || {
             let table = causal.unwrap();
-            let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
-            let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
-                .flat_map(|layer| {
-                    let buffers = &buffers;
-                    table.columns.iter().map(move |role| {
-                        let name = format!("L{layer}_{role}");
-                        if buffers.contains(name.as_str()) {
-                            Some(name)
-                        } else {
-                            buffers.contains(role.as_str()).then(|| role.clone())
-                        }
-                    })
-                })
-                .collect();
+            let roles = crate::packet::layer_roles(
+                m,
+                m.batch_layout.as_ref().unwrap().layers.len(),
+                &table.columns,
+                |role, layer| [format!("L{layer}_{role}"), role.to_owned()],
+            );
             let decoders: Vec<_> = causal_groups.values().flatten().cloned().collect();
             crate::packet::private_bindings(&decoders, decoders.len(), &roles)
         };
-        let head_rows: usize = segments
-            .iter()
-            .enumerate()
-            .map(|(lane, s)| if verified(lane) { s.tokens } else { 1 })
-            .sum();
-        if head_rows > head_capacity(m)
-            || segments.iter().enumerate().any(|(lane, s)| {
-                verified(lane)
-                    && !m
-                        .mtp
-                        .as_ref()
-                        .is_some_and(|spec| spec.batch_verification_tokens.contains(&s.tokens))
-            })
-        {
+        let heads = crate::packet::Rows::new(
+            segments
+                .iter()
+                .enumerate()
+                .map(|(lane, s)| if verified(lane) { s.tokens } else { 1 }),
+            head_capacity(m),
+        )?;
+        let head_rows = heads.total;
+        if segments.iter().enumerate().any(|(lane, s)| {
+            verified(lane)
+                && !m
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|spec| spec.batch_verification_tokens.contains(&s.tokens))
+        }) {
             return Err("Invalid Qwen verification rows".into());
         }
         if !include_plan {
@@ -1263,7 +1243,7 @@ impl QwenRows {
         let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
         let parallel = prefills.is_none() && decoders > 0;
         let packet = parallel && m.programs.contains_key("qwen_rows/packet/begin");
-        let (mut out, mut offset, mut views) = (Vec::new(), 0, Vec::new());
+        let (mut out, mut views) = (Vec::new(), Vec::new());
         let empty = BTreeMap::new();
         if packet {
             append(
@@ -1276,22 +1256,15 @@ impl QwenRows {
             )?;
         }
         for (lane, segment) in segments.iter().enumerate() {
-            let v = layout
-                .row_strides
-                .iter()
-                .map(|(name, stride)| {
-                    (
-                        name.clone(),
-                        BufferView {
-                            buffer: name.clone(),
-                            offset: offset * stride,
-                        },
-                    )
-                })
-                .collect();
+            let v = crate::packet::views(
+                rows.starts[lane],
+                layout
+                    .row_strides
+                    .iter()
+                    .map(|(name, &stride)| (name.as_str(), stride)),
+            )?;
             if packet && lane < decoders {
                 views.push(v);
-                offset += segment.tokens;
                 continue;
             }
             if segment.tokens == 1 {
@@ -1315,7 +1288,6 @@ impl QwenRows {
                 &v,
             )?;
             views.push(v);
-            offset += segment.tokens;
         }
         for layer in 0..layout.layers.len() {
             append(
@@ -1402,12 +1374,8 @@ impl QwenRows {
         if packet {
             append(m, &mut out, "qwen_rows/packet/end", decoders, None, &empty)?;
         }
-        let mut head_lane = 0;
-        let mut heads = vec![];
         for (lane, (segment, v)) in segments.iter().zip(&views).enumerate() {
             if packet && lane < decoders {
-                heads.push((head_lane, 1));
-                head_lane += 1;
                 continue;
             }
             append(
@@ -1431,12 +1399,7 @@ impl QwenRows {
             let mut gather = v.clone();
             gather.insert(
                 "HeadHidden".into(),
-                BufferView {
-                    buffer: "HeadHidden".into(),
-                    offset: head_lane
-                        * m.batch_layout.as_ref().ok_or("Missing Qwen layout")?.hidden
-                        * 2,
-                },
+                crate::packet::view("HeadHidden", heads.starts[lane], layout.hidden * 2)?,
             );
             append(
                 m,
@@ -1450,8 +1413,6 @@ impl QwenRows {
                 Some(segment.slot),
                 &gather,
             )?;
-            heads.push((head_lane, if verified(lane) { segment.tokens } else { 1 }));
-            head_lane += heads.last().unwrap().1;
         }
         append(
             m,
@@ -1475,23 +1436,11 @@ impl QwenRows {
             if packet && lane < decoders {
                 continue;
             }
-            let (first, count) = heads[lane];
-            let v = BTreeMap::from([
-                (
-                    "HeadLogits".into(),
-                    BufferView {
-                        buffer: "HeadLogits".into(),
-                        offset: first * m.vocab * 4,
-                    },
-                ),
-                (
-                    "Pairs".into(),
-                    BufferView {
-                        buffer: "Pairs".into(),
-                        offset: first * 8,
-                    },
-                ),
-            ]);
+            let count = if verified(lane) { segment.tokens } else { 1 };
+            let v = crate::packet::views(
+                heads.starts[lane],
+                [("HeadLogits", m.vocab * 4), ("Pairs", 8)],
+            )?;
             out.push(Invocation {
                 operation: Operation::Copy {
                     source: "HeadLogits".into(),

@@ -12,7 +12,8 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from tools.quantization.embedding_vq import pack
-from tools.quantization.flash_next import atomic_json, bf16, digest, equivalent
+from tools.build.files import atomic_json, file_hash as digest
+from tools.quantization.flash_next import bf16, equivalent
 
 
 def policy(name, info):

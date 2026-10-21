@@ -1,20 +1,16 @@
 """Owner-parallel causal kernels with device lengths and shared row arenas."""
 
 import hashlib
-import inspect
 import json
 
 from kernels.model.rows import explicit_scalar
 from tools.model.qwen35.parallel import LANES, ROW_BUFFERS, state_role, attention_pointers, geometry
-from tools.model.private_rows import PrivateRows, compile_private
+from tools.model.private_rows import PrivateRows
+from tools.model.compile import compile_function, instantiate as invoke
 
 TABLE = "QwenVerifyPointers"
 OFFSET = "QwenVerifyRowOffset"
 SCRATCH = "QwenRowScratch"
-
-
-def invoke(factory, *args, **kwargs):
-    return inspect.unwrap(getattr(factory, "func", factory))(*args, **kwargs)
 
 
 def symbolic_rows(function):
@@ -192,7 +188,7 @@ def build(b, *, attention=None, conv=None):
         b.emit(
             f"verify_state/layer{layer}/{role}",
             key,
-            lambda fn=fn: compile_private(fn),
+            lambda fn=fn: compile_function(fn),
             bindings,
             LANES,
         )

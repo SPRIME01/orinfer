@@ -80,7 +80,7 @@ def selection(b, banks):
     if not hasattr(b, "moe_selection"):
         import torch
         from tools.model.expert_tuning import MoeTuner
-        from tools.model.qwen35.build import gpu_lock
+        from tools.build.gpu import gpu_lock
 
         w = b.weights
         with gpu_lock(b.lock):
@@ -437,7 +437,7 @@ def build(b, section, prefix, *, rows=4096, draft=False):
         prefix + ".router", [prefix + ".gate.weight", prefix + ".shared_expert_gate.weight"]
     )
     from tools.model.expert_tuning import MoeTuner
-    from tools.model.qwen35.build import gpu_lock
+    from tools.build.gpu import gpu_lock
 
     if not hasattr(b, "moe_router_tuner"):
         b.moe_router_tuner = MoeTuner(b.output / "moe-tuning", b.aot.identity)

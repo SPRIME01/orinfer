@@ -41,6 +41,7 @@ def mma_loop(
     reduction_groups=1,
     grouped_input=False,
     weight_first=False,
+    cast_input=False,
 ):
     @T.macro
     def product(A, W, acc, by, bx, group):
@@ -55,7 +56,10 @@ def mma_loop(
                 offset = branch * (k // reduction_groups) + kg * bk
                 if weight_first:
                     T.copy(W[bx * bn, group * k + offset], w)
-                if grouped_input:
+                if cast_input:
+                    for i, j in T.Parallel(bm, bk, coalesced_width=T.int32(1)):
+                        a[i, j] = T.if_then_else(by * bm + i < m, A[by * bm + i, offset + j], 0.0)
+                elif grouped_input:
                     for i, j in T.Parallel(bm, bk):
                         a[i, j] = 0
                         if by * bm + i < m:

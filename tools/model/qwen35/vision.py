@@ -1,7 +1,7 @@
 """Bind the shared ViT encoder once with runtime patch rows and a merge divisor."""
 
 import math
-from tools.model.qwen35.build import primitive
+from tools.model.compile import primitive
 from tools.vision.config import validate_vision
 
 PATCHES = 32768

@@ -1,9 +1,9 @@
 """Request-parallel M1 state, wrapping the original TileLang arithmetic."""
 
-import inspect
 import re
 
-from tools.model.private_rows import PrivateRows, compile_private
+from tools.model.private_rows import PrivateRows
+from tools.model.compile import compile_function, instantiate as invoke
 
 TABLE = "QwenRowPointers"
 SCRATCH = "QwenRowScratch"
@@ -55,9 +55,6 @@ def factory(role, context, attention, text=None, recurrent=None):
     qh, kvh = text.get("num_attention_heads", 24), text.get("num_key_value_heads", 4)
     dim = text.get("head_dim", 256)
     gated = text.get("attn_output_gate", True)
-
-    def invoke(fn, *args, **kwargs):
-        return inspect.unwrap(getattr(fn, "func", fn))(*args, **kwargs)
 
     if role == "gates":
         fn = invoke(_compile_gates, packed_ab=True, heads=hv)
@@ -142,7 +139,7 @@ def build(b, attention=None, recurrent=None):
     Changing log capacity while a request is live requires materialization;
     one package therefore uses one log geometry for its complete row domain.
     """
-    from tools.model.qwen35.build import gpu_lock
+    from tools.build.gpu import gpu_lock
 
     if attention is None:
         from tools.model.qwen35.attention import select
@@ -251,7 +248,7 @@ def build(b, attention=None, recurrent=None):
             key = f"private-rows-{role}-{b.h}-{b.hv}-{b.qh}-{attention if role.startswith('attention') else config}"
 
             def compile_wrapped(wrapped=wrapped, role=role, config=config):
-                return compile_private(
+                return compile_function(
                     wrapped,
                     pass_configs={
                         "tl.disable_thread_storage_sync": True,

@@ -14,7 +14,7 @@ from tools.model.flash_next.weights import coverage, check_piece, payload_hash, 
 from tools.model.flash_next.checkpoint import Checkpoint
 from tools.quantization.e8p import basis
 from tools.quantization.embedding_vq import pack, decode
-from tools.quantization.flash_next import digest
+from tools.build.files import file_hash as digest
 
 
 class FakeSource:

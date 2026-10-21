@@ -8,7 +8,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from tools.model.publication import file_hash
+from tools.build.files import file_hash
 from tools.model.safetensors_source import relative_name
 
 

@@ -23,15 +23,8 @@ from tools.model.flash_next.construction import (
     projection,
 )  # noqa: E402
 from tools.model.host_compiler import Compiler  # noqa: E402
-from tools.model.publication import (  # noqa: E402
-    ROOT,
-    atomic_model,
-    clone_model,
-    file_hash,
-    load_model,
-    source_path,
-    write_json,
-)
+from tools.model.publication import ROOT, atomic_model, clone_model, load_model, source_path  # noqa: E402
+from tools.build.files import file_hash, write_json, source_hash  # noqa: E402
 
 
 def inventory(data, package, manifest, compiler):
@@ -70,11 +63,12 @@ def source_identity():
         ("kernels/model", "*.py"),
         ("tools/model", "*.py"),
         ("tools/operators", "*.py"),
+        ("tools/build", "*.py"),
         ("crates/orinfer-models", "*.rs"),
         ("crates/orinfer-model-sdk", "*.rs"),
     ):
         paths.extend((ROOT / directory).rglob(suffix))
-    return identity({str(p.relative_to(ROOT)): file_hash(p) for p in sorted(set(paths))})
+    return source_hash(ROOT, paths)
 
 
 def weight_contract(weights, buffers):

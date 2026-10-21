@@ -36,7 +36,7 @@ from tools.model.flash_next.reference.qsa import (
 )
 from tools.model.flash_next.reference.inputs import Inputs
 from tools.model.safetensors_source import Source
-from tools.quantization.flash_next import atomic_json, digest
+from tools.build.files import atomic_json, file_hash as digest
 from tools.operators.common import configure, environment, SEED
 
 

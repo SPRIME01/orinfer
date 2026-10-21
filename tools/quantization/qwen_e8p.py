@@ -19,11 +19,11 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from tools.model.compact import write_shard
-from tools.model.publication import file_hash
-from tools.quantization.flash_next import atomic_json as write_json
+from tools.build.files import file_hash
+from tools.build.files import atomic_json as write_json
 from tools.model.safetensors_source import Source, local_header
 from tools.quantization.flash_next_aux import int8_rows
-from tools.quantization.qwen35 import gpu_lock
+from tools.build.gpu import gpu_lock
 
 
 def rotated_w8_layers(config):

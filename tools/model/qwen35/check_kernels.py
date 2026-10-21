@@ -4,7 +4,8 @@ import argparse
 import json
 from pathlib import Path
 import numpy as np
-from tools.model.qwen35.build import gpu_lock, primitive
+from tools.build.gpu import gpu_lock
+from tools.model.compile import primitive
 
 
 def run():

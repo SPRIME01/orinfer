@@ -1,6 +1,6 @@
 """Native one-layer W8 draft and compact, exact-prefix target verification."""
 
-from tools.model.qwen35.build import primitive
+from tools.model.compile import primitive
 
 WARM = 512
 VERIFY = 8

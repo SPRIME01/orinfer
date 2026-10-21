@@ -13,30 +13,13 @@ from pathlib import Path
 import re
 import time
 
+from tools.build.files import atomic_json, file_hash as digest
+
 import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from tools.model.safetensors_source import Source, local_header
-
-
-def atomic_json(path, value):
-    path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("w") as f:
-        json.dump(value, f, indent=2)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    temporary.replace(path)
-
-
-def digest(path):
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        for data in iter(lambda: f.read(4 * 1024**2), b""):
-            h.update(data)
-    return h.hexdigest()
 
 
 def equivalent(left, right):

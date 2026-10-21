@@ -5,7 +5,7 @@ use crate::{
     model::{Manifest, Operation},
 };
 use orinfer_model_sdk::{abi::BatchOperation, architecture::BatchSegment};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub(super) fn plan(
     m: &Manifest,
@@ -15,32 +15,17 @@ pub(super) fn plan(
     let body = operation != BatchOperation::DraftHead;
     let head = operation != BatchOperation::Warm;
     let spec = m.mtp.as_ref().ok_or("Missing draft adapter")?;
-    let used = segments.iter().try_fold(0usize, |sum, s| {
-        sum.checked_add(s.tokens).ok_or("Draft row overflow")
-    })?;
-    if used > spec.batch_draft_profiles.last().copied().unwrap_or(0) {
-        return Err("Unsupported draft batch capacity".into());
-    }
-    let mut owners = BTreeSet::new();
-    if segments.is_empty()
-        || (operation == BatchOperation::Draft && segments.len() < 2)
-        || segments.iter().any(|s| {
-            s.tokens == 0
-                || (operation != BatchOperation::Warm && s.tokens != 1)
-                || !owners.insert(s.slot)
-        })
+    let capacity = spec.batch_draft_profiles.last().copied().unwrap_or(0);
+    let rows = crate::packet::Rows::packet(segments, capacity, capacity)?;
+    let used = rows.total;
+    if (operation == BatchOperation::Draft && segments.len() < 2)
+        || segments
+            .iter()
+            .any(|s| operation != BatchOperation::Warm && s.tokens != 1)
     {
         return Err("Draft packet requires unique independent one-token rows".into());
     }
-    let mut offset = 0;
-    let offsets: Vec<_> = segments
-        .iter()
-        .map(|s| {
-            let start = offset;
-            offset += s.tokens;
-            start
-        })
-        .collect();
+    let offsets = rows.starts;
     let frame_capacity = 512;
     let prefix = "draft_rows";
     let arena = "DraftRows_";
@@ -73,10 +58,7 @@ pub(super) fn plan(
         if !bytes.is_multiple_of(frame_capacity) {
             return Err("Unaligned draft row arena".into());
         }
-        Ok(BufferView {
-            buffer: name.into(),
-            offset: index * (bytes / frame_capacity),
-        })
+        crate::packet::view(name, index, bytes / frame_capacity)
     };
     let embedding = "DraftRows_Embedding".to_owned();
     let condition = "DraftRows_Condition".to_owned();

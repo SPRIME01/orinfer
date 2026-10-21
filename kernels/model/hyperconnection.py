@@ -16,12 +16,39 @@ import tilelang.language as T
 from tools.operators.common import orin_jit
 from kernels.model.rows import row_count
 from kernels.model.half_math import SOURCE as HALF_MATH, stream_sigmoid
+from kernels.model.floating_core import mma_loop
 
 
 def _dtype(value):
     if value not in ("float16", "bfloat16"):
         raise ValueError("HC stream dtype must be FP16 or BF16")
     return value
+
+
+def combine_fragment(H, streams, dtype):
+    """Residual injection and its FP32 norm reduction, retaining stream rounding."""
+    width = 1 << (H - 1).bit_length()
+
+    @T.macro
+    def combine(Block, Residual, Inject, Output, values, square, total, row, branch):
+        raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
+        gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
+        for j in T.Parallel(width, coalesced_width=T.int32(1)):
+            values[j] = 0.0
+            if j < H:
+                injection = T.cast(
+                    T.cast(Block[row, j], T.float32) * T.cast(gate, T.float32), dtype
+                )
+                rounded = T.cast(
+                    T.cast(Residual[row, branch, j], T.float32) + T.cast(injection, T.float32),
+                    dtype,
+                )
+                values[j] = T.cast(rounded, T.float32)
+                Output[row, branch, j] = rounded
+            square[j] = values[j] * values[j]
+        T.reduce_sum(square, total, dim=0)
+
+    return combine
 
 
 def norm_fragment(H, eps, dtype):
@@ -191,6 +218,7 @@ def hc_combine_norm(
     if any(type(x) is not int or x <= 0 for x in (M, H, streams)) or not 0 < eps < 1:
         raise ValueError("Invalid HC combination/normalization dimensions")
     width = 1 << (H - 1).bit_length()
+    combine = combine_fragment(H, streams, dtype)
 
     @T.prim_func
     def main(
@@ -206,22 +234,7 @@ def hc_combine_norm(
             values = T.alloc_fragment((width,), T.float32)
             square = T.alloc_fragment((width,), T.float32)
             total = T.alloc_fragment((1,), T.float32)
-            raw = T.cast(T.cast(T.cast(Inject[row, branch], T.float32) / streams, dtype), T.float32)
-            gate = T.cast(2.0 * T.cast(stream_sigmoid(raw, dtype), T.float32), dtype)
-            for j in T.Parallel(width, coalesced_width=T.int32(1)):
-                values[j] = 0.0
-                if j < H:
-                    injection = T.cast(
-                        T.cast(Block[row, j], T.float32) * T.cast(gate, T.float32), dtype
-                    )
-                    rounded = T.cast(
-                        T.cast(Residual[row, branch, j], T.float32) + T.cast(injection, T.float32),
-                        dtype,
-                    )
-                    values[j] = T.cast(rounded, T.float32)
-                    Output[row, branch, j] = rounded
-                square[j] = values[j] * values[j]
-            T.reduce_sum(square, total, dim=0)
+            combine(Block, Residual, Inject, Output, values, square, total, row, branch)
             for j in T.Parallel(H, coalesced_width=T.int32(1)):
                 Normed[row, branch, j] = (
                     values[j] * T.rsqrt(total[0] / H + eps) * (1.0 + Weight[branch, j])
@@ -271,30 +284,14 @@ def hc_projection(
         raise ValueError("Invalid HC reduction grouping")
     threads = 64 if block_n == 16 else 128
     M = row_count(M, dynamic_rows)
+    accumulate = mma_loop(
+        M, K, block_m, block_n, 64, stages=2, reduction_groups=reduction_groups, cast_input=True
+    )
 
     @T.macro
     def project(A, W, C, by, bx):
-        a = T.alloc_shared((block_m, 64), T.bfloat16)
-        w = T.alloc_shared((block_n, 64), T.bfloat16)
         acc = T.alloc_fragment((block_m, block_n), T.float32)
-        if reduction_groups == 4:
-            total = T.alloc_fragment((block_m, block_n), T.float32)
-            T.clear(total)
-        for branch in T.serial(reduction_groups):
-            T.clear(acc)
-            for kg in T.Pipelined(K // (64 * reduction_groups), num_stages=2):
-                offset = branch * (K // reduction_groups) + kg * 64
-                for i, j in T.Parallel(block_m, 64, coalesced_width=T.int32(1)):
-                    a[i, j] = T.if_then_else(
-                        by * block_m + i < M, A[by * block_m + i, offset + j], 0.0
-                    )
-                T.copy(W[bx * block_n, offset], w)
-                T.gemm(a, w, acc, transpose_B=True)
-            if reduction_groups == 4:
-                for i, j in T.Parallel(block_m, block_n):
-                    total[i, j] += acc[i, j]
-        if reduction_groups == 4:
-            T.copy(total, acc)
+        accumulate(A, W, acc, by, bx, 0)
         if silu:
             for i, j in T.Parallel(block_m, block_n):
                 if by * block_m + i < M and bx * block_n + j < N:

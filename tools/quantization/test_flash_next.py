@@ -5,7 +5,8 @@ import unittest
 import numpy as np
 from safetensors.numpy import save_file
 
-from tools.quantization.flash_next import bf16, digest, verify
+from tools.quantization.flash_next import bf16, verify
+from tools.build.files import file_hash as digest
 
 
 class FlashConversionTests(unittest.TestCase):

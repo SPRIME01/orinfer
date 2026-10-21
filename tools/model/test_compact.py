@@ -13,7 +13,8 @@ from safetensors import safe_open
 from safetensors.numpy import save_file
 
 from tools.model.compact import compact, compact_weights, header, write_shard
-from tools.model.publication import AssetReader, file_hash, write_json
+from tools.model.publication import AssetReader
+from tools.build.files import file_hash, write_json
 from tools.model.package import archive, install
 
 

@@ -8,7 +8,8 @@ import tempfile
 import numpy as np
 from safetensors.numpy import save_file
 from tools.model.compact import write_shard
-from tools.model.publication import file_hash, link_or_copy, source_path, write_json
+from tools.build.files import file_hash, write_json
+from tools.model.publication import link_or_copy, source_path
 from tools.model.safetensors_source import local_header
 
 DTYPES = {

@@ -5,14 +5,13 @@ Every candidate receives the same data, tail guards and changed-input graph
 check. Only selected tiles are emitted; no tuning runs in the Rust runtime.
 """
 
-import hashlib
-import json
 import math
 from itertools import chain
 from pathlib import Path
 from tools.model.compile import primitive
 from tools.model.row_selection import aggregate_winner, ranges
-from tools.model.publication import write_json
+from tools.build.files import atomic_json
+from tools.model.tuning import compile_candidates, measure, read_record, record_path
 
 ROTATION_TILES = (256, 512, 1024)
 ATTENTION_PIPELINES = [
@@ -58,7 +57,7 @@ class RowTuner:
         relative_tolerance=0.0,
         validation_inputs=None,
     ):
-        from tools.operators.common import benchmark, SEED
+        from tools.operators.common import SEED
         import torch
 
         measured = [1, 2, 3, 4, 8, 17, 64, 129, 512, 4096] if measure_rows is None else measure_rows
@@ -73,14 +72,12 @@ class RowTuner:
         )
         if relative_tolerance:
             identity["selection_tolerance"] = relative_tolerance
-        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-        path = self.output / (key + ".json")
-        if path.exists():
-            cached = json.loads(path.read_text())
-            if cached["identity"] != identity:
-                raise ValueError("Row pipeline tuning cache identity changed")
+        path = record_path(self.output, identity)
+        key = path.stem
+        cached = read_record(path, identity)
+        if cached is not None:
             return cached
-        kernels = [build(c) for c in configs]
+        kernels, _, _ = compile_candidates(configs, build)
         records = []
         for rows in measured:
             times = {str(i): [] for i in range(len(configs))}
@@ -97,17 +94,15 @@ class RowTuner:
                     run, check, change = fixture(pair, configs[index])
                     run()
                     check()
-                    repetitions = 1
+                    latency = measure(
+                        run,
+                        budget_ms=0.25 if measured_case else 0,
+                        max_repetitions=32,
+                        change=change,
+                        check=check,
+                    )
                     if measured_case:
-                        pilot, _ = benchmark(run, repetitions=1, warmup=1)
-                        repetitions = max(1, min(32, math.ceil(0.25 / pilot["median_ms"])))
-                    timing, graph = benchmark(run, repetitions=repetitions, warmup=0)
-                    change()
-                    graph.replay()
-                    check()
-                    change()
-                    if measured_case:
-                        times[str(index)].append(timing["median_ms"])
+                        times[str(index)].append(latency)
             record = dict(
                 rows=rows,
                 times={k: math.exp(sum(map(math.log, v)) / len(v)) for k, v in times.items()},
@@ -133,7 +128,7 @@ class RowTuner:
             ]
         chosen = ranges(decisions, capacity=4096)
         result = dict(identity=identity, configs=configs, measurements=records, **chosen)
-        write_json(path, result)
+        atomic_json(path, result)
         return result
 
     def activation_rotation(self, k, swiglu, *, multiplier=1):

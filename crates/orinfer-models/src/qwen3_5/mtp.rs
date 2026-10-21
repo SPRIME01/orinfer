@@ -330,20 +330,12 @@ pub(super) fn commit(
             || COLUMNS.to_vec(),
             |t| t.columns.iter().map(String::as_str).collect(),
         );
-        let buffers: BTreeSet<_> = m.buffers.iter().map(|b| b.name.as_str()).collect();
-        let roles: Vec<_> = (0..m.batch_layout.as_ref().unwrap().layers.len())
-            .flat_map(|layer| {
-                let buffers = &buffers;
-                columns.iter().map(move |&role| {
-                    let name = format!("L{layer}_{role}");
-                    if buffers.contains(name.as_str()) {
-                        Some(name)
-                    } else {
-                        buffers.contains(role).then(|| role.into())
-                    }
-                })
-            })
-            .collect();
+        let roles = crate::packet::layer_roles(
+            m,
+            m.batch_layout.as_ref().unwrap().layers.len(),
+            &columns,
+            |role, layer| [format!("L{layer}_{role}"), role.to_owned()],
+        );
         let bindings = crate::packet::private_bindings(segments, segments.len(), &roles);
         if include {
             append(
@@ -380,24 +372,19 @@ pub(super) fn draft(
 ) -> Result<abi::BatchPlan> {
     let body = operation != abi::BatchOperation::DraftHead;
     let head = operation != abi::BatchOperation::Warm;
-    let mut owners = BTreeSet::new();
-    let total = segments
+    let rows = crate::packet::Rows::packet(
+        segments,
+        LANES,
+        if operation == abi::BatchOperation::Warm {
+            spec_warm_capacity(m)
+        } else {
+            LANES
+        },
+    )?;
+    let total = rows.total;
+    if segments
         .iter()
-        .try_fold(0usize, |n, s| n.checked_add(s.tokens))
-        .ok_or("Draft row overflow")?;
-    if segments.is_empty()
-        || segments.len() > LANES
-        || total
-            > if operation == abi::BatchOperation::Warm {
-                spec_warm_capacity(m)
-            } else {
-                LANES
-            }
-        || segments.iter().any(|s| {
-            s.tokens == 0
-                || !owners.insert(s.slot)
-                || (operation != abi::BatchOperation::Warm && s.tokens != 1)
-        })
+        .any(|s| operation != abi::BatchOperation::Warm && s.tokens != 1)
     {
         return Err("Invalid Qwen draft packet".into());
     }
@@ -434,26 +421,16 @@ pub(super) fn draft(
         ))
     })
     .collect::<Result<_>>()?;
-    let mut offset = 0;
     let views: Vec<BTreeMap<String, BufferView>> = segments
         .iter()
-        .map(|s| {
-            let v = strides
-                .iter()
-                .map(|(name, stride)| {
-                    (
-                        (*name).into(),
-                        BufferView {
-                            buffer: (*name).into(),
-                            offset: offset * stride,
-                        },
-                    )
-                })
-                .collect();
-            offset += s.tokens;
-            v
+        .enumerate()
+        .map(|(lane, _)| {
+            crate::packet::views(
+                rows.starts[lane],
+                strides.iter().map(|&(name, stride)| (name, stride)),
+            )
         })
-        .collect();
+        .collect::<Result<_>>()?;
     let copy = |out: &mut Vec<Invocation>,
                 source: &str,
                 destination: &str,
@@ -500,13 +477,7 @@ pub(super) fn draft(
         append(m, &mut out, "mtp_post", total, None, &empty)?;
     }
     for (lane, (s, v)) in segments.iter().zip(&views).enumerate() {
-        let hv = BTreeMap::from([(
-            "HeadHidden".into(),
-            BufferView {
-                buffer: "HeadHidden".into(),
-                offset: lane * hidden * 2,
-            },
-        )]);
+        let hv = crate::packet::views(lane, [("HeadHidden", hidden * 2)])?;
         if body {
             append(m, &mut out, "mtp_advance", s.tokens, Some(s.slot), v)?;
             append(m, &mut out, "mtp_gather", 1, Some(s.slot), v)?;
@@ -533,22 +504,7 @@ pub(super) fn draft(
     if head {
         append(m, &mut out, "qwen_rows/head", segments.len(), None, &empty)?;
         for (lane, s) in segments.iter().enumerate() {
-            let v = BTreeMap::from([
-                (
-                    "HeadLogits".into(),
-                    BufferView {
-                        buffer: "HeadLogits".into(),
-                        offset: lane * m.vocab * 4,
-                    },
-                ),
-                (
-                    "Pairs".into(),
-                    BufferView {
-                        buffer: "Pairs".into(),
-                        offset: lane * 8,
-                    },
-                ),
-            ]);
+            let v = crate::packet::views(lane, [("HeadLogits", m.vocab * 4), ("Pairs", 8)])?;
             copy(&mut out, "HeadLogits", "MtpLogits", m.vocab * 4, s.slot, &v);
             append(m, &mut out, "mtp_select", 1, Some(s.slot), &v)?;
         }

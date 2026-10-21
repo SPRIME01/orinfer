@@ -13,14 +13,8 @@ from types import SimpleNamespace
 
 from tools.model.build_cache import BuildCache, identity
 from tools.model.host_compiler import Compiler
-from tools.model.publication import (
-    ROOT,
-    atomic_model,
-    clone_model,
-    file_hash,
-    load_model,
-    write_json,
-)
+from tools.model.publication import ROOT, atomic_model, clone_model, load_model
+from tools.build.files import write_json, source_hash
 
 
 def source_identity():
@@ -29,8 +23,10 @@ def source_identity():
         ROOT / "tools/model/expert_tuning.py",
         ROOT / "tools/model/row_selection.py",
         ROOT / "tools/model/row_tuning.py",
+        ROOT / "tools/model/tuning.py",
+        ROOT / "tools/build/files.py",
     ]
-    return identity({str(p.relative_to(ROOT)): file_hash(p) for p in files})
+    return source_hash(ROOT, files)
 
 
 def router_geometry(package, operands, buffers, rows):

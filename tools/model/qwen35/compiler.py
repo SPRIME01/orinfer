@@ -1,11 +1,11 @@
 """Reuse Flash Next's content cache and host-ABI emitter for native Qwen AOT."""
 
-import hashlib
 from pathlib import Path
 from tools.model.build_cache import BuildCache
 from tools.model.host_compiler import Compiler
 from tools.model.row_convergence import divide_rows
 from tools.operators.common import export_kernel
+from tools.build.files import source_hash
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -18,38 +18,40 @@ class Aot:
         self.compiler = Compiler(root, root, output, buffers)
         self.kernels, self.dynamic = [], []
         self.objects = {}
-        sha = hashlib.sha256()
+        sources = []
         for directory in [
             ROOT / "kernels",
             ROOT / "tools/model/qwen35",
             ROOT / "tools/model/qwen_asr",
+            ROOT / "tools/build",
         ]:
             for file in sorted(directory.rglob("*.py")):
                 if file.name.startswith(("test_", "check_")):
                     continue
-                sha.update(str(file.relative_to(ROOT)).encode())
-                sha.update(file.read_bytes())
-        for file in [
-            ROOT / "tools/model/compile.py",
-            ROOT / "tools/model/row_tuning.py",
-            ROOT / "tools/model/attention_reference.py",
-            ROOT / "tools/model/private_rows.py",
-            ROOT / "tools/model/expert_tuning.py",
-            ROOT / "tools/model/gdn_tuning.py",
-            ROOT / "tools/model/row_selection.py",
-            ROOT / "tools/model/host_compiler.py",
-            ROOT / "tools/model/projection_tuning.py",
-            ROOT / "tools/model/projection_policy.py",
-            ROOT / "tools/model/row_convergence.py",
-            ROOT / "tools/operators/abi.py",
-            ROOT / "tools/operators/common.py",
-        ]:
-            sha.update(file.read_bytes())
+                sources.append(file)
+        sources.extend(
+            [
+                ROOT / "tools/model/compile.py",
+                ROOT / "tools/model/row_tuning.py",
+                ROOT / "tools/model/tuning.py",
+                ROOT / "tools/model/attention_reference.py",
+                ROOT / "tools/model/private_rows.py",
+                ROOT / "tools/model/expert_tuning.py",
+                ROOT / "tools/model/gdn_tuning.py",
+                ROOT / "tools/model/row_selection.py",
+                ROOT / "tools/model/host_compiler.py",
+                ROOT / "tools/model/projection_tuning.py",
+                ROOT / "tools/model/projection_policy.py",
+                ROOT / "tools/model/row_convergence.py",
+                ROOT / "tools/operators/abi.py",
+                ROOT / "tools/operators/common.py",
+            ]
+        )
         import torch
         import tilelang
 
         self.identity = dict(
-            source=sha.hexdigest(),
+            source=source_hash(ROOT, sources),
             tilelang=tilelang.__version__,
             cuda=torch.version.cuda,
             target="sm_87",

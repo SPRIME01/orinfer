@@ -6,7 +6,7 @@ from tools.model.gdn_tuning import chunked
 
 
 def prefill(b, section, layer):
-    from tools.model.qwen35.build import gpu_lock
+    from tools.build.gpu import gpu_lock
 
     w, hv = b.weights, b.hv
     if "GdnChunkW" not in w.buffers:

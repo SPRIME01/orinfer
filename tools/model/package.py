@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.model.publication import AssetReader, file_hash, source_path
+from tools.model.publication import AssetReader, source_path
+from tools.build.files import file_hash
 
 
 CONTRACT = json.loads(

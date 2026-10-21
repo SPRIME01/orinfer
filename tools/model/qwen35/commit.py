@@ -1,11 +1,10 @@
 """Batch exact-prefix restoration with the shared independent-owner wrapper."""
 
 import hashlib
-import inspect
-from kernels.model.independent_rows import independent_rows
 from kernels.model.gdn_sequence import gdn_commit_controlled
 from kernels.model.speculation import select_prefix
-from tools.model.compile import primitive
+from tools.model.compile import compile_function, instantiate
+from tools.model.private_rows import wrap_private
 from tools.model.qwen35.parallel import LANES
 
 TABLE = "QwenCommitPointers"
@@ -21,15 +20,14 @@ COLUMNS = (
 )
 
 
-def factory(role, hk, hv, channels, layers, columns, capacity):
-    columns = {name: i for i, name in enumerate(columns)}
+def factory(role, hk, hv, channels, capacity):
     if role == "state":
         if capacity:
             from kernels.model.gdn_deferred import commit
 
             fn = commit(capacity, key_heads=hk, value_heads=hv)
         else:
-            fn = inspect.unwrap(gdn_commit_controlled)(8, key_heads=hk, value_heads=hv)
+            fn = instantiate(gdn_commit_controlled, 8, key_heads=hk, value_heads=hv)
         mapping = dict(
             K="VerifyK",
             G="VerifyG",
@@ -43,15 +41,12 @@ def factory(role, hk, hv, channels, layers, columns, capacity):
                 LogK="GdnLogKey", LogD="GdnLogDelta", LogG="GdnLogGate", Count="GdnLogCount"
             )
     elif role == "history":
-        fn = inspect.unwrap(select_prefix)(8, 3 * channels, "float16")
+        fn = instantiate(select_prefix, 8, 3 * channels, "float16")
         mapping = dict(Prefix="HistoryPrefixes", Count="AcceptedInputs", State="History")
     else:
         raise ValueError("Unknown commit role")
     roles = {name: ("private", identity) for name, identity in mapping.items()}
-    wrapped, _ = independent_rows(
-        fn, LANES, roles, columns, row_stride=layers * len(columns), dynamic=True
-    )
-    return wrapped
+    return fn, roles
 
 
 def build(b):
@@ -69,13 +64,21 @@ def build(b):
         if kind != "linear_attention":
             continue
         for role in ("state", "history"):
-            fn = factory(role, b.hk, b.hv, b.qkv, layers, columns, capacity)
+            fn, roles = factory(role, b.hk, b.hv, b.qkv, capacity)
+            fn, bindings = wrap_private(
+                fn,
+                LANES,
+                roles,
+                columns,
+                {},
+                target,
+                table_offset=layer * len(columns) * 8,
+                row_stride=layers * len(columns),
+            )
             b.emit(
                 f"commit/layer{layer}/{role}",
                 "commit-rows-" + hashlib.sha256(str(fn).encode()).hexdigest(),
-                lambda fn=fn: primitive(lambda: fn),
-                dict(
-                    Pointers=dict(kind="buffer_slice", name=target, offset=layer * len(columns) * 8)
-                ),
+                lambda fn=fn: compile_function(fn),
+                bindings,
                 LANES,
             )

@@ -4,6 +4,31 @@ import tilelang.language as T
 from tools.operators.common import orin_jit
 
 
+def output_fragments(vocab, *, batched=False):
+    """Share full-logit and selection writes across direct and owner-table I/O."""
+
+    @T.macro
+    def logits(Source, Logits, row, block):
+        for column in T.Parallel(512):
+            index = block * 512 + column
+            if index < vocab:
+                if batched:
+                    Logits[index] = Source[row, index]
+                else:
+                    Logits[index] = Source[index]
+
+    @T.macro
+    def selected(Pair, Token, Status, row):
+        if batched:
+            Token[0] = Pair[row, 0]
+            Status[0] = Pair[row, 1]
+        else:
+            Token[0] = Pair[0]
+            Status[0] = Pair[1]
+
+    return logits, selected
+
+
 @orin_jit
 def token_input():
     @T.prim_func
@@ -17,6 +42,8 @@ def token_input():
 
 @orin_jit
 def outputs(vocab):
+    write_logits, write_selected = output_fragments(vocab)
+
     @T.prim_func
     def kernel(
         Source: T.Tensor((vocab,), T.float32),
@@ -26,12 +53,8 @@ def outputs(vocab):
         Status: T.Tensor((1,), T.int32),
     ):
         with T.Kernel(T.ceildiv(vocab, 512), threads=128) as block:
-            for column in T.Parallel(512):
-                index = block * 512 + column
-                if index < vocab:
-                    Logits[index] = Source[index]
+            write_logits(Source, Logits, 0, block)
             if block == 0 and T.get_thread_binding() == 0:
-                Token[0] = Pair[0]
-                Status[0] = Pair[1]
+                write_selected(Pair, Token, Status, 0)
 
     return kernel

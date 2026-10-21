@@ -1,4 +1,5 @@
 //! Concatenated dense/MoE rows with independent causal segments and endpoint heads.
+use crate::packet::invocation as invoke;
 use crate::{
     artifact::Result,
     execution::{BufferView, Invocation},
@@ -45,26 +46,21 @@ pub(super) fn register(m: &mut Manifest) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_segments(m: &Manifest, segments: &[BatchSegment]) -> Result<usize> {
+pub(super) fn validate_segments(
+    m: &Manifest,
+    segments: &[BatchSegment],
+) -> Result<crate::packet::Rows> {
     if m.batch_layout
         .as_ref()
         .is_none_or(|l| l.profiles.is_empty())
-        || segments.is_empty()
-        || segments.len() > 128
     {
         return Err("Flash package lacks mixed causal segments".into());
     }
-    let mut slots = BTreeSet::new();
-    let total = segments.iter().try_fold(0usize, |n, s| -> Result<usize> {
-        if !segment_supported(m, s.tokens) || !slots.insert(s.slot) {
-            return Err("Invalid or repeated Flash causal segment".into());
-        }
-        n.checked_add(s.tokens).ok_or("Mixed row overflow".into())
-    })?;
-    if total == 0 || total > 1024 {
-        return Err("Flash mixed row capacity exceeded".into());
+    let rows = crate::packet::Rows::packet(segments, 128, 1024)?;
+    if segments.iter().any(|s| !segment_supported(m, s.tokens)) {
+        return Err("Invalid Flash causal segment".into());
     }
-    Ok(total)
+    Ok(rows)
 }
 
 fn segment_supported(m: &Manifest, tokens: usize) -> bool {
@@ -84,18 +80,6 @@ pub(super) fn mixed_rows_plan(
     plan_kind(m, segments, Kind::MixedRows(prefills))
 }
 
-fn invoke(
-    operation: Operation,
-    sequence: Option<usize>,
-    views: &BTreeMap<String, BufferView>,
-) -> Invocation {
-    Invocation {
-        operation,
-        sequence,
-        views: views.clone(),
-        launch: None,
-    }
-}
 fn append(
     out: &mut Vec<Invocation>,
     m: &Manifest,
@@ -166,49 +150,6 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 }
             })
     };
-    let head_used: usize = segments
-        .iter()
-        .map(|s| if verified(s) { s.tokens } else { 1 })
-        .sum();
-    if kind == Kind::Ordinary {
-        validate_segments(m, segments)?
-    } else {
-        let mut slots = BTreeSet::new();
-        let mut has_prefill = false;
-        let mut has_verify = false;
-        let total = segments.iter().try_fold(0usize, |total, s| {
-            if !slots.insert(s.slot) {
-                return Err("Repeated mixed sequence".to_string());
-            }
-            if verified(s) {
-                has_verify = true;
-            } else if mixed && !explicit_verify.contains(&s.slot) && segment_supported(m, s.tokens)
-            {
-                has_prefill = true;
-            } else {
-                return Err("Invalid mixed verification segment".into());
-            }
-            total
-                .checked_add(s.tokens)
-                .ok_or("Verification row overflow".to_string())
-        })?;
-        if !(1..=128).contains(&segments.len())
-            || head_used > 128
-            || !has_verify
-            || (mixed && !has_prefill)
-        {
-            return Err("Invalid mixed verification endpoints".into());
-        }
-        if total > 1024 {
-            return Err("Verification row capacity exceeded".into());
-        }
-        total
-    };
-    let layout = m
-        .batch_layout
-        .as_ref()
-        .filter(|l| !l.profiles.is_empty())
-        .ok_or("Missing mixed row layout")?;
     // Put single-token rows first so the existing request-table mixers can
     // consume a contiguous subgroup without gathering projections or state.
     let ordered: Vec<_> = segments
@@ -218,6 +159,39 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         .cloned()
         .collect();
     let segments = ordered.as_slice();
+    let heads = crate::packet::Rows::new(
+        segments
+            .iter()
+            .map(|s| if verified(s) { s.tokens } else { 1 }),
+        128,
+    )?;
+    let head_used = heads.total;
+    let rows = if kind == Kind::Ordinary {
+        validate_segments(m, segments)?
+    } else {
+        let rows = crate::packet::Rows::packet(segments, 128, 1024)?;
+        let mut has_prefill = false;
+        let mut has_verify = false;
+        for s in segments {
+            if verified(s) {
+                has_verify = true;
+            } else if mixed && !explicit_verify.contains(&s.slot) && segment_supported(m, s.tokens)
+            {
+                has_prefill = true;
+            } else {
+                return Err("Invalid mixed verification segment".into());
+            }
+        }
+        if !has_verify || (mixed && !has_prefill) {
+            return Err("Invalid mixed verification endpoints".into());
+        }
+        rows
+    };
+    let layout = m
+        .batch_layout
+        .as_ref()
+        .filter(|l| !l.profiles.is_empty())
+        .ok_or("Missing mixed row layout")?;
     let decoders = segments.iter().take_while(|s| s.tokens == 1).count();
     let parallel = kind == Kind::Ordinary && decoders >= 2 && !layout.state_columns.is_empty();
 
@@ -225,8 +199,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
     let empty = BTreeMap::new();
     let mut out = vec![];
     let mut starts = vec![];
-    let mut start = 0;
-    for s in segments {
+    for (s, &start) in segments.iter().zip(&rows.starts) {
         let width = if verified(s) {
             m.mtp
                 .as_ref()
@@ -295,10 +268,7 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             }
             let old = format!("FlashMixed_{role}");
             let name = format!("FlashDecode_{role}");
-            let view = BufferView {
-                buffer: name.clone(),
-                offset: start * stride,
-            };
+            let view = crate::packet::view(&name, start, *stride)?;
             views.insert(old, view.clone());
             views.insert(name, view);
         }
@@ -325,11 +295,10 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             ));
         }
         starts.push((start, program, views));
-        start += s.tokens;
     }
 
     let append_body = |out: &mut Vec<Invocation>, program: &str| -> Result<()> {
-        super::rows::append(m, out, program, start, None, &empty)
+        super::rows::append(m, out, program, rows.total, None, &empty)
     };
     append_body(&mut out, &format!("{prefix}/begin"))?;
     for layer in 0..48 {
@@ -401,8 +370,9 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         append_body(&mut out, &format!("{prefix}/layer{layer}/post"))?;
     }
 
-    let mut head_lane = 0;
-    for (s, (first, program, views)) in segments.iter().zip(&starts) {
+    for ((s, (first, program, views)), &head_lane) in
+        segments.iter().zip(&starts).zip(&heads.starts)
+    {
         let name = if verified(s) {
             "causal_rows/verify/advance".into()
         } else {
@@ -438,17 +408,15 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
         let copy = BTreeMap::from([
             (
                 RESIDUAL.into(),
-                BufferView {
-                    buffer: "FlashDecode_Residual".into(),
-                    offset: (first + if verified(s) { 0 } else { s.tokens - 1 }) * 20480,
-                },
+                crate::packet::view(
+                    "FlashDecode_Residual",
+                    first + if verified(s) { 0 } else { s.tokens - 1 },
+                    20480,
+                )?,
             ),
             (
                 HEAD_RESIDUAL.into(),
-                BufferView {
-                    buffer: HEAD_RESIDUAL.into(),
-                    offset: head_lane * 20480,
-                },
+                crate::packet::view(HEAD_RESIDUAL, head_lane, 20480)?,
             ),
         ]);
         out.push(invoke(
@@ -460,7 +428,6 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             Some(s.slot),
             &copy,
         ));
-        head_lane += if verified(s) { s.tokens } else { 1 };
     }
     let views = BTreeMap::from([(
         "FlashDecode_Residual".into(),
@@ -473,26 +440,13 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
 
     let logits = "FlashDecode_Logits".to_owned();
     let selected = "FlashDecode_Selected".to_owned();
-    let mut head_lane = 0;
-    for s in segments {
+    for (s, &head_lane) in segments.iter().zip(&heads.starts) {
         if verified(s) {
             let spec = m.mtp.as_ref().unwrap();
-            let views = BTreeMap::from([
-                (
-                    logits.clone(),
-                    BufferView {
-                        buffer: logits.clone(),
-                        offset: head_lane * m.vocab * 4,
-                    },
-                ),
-                (
-                    selected.clone(),
-                    BufferView {
-                        buffer: selected.clone(),
-                        offset: head_lane * 8,
-                    },
-                ),
-            ]);
+            let views = crate::packet::views(
+                head_lane,
+                [(logits.as_str(), m.vocab * 4), (selected.as_str(), 8)],
+            )?;
             for (source, destination, bytes) in [
                 (
                     logits.clone(),
@@ -525,16 +479,9 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
             );
 
             out.push(selection);
-            head_lane += s.tokens;
             continue;
         }
-        let mut views = BTreeMap::from([(
-            logits.clone(),
-            BufferView {
-                buffer: logits.clone(),
-                offset: head_lane * m.vocab * 4,
-            },
-        )]);
+        let mut views = crate::packet::views(head_lane, [(logits.as_str(), m.vocab * 4)])?;
         out.push(invoke(
             Operation::Copy {
                 source: logits.clone(),
@@ -563,7 +510,6 @@ fn plan_kind(m: &Manifest, segments: &[BatchSegment], kind: Kind) -> Result<Vec<
                 &views,
             ));
         }
-        head_lane += 1;
     }
 
     Ok(out)

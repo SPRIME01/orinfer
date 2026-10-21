@@ -4,7 +4,7 @@ from functools import lru_cache
 import os
 from pathlib import Path
 
-from tools.model.publication import file_hash
+from tools.build.files import file_hash
 
 
 ROOT = Path(__file__).resolve().parents[1]

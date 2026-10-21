@@ -6,8 +6,6 @@ This publishes weights; execution-package construction is a separate step.
 """
 
 import argparse
-from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import math
@@ -18,12 +16,15 @@ import shutil
 import struct
 import time
 
+from tools.build.gpu import gpu_lock
+
 import numpy as np
 from safetensors.numpy import save_file
 
 from tools.model.compact import write_shard
 from tools.model.safetensors_source import Source, SIZES, local_header
-from tools.quantization.flash_next import atomic_json, bf16, digest, equivalent
+from tools.build.files import atomic_json, file_hash as digest
+from tools.quantization.flash_next import bf16, equivalent
 from tools.quantization.flash_next_aux import int8_rows
 from tools.quantization.row_q4 import MAGNITUDES
 
@@ -60,22 +61,6 @@ def group(name):
     if name.startswith("mtp."):
         return "model-mtp"
     return "model-shared-" + name.split(".")[-2]
-
-
-@contextmanager
-def gpu_lock(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            import torch
-
-            if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def tasks(source, chunk_bytes):

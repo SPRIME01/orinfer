@@ -15,7 +15,7 @@ from safetensors import safe_open
 from tools.model.flash_next.weights import header
 from tools.model.safetensors_source import relative_name, SIZES
 from tools.quantization.embedding_vq import EmbeddingDecoder
-from tools.quantization.flash_next import digest
+from tools.build.files import file_hash as digest
 
 
 DTYPES = {

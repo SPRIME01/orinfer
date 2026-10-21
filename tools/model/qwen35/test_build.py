@@ -55,7 +55,7 @@ def config():
 
 class BuildTests(unittest.TestCase):
     def test_joined_integer_banks_preserve_output_rows_scales_and_layout(self):
-        from tools.model.publication import file_hash
+        from tools.build.files import file_hash
         from tools.model.safetensors_source import local_header
 
         for codec in ("int8", "packed"):
@@ -414,7 +414,7 @@ class BuildTests(unittest.TestCase):
                     configuration(candidate, 262144)
 
     def test_native_shard_layout_is_explicit_without_requantization(self):
-        from tools.model.publication import file_hash
+        from tools.build.files import file_hash
         from tools.model.safetensors_source import local_header
 
         with tempfile.TemporaryDirectory() as directory:
@@ -714,7 +714,7 @@ class BuildTests(unittest.TestCase):
 
     def test_e8p_repack_is_lossless_and_publishes_one_weight_representation(self):
         from tools.model.compact import write_shard
-        from tools.model.publication import file_hash
+        from tools.build.files import file_hash
         from tools.model.safetensors_source import local_header
 
         with tempfile.TemporaryDirectory() as directory:

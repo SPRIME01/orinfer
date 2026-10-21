@@ -20,7 +20,7 @@ import numpy as np
 from safetensors import safe_open
 
 from tools.model.safetensors_source import Source, local_header, relative_name
-from tools.quantization.flash_next import atomic_json, digest
+from tools.build.files import atomic_json, file_hash as digest
 from tools.quantization.flash_next_aux import policy
 from tools.quantization.e8p import basis
 

@@ -16,7 +16,7 @@ import torch
 from kernels.model.e8p_q4 import projection
 from kernels.model.q4_projection import q4_decode
 from tools.model.compile import primitive
-from tools.model.publication import file_hash
+from tools.build.files import file_hash
 from tools.operators.common import benchmark, configure, write_json
 from tools.quantization.e8p import basis
 from tools.quantization.e8p_q4 import Weights

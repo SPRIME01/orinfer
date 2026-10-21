@@ -1,13 +1,13 @@
 """Offline SM87 operator helpers; runtime kernels remain independent of Torch."""
 
 import hashlib
-import json
 import os
 import shutil
 import statistics
 import time
 from functools import partial, wraps
 from pathlib import Path
+from tools.build.files import file_hash, write_json as write_json
 
 import torch
 import tilelang
@@ -52,11 +52,7 @@ def orin_jit(function=None, *, pass_configs=None):
 
 def identity(path):
     path = Path(path)
-    h = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1048576), b""):
-            h.update(block)
-    return {"path": str(path), "sha256": h.hexdigest(), "bytes": path.stat().st_size}
+    return {"path": str(path), "sha256": file_hash(path), "bytes": path.stat().st_size}
 
 
 def tensor_sha(tensor):
@@ -132,7 +128,3 @@ def environment():
         "seed": SEED,
         "output_root": os.environ.get("ORINFER_OPERATOR_OUTPUT"),
     }
-
-
-def write_json(path, data):
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")

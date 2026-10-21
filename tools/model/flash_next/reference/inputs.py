@@ -13,7 +13,7 @@ from tools.eval.scoring_common import SEED
 from tools.model.flash_next.reference.original import Original
 from tools.model.flash_next.ple import PleLookup
 from tools.model.safetensors_source import Source
-from tools.quantization.flash_next import atomic_json, digest
+from tools.build.files import atomic_json, file_hash as digest
 
 
 class Inputs:

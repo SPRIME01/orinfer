@@ -3,6 +3,22 @@
 import math
 
 
+def wrap_private(function, capacity, modes, columns, pointers, table, *, table_offset=0, **options):
+    from kernels.model.independent_rows import independent_rows
+
+    function, inputs = independent_rows(
+        function,
+        capacity,
+        modes,
+        {name: i for i, name in enumerate(columns)},
+        dynamic=True,
+        **options,
+    )
+    bindings = {name: pointers[name] for name in inputs if name not in (None, "__rows__")}
+    bindings["Pointers"] = dict(kind="buffer_slice", name=table, offset=table_offset)
+    return function, bindings
+
+
 class PrivateRows:
     def __init__(self, weights, row_buffers, scratch, identity, capacity, layers, columns=()):
         self.weights, self.row_buffers, self.scratch = weights, set(row_buffers), scratch
@@ -71,15 +87,15 @@ class PrivateRows:
         return self.offsets, cursor, self.columns
 
     def wrap(self, function, modes, pointers, layer, table, **options):
-        from kernels.model.independent_rows import independent_rows
-
-        function, inputs = independent_rows(
+        return wrap_private(
             function,
             self.capacity,
             modes,
-            {name: i for i, name in enumerate(self.columns)},
+            self.columns,
+            pointers,
+            table,
+            table_offset=layer * len(self.columns) * 8,
             row_stride=self.layers * len(self.columns),
-            dynamic=True,
             offsets={
                 name: self.offsets[arg["name"]]
                 for name, arg in pointers.items()
@@ -87,20 +103,3 @@ class PrivateRows:
             },
             **options,
         )
-        bindings = {name: pointers[name] for name in inputs if name not in (None, "__rows__")}
-        bindings["Pointers"] = dict(
-            kind="buffer_slice", name=table, offset=layer * len(self.columns) * 8
-        )
-        return function, bindings
-
-
-def compile_private(function, **options):
-    import tilelang
-
-    return tilelang.compile(
-        function,
-        out_idx=[],
-        execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
-        **options,
-    )

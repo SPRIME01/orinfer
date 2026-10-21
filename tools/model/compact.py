@@ -11,15 +11,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.model.publication import (  # noqa: E402
-    AssetReader,
-    ROOT,
-    file_hash,
-    load_model,
-    source_path,
-    staged_directory,
-    write_json,
-)
+from tools.model.publication import AssetReader, ROOT, load_model, source_path, staged_directory  # noqa: E402
+from tools.build.files import file_hash, write_json  # noqa: E402
 from tools.model.safetensors_source import read_header  # noqa: E402
 
 

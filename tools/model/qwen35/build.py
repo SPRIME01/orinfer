@@ -7,16 +7,17 @@ single packed weight copy remain fixed. All online scheduling and layer order ar
 
 import argparse
 import hashlib
-from contextlib import contextmanager
-import fcntl
 import json
 import math
 from pathlib import Path
 import shutil
 import subprocess
 
+from tools.build.gpu import gpu_lock
+
 import numpy as np
-from tools.model.publication import atomic_model, file_hash, write_json
+from tools.model.publication import atomic_model
+from tools.build.files import file_hash, write_json
 from tools.model.package import config_signature, execution_identity, model_library
 from tools.model.compact import compact_package
 from tools.model.qwen35.storage import Weights
@@ -175,25 +176,6 @@ def configuration(config, context):
     if type(context) is not int or not 1 <= context <= min(t["max_position_embeddings"], 262144):
         raise ValueError("Invalid context capacity")
     return t
-
-
-@contextmanager
-def gpu_lock(path):
-    if path is None:
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as stream:
-        fcntl.flock(stream, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            import torch
-
-            if torch.cuda.is_initialized():
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-            fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 class Builder:
