@@ -27,6 +27,16 @@ bash tools/operators/run.sh --resume tools/model/flash_next/build.py artifacts/f
 
 对已经验收的原生包，可加 `--prefill-only` 只重建其声明的 prefill 投影，沿用其他固定身份的算子与专家组合。它只限制离线构建范围，运行时仍使用同一动态行模板。
 
+`--projection-kinds w8` 可只重建 W8 投影；`--projection-shape N K` 按输出、输入维度进一步限定范围，可重复指定多个几何，并可与 `--prefill-only` 组合。其他投影、专家和辅助绑定沿用输入包。例如，只重建 640→2560 的 W8 投影：
+
+```bash
+bash tools/operators/run.sh tools/model/flash_next/build.py artifacts/flash-w8-build \
+  --model /path/to/native-model --model-output artifacts/models/flash-w8-ready \
+  --projection-kinds w8 --projection-shape 2560 640
+```
+
+W8 调优包含寄存器 scale 复用和按行 tile 遍历的候选；它们读取相同的原生 W8 权重，保持完整 INT32 点积、先权重 scale 后 token scale 的 FP32 乘法顺序，以及最终输出舍入。候选由真实权重和多个行数的测量选择，发布包只保留选中的实现，Rust 在线路径没有新增依赖。
+
 在 CPU 上清点构造契约：
 
 ```bash

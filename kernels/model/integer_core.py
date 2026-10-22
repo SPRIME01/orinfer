@@ -30,6 +30,8 @@ def swiglu(gate, up):
 
 def tile_coordinates(pid, rows, columns, group_m):
     """Group neighbouring row tiles while reusing a bounded activation slab."""
+    if group_m == 1:
+        return pid // columns, pid % columns
     if group_m:
         first = (pid // (group_m * columns)) * group_m
         actual = T.min(rows - first, group_m)
@@ -171,6 +173,7 @@ def tensor_core(
     dual=False,
     packed_k=0,
     grouped=False,
+    cache_scales=False,
 ):
     if codec == "e8p_q4" and dual:
         raise ValueError("E8P-Q4 reserves the secondary operand for its shared basis")
@@ -198,6 +201,28 @@ def tensor_core(
         a = T.alloc_shared((bm, bk), T.int8)
         w = T.alloc_shared((bn, bk), T.int8)
         acc = T.alloc_fragment((bn, bm) if left else (bm, bn), T.int32)
+        if cache_scales:
+            # Broadcast layouts follow the accumulator: each thread loads its
+            # distinct column/row scales once and reuses them across outputs.
+            # Widening FP16 scales is exact; rescale retains both FP32 multiplies.
+            weight_scales = T.alloc_fragment((bn,), T.float32)
+            token_scales = T.alloc_fragment((bm,), T.float32)
+            for j in T.Parallel(bn):
+                weight_scales[j] = 0
+                if bx * bn + j < n:
+                    weight_scales[j] = T.cast(
+                        WS[expert, bx * bn + j] if grouped else WS[bx * bn + j], T.float32
+                    )
+            for i in T.Parallel(bm):
+                token_scales[i] = 0
+                if by * bm + i < m:
+                    token_scales[i] = T.cast(AS[first + by * bm + i], T.float32)
+            if dual:
+                up_scales = T.alloc_fragment((bn,), T.float32)
+                for j in T.Parallel(bn):
+                    up_scales[j] = 0
+                    if bx * bn + j < n:
+                        up_scales[j] = T.cast(US[bx * bn + j], T.float32)
         if dual:
             u = T.alloc_shared((bn, bk), T.int8)
             up = T.alloc_fragment((bn, bm) if left else (bm, bn), T.int32)
@@ -226,12 +251,16 @@ def tensor_core(
                     T.gemm(a, u, up, transpose_B=True)
         for i, j in T.Parallel(bm, bn):
             if by * bm + i < m and bx * bn + j < n:
-                scale = WS[expert, bx * bn + j] if grouped else WS[bx * bn + j]
-                value = rescale(acc[j, i] if left else acc[i, j], scale, AS[first + by * bm + i])
+                if cache_scales:
+                    scale = weight_scales[j]
+                    token_scale = token_scales[i]
+                else:
+                    scale = WS[expert, bx * bn + j] if grouped else WS[bx * bn + j]
+                    token_scale = AS[first + by * bm + i]
+                value = rescale(acc[j, i] if left else acc[i, j], scale, token_scale)
                 if dual:
-                    other = rescale(
-                        up[j, i] if left else up[i, j], US[bx * bn + j], AS[by * bm + i]
-                    )
+                    other_scale = up_scales[j] if cache_scales else US[bx * bn + j]
+                    other = rescale(up[j, i] if left else up[i, j], other_scale, token_scale)
                     Out[first + by * bm + i, bx * bn + j] = swiglu(value, other)
                 else:
                     Out[first + by * bm + i, bx * bn + j] = value

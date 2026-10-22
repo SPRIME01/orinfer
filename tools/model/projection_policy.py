@@ -91,6 +91,10 @@ def w8_configs(rows, outputs):
     return (
         [dict(block_m=m, block_n=n, block_k=128) for m in (16, 32, 64, 128) for n in (64, 128)]
         + [dict(block_m=128, block_n=128, block_k=128, group_m=4)]
+        + [
+            dict(block_m=m, block_n=n, block_k=128, group_m=1, cache_scales=True)
+            for m, n in ((32, 64), (64, 64), (128, 128))
+        ]
         + [dict(algorithm="dp4a", block_m=min(rows, 4), block_n=n, block_k=128) for n in (4, 8, 16)]
     )
 

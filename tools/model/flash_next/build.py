@@ -21,6 +21,8 @@ from tools.model.flash_next.construction import (
     fixed_extents,
     prefill_names,
     projection,
+    select_projections,
+    bounded_measurements,
 )  # noqa: E402
 from tools.model.host_compiler import Compiler  # noqa: E402
 from tools.model.publication import ROOT, atomic_model, clone_model, load_model, source_path  # noqa: E402
@@ -127,6 +129,7 @@ def rebuild(args):
     buffers = {b["name"]: b for b in data["metadata"]["buffers"]}
     inspector = Compiler(origin, origin, args.output, buffers)
     groups, dynamic = inventory(data, package, manifest, inspector)
+    bounded = bounded_measurements(manifest)
     prefill = prefill_names(manifest)
     prefill_groups = {
         s
@@ -137,8 +140,10 @@ def rebuild(args):
         groups = {s: items for s, items in groups.items() if s in prefill_groups}
         if not groups:
             raise ValueError("No dynamic prefill projection contracts found")
+    groups = select_projections(groups, kinds=args.projection_kinds, shapes=args.projection_shape)
+    partial = args.prefill_only or args.projection_kinds or args.projection_shape
     experts = expert_matrices(package, inspector)
-    if args.prefill_only:
+    if partial:
         experts = {}
     report = dict(
         source_package=data["execution_package"],
@@ -148,6 +153,8 @@ def rebuild(args):
         preserved_bindings=len(package["kernels"]) - sum(map(len, groups.values())),
         expert_geometries=[list(key) for key in sorted(experts)],
         prefill_only=args.prefill_only,
+        projection_kinds=args.projection_kinds,
+        projection_shapes=args.projection_shape,
         prefill_tuning_rows=args.prefill_tuning_rows,
     )
     args.output.mkdir(parents=True, exist_ok=True)
@@ -253,44 +260,58 @@ def rebuild(args):
                 if spec in prefill_groups
                 else None
             )
-            entry_contract = dict(
-                source=contract["source"],
-                toolchain=contract["toolchain"],
-                seed=contract["seed"],
-                spec=spec.spec(),
-                weights=wc,
-                measure_rows=measured,
-            )
 
-            def construct(folder):
-                actual = read_weights(args.model, operands, buffers)
-                kernel, config = tuning.compile(
-                    **spec.spec(),
-                    weights=actual,
-                    weight_identity=identity(wc),
-                    measure_rows=measured,
+            def compile_extent(measurements):
+                entry_contract = dict(
+                    source=contract["source"],
+                    toolchain=contract["toolchain"],
+                    seed=contract["seed"],
+                    spec=spec.spec(),
+                    weights=wc,
+                    measure_rows=measurements,
                 )
-                export_kernel(kernel, folder)
-                write_json(
-                    folder / "validation.json",
-                    dict(config=config, tuning=list(tuning.results.values())[-1]),
-                )
-                del actual
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+
+                def construct(folder):
+                    actual = read_weights(args.model, operands, buffers)
+                    kernel, config = tuning.compile(
+                        **spec.spec(),
+                        weights=actual,
+                        weight_identity=identity(wc),
+                        measure_rows=measurements,
+                    )
+                    export_kernel(kernel, folder)
+                    write_json(
+                        folder / "validation.json",
+                        dict(config=config, tuning=list(tuning.results.values())[-1]),
+                    )
+                    del actual
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+
+                artifact, hit = cache.get(entry_contract, construct)
+                return artifact, hit, identity(entry_contract)
 
             tick = time.monotonic()
-            artifact, hit = cache.get(entry_contract, construct)
-            key = identity(entry_contract)
+            artifact, hit, key = compile_extent(measured)
+            extents = {tuple(measured or []): (artifact, hit, key)}
             for old, _ in items:
+                samples = (
+                    bounded.get(old["name"])
+                    if spec.dynamic and spec not in prefill_groups
+                    else None
+                )
+                sample_key = tuple(samples or measured or [])
+                if sample_key not in extents:
+                    extents[sample_key] = compile_extent(list(sample_key))
+                selected, _, selected_key = extents[sample_key]
                 capacity = dynamic.get(old["name"], {}).get("capacity", spec.rows)
                 item, launch = compiler.emit(
                     old,
                     old["name"],
                     compiler.pointers(old),
                     capacity,
-                    key=key,
-                    artifact=artifact,
+                    key=selected_key,
+                    artifact=selected,
                 )
                 replacements[old["name"]] = item
                 if old["name"] in dynamic:
@@ -302,6 +323,11 @@ def rebuild(args):
                     cache_hit=hit,
                     seconds=time.monotonic() - tick,
                     representative=representative["name"],
+                    bounded_choices=[
+                        dict(rows=list(rows), key=value[2])
+                        for rows, value in extents.items()
+                        if rows != tuple(measured or [])
+                    ],
                 )
             )
             write_json(
@@ -319,7 +345,7 @@ def rebuild(args):
         from tools.model.sampling import append as append_sampling
 
         append_sampling(data, package, root, args.output / "sampling")
-        if not args.prefill_only:
+        if not partial:
             from tools.model.auxiliary_tuning import publish as publish_auxiliary
 
             publish_auxiliary(data, package, manifest, compiler, args.output / "auxiliary")
@@ -359,11 +385,27 @@ def main():
         help="Rebuild only declared prefill projections; preserve other certified bindings",
     )
     p.add_argument("--prefill-tuning-rows", type=int, nargs="+", default=[512, 2048, 4096])
+    p.add_argument(
+        "--projection-kinds",
+        nargs="+",
+        choices=["q4", "w8", "swiglu"],
+        help="Rebuild selected projection kinds; preserve other projections and auxiliary bindings",
+    )
+    p.add_argument(
+        "--projection-shape",
+        nargs=2,
+        type=int,
+        action="append",
+        metavar=("N", "K"),
+        help="Restrict rebuilds to these output/input dimensions; repeat for multiple geometries",
+    )
     args = p.parse_args()
     if args.model.resolve() == args.model_output.resolve():
         p.error("model-output must differ from the immutable input")
     if any(r < 1 for r in args.prefill_tuning_rows):
         p.error("prefill-tuning-rows must be positive")
+    if any(n < 1 or k < 1 for n, k in args.projection_shape or []):
+        p.error("projection-shape dimensions must be positive")
     rebuild(args)
 
 

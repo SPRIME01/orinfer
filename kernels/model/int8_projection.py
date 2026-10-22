@@ -24,6 +24,7 @@ def int8_projection(
     dynamic_rows: bool = False,
     output_stride: int | None = None,
     tail_m: int = 0,
+    cache_scales: bool = False,
 ):
     if any(type(v) is not int or v <= 0 for v in (M, N, K)) or K % 64 or K * 128 * 128 > 2**31 - 1:
         raise ValueError("Invalid INT8 projection geometry")
@@ -33,6 +34,8 @@ def int8_projection(
         raise ValueError("Invalid INT8 row tile")
     if block_n not in (64, 128) or block_k not in (64, 128) or K % block_k:
         raise ValueError("Invalid INT8 column/reduction tile")
+    if type(cache_scales) is not bool:
+        raise ValueError("Invalid INT8 scale-cache choice")
     if type(group_m) is not int or group_m not in (0, 1, 2, 4, 8):
         raise ValueError("Invalid INT8 row grouping")
     M = row_count(M, dynamic_rows)
@@ -40,7 +43,9 @@ def int8_projection(
     if type(stride) is not int or stride < N:
         raise ValueError("INT8 output stride must contain the complete output row")
     nt = (N + block_n - 1) // block_n
-    mt, project = tensor_core_tiles(M, N, K, block_m, block_n, block_k, tail_m=tail_m)
+    mt, project = tensor_core_tiles(
+        M, N, K, block_m, block_n, block_k, tail_m=tail_m, cache_scales=cache_scales
+    )
 
     @T.prim_func
     def main(

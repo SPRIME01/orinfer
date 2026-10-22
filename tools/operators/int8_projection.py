@@ -111,6 +111,80 @@ def main():
                     "export": export_kernel(kernel, a.output / f"small-M{m}-N{n}-K{k}-{dtype}"),
                 }
             )
+    # Cached scales keep the same integer and epilogue arithmetic.
+    # Exercise partial M/N tiles with physical output strides and one captured
+    # dynamic kernel reused at several different live lengths.
+    from tools.model.compile import primitive
+
+    for config in (
+        dict(block_m=32, block_n=64, block_k=128, group_m=1, cache_scales=True),
+        dict(block_m=64, block_n=64, block_k=128, group_m=1, cache_scales=True),
+        dict(block_m=128, block_n=128, block_k=128, group_m=1, cache_scales=True),
+    ):
+        for dtype in ("float16", "float32"):
+            capacity, n, k, stride = 512, 257, 640, 272
+            kernel = primitive(
+                int8_projection,
+                capacity,
+                n,
+                k,
+                dtype,
+                dynamic_rows=True,
+                output_stride=stride,
+                **config,
+            )
+            for m in (1, 3, 17, 63, 65, 129, 511):
+                x = torch.randint(-128, 128, (m, k), device="cuda", dtype=torch.int8)
+                w = torch.randint(-128, 128, (n, k), device="cuda", dtype=torch.int8)
+                x[:, :4] = torch.tensor([-128, -1, 0, 127], device="cuda", dtype=torch.int8)
+                ws = (torch.rand(n, device="cuda") * 0.003).half()
+                ts = (torch.rand(m, device="cuda") * 0.005).half()
+                ws[0] = 0
+                storage = torch.full(
+                    (m + 2, stride), 99, device="cuda", dtype=getattr(torch, dtype)
+                )
+                out = storage[:m, :n]
+
+                def run_wide():
+                    kernel.adapter.func(
+                        x, w, ws, ts, out, m, stream=torch.cuda.current_stream().cuda_stream
+                    )
+
+                def check_wide():
+                    expected = (
+                        ((x.double() @ w.double().T).float() * ws.float()[None, :])
+                        * ts.float()[:, None]
+                    ).to(out.dtype)
+                    assert torch.equal(out, expected), error(out, expected)
+                    assert bool((storage[m:] == 99).all())
+                    assert bool((storage[:m, n:] == 99).all())
+
+                run_wide()
+                torch.cuda.synchronize()
+                check_wide()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run_wide()
+                x.bitwise_not_()
+                w.bitwise_not_()
+                ws.mul_(1.5)
+                ts.mul_(0.75)
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                check_wide()
+                cases.append(
+                    dict(
+                        shape=[m, n, k],
+                        output_dtype=dtype,
+                        config=config,
+                        dynamic_capacity=capacity,
+                        output_stride=stride,
+                        exact_integer_oracle=True,
+                        tail_guard=True,
+                        changed_input_weight_and_scale_graph=True,
+                    )
+                )
     write_json(a.output / "results.json", {"complete": True, "cases": cases, "scope": __doc__})
 
 

@@ -143,6 +143,7 @@ def factory(spec):
         split_k=1,
         group_m=0,
         tail_m=0,
+        cache_scales=False,
     ):
         decoded = json.loads(encoded)
         cfg = dict(block_m=block_m)
@@ -154,6 +155,9 @@ def factory(spec):
             cfg["split_k"] = split_k
         if decoded["kind"] in ("q4", "e8p_q4", "w8") and algorithm == "tensor_core":
             cfg.update({k: v for k, v in dict(group_m=group_m, tail_m=tail_m).items() if v})
+        if decoded["kind"] == "w8" and algorithm == "tensor_core":
+            if cache_scales:
+                cfg["cache_scales"] = True
         return make_prim(decoded, cfg)
 
     return build

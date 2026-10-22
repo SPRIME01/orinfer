@@ -21,6 +21,33 @@ class Projection:
         return asdict(self)
 
 
+def select_projections(groups, *, kinds=None, shapes=None):
+    """Restrict a rebuild by logical geometry, preserving every other binding."""
+    selected = {
+        spec: items
+        for spec, items in groups.items()
+        if (not kinds or spec.kind in kinds)
+        and (not shapes or [spec.outputs, spec.inputs] in shapes)
+    }
+    if not selected:
+        raise ValueError("No projection contracts match the requested scope")
+    return selected
+
+
+def bounded_measurements(manifest):
+    """Measure each declared dynamic selection at its endpoints and centre."""
+    result = {}
+    for variants in manifest.get("row_execution", {}).get("variants", {}).values():
+        for variant in variants:
+            first, last = variant["min_rows"], variant["max_rows"]
+            if first == last:
+                continue
+            samples = {first, last, math.isqrt(first * last)}
+            for name in variant["kernels"]:
+                result.setdefault(name, set()).update(samples)
+    return {name: sorted(rows) for name, rows in result.items()}
+
+
 def fixed_extents(manifest):
     result = {}
     for variants in manifest.get("row_execution", {}).get("variants", {}).values():

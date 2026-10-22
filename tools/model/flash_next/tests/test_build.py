@@ -11,6 +11,33 @@ from tools.model.projection_tuning import measurement_rows, profile_rows
 
 
 class BuildTests(unittest.TestCase):
+    def test_dynamic_selection_measurements_keep_declared_non_aot_intervals(self):
+        from tools.model.flash_next.construction import bounded_measurements
+
+        variants = [
+            dict(min_rows=first, max_rows=last, kernels=[name])
+            for first, last, name in ((8, 8, "aot"), (17, 31, "short"), (33, 127, "medium"))
+        ]
+        samples = bounded_measurements(dict(row_execution=dict(variants=dict(slot=variants))))
+        self.assertEqual(samples, dict(short=[17, 22, 31], medium=[33, 64, 127]))
+        self.assertEqual(bounded_measurements({}), {})
+
+    def test_projection_scope_keeps_all_row_contracts_of_selected_geometries(self):
+        from tools.model.flash_next.construction import Projection, select_projections
+
+        groups = {
+            Projection(kind, rows, n, k, "float16", rows > 32): [rows]
+            for kind, n, k in (("w8", 2560, 640), ("w8", 2560, 6144), ("q4", 2560, 640))
+            for rows in (1, 17, 128, 4096)
+        }
+        selected = select_projections(groups, kinds=["w8"], shapes=[[2560, 640]])
+        self.assertEqual({spec.rows for spec in selected}, {1, 17, 128, 4096})
+        self.assertTrue(all(spec.kind == "w8" and spec.inputs == 640 for spec in selected))
+        self.assertEqual(select_projections(groups), groups)
+        self.assertEqual(len(groups), 12)
+        with self.assertRaisesRegex(ValueError, "requested scope"):
+            select_projections(groups, shapes=[[640, 2560]])
+
     def test_router_uses_checkpoint_geometry_for_flattened_sliced_workspaces(self):
         from tools.model.auxiliary_tuning import router_geometry
 
@@ -42,6 +69,22 @@ class BuildTests(unittest.TestCase):
                 q4_configs(rows),
             )
             self.assertIn(dict(block_m=128, block_n=128, block_k=128), w8_configs(rows, 48))
+            self.assertIn(
+                dict(block_m=128, block_n=128, block_k=128, group_m=1, cache_scales=True),
+                w8_configs(rows, 48),
+            )
+
+    def test_fixed_projection_factory_preserves_scale_cache_and_traversal(self):
+        from unittest.mock import patch
+        from tools.model.projection_tuning import factory
+
+        spec = dict(kind="w8", rows=32, outputs=2560, inputs=640, dtype="float16", dynamic=False)
+        build = factory(spec)
+        with patch("tools.model.projection_tuning.make_prim", side_effect=lambda spec, cfg: cfg):
+            config = build(block_m=64, group_m=1, cache_scales=True)
+            self.assertTrue(config["cache_scales"])
+            self.assertEqual(config["group_m"], 1)
+            self.assertNotIn("cache_scales", build())
 
     def test_prefill_workload_does_not_change_dynamic_capacity(self):
         self.assertEqual(measurement_rows(4096, True, [512, 2048, 4096, 512]), [512, 2048, 4096])
